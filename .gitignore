@@ -1,0 +1,53 @@
+# Build artifacts
+/target/
+/debug/
+/release/
+
+# Rust/cargo incidental files
+**/*.rs.bk
+/.cargo/
+
+# IDE & editor state
+.vscode/
+.idea/
+*.code-workspace
+*.swp
+*.swo
+*.orig
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Local datasets & scratch (adjust as needed)
+data/
+etl_work/
+.reddit_etl_work/
+**/_staging/
+**/*_shards/
+**/*_dedup/
+**/*_kv_shards/
+**/*_kv_sum/
+**/*_kv_min/
+**/parents_cache/
+**/spool/
+**/spool_with_parents/
+**/export_partitioned/
+**/export_zst/
+**/agg_shards/
+**/*.inprogress
+**/*.tmp
+
+# Logs & coverage
+*.log
+logs/
+coverage/
+*.profraw
+*.profdata
+
+# Platform-specific binaries/symbols
+*.exe
+*.dll
+*.pdb
+*.dSYM
+*.py
