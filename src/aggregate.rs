@@ -3,18 +3,29 @@
 
 use crate::progress::make_count_progress;
 use crate::pipeline::RedditETL;
+use crate::ndjson::for_each_jsonl_line_cfg;
 use crate::util::replace_file_atomic_backoff;
 use anyhow::Result;
+use indicatif::ProgressBar;
 use rayon::prelude::*;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
 use std::fs;
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// State that ingests JSON records and folds together with peer states.
+///
+/// `merge` MUST be associative: for any states `a`, `b`, `c`,
+/// `(a.merge(b)).merge(c)` and `a.merge(b.merge(c))` must produce equal
+/// final states. Shard merging uses `rayon`'s tree reduction, which splits
+/// the input into adjacent ranges and combines partial results in arbitrary
+/// nesting — non-associative `merge` impls will produce nondeterministic
+/// output. Commutativity is *not* required: adjacent shards are always
+/// combined in left-to-right order.
 pub trait Aggregator: Send + Default + Serialize + DeserializeOwned {
     fn ingest(&mut self, record: &Value);
     fn merge(&mut self, other: Self);
@@ -27,6 +38,54 @@ fn shard_name_for_input(shards_dir: &Path, input: &Path) -> PathBuf {
     shards_dir.join(format!("agg_{}.json", stem))
 }
 
+fn load_shard<A: Aggregator>(shard: &Path) -> Result<A> {
+    let f = File::open(shard)?;
+    let r = BufReader::new(f);
+    let part: A = serde_json::from_reader(r)?;
+    Ok(part)
+}
+
+/// Parallel tree-merge of aggregator shards from disk.
+/// `pb`, if provided, is incremented once per shard as it's loaded.
+///
+/// Uses `try_fold` + `try_reduce` so each rayon worker accumulates an
+/// entire chunk locally (no cross-thread synchronization per shard), then
+/// only the per-worker totals are combined via tree reduction.
+#[doc(hidden)]
+pub fn merge_aggregator_shards_parallel<A: Aggregator>(
+    shards: &[PathBuf],
+    pb: Option<&ProgressBar>,
+) -> Result<A> {
+    shards
+        .par_iter()
+        .try_fold(A::default, |mut acc, shard| -> Result<A> {
+            let part: A = load_shard(shard)?;
+            acc.merge(part);
+            if let Some(pb) = pb { pb.inc(1); }
+            Ok(acc)
+        })
+        .try_reduce(A::default, |mut left, right| {
+            left.merge(right);
+            Ok(left)
+        })
+}
+
+/// Serial fold of aggregator shards from disk. Kept for benchmark
+/// comparisons against the parallel path.
+#[doc(hidden)]
+pub fn merge_aggregator_shards_serial<A: Aggregator>(
+    shards: &[PathBuf],
+    pb: Option<&ProgressBar>,
+) -> Result<A> {
+    let mut total = A::default();
+    for shard in shards {
+        let part: A = load_shard(shard)?;
+        total.merge(part);
+        if let Some(pb) = pb { pb.inc(1); }
+    }
+    Ok(total)
+}
+
 impl RedditETL {
     /// Build per-file aggregation shards in parallel, then merge into `final_out`.
     /// - Always rebuilds shards (no resume behavior).
@@ -34,8 +93,9 @@ impl RedditETL {
     ///
     /// Returns `(merged_shards, shard_errors)`: the number of shards that were
     /// successfully built and folded into the final output, and the number of
-    /// inputs whose shard build failed (and were therefore dropped from the
-    /// aggregate). Failures are logged via `tracing::warn!`.
+    /// inputs whose shard build had errors — either fatal (dropped from the
+    /// aggregate) or a tolerated mid-file read error (built and merged from a
+    /// partial read of the input). Failures are logged via `tracing::warn!`.
     pub fn aggregate_jsonls_parallel<A: Aggregator>(
         &self,
         inputs: Vec<PathBuf>,
@@ -55,31 +115,39 @@ impl RedditETL {
             let out_shard = shard_name_for_input(shards_dir, input);
             let tmp_shard = out_shard.with_extension("json.inprogress");
 
-            let result = (|| -> Result<()> {
+            let result = (|| -> Result<bool> {
                 let mut agg = A::default();
-                let f = File::open(input)?;
-                let r = BufReader::new(f);
-                for line in r.lines() {
-                    let line = line?;
-                    if line.is_empty() { continue; }
-                    if let Ok(v) = serde_json::from_str::<Value>(&line) {
-                        agg.ingest(&v);
+                let had_read_error = for_each_jsonl_line_cfg(input, 16 * 1024, |line| {
+                    if !line.is_empty() {
+                        if let Ok(v) = serde_json::from_str::<Value>(line) {
+                            agg.ingest(&v);
+                        }
                     }
-                }
+                    Ok(())
+                })?;
                 let out = File::create(&tmp_shard)?;
                 let mut w = BufWriter::new(out);
                 serde_json::to_writer(&mut w, &agg)?;
                 w.flush()?;
                 drop(w);
                 replace_file_atomic_backoff(&tmp_shard, &out_shard)?;
-                Ok(())
+                Ok(had_read_error)
             })();
 
-            if let Err(e) = result {
-                shard_errors.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(path=%out_shard.display(), error=%e, "failed building aggregate shard");
-                // Best-effort cleanup of any partial temp file.
-                let _ = fs::remove_file(&tmp_shard);
+            match result {
+                Err(e) => {
+                    shard_errors.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(path=%out_shard.display(), error=%e, "failed building aggregate shard");
+                    // Best-effort cleanup of any partial temp file.
+                    let _ = fs::remove_file(&tmp_shard);
+                }
+                // Shard built and will be merged, but the input was only
+                // partially read (a transient I/O error was tolerated mid-file).
+                // Count it so (built, errors) reflects the partial coverage.
+                Ok(true) => {
+                    shard_errors.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(false) => {}
             }
 
             if let Some(pb) = &pb_build { pb.inc(1); }
@@ -98,16 +166,12 @@ impl RedditETL {
 
         let pb_merge = if self.opts.progress { Some(make_count_progress(shards.len() as u64, "Aggregate: merge shards")) } else { None };
 
-        let mut total = A::default();
-        let mut merged_shards = 0usize;
-        for shard in shards {
-            let f = File::open(&shard)?;
-            let r = BufReader::new(f);
-            let part: A = serde_json::from_reader(r)?;
-            total.merge(part);
-            merged_shards += 1;
-            if let Some(pb) = &pb_merge { pb.inc(1); }
-        }
+        // Tree-merge shards in parallel. `Aggregator::merge` is required to
+        // be associative (see trait docs); rayon's reduction preserves the
+        // left-to-right ordering of adjacent shards but nests combines
+        // arbitrarily.
+        let total: A = merge_aggregator_shards_parallel(&shards, pb_merge.as_ref())?;
+        let merged_shards = shards.len();
 
         // Atomically publish the final output via tmp + rename so an
         // interrupted run never leaves a half-written `final_out` in place.

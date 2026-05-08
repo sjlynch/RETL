@@ -15,6 +15,7 @@ mod counting;
 mod util;
 mod mem;
 mod atomic_write;
+mod progress_manifest;
 mod pipeline;
 
 mod parents;
@@ -24,6 +25,7 @@ mod partition;
 
 mod bucketing;
 mod json_utils;
+mod json_whitelist;
 mod ndjson;
 mod key_extractor;
 mod dedupe;
@@ -36,6 +38,9 @@ pub use crate::query::QuerySpec;
 
 pub use crate::parents::{ParentIds, ParentMaps};
 pub use crate::aggregate::Aggregator;
+
+#[doc(hidden)]
+pub use crate::aggregate::{merge_aggregator_shards_parallel, merge_aggregator_shards_serial};
 
 // Expose multiprogress and progress helpers.
 pub use crate::progress::{set_global_multiprogress, make_count_progress, make_progress_bar_labeled, ProgressScope};
@@ -62,6 +67,10 @@ pub use crate::json_utils::{author_lower, subreddit_lower, is_comment_record};
 
 // export NDJSON helpers
 pub use crate::ndjson::{NdjsonReader, NdjsonWriter};
+
+// export streaming whitelist tokenizer for tests/benches
+#[doc(hidden)]
+pub use crate::json_whitelist::{TokenizerError, WhitelistTokenizer};
 
 // export KeyExtractor abstraction
 pub use crate::key_extractor::KeyExtractor;
