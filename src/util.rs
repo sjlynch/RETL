@@ -7,11 +7,49 @@ pub fn basic_query_allow_all() -> QuerySpec {
 }
 
 static INIT_ONCE: std::sync::Once = std::sync::Once::new();
-pub fn init_tracing_once() {
+
+/// Initialize tracing for the binary. Call this once at program startup from
+/// `main`. Library code must NOT call this — the binary owns the tracing
+/// subscriber.
+pub fn init_tracing_for_binary() {
     INIT_ONCE.call_once(|| {
         let env_filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
         let _ = tracing_subscriber::fmt().with_env_filter(env_filter).try_init();
     });
+}
+
+/// Back-compat alias for [`init_tracing_for_binary`]. Pre-existing library
+/// callers route through here while they migrate to a no-op + explicit
+/// binary-side init.
+#[doc(hidden)]
+pub fn init_tracing_once() {
+    init_tracing_for_binary();
+}
+
+/// Run `f` inside a freshly-built scoped Rayon thread pool.
+///
+/// Replaces the legacy `rayon::ThreadPoolBuilder::new().num_threads(n).build_global().ok()`
+/// pattern, which silently no-ops on the second call and leaks the requested
+/// parallelism across unrelated jobs. A scoped pool is rebuildable per-call
+/// and bounds parallelism to the closure.
+///
+/// `n = None` (or `Some(0)`) lets Rayon pick its default (typically the
+/// number of logical CPUs).
+pub fn with_thread_pool<R>(
+    n: Option<usize>,
+    f: impl FnOnce(&rayon::ThreadPool) -> R + Send,
+) -> Result<R>
+where
+    R: Send,
+{
+    let mut builder = rayon::ThreadPoolBuilder::new();
+    if let Some(n) = n {
+        if n > 0 {
+            builder = builder.num_threads(n);
+        }
+    }
+    let pool = builder.build().context("build scoped rayon thread pool")?;
+    Ok(pool.install(|| f(&pool)))
 }
 
 // -------- NEW: default bot/service accounts + merging from env/file --------
@@ -80,6 +118,31 @@ pub fn merge_extra_exclusions(target: &mut Vec<String>) {
     }
     target.sort();
     target.dedup();
+}
+
+// -------- NEW: scoped Rayon thread pool helper --------
+
+/// Run `f` inside a scoped Rayon thread pool sized to `n` threads. If `n` is
+/// `None` (or `Some(0)`), run on the global default pool.
+///
+/// Prefer this over `rayon::ThreadPoolBuilder::build_global()`, which mutates
+/// process-wide state, only succeeds for the first caller, and prevents
+/// different stages from picking different thread counts.
+pub fn with_thread_pool<R, F>(n: Option<usize>, f: F) -> R
+where
+    F: FnOnce() -> R + Send,
+    R: Send,
+{
+    match n {
+        Some(k) if k > 0 => {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(k)
+                .build()
+                .expect("failed to build rayon thread pool");
+            pool.install(f)
+        }
+        _ => f(),
+    }
 }
 
 // -------- NEW: robust open/create with backoff (Windows-friendly) --------
