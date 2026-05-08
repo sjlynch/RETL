@@ -46,7 +46,14 @@ pub use crate::aggregate::{merge_aggregator_shards_parallel, merge_aggregator_sh
 pub use crate::progress::{set_global_multiprogress, make_count_progress, make_progress_bar_labeled, ProgressScope};
 
 // Expose memory helpers for adaptive throttling from the binary.
-pub use crate::mem::{available_memory_fraction, is_low_memory};
+pub use crate::mem::{available_memory_fraction, is_low_memory, maybe_throttle_low_memory};
+
+// Test-only injection point so integration tests can drive the cooperative
+// throttles in dedupe/bucketing/zstd_jsonl. Strictly gated; production
+// builds (no `test-utils`) don't see this symbol.
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub use crate::mem::set_available_memory_fraction_for_tests;
 
 // Expose integrity checker mode, and (optionally) direct zstd validators.
 pub use crate::integrity::IntegrityMode;

@@ -93,3 +93,19 @@ pub fn maybe_throttle_low_memory(threshold: f64) {
         std::thread::sleep(Duration::from_millis(25));
     }
 }
+
+/// Test-only setter that overrides the cached available-memory fraction.
+///
+/// Stamps `LAST_CHECK_MS` to "now" so the next read uses the injected value
+/// rather than tripping the cache window and clobbering it with a real
+/// sysinfo refresh. Without that, the cooperative throttles in
+/// `dedupe`/`bucketing`/`zstd_jsonl` cannot be exercised deterministically.
+///
+/// Gated to test/dev builds; production binaries (built without the
+/// `test-utils` feature) carry zero overhead.
+#[cfg(any(test, feature = "test-utils"))]
+pub fn set_available_memory_fraction_for_tests(frac: f64) {
+    let frac = frac.clamp(0.0, 1.0);
+    FRAC_PPM.store((frac * PPM) as u64, Ordering::Relaxed);
+    LAST_CHECK_MS.store(now_ms(), Ordering::Relaxed);
+}

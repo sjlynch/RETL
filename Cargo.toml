@@ -35,6 +35,10 @@ crossbeam-channel = "0.5"
 
 [features]
 default = []
+# Exposes test-only injection points (e.g. `set_available_memory_fraction_for_tests`)
+# so integration tests under `tests/` can drive code paths that depend on
+# process-global state. Off by default; production binaries carry no overhead.
+test-utils = []
 
 [profile.release]
 opt-level = 3
@@ -55,3 +59,10 @@ criterion = { version = "0.5", features = ["html_reports"] }
 [[bench]]
 name = "inner_loops"
 harness = false
+
+# `mem_throttle` drives a test-only setter that lives behind the `test-utils`
+# feature gate (see `src/mem.rs`). Run with `cargo test --features test-utils`.
+[[test]]
+name = "mem_throttle"
+path = "tests/mem_throttle.rs"
+required-features = ["test-utils"]
