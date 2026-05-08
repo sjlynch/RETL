@@ -1,8 +1,10 @@
+use crate::date::YearMonth;
+use crate::filters::ym_from_epoch;
 use crate::paths::{discover_all, plan_files, FileKind};
 use crate::progress::{make_count_progress, make_progress_bar_labeled, total_compressed_size};
-use crate::util::init_tracing_once;
 use crate::pipeline::RedditETL;
 use crate::mem::{available_memory_fraction, is_low_memory};
+use crate::util::replace_file_atomic_backoff;
 use crate::zstd_jsonl::{
     for_each_line_with_progress_cfg_no_throttle,
     parse_minimal,
@@ -16,6 +18,8 @@ use std::fs::File;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ahash::{AHashSet, RandomState};
 
@@ -163,11 +167,89 @@ impl ParentIds {
     }
 }
 
+/// Parent shard cache lookup tables.
+///
+/// Replaces the prior per-id index (one entry PER parent id — tens of millions
+/// at corpus scale). Now keyed by month: the resolver writes one shard JSON per
+/// (YearMonth, FileKind), and consumers resolve a parent id to its shard via
+/// the child record's own-month metadata + the parent's prefix-derived FileKind.
 pub struct ParentMaps {
     pub comments: HashMap<String, String>,
     pub submissions: HashMap<String, (String, String)>,
-    pub comment_index: Option<HashMap<String, PathBuf>>,
-    pub submission_index: Option<HashMap<String, PathBuf>>,
+    pub comment_shards: Option<HashMap<YearMonth, PathBuf>>,
+    pub submission_shards: Option<HashMap<YearMonth, PathBuf>>,
+}
+
+impl ParentMaps {
+    /// Helper: pick the shard that is most likely to own `_id`, given its
+    /// FileKind (from the parent_id prefix) and the consuming record's own
+    /// month. Reddit threads almost always live in a single month, so the
+    /// child's own month is a strong prior for the parent's shard.
+    pub fn shard_for(&self, kind: FileKind, own_month: YearMonth) -> Option<&PathBuf> {
+        let map = match kind {
+            FileKind::Comment => self.comment_shards.as_ref()?,
+            FileKind::Submission => self.submission_shards.as_ref()?,
+        };
+        map.get(&own_month)
+    }
+}
+
+/// Process-wide cache for membership-id shards (set of t1_/t3_ ids per shard
+/// file). Shared across rayon workers so each shard is read+parsed at most
+/// once globally rather than once per worker.
+struct SharedIdsetCache {
+    inner: parking_lot::RwLock<SharedIdsetState>,
+    cap: usize,
+}
+
+struct SharedIdsetState {
+    map: HashMap<PathBuf, Arc<AHashSet<String>>>,
+    order: VecDeque<PathBuf>,
+}
+
+impl SharedIdsetCache {
+    fn new(cap: usize) -> Self {
+        Self {
+            inner: parking_lot::RwLock::new(SharedIdsetState {
+                map: HashMap::new(),
+                order: VecDeque::new(),
+            }),
+            cap: cap.max(1),
+        }
+    }
+
+    fn get_or_load(&self, path: &Path) -> Result<Arc<AHashSet<String>>> {
+        if let Some(v) = self.inner.read().map.get(path) {
+            return Ok(v.clone());
+        }
+        // Load outside the lock so concurrent workers loading different shards
+        // don't serialize on the I/O.
+        let f = File::open(path)
+            .with_context(|| format!("open idset shard {}", path.display()))?;
+        let r = BufReader::new(f);
+        let mut set: AHashSet<String> = AHashSet::with_capacity(64_000);
+        for line in r.lines() {
+            let mut s = line.with_context(|| format!("read idset shard {}", path.display()))?;
+            if s.ends_with('\r') { s.pop(); }
+            if !s.is_empty() { set.insert(s); }
+        }
+        let arc = Arc::new(set);
+
+        let mut g = self.inner.write();
+        // Another worker may have raced us to load the same shard; prefer
+        // their copy so callers don't see different Arc identities.
+        if let Some(existing) = g.map.get(path) {
+            return Ok(existing.clone());
+        }
+        if g.map.len() >= self.cap {
+            if let Some(old) = g.order.pop_front() {
+                g.map.remove(&old);
+            }
+        }
+        g.map.insert(path.to_path_buf(), arc.clone());
+        g.order.push_back(path.to_path_buf());
+        Ok(arc)
+    }
 }
 
 impl RedditETL {
@@ -175,8 +257,6 @@ impl RedditETL {
     where
         I: IntoIterator<Item = PathBuf>,
     {
-        init_tracing_once();
-
         let paths: Vec<PathBuf> = jsonl_paths.into_iter().collect();
         if paths.is_empty() {
             // FIX: return the correct type (ParentIds) when inputs are empty.
@@ -199,22 +279,34 @@ impl RedditETL {
 
         let read_buf = self.opts.read_buffer_bytes;
 
+        // Surface I/O / parse errors instead of silently dropping them. Each
+        // worker writes a tracing::warn! on failure and bumps the shared
+        // counter; the total is reported back via tracing at the end.
+        let err_count = AtomicUsize::new(0);
+
         paths.par_iter().for_each(|p| {
-            let _ = (|| -> Result<()> {
+            let res = (|| -> Result<()> {
                 let f = File::open(p).with_context(|| format!("open {}", p.display()))?;
                 let mut r = BufReader::with_capacity(read_buf, f);
                 let mut buf = String::with_capacity(64 * 1024);
                 loop {
                     buf.clear();
-                    let n = r.read_line(&mut buf)?;
+                    let n = r.read_line(&mut buf)
+                        .with_context(|| format!("read {}", p.display()))?;
                     if n == 0 { break; }
                     if buf.ends_with('\n') { buf.pop(); if buf.ends_with('\r') { buf.pop(); } }
                     if buf.is_empty() { continue; }
 
-                    let v: Value = match serde_json::from_str(&buf) { Ok(x) => x, Err(_) => {
-                        if let Some(pb) = &pb { pb.inc(n as u64); }
-                        continue;
-                    }};
+                    let v: Value = match serde_json::from_str(&buf) {
+                        Ok(x) => x,
+                        Err(_) => {
+                            // Single malformed line should not abort the file;
+                            // count it but do not bail.
+                            err_count.fetch_add(1, Ordering::Relaxed);
+                            if let Some(pb) = &pb { pb.inc(n as u64); }
+                            continue;
+                        }
+                    };
                     if let Some(parent_id) = v.get("parent_id").and_then(|x| x.as_str()) {
                         if let Some(rest) = parent_id.strip_prefix("t1_") {
                             t1_writer.write(rest)?;
@@ -232,6 +324,11 @@ impl RedditETL {
                 }
                 Ok(())
             })();
+
+            if let Err(e) = res {
+                err_count.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(path=%p.display(), error=%e, "collect_parent_ids: skipped file due to error");
+            }
         });
 
         let t1_shards = t1_writer.dedup()?;
@@ -246,6 +343,11 @@ impl RedditETL {
             pb.finish_with_message(final_msg);
         }
 
+        let errors = err_count.load(Ordering::Relaxed);
+        if errors > 0 {
+            tracing::warn!(error_count = errors, "collect_parent_ids_from_jsonls completed with errors");
+        }
+
         Ok(ParentIds {
             t1_ids_mem: None,
             t3_ids_mem: None,
@@ -255,8 +357,6 @@ impl RedditETL {
     }
 
     pub fn resolve_parent_maps(&self, ids: &ParentIds, cache_dir: &Path, resume: bool) -> Result<ParentMaps> {
-        init_tracing_once();
-
         let comments_out = cache_dir.join("comments");
         let submissions_out = cache_dir.join("submissions");
         fs::create_dir_all(&comments_out)?;
@@ -269,8 +369,8 @@ impl RedditETL {
             return Ok(ParentMaps {
                 comments: HashMap::new(),
                 submissions: HashMap::new(),
-                comment_index: Some(HashMap::new()),
-                submission_index: Some(HashMap::new()),
+                comment_shards: Some(HashMap::new()),
+                submission_shards: Some(HashMap::new()),
             });
         }
 
@@ -281,8 +381,20 @@ impl RedditETL {
 
         let read_buf = self.opts.read_buffer_bytes;
 
-        let comment_idx = parking_lot::Mutex::new(HashMap::<String, PathBuf>::new());
-        let submission_idx = parking_lot::Mutex::new(HashMap::<String, PathBuf>::new());
+        // Shard-keyed indexes (one entry per processed monthly shard, NOT per id).
+        // ~10^6x memory reduction vs. the prior per-id index at corpus scale.
+        let comment_shards = parking_lot::Mutex::new(HashMap::<YearMonth, PathBuf>::new());
+        let submission_shards = parking_lot::Mutex::new(HashMap::<YearMonth, PathBuf>::new());
+
+        // Process-wide id-shard cache: each (t1|t3) ids_NNNN.txt shard is read
+        // and parsed at most once globally instead of once per rayon worker.
+        let free = available_memory_fraction();
+        let idset_cap = if free > 0.50 { 512 } else if free > 0.20 { 256 } else { 128 };
+        let idset_cache: Arc<SharedIdsetCache> = Arc::new(SharedIdsetCache::new(idset_cap));
+
+        // Track per-file errors so we can warn-and-continue rather than
+        // silently dropping bad files (or failing the whole job).
+        let resolve_err_count = AtomicUsize::new(0);
 
         // Limit file concurrency to reduce RAM spikes while resolving.
         crate::concurrency::for_each_file_limited(&files, self.opts.file_concurrency, |job| -> Result<()> {
@@ -292,54 +404,52 @@ impl RedditETL {
             };
             let out = out_dir.join(format!("{}_{}.json", prefix, job.ym));
 
-            if resume && out.exists() {
-                if let Some(pb) = &pb {
-                    let sz = fs::metadata(&job.path).map(|m| m.len()).unwrap_or(0);
-                    pb.inc(sz);
+            // Always record the shard path for downstream lookups, even on
+            // resume — attach() needs the shard map populated regardless of
+            // whether this run produced the file.
+            let record_shard = |path: PathBuf| {
+                match job.kind {
+                    FileKind::Comment => {
+                        comment_shards.lock().insert(job.ym, path);
+                    }
+                    FileKind::Submission => {
+                        submission_shards.lock().insert(job.ym, path);
+                    }
                 }
-                return Ok(());
+            };
+
+            if resume && out.exists() {
+                // Validate that the existing JSON parses; treat unreadable /
+                // corrupt files as missing and rebuild them.
+                let valid = match File::open(&out) {
+                    Ok(f) => match job.kind {
+                        FileKind::Comment => serde_json::from_reader::<_, HashMap<String, String>>(BufReader::new(f)).is_ok(),
+                        FileKind::Submission => serde_json::from_reader::<_, HashMap<String, (String, String)>>(BufReader::new(f)).is_ok(),
+                    },
+                    Err(_) => false,
+                };
+                if valid {
+                    record_shard(out.clone());
+                    if let Some(pb) = &pb {
+                        let sz = fs::metadata(&job.path).map(|m| m.len()).unwrap_or(0);
+                        pb.inc(sz);
+                    }
+                    return Ok(());
+                } else {
+                    tracing::warn!(path=%out.display(), "resume: existing parent shard is unreadable/corrupt, rebuilding");
+                    let _ = fs::remove_file(&out);
+                }
             }
 
-            // Worker-local caches for membership id shards, FIFO (no O(n) LRU update cost).
-            let mut idset_t1_cache: HashMap<PathBuf, AHashSet<String>> = HashMap::new();
-            let mut idset_t1_order: VecDeque<PathBuf> = VecDeque::new();
-            let mut idset_t3_cache: HashMap<PathBuf, AHashSet<String>> = HashMap::new();
-            let mut idset_t3_order: VecDeque<PathBuf> = VecDeque::new();
-
-            let free = available_memory_fraction();
-            let idset_t1_cap = if free > 0.50 { 256 } else if free > 0.20 { 128 } else { 64 };
-            let idset_t3_cap = idset_t1_cap;
-
-            let ensure_contains = |path: &Path,
-                                   cache: &mut HashMap<PathBuf, AHashSet<String>>,
-                                   order: &mut VecDeque<PathBuf>,
-                                   cap: usize,
-                                   id: &str| -> Result<bool> {
-                if !cache.contains_key(path) {
-                    if cache.len() >= cap {
-                        if let Some(old) = order.pop_front() {
-                            cache.remove(&old);
-                        }
-                    }
-                    let f = File::open(path)
-                        .with_context(|| format!("open idset shard {}", path.display()))?;
-                    let r = BufReader::new(f);
-                    let mut set = AHashSet::with_capacity(64_000);
-                    for line in r.lines() {
-                        let mut s = line?;
-                        if s.ends_with('\r') { s.pop(); }
-                        if !s.is_empty() { set.insert(s); }
-                    }
-                    cache.insert(path.to_path_buf(), set);
-                    order.push_back(path.to_path_buf());
-                }
-                Ok(cache.get(path).map_or(false, |set| set.contains(id)))
+            let ensure_contains = |shard_path: &Path, id: &str| -> Result<bool> {
+                let set = idset_cache.get_or_load(shard_path)?;
+                Ok(set.contains(id))
             };
 
             let mut out_map_c: HashMap<String, String> = HashMap::new();
             let mut out_map_s: HashMap<String, (String, String)> = HashMap::new();
 
-            let _ = for_each_line_with_progress_cfg_no_throttle(
+            for_each_line_with_progress_cfg_no_throttle(
                 &job.path,
                 read_buf,
                 |d| { if let Some(pb) = &pb { pb.inc(d); } },
@@ -354,7 +464,7 @@ impl RedditETL {
                                 let needed = if let Some(sh) = &ids.t1_ids_sharded {
                                     let idx = sh.idx(id);
                                     let p = sh.path_for(idx);
-                                    ensure_contains(&p, &mut idset_t1_cache, &mut idset_t1_order, idset_t1_cap, id)?
+                                    ensure_contains(&p, id)?
                                 } else if let Some(mem) = &ids.t1_ids_mem {
                                     mem.contains(id)
                                 } else { false };
@@ -369,7 +479,7 @@ impl RedditETL {
                                 let needed = if let Some(sh) = &ids.t3_ids_sharded {
                                     let idx = sh.idx(id);
                                     let p = sh.path_for(idx);
-                                    ensure_contains(&p, &mut idset_t3_cache, &mut idset_t3_order, idset_t3_cap, id)?
+                                    ensure_contains(&p, id)?
                                 } else if let Some(mem) = &ids.t3_ids_mem {
                                     mem.contains(id)
                                 } else { false };
@@ -384,31 +494,37 @@ impl RedditETL {
                     }
                     Ok(())
                 }
-            );
+            )
+            .with_context(|| format!("scan {}", job.path.display()))?;
 
-            if let Err(e) = (|| -> Result<()> {
-                let f = File::create(&out)?;
+            // Atomic write: serialize to a sibling .tmp first, fsync the data
+            // path via BufWriter::flush, then atomically replace the dest.
+            // Prevents readers from observing torn / half-written shard JSON
+            // after a crash mid-write.
+            let tmp = out.with_extension("json.tmp");
+            let write_res = (|| -> Result<()> {
+                let f = File::create(&tmp)
+                    .with_context(|| format!("create tmp {}", tmp.display()))?;
                 let mut w = BufWriter::new(f);
                 match job.kind {
-                    FileKind::Comment => {
-                        {
-                            let mut idx = comment_idx.lock();
-                            for k in out_map_c.keys() { idx.insert(k.clone(), out.clone()); }
-                        }
-                        serde_json::to_writer(&mut w, &out_map_c)?
-                    }
-                    FileKind::Submission => {
-                        {
-                            let mut idx = submission_idx.lock();
-                            for k in out_map_s.keys() { idx.insert(k.clone(), out.clone()); }
-                        }
-                        serde_json::to_writer(&mut w, &out_map_s)?
-                    }
+                    FileKind::Comment => serde_json::to_writer(&mut w, &out_map_c)?,
+                    FileKind::Submission => serde_json::to_writer(&mut w, &out_map_s)?,
                 }
                 w.flush()?;
+                replace_file_atomic_backoff(&tmp, &out)?;
                 Ok(())
-            })() {
-                tracing::warn!(path=%out.display(), error=%e, "failed writing parent shard");
+            })();
+
+            match write_res {
+                Ok(_) => {
+                    record_shard(out.clone());
+                }
+                Err(e) => {
+                    resolve_err_count.fetch_add(1, Ordering::Relaxed);
+                    // Best-effort cleanup so a stale .tmp doesn't linger.
+                    let _ = fs::remove_file(&tmp);
+                    tracing::warn!(path=%out.display(), error=%e, "failed writing parent shard");
+                }
             }
 
             Ok(())
@@ -421,6 +537,11 @@ impl RedditETL {
                 "done".to_string()
             };
             pb.finish_with_message(final_msg);
+        }
+
+        let resolve_errs = resolve_err_count.load(Ordering::Relaxed);
+        if resolve_errs > 0 {
+            tracing::warn!(error_count = resolve_errs, "resolve_parent_maps completed with shard write errors");
         }
 
         // Much stricter: only eager-load when plenty of RAM is free.
@@ -456,8 +577,8 @@ impl RedditETL {
         Ok(ParentMaps {
             comments: comments_map,
             submissions: submissions_map,
-            comment_index: Some(comment_idx.into_inner()),
-            submission_index: Some(submission_idx.into_inner()),
+            comment_shards: Some(comment_shards.into_inner()),
+            submission_shards: Some(submission_shards.into_inner()),
         })
     }
 
@@ -468,7 +589,6 @@ impl RedditETL {
         parents: &ParentMaps,
         resume: bool,
     ) -> Result<Vec<PathBuf>> {
-        init_tracing_once();
         fs::create_dir_all(out_dir)?;
 
         let label = self.opts.progress_label.as_deref().unwrap_or("Attaching parents");
@@ -477,8 +597,8 @@ impl RedditETL {
         let parents_c_eager = &parents.comments;
         let parents_s_eager = &parents.submissions;
 
-        let idx_c = parents.comment_index.as_ref();
-        let idx_s = parents.submission_index.as_ref();
+        let comment_shards = parents.comment_shards.as_ref();
+        let submission_shards = parents.submission_shards.as_ref();
 
         let out_paths: Vec<PathBuf> = inputs
             .par_iter()
@@ -491,6 +611,10 @@ impl RedditETL {
                     return Ok(out_path);
                 }
 
+                // Per-worker FIFO caches. Note: we deliberately do NOT bump
+                // entries on hit (would cost O(n) on a VecDeque). Plain FIFO
+                // is sufficient because shard load order is dominated by
+                // own-month locality — the same shards stay hot naturally.
                 let mut c_cache: HashMap<PathBuf, HashMap<String, String>> = HashMap::new();
                 let mut c_order: VecDeque<PathBuf> = VecDeque::new();
                 let c_cap: usize = 8;
@@ -499,57 +623,91 @@ impl RedditETL {
                 let mut s_order: VecDeque<PathBuf> = VecDeque::new();
                 let s_cap: usize = 6;
 
-                let mut load_comments_shard_value = |comment_id: &str| -> Result<Option<String>> {
+                // Resolve a comment-parent id by looking in the own-month
+                // shard first; if absent, fall back to scanning other months
+                // for the same kind. The fallback rarely fires on real data
+                // (Reddit threads almost always live in a single month).
+                let mut load_comments_shard_value = |comment_id: &str, own_ym: Option<YearMonth>| -> Result<Option<String>> {
                     if let Some(v) = parents_c_eager.get(comment_id) {
                         return Ok(Some(v.clone()));
                     }
-                    if let Some(idx) = idx_c {
-                        if let Some(p) = idx.get(comment_id) {
-                            if !c_cache.contains_key(p) {
-                                if c_cache.len() >= c_cap {
-                                    if let Some(old) = c_order.pop_front() {
-                                        c_cache.remove(&old);
-                                    }
+                    let Some(idx) = comment_shards else { return Ok(None); };
+
+                    let try_shard = |p: &Path,
+                                     c_cache: &mut HashMap<PathBuf, HashMap<String, String>>,
+                                     c_order: &mut VecDeque<PathBuf>|
+                     -> Result<Option<String>> {
+                        if !c_cache.contains_key(p) {
+                            if c_cache.len() >= c_cap {
+                                if let Some(old) = c_order.pop_front() {
+                                    c_cache.remove(&old);
                                 }
-                                let file = File::open(p)?;
-                                let rdr = BufReader::new(file);
-                                let map: HashMap<String, String> = serde_json::from_reader(rdr)?;
-                                c_cache.insert(p.clone(), map);
-                                c_order.push_back(p.clone());
-                            } else {
-                                let pos = c_order.iter().position(|x| x == p);
-                                if let Some(i) = pos { c_order.remove(i); }
-                                c_order.push_back(p.clone());
                             }
-                            return Ok(c_cache.get(p).and_then(|m| m.get(comment_id).cloned()));
+                            let file = File::open(p)
+                                .with_context(|| format!("open parent shard {}", p.display()))?;
+                            let rdr = BufReader::new(file);
+                            let map: HashMap<String, String> = serde_json::from_reader(rdr)
+                                .with_context(|| format!("parse parent shard {}", p.display()))?;
+                            c_cache.insert(p.to_path_buf(), map);
+                            c_order.push_back(p.to_path_buf());
+                        }
+                        Ok(c_cache.get(p).and_then(|m| m.get(comment_id).cloned()))
+                    };
+
+                    if let Some(ym) = own_ym {
+                        if let Some(p) = idx.get(&ym) {
+                            if let Some(v) = try_shard(p, &mut c_cache, &mut c_order)? {
+                                return Ok(Some(v));
+                            }
+                        }
+                    }
+                    for (ym, p) in idx {
+                        if Some(*ym) == own_ym { continue; }
+                        if let Some(v) = try_shard(p, &mut c_cache, &mut c_order)? {
+                            return Ok(Some(v));
                         }
                     }
                     Ok(None)
                 };
 
-                let mut load_submissions_shard_value = |submission_id: &str| -> Result<Option<(String, String)>> {
+                let mut load_submissions_shard_value = |submission_id: &str, own_ym: Option<YearMonth>| -> Result<Option<(String, String)>> {
                     if let Some(v) = parents_s_eager.get(submission_id) {
                         return Ok(Some(v.clone()));
                     }
-                    if let Some(idx) = idx_s {
-                        if let Some(p) = idx.get(submission_id) {
-                            if !s_cache.contains_key(p) {
-                                if s_cache.len() >= s_cap {
-                                    if let Some(old) = s_order.pop_front() {
-                                        s_cache.remove(&old);
-                                    }
+                    let Some(idx) = submission_shards else { return Ok(None); };
+
+                    let try_shard = |p: &Path,
+                                     s_cache: &mut HashMap<PathBuf, HashMap<String, (String, String)>>,
+                                     s_order: &mut VecDeque<PathBuf>|
+                     -> Result<Option<(String, String)>> {
+                        if !s_cache.contains_key(p) {
+                            if s_cache.len() >= s_cap {
+                                if let Some(old) = s_order.pop_front() {
+                                    s_cache.remove(&old);
                                 }
-                                let file = File::open(p)?;
-                                let rdr = BufReader::new(file);
-                                let map: HashMap<String, (String, String)> = serde_json::from_reader(rdr)?;
-                                s_cache.insert(p.clone(), map);
-                                s_order.push_back(p.clone());
-                            } else {
-                                let pos = s_order.iter().position(|x| x == p);
-                                if let Some(i) = pos { s_order.remove(i); }
-                                s_order.push_back(p.clone());
                             }
-                            return Ok(s_cache.get(p).and_then(|m| m.get(submission_id).cloned()));
+                            let file = File::open(p)
+                                .with_context(|| format!("open parent shard {}", p.display()))?;
+                            let rdr = BufReader::new(file);
+                            let map: HashMap<String, (String, String)> = serde_json::from_reader(rdr)
+                                .with_context(|| format!("parse parent shard {}", p.display()))?;
+                            s_cache.insert(p.to_path_buf(), map);
+                            s_order.push_back(p.to_path_buf());
+                        }
+                        Ok(s_cache.get(p).and_then(|m| m.get(submission_id).cloned()))
+                    };
+
+                    if let Some(ym) = own_ym {
+                        if let Some(p) = idx.get(&ym) {
+                            if let Some(v) = try_shard(p, &mut s_cache, &mut s_order)? {
+                                return Ok(Some(v));
+                            }
+                        }
+                    }
+                    for (ym, p) in idx {
+                        if Some(*ym) == own_ym { continue; }
+                        if let Some(v) = try_shard(p, &mut s_cache, &mut s_order)? {
+                            return Ok(Some(v));
                         }
                     }
                     Ok(None)
@@ -567,17 +725,24 @@ impl RedditETL {
                     let is_comment = v.get("body").is_some() && v.get("parent_id").is_some();
 
                     if is_comment {
+                        // Own-month is derived from the consuming record's
+                        // created_utc; used to pick the most-likely parent
+                        // shard before falling back to other months.
+                        let own_ym = v.get("created_utc")
+                            .and_then(|x| x.as_i64())
+                            .map(ym_from_epoch);
+
                         if let Some(parent_id) = v.get("parent_id").and_then(|x| x.as_str()) {
                             let mut parent_obj = serde_json::Map::new();
 
                             if let Some(rest) = parent_id.strip_prefix("t1_") {
-                                if let Some(text) = load_comments_shard_value(rest)? {
+                                if let Some(text) = load_comments_shard_value(rest, own_ym)? {
                                     parent_obj.insert("kind".into(), Value::String("comment".into()));
                                     parent_obj.insert("id".into(), Value::String(rest.to_string()));
                                     parent_obj.insert("body".into(), Value::String(text));
                                 }
                             } else if let Some(rest) = parent_id.strip_prefix("t3_") {
-                                if let Some((title, selftext)) = load_submissions_shard_value(rest)? {
+                                if let Some((title, selftext)) = load_submissions_shard_value(rest, own_ym)? {
                                     parent_obj.insert("kind".into(), Value::String("submission".into()));
                                     parent_obj.insert("id".into(), Value::String(rest.to_string()));
                                     parent_obj.insert("title".into(), Value::String(title));
