@@ -115,3 +115,125 @@ pub fn decompress_zst_lines(path: &Path) -> Vec<String> {
     let r = BufReader::new(dec);
     r.lines().map(|l| l.unwrap()).filter(|s| !s.is_empty()).collect()
 }
+
+// =============================================================================
+// Shared helpers appended for T12 behavioral coverage backfill (#T12).
+// Append-only — coexist with #T11 helpers above.
+// =============================================================================
+
+use retl::YearMonth;
+
+/// Build a corpus spanning multiple months. For each `(year, month)` in `months`,
+/// writes one comment file (RC_YYYY-MM.zst) and one submission file (RS_YYYY-MM.zst)
+/// with **two records each** in r/programming. Authors are deterministic per month
+/// so callers can assert exact dedupe results.
+///
+/// Records carry `created_utc` aligned to the first day of the named month so
+/// record-level `within_bounds` checks match plan-level filenames.
+pub fn make_corpus_multi_month(months: &[YearMonth]) -> PathBuf {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.into_path();
+
+    for ym in months {
+        let label = format!("{:04}-{:02}", ym.year, ym.month);
+        // Compute a unix timestamp at the start of this month (UTC).
+        let ts = ym_to_epoch_first_day(ym.year, ym.month);
+
+        // Submissions: one human, one bot
+        let rs_path = base.join("submissions").join(format!("RS_{}.zst", label));
+        let rs_lines = vec![
+            json!({
+                "archived": false, "author": format!("user_{}", label),
+                "created_utc": ts, "domain":"example.com", "id": format!("s_{}", label),
+                "is_self":false, "is_video":false, "num_comments":1, "over_18":false,
+                "score":10, "selftext":"", "title":"hi", "subreddit":"programming",
+                "subreddit_id":"t5_x", "url":"http://example.com/x"
+            }).to_string(),
+            json!({
+                "archived": false, "author":"AutoModerator",
+                "created_utc": ts + 1, "domain":"reddit.com", "id": format!("sb_{}", label),
+                "is_self":false, "is_video":false, "num_comments":1, "over_18":false,
+                "score":1, "selftext":"", "title":"meta", "subreddit":"programming",
+                "subreddit_id":"t5_x", "url":"http://reddit.com/rules"
+            }).to_string(),
+        ];
+        write_zst_lines(&rs_path, &rs_lines);
+
+        // Comments: same human author + a unique commenter for the month
+        let rc_path = base.join("comments").join(format!("RC_{}.zst", label));
+        let rc_lines = vec![
+            json!({
+                "controversiality":0, "body":"hi", "subreddit_id":"t5_x",
+                "link_id": format!("t3_s_{}", label), "stickied":false,
+                "subreddit":"programming", "score":2, "ups":2,
+                "author": format!("user_{}", label), "id": format!("c1_{}", label),
+                "edited":false, "parent_id": format!("t3_s_{}", label),
+                "gilded":0, "distinguished":null,
+                "created_utc": ts + 100, "retrieved_on": ts + 200
+            }).to_string(),
+            json!({
+                "controversiality":0, "body":"yo", "subreddit_id":"t5_x",
+                "link_id": format!("t3_s_{}", label), "stickied":false,
+                "subreddit":"programming", "score":3, "ups":3,
+                "author": format!("commenter_{}", label), "id": format!("c2_{}", label),
+                "edited":false, "parent_id": format!("t3_s_{}", label),
+                "gilded":0, "distinguished":null,
+                "created_utc": ts + 200, "retrieved_on": ts + 300
+            }).to_string(),
+        ];
+        write_zst_lines(&rc_path, &rc_lines);
+    }
+
+    base
+}
+
+/// Build a single-month corpus (RC_2006-01.zst) with `n` synthetic comment records
+/// in r/programming. Authors cycle through ~`n/4` distinct names so dedupe/bucketing
+/// has interesting groups; ids are unique. Used to drive bucketing's adaptive flush
+/// threshold and to stress dedupe with non-trivial run sizes.
+pub fn make_corpus_n_records(n: usize) -> PathBuf {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.into_path();
+    let rc_path = base.join("comments").join("RC_2006-01.zst");
+
+    let distinct = (n / 4).max(1);
+    let ts0: i64 = 1136073600; // 2006-01-01 00:00:00 UTC
+
+    let mut lines: Vec<String> = Vec::with_capacity(n);
+    for i in 0..n {
+        let author = format!("user_{:05}", i % distinct);
+        lines.push(
+            json!({
+                "controversiality":0,
+                "body": format!("body line {}", i),
+                "subreddit_id":"t5_x",
+                "link_id":"t3_s1",
+                "stickied":false,
+                "subreddit":"programming",
+                "score": (i as i64) % 100,
+                "ups": (i as i64) % 100,
+                "author": author,
+                "id": format!("rc{:08}", i),
+                "edited":false,
+                "parent_id":"t3_s1",
+                "gilded":0,
+                "distinguished":null,
+                "created_utc": ts0 + (i as i64),
+                "retrieved_on": ts0 + (i as i64) + 100
+            })
+            .to_string(),
+        );
+    }
+    write_zst_lines(&rc_path, &lines);
+    base
+}
+
+/// Compute a unix timestamp for the first day of a (year, month) at 00:00:00 UTC.
+/// Uses the `time` crate (already a transitive dep). Days-since-epoch math.
+fn ym_to_epoch_first_day(year: u16, month: u8) -> i64 {
+    use time::{Date, Month, OffsetDateTime, Time, UtcOffset};
+    let m = Month::try_from(month).unwrap();
+    let d = Date::from_calendar_date(year as i32, m, 1).unwrap();
+    let dt = OffsetDateTime::new_in_offset(d, Time::MIDNIGHT, UtcOffset::UTC);
+    dt.unix_timestamp()
+}
