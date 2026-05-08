@@ -2,10 +2,14 @@
 //! and the usernames collector for a single monthly file.
 
 use crate::filters::{matches_minimal, matches_subreddit_basic, within_bounds};
+use crate::json_whitelist::WhitelistTokenizer;
 use crate::paths::FileJob;
 use crate::query::QuerySpec;
 use crate::shard::ShardedWriter;
-use crate::zstd_jsonl::{for_each_line_cfg, for_each_line_with_progress_cfg, parse_minimal};
+use crate::zstd_jsonl::{
+    for_each_line_cfg, for_each_line_cfg_with_skip, for_each_line_with_progress_cfg,
+    for_each_line_with_progress_cfg_with_skip, parse_minimal,
+};
 use anyhow::Result;
 use indicatif::ProgressBar;
 use serde_json::{Map, Value};
@@ -156,6 +160,13 @@ pub fn stream_job<W: Write + ?Sized>(
 ) -> Result<u64> {
     let mut written: u64 = 0;
     let mut ts_buf = String::new();
+    let mut tok_buf = String::new();
+
+    // Build the streaming tokenizer once per file so the small key-set is
+    // hashed exactly once and the buffers above are reused across every line.
+    let tokenizer: Option<WhitelistTokenizer> = whitelist
+        .as_ref()
+        .map(|fields| WhitelistTokenizer::new(fields.iter().map(|s| s.as_str())));
 
     let mut on_line = |line: &str| -> Result<()> {
         if let Ok(min) = parse_minimal(line) {
@@ -181,9 +192,30 @@ pub fn stream_job<W: Write + ?Sized>(
                 return Ok(());
             }
 
-            // TODO: whitelist-only path also defeats the fast-path passthrough; a
-            // streaming JSON tokenizer would let us emit just the requested fields
-            // without parsing into a Value. Out of scope here.
+            // Whitelist branch — preferred path is the streaming tokenizer
+            // which copies raw value bytes verbatim and never builds a
+            // `serde_json::Value`. If the tokenizer rejects the line as
+            // structurally surprising, fall back to the slow Value path so we
+            // never regress correctness on an odd record.
+            if let Some(tok) = &tokenizer {
+                if tok.tokenize_into(line, &mut tok_buf).is_ok() {
+                    if human_timestamps {
+                        // Compose: run the byte-level timestamp rewriter on the
+                        // already-whitelisted bytes. Merging the two passes is
+                        // possible but premature — defer until profiling shows
+                        // it matters.
+                        rewrite_human_timestamps_bytes(&tok_buf, &mut ts_buf);
+                        writer.write_all(ts_buf.as_bytes())?;
+                    } else {
+                        writer.write_all(tok_buf.as_bytes())?;
+                    }
+                    writer.write_all(b"\n")?;
+                    written += 1;
+                    return Ok(());
+                }
+                // Fall through to slow path on tokenizer error.
+            }
+
             // Slow path: parse Value for whitelisting (and timestamp conversion if both apply).
             let val: Value = serde_json::from_str(line)?;
             let mut out_val = if let Some(fields) = whitelist {
@@ -218,12 +250,20 @@ pub fn stream_job<W: Write + ?Sized>(
     Ok(written)
 }
 
-pub fn process_file_for_usernames(
+/// Process a single monthly file and shard usernames matching `subreddit`.
+///
+/// On decode error, the file is logged via `warn_decode_skip` and skipped (the
+/// outer `Result` stays `Ok`). The optional `on_skip(path, &error)` callback
+/// fires once per skipped file so callers can count, alert, or fail-fast — it
+/// does not change the swallow-by-default behavior; corrupt files never abort
+/// the job.
+pub fn process_file_for_usernames_with_skip(
     job: &FileJob,
     read_buf_bytes: usize,
     subreddit: &str,
     shard_writer: &ShardedWriter,
     pb: Option<ProgressBar>,
+    mut on_skip: impl FnMut(&std::path::Path, &anyhow::Error),
 ) -> Result<()> {
     let handle_line = |line: &str| -> Result<()> {
         let min = match parse_minimal(line) { Ok(m) => m, Err(_) => return Ok(()) };
@@ -237,9 +277,20 @@ pub fn process_file_for_usernames(
     };
 
     if let Some(pb) = pb {
-        for_each_line_with_progress_cfg(&job.path, read_buf_bytes, |delta| pb.inc(delta), |s| handle_line(s))?;
+        for_each_line_with_progress_cfg_with_skip(
+            &job.path,
+            read_buf_bytes,
+            |p, e| on_skip(p, e),
+            |delta| pb.inc(delta),
+            |s| handle_line(s),
+        )?;
     } else {
-        for_each_line_cfg(&job.path, read_buf_bytes, |s| handle_line(s))?;
+        for_each_line_cfg_with_skip(
+            &job.path,
+            read_buf_bytes,
+            |p, e| on_skip(p, e),
+            |s| handle_line(s),
+        )?;
     }
     Ok(())
 }

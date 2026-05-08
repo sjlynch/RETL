@@ -36,6 +36,11 @@ pub struct ETLOptions {
 
     // zstd compression level used by partitioned ZST writers
     pub zst_level: i32,
+
+    /// Opt-in: when true, `extract_spool_monthly` reads/writes a
+    /// `<out_dir>/_progress.json` sidecar and skips months already
+    /// committed by a prior run. Default false to preserve current behavior.
+    pub resume: bool,
 }
 
 impl Default for ETLOptions {
@@ -68,6 +73,8 @@ impl Default for ETLOptions {
             human_readable_timestamps: false,
 
             zst_level: 7,
+
+            resume: false,
         }
     }
 }
@@ -156,6 +163,12 @@ impl ETLOptions {
     /// clamped. Default: 7 (good ratio, ~5x faster than 19 on real workloads).
     pub fn with_zst_level(mut self, level: i32) -> Self {
         self.zst_level = level.clamp(1, 22);
+        self
+    }
+
+    /// Opt in to resumable spool runs (`extract_spool_monthly` only).
+    pub fn with_resume(mut self, yes: bool) -> Self {
+        self.resume = yes;
         self
     }
 }

@@ -1,113 +1,76 @@
-# RETL (Reddit ETL)
+# RETL
 
-**RETL** is a fast, memory‑aware, streaming ETL toolkit for working with the Reddit monthly **RC** (comments) and **RS** (submissions) corpora. It’s designed to scan large `.zst` JSONL drops efficiently, filter with an intuitive query builder, and export results for analysis — all with pragmatic attention to parallelism, backpressure, and Windows‑friendly file operations.
+A Rust library for streaming ETL over the Reddit monthly comment (`RC`) and
+submission (`RS`) zstd-compressed JSONL dumps. RETL scans the monthly archives
+in a single pass, applies filters via a builder API, and writes results to
+JSONL, ZST, or TSV.
 
-> TL;DR: Point RETL at a `comments/` and `submissions/` directory full of `RC_YYYY-MM.zst` / `RS_YYYY-MM.zst` files, build a query, then extract or analyze in one pass.
+## Why RETL
 
----
+The Reddit monthly dumps are large (tens of GB compressed per month in later
+years) and are distributed as one `.zst`-compressed JSONL file per month. Most
+analyses don't need the records in memory at once — they need to filter,
+count, or re-export them.
 
-## Features
+RETL is built around that workflow:
 
-- 🚀 **Streaming, single‑pass processing** of `.zst` JSONL monthly dumps (RC/RS)
-- 🧠 **Intuitive query builder (DSL)**: subreddits, authors (allow/deny), regex, keywords, URL presence, domains, score thresholds
-- 🧰 **Exports**:
-  - JSONL / JSON array (stitched)
-  - Partitioned per source (RC/RS) as JSONL or ZST
-- 📈 **Analytics helpers**: `count_by_month()`, per‑author counts, “first seen” index
-- 👪 **Parent pipeline**: collect parent IDs → resolve content → attach parent payloads back to records
-- 🧪 **Integrity checks** for corrupted monthly files (quick or full)
-- 🧵 **Parallel, backpressure‑aware** I/O with file concurrency caps and cooperative throttling
-- 🪟 **Windows‑friendly I/O** with robust retry/backoff on transient errors
+- Streams records line-by-line; memory use does not scale with corpus size.
+- Filters (subreddit, author, score, keywords, regex, URL/domain) run during
+  decompression so the unmatched majority is dropped before allocation.
+- Parallelizes across files with a configurable concurrency cap, so wide date
+  ranges do not exhaust RAM or file descriptors.
+- Atomic writes (`*.inprogress` → rename) so a killed run never leaves
+  partial output files behind.
+- Tested on Windows: file operations retry with backoff to tolerate the
+  short-lived sharing-violation errors common with antivirus and indexers.
 
----
+## Data layout
 
-## Table of Contents
+RETL expects a base directory with two subdirectories of monthly files:
 
-- [Data Layout](#data-layout)
-- [Install](#install)
-- [Quick Start](#quick-start)
-- [Usage Examples](#usage-examples)
-  - [Extract to JSONL](#extract-to-jsonl)
-  - [Partitioned Export (JSONL/ZST)](#partitioned-export-jsonlzst)
-  - [Count by Month](#count-by-month)
-  - [Usernames with Filters](#usernames-with-filters)
-  - [Author Analytics (TSV)](#author-analytics-tsv)
-  - [Parents Pipeline (Attach Parent Content)](#parents-pipeline-attach-parent-content)
-  - [Integrity Checks](#integrity-checks)
-- [Performance & Tuning](#performance--tuning)
-- [Environment Aids](#environment-aids)
-- [Fuzzing](#fuzzing)
-- [License](#license)
-
----
-
-## Data Layout
-
-RETL expects a base directory with two subfolders:
-
-~~~text
+```
 <base_dir>/
   comments/
     RC_YYYY-MM.zst
-    RC_YYYY-MM.zst
-    ...
   submissions/
     RS_YYYY-MM.zst
-    RS_YYYY-MM.zst
-    ...
-~~~
+```
 
-File name patterns are enforced at discovery time:
-- Comments: `^RC_\d{4}-\d{2}\.zst$`
-- Submissions: `^RS_\d{4}-\d{2}\.zst$`
+Filenames must match `RC_\d{4}-\d{2}\.zst` and `RS_\d{4}-\d{2}\.zst`. Files
+that do not match are ignored at discovery time.
 
----
-
-You can browse and download monthly dumps via Academic Torrents:
+Monthly dumps are available via Academic Torrents:
 https://academictorrents.com/browse.php?search=reddit
-
-Note on scale & performance:
-The monthly files become very large in later years. It’s normal for broader queries to run longer and consume significant I/O. RETL’s streaming design and throttling aim to keep resource use predictable; tune .file_concurrency(n), .parallelism(n), and .io_buffers(...) as appropriate for your hardware and dataset size.
 
 ## Install
 
-### As a library (recommended)
+RETL is not published to crates.io. Add it to your `Cargo.toml` from Git:
 
-Add RETL to your Cargo.toml via Git (replace the URL with your repo if needed):
-
-~~~toml
+```toml
 [dependencies]
 retl = { git = "https://github.com/sjlynch/retl", branch = "main" }
-~~~
+```
 
-> This repository currently sets `publish = false` in `Cargo.toml`, so installing from crates.io is not expected.
+The repo also includes a small example binary in `src/main.rs` that collects
+authors over a small date window. The library API is the intended entry point.
 
-### Build the demo binary
-
-This repo also includes a small example binary in `src/main.rs`:
-
-~~~sh
+```sh
 cargo build --release
 ./target/release/retl
-~~~
+```
 
-The binary demonstrates author collection across a small date window, and is intentionally minimal — the library API is where RETL shines.
+## Quick start
 
----
+Place the corpus under `./data/`:
 
-## Quick Start
-
-Place your corpus under `./data/`:
-
-~~~text
+```
 ./data/comments/RC_2006-01.zst
 ./data/submissions/RS_2006-01.zst
-...
-~~~
+```
 
-Create a small driver:
+Count matching records by month:
 
-~~~rust
+```rust
 use anyhow::Result;
 use retl::{RedditETL, Sources, YearMonth};
 
@@ -121,30 +84,50 @@ fn main() -> Result<()> {
         .subreddit("programming")
         .keywords_any(["rust"])
         .contains_url(true)
-        .count_by_month()?; // {"2006-01": N}
+        .count_by_month()?;
 
     for (ym, n) in counts {
         println!("{ym}\t{n}");
     }
     Ok(())
 }
-~~~
+```
 
-Run:
+## API overview
 
-~~~sh
-cargo run --release
-~~~
+Every operation follows the same two-stage builder:
 
----
+1. `RedditETL::new()` configures the corpus and execution options
+   (`base_dir`, `sources`, `date_range`, `parallelism`, `file_concurrency`,
+   `io_buffers`, `work_dir`, `progress`).
+2. `.scan()` enters query mode where filters (`subreddit`, `authors_in`,
+   `authors_out`, `min_score`, `keywords_any`, `domains_in`, `contains_url`,
+   `author_regex`) and a terminal operation are chained.
 
-## Usage Examples
+Terminal operations:
 
-All examples below operate on the same API you saw in the Quick Start.
+| Method                              | Output                                                    |
+| ----------------------------------- | --------------------------------------------------------- |
+| `count_by_month()`                  | `BTreeMap<YearMonth, u64>`                                |
+| `usernames()`                       | Streaming iterator of deduped author names                |
+| `for_each_username(\|u\| ...)`      | Callback variant of `usernames()`                         |
+| `extract_to_jsonl(path)`            | Single stitched JSONL file                                |
+| `extract_to_json(path, pretty)`     | Single JSON array file                                    |
+| `extract_spool_monthly(dir)`        | One JSONL per month (input for the parents pipeline)      |
+| `export_partitioned(dir, format)`   | Re-exports filtered corpus partitioned by month/source    |
+| `author_counts_to_tsv(path)`        | TSV of `author<TAB>count`                                 |
+| `build_first_seen_index_to_tsv(p)`  | TSV of `author<TAB>earliest_created_utc`                  |
+| `check_corpus_integrity(mode)`      | List of `(path, error)` for files that failed validation  |
 
-### Extract to JSONL
+## Examples
 
-~~~rust
+### Extract filtered records to JSONL
+
+`whitelist_fields` keeps only the named fields per record.
+`timestamps_human_readable(true)` rewrites `created_utc` (and similar fields)
+to ISO-8601 UTC strings.
+
+```rust
 use retl::{RedditETL, Sources, YearMonth};
 use std::path::Path;
 
@@ -156,17 +139,21 @@ RedditETL::new()
     .scan()
     .subreddit("askscience")
     .whitelist_fields([
-        "author","body","created_utc","subreddit",
-        "parent_id","link_id","id","score",
+        "author", "body", "created_utc", "subreddit",
+        "parent_id", "link_id", "id", "score",
     ])
     .timestamps_human_readable(true)
-    .extract_to_jsonl(Path::new("askscience_comments_q1_2016_minimal.jsonl"))?;
-~~~
+    .extract_to_jsonl(Path::new("askscience_q1_2016.jsonl"))?;
+```
 
-### Partitioned Export (JSONL/ZST)
+### Re-export a filtered subset as a partitioned corpus
 
-~~~rust
+`ExportFormat::Zst` writes recompressed `.zst` files; `ExportFormat::Jsonl`
+writes plain JSONL. The output directory mirrors the input layout.
+
+```rust
 use retl::{ExportFormat, RedditETL, Sources, YearMonth};
+use std::path::Path;
 
 RedditETL::new()
     .base_dir("./data")
@@ -176,44 +163,18 @@ RedditETL::new()
     .scan()
     .subreddit("programming")
     .allow_pseudo_users() // include "[deleted]"
-    .export_partitioned(std::path::Path::new("out_corpus_zst"), ExportFormat::Zst)?;
-~~~
+    .export_partitioned(Path::new("out_corpus_zst"), ExportFormat::Zst)?;
+```
 
-Outputs:
+### Stream usernames
 
-~~~text
-out_corpus_zst/comments/RC_2016-01.zst
-out_corpus_zst/submissions/RS_2016-01.zst
-~~~
-
-### Count by Month
-
-~~~rust
+```rust
 use retl::{RedditETL, Sources, YearMonth};
 
-let counts = RedditETL::new()
-    .base_dir("./data")
-    .sources(Sources::Both)
-    .date_range(Some(YearMonth::new(2016, 1)), Some(YearMonth::new(2016, 12)))
-    .progress(false)
-    .scan()
-    .subreddit("worldnews")
-    .keywords_any(["election","vote","ballot"])
-    .contains_url(true)
-    .min_score(10)
-    .count_by_month()?;
-~~~
-
-### Usernames with Filters
-
-~~~rust
-use retl::{RedditETL, Sources, YearMonth};
-
-let mut it = RedditETL::new()
+let mut authors = RedditETL::new()
     .base_dir("./data")
     .sources(Sources::Both)
     .date_range(Some(YearMonth::new(2006, 1)), Some(YearMonth::new(2006, 1)))
-    .progress(false)
     .scan()
     .subreddit("programming")
     .keywords_any(["rust"])
@@ -221,46 +182,46 @@ let mut it = RedditETL::new()
     .min_score(2)
     .usernames()?;
 
-while let Some(u) = it.next() {
-    println!("{}", u);
+while let Some(u) = authors.next() {
+    println!("{u}");
 }
-~~~
+```
 
-### Author Analytics (TSV)
+### Author analytics
 
-Produce a TSV of total records per author:
-
-~~~rust
+```rust
 use retl::{RedditETL, Sources, YearMonth};
+use std::path::Path;
 
-RedditETL::new()
+let etl = RedditETL::new()
     .base_dir("./data")
     .sources(Sources::Both)
-    .date_range(Some(YearMonth::new(2006, 1)), Some(YearMonth::new(2006, 1)))
-    .progress(false)
+    .date_range(Some(YearMonth::new(2006, 1)), Some(YearMonth::new(2006, 1)));
+
+etl.clone()
     .scan()
     .subreddit("programming")
-    .author_counts_to_tsv(std::path::Path::new("author_counts.tsv"))?;
-~~~
+    .author_counts_to_tsv(Path::new("author_counts.tsv"))?;
 
-And the earliest “first seen” timestamp per author:
-
-~~~rust
-RedditETL::new()
-    .base_dir("./data")
-    .sources(Sources::Both)
-    .date_range(Some(YearMonth::new(2006, 1)), Some(YearMonth::new(2006, 1)))
-    .progress(false)
-    .scan()
+etl.scan()
     .subreddit("programming")
-    .build_first_seen_index_to_tsv(std::path::Path::new("first_seen.tsv"))?;
-~~~
+    .build_first_seen_index_to_tsv(Path::new("first_seen.tsv"))?;
+```
 
-### Parents Pipeline (Attach Parent Content)
+### Parents pipeline
 
-Collect parent IDs from your spooled JSONL, resolve parent contents by scanning the corpus, then attach parents back onto your records:
+Comments reference their parent by `parent_id` (`t1_<id>` for a comment,
+`t3_<id>` for a submission). The parents pipeline resolves those references
+and attaches a `"parent"` object to each record.
 
-~~~rust
+The pipeline runs in three passes so each stage can be parallelized and
+resumed independently:
+
+1. Spool filtered records to per-month JSONL files.
+2. Collect parent IDs from the spool.
+3. Resolve parent IDs against the corpus, then attach the parent payloads.
+
+```rust
 use retl::{ParentIds, ParentMaps, RedditETL, Sources, YearMonth};
 use std::path::Path;
 
@@ -274,94 +235,84 @@ let (spool_parts, _n) = RedditETL::new()
     .allow_pseudo_users()
     .extract_spool_monthly(Path::new("spool"))?;
 
-// Step 2: Collect parent IDs
 let ids: ParentIds = RedditETL::new()
     .base_dir("./data")
     .progress(true)
     .collect_parent_ids_from_jsonls(spool_parts.clone())?;
 
-// Step 3: Resolve to cache over ±1 month window
+// Widen the date range here so parents written shortly before the
+// comment's month are still resolvable.
 let parents: ParentMaps = RedditETL::new()
     .base_dir("./data")
     .date_range(Some(YearMonth::new(2005, 12)), Some(YearMonth::new(2006, 2)))
     .progress(true)
-    .resolve_parent_maps(&ids, Path::new("parents_cache"), /*resume=*/true)?;
+    .resolve_parent_maps(&ids, Path::new("parents_cache"), /* resume */ true)?;
 
-// Step 4: Attach parent payloads
-let _out_paths = RedditETL::new()
+RedditETL::new()
     .base_dir("./data")
     .progress(true)
-    .attach_parents_jsonls_parallel(spool_parts, Path::new("spool_with_parents"), &parents, /*resume=*/false)?;
-~~~
+    .attach_parents_jsonls_parallel(
+        spool_parts,
+        Path::new("spool_with_parents"),
+        &parents,
+        /* resume */ false,
+    )?;
+```
 
-Each comment will receive a `"parent"` object containing either the parent comment’s body (`t1_...`) or the submission’s title/selftext (`t3_...`).
+`resume: true` skips work whose output already exists, which makes the
+pipeline restartable after an interruption.
 
-### Integrity Checks
+### Integrity checks
 
-Quick sampling (fast) and full decode (slow but thorough):
+`Quick` decodes only the first `sample_bytes` of each file (catches early
+corruption fast); `Full` decodes the entire stream and verifies checksums.
 
-~~~rust
+```rust
 use retl::{IntegrityMode, RedditETL, Sources, YearMonth};
 
-let bad_quick = RedditETL::new()
+let bad = RedditETL::new()
     .base_dir("./data")
     .sources(Sources::Comments)
     .date_range(Some(YearMonth::new(2006, 2)), Some(YearMonth::new(2006, 2)))
-    .progress(false)
     .check_corpus_integrity(IntegrityMode::Quick { sample_bytes: 64 * 1024 })?;
 
-let bad_full = RedditETL::new()
-    .base_dir("./data")
-    .sources(Sources::Comments)
-    .date_range(Some(YearMonth::new(2006, 2)), Some(YearMonth::new(2006, 2)))
-    .progress(false)
-    .check_corpus_integrity(IntegrityMode::Full)?;
-~~~
+for (path, err) in bad {
+    eprintln!("{}: {err}", path.display());
+}
+```
 
----
+## Performance and tuning
 
-## Performance & Tuning
+Defaults are conservative. The knobs below are the ones that matter on large
+corpora:
 
-- **Parallelism**: set Rayon threads based on your hardware:
-  ~~~rust
-  .parallelism(24)
-  ~~~
-- **File concurrency**: limit how many monthly files are decoded at once (helps with RAM/IO pressure):
-  ~~~rust
-  .file_concurrency(4)
-  ~~~
-- **Buffers**: tune read/write buffers if you’re IO‑bound:
-  ~~~rust
-  .io_buffers(256 * 1024, 256 * 1024)
-  ~~~
-- **Work directory**: point scratch space to fast storage:
-  ~~~rust
-  .work_dir("/mnt/nvme/etl_tmp")
-  ~~~
-- **Progress**: toggle progress bars and custom labels:
-  ~~~rust
-  .progress(true).progress_label("Counting")
-  ~~~
+- `.parallelism(n)` — Rayon worker threads. CPU-bound work (decompression,
+  parsing) scales with this up to physical core count.
+- `.file_concurrency(n)` — number of monthly files decoded in parallel. The
+  per-file working set is large; raising this is the fastest way to use up
+  RAM. Start at 4–8.
+- `.io_buffers(read, write)` — read/write buffer sizes in bytes. The default
+  is fine for SSD-backed local storage; increase to 1–4 MiB on networked
+  filesystems.
+- `.work_dir(path)` — scratch directory for intermediate shards and
+  `.inprogress` files. Point this at fast local storage if the corpus lives
+  on a network share.
+- `.progress(true)` and `.progress_label("...")` — render an `indicatif`
+  progress bar.
 
-RETL cooperates under low memory by adaptively throttling certain stages.
+RETL throttles cooperatively when system memory falls below a threshold; you
+do not need to manage this manually.
 
----
+## Environment variables
 
-## Environment Aids
+- `RUST_LOG` — standard `tracing` filter (e.g. `RUST_LOG=info`).
+- `ETL_EXCLUDE_AUTHORS` — comma-separated authors to add to the default
+  bot/service exclusion list.
+- `ETL_EXCLUDE_AUTHORS_FILE` — path to a newline-separated file of additional
+  authors to exclude.
 
-- **Logging**: respect `RUST_LOG`, e.g.:
-  ~~~sh
-  RUST_LOG=info cargo run --release
-  ~~~
-- **Exclude bots**: start from a conservative default list and extend via env/file:
-  - `ETL_EXCLUDE_AUTHORS="bot_a, bot_b, service_c"`
-  - `ETL_EXCLUDE_AUTHORS_FILE=/path/to/extra_exclusions.txt`
-  Then use:
-  ~~~rust
-  .exclude_common_bots()
-  ~~~
-
----
+The merged exclusion list is applied by `.exclude_common_bots()` on a
+`ScanPlan`.
 
 ## Fuzzing
 
@@ -377,16 +328,16 @@ for the two functions that walk attacker-controlled bytes:
 
 Setup (one-time):
 
-~~~sh
+```sh
 cargo install cargo-fuzz
 rustup toolchain install nightly
-~~~
+```
 
 The `fuzz/` crate is pre-scaffolded — no `cargo fuzz init` needed. Two
 targets live under `fuzz/fuzz_targets/`, each seeded with ~50 inputs at
 `fuzz/corpus/<target>/`:
 
-~~~sh
+```sh
 # Walks &str → parse_minimal; any panic/abort is a finding.
 cargo +nightly fuzz run fuzz_parse_minimal -- -max_total_time=300
 
@@ -396,7 +347,7 @@ cargo +nightly fuzz run fuzz_parse_minimal -- -max_total_time=300
 # (c) on shallow top-level objects, the byte path matches the slow path
 #     (apply_human_timestamps applied to the parsed Value).
 cargo +nightly fuzz run fuzz_rewrite_timestamps -- -max_total_time=300
-~~~
+```
 
 The seed corpora include real Reddit-shaped JSONL lines plus adversarial
 inputs: bodies that contain `\"created_utc\":` substrings (must be left
@@ -416,17 +367,6 @@ Triage:
 Fuzzing is **not** wired into CI by default — it runs on demand under
 nightly because libfuzzer is a nightly-only sanitizer.
 
----
-
 ## License
 
-**MIT**. See `LICENSE` for details.
-
----
-
-## Project Goals
-
-- Provide an **intuitive, composable query system** that feels like a fluent DSL
-- Keep **memory profile predictable** with adaptive buffering and backpressure
-- Make **common workflows boringly easy** (extract, export, count, attach parents)
-- Stay **robust on Windows** and networked filesystems via retry/backoff I/O
+MIT. See `LICENSE`.

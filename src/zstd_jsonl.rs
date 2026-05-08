@@ -74,14 +74,8 @@ pub fn parse_minimal(line: &str) -> Result<MinimalRecord> {
 /// on very large frames. If it still fails (e.g., checksum/corruption), log a single
 /// warning and skip the file (do not abort the run).
 #[allow(dead_code)]
-pub fn for_each_line(path: &Path, mut on_line: impl FnMut(&str) -> Result<()>) -> Result<()> {
-    match for_each_line_attempt(path, &mut on_line, Some(31), None) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            warn_decode_skip(path, &e);
-            Ok(())
-        }
-    }
+pub fn for_each_line(path: &Path, on_line: impl FnMut(&str) -> Result<()>) -> Result<()> {
+    for_each_line_with_skip(path, |_, _| {}, on_line)
 }
 
 /// Tunable version: choose BufReader capacity via `read_buf_bytes`.
@@ -89,12 +83,44 @@ pub fn for_each_line(path: &Path, mut on_line: impl FnMut(&str) -> Result<()>) -
 pub fn for_each_line_cfg(
     path: &Path,
     read_buf_bytes: usize,
+    on_line: impl FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    for_each_line_cfg_with_skip(path, read_buf_bytes, |_, _| {}, on_line)
+}
+
+/// Like `for_each_line`, but invokes `on_skip(path, &error)` when the file is
+/// skipped due to a decode error so callers can record per-file metrics, alert,
+/// or escalate. The decode error is still logged via `warn_decode_skip` and the
+/// outer `Result` is still `Ok(())` — corruption never aborts the run.
+#[allow(dead_code)]
+pub fn for_each_line_with_skip(
+    path: &Path,
+    mut on_skip: impl FnMut(&Path, &anyhow::Error),
+    mut on_line: impl FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    match for_each_line_attempt(path, &mut on_line, Some(31), None) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            warn_decode_skip(path, &e);
+            on_skip(path, &e);
+            Ok(())
+        }
+    }
+}
+
+/// Like `for_each_line_cfg`, but invokes `on_skip(path, &error)` when the file
+/// is skipped due to a decode error. See `for_each_line_with_skip` for details.
+pub fn for_each_line_cfg_with_skip(
+    path: &Path,
+    read_buf_bytes: usize,
+    mut on_skip: impl FnMut(&Path, &anyhow::Error),
     mut on_line: impl FnMut(&str) -> Result<()>,
 ) -> Result<()> {
     match for_each_line_attempt(path, &mut on_line, Some(31), Some(read_buf_bytes)) {
         Ok(()) => Ok(()),
         Err(e) => {
             warn_decode_skip(path, &e);
+            on_skip(path, &e);
             Ok(())
         }
     }
@@ -158,19 +184,10 @@ impl<R: Read> Read for CountingReader<R> {
 pub fn for_each_line_with_progress_cfg(
     path: &Path,
     read_buf_bytes: usize,
-    mut on_progress: impl FnMut(u64),
-    mut on_line: impl FnMut(&str) -> Result<()>,
+    on_progress: impl FnMut(u64),
+    on_line: impl FnMut(&str) -> Result<()>,
 ) -> Result<()> {
-    match for_each_line_attempt_with_progress(path, Some(read_buf_bytes), &mut on_progress, &mut on_line, Some(31), /*throttle=*/true) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            warn_decode_skip(path, &e);
-            if let Ok(meta) = fs::metadata(path) {
-                on_progress(meta.len());
-            }
-            Ok(())
-        }
-    }
+    for_each_line_with_progress_cfg_with_skip(path, read_buf_bytes, |_, _| {}, on_progress, on_line)
 }
 
 /// NEW: progress-aware streaming **without** per-line memory throttle.
@@ -179,6 +196,43 @@ pub fn for_each_line_with_progress_cfg(
 pub fn for_each_line_with_progress_cfg_no_throttle(
     path: &Path,
     read_buf_bytes: usize,
+    on_progress: impl FnMut(u64),
+    on_line: impl FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    for_each_line_with_progress_cfg_no_throttle_with_skip(path, read_buf_bytes, |_, _| {}, on_progress, on_line)
+}
+
+/// Like `for_each_line_with_progress_cfg`, but invokes `on_skip(path, &error)`
+/// when the file is skipped due to a decode error. See `for_each_line_with_skip`
+/// for details.
+pub fn for_each_line_with_progress_cfg_with_skip(
+    path: &Path,
+    read_buf_bytes: usize,
+    mut on_skip: impl FnMut(&Path, &anyhow::Error),
+    mut on_progress: impl FnMut(u64),
+    mut on_line: impl FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    match for_each_line_attempt_with_progress(path, Some(read_buf_bytes), &mut on_progress, &mut on_line, Some(31), /*throttle=*/true) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            warn_decode_skip(path, &e);
+            on_skip(path, &e);
+            if let Ok(meta) = fs::metadata(path) {
+                on_progress(meta.len());
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Like `for_each_line_with_progress_cfg_no_throttle`, but invokes
+/// `on_skip(path, &error)` when the file is skipped due to a decode error.
+/// See `for_each_line_with_skip` for details.
+#[allow(dead_code)]
+pub fn for_each_line_with_progress_cfg_no_throttle_with_skip(
+    path: &Path,
+    read_buf_bytes: usize,
+    mut on_skip: impl FnMut(&Path, &anyhow::Error),
     mut on_progress: impl FnMut(u64),
     mut on_line: impl FnMut(&str) -> Result<()>,
 ) -> Result<()> {
@@ -186,6 +240,7 @@ pub fn for_each_line_with_progress_cfg_no_throttle(
         Ok(()) => Ok(()),
         Err(e) => {
             warn_decode_skip(path, &e);
+            on_skip(path, &e);
             if let Ok(meta) = fs::metadata(path) {
                 on_progress(meta.len());
             }
@@ -283,6 +338,7 @@ pub fn validate_zst_full(path: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::path::PathBuf;
 
     fn write_zst_with_checksum(path: &Path, payload: &[u8]) {
         let f = fs::File::create(path).unwrap();
@@ -345,5 +401,65 @@ mod tests {
             "for_each_line_cfg should skip a corrupt file gracefully, got {:?}",
             res
         );
+
+        // The *_with_skip variant must also skip gracefully AND surface the
+        // skip event to the caller via `on_skip`. The path passed to the
+        // callback must match the file we tried to read, and the captured
+        // error must be non-empty.
+        let mut skip_calls: Vec<(PathBuf, String)> = Vec::new();
+        let mut lines_seen2 = 0usize;
+        let res = for_each_line_cfg_with_skip(
+            &path,
+            16 * 1024,
+            |p, e| skip_calls.push((p.to_path_buf(), e.to_string())),
+            |_line| {
+                lines_seen2 += 1;
+                Ok(())
+            },
+        );
+        assert!(
+            res.is_ok(),
+            "for_each_line_cfg_with_skip should skip a corrupt file gracefully, got {:?}",
+            res
+        );
+        assert_eq!(
+            skip_calls.len(),
+            1,
+            "on_skip must fire exactly once for a corrupt file, got {:?}",
+            skip_calls
+        );
+        let (skipped_path, err_msg) = &skip_calls[0];
+        assert_eq!(skipped_path, &path, "on_skip must receive the original path");
+        assert!(!err_msg.is_empty(), "on_skip must receive a non-empty error description");
+    }
+
+    /// On a healthy file, the *_with_skip variant must NOT invoke `on_skip`
+    /// and must still deliver every line to `on_line`. This guards against
+    /// regressions where the skip callback fires on the happy path.
+    #[test]
+    fn healthy_file_does_not_trigger_on_skip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("healthy.zst");
+
+        let mut payload = Vec::new();
+        for i in 0..50 {
+            payload.extend_from_slice(format!("{{\"id\":\"r{}\"}}\n", i).as_bytes());
+        }
+        write_zst_with_checksum(&path, &payload);
+
+        let mut skip_count = 0usize;
+        let mut lines_seen = 0usize;
+        let res = for_each_line_cfg_with_skip(
+            &path,
+            16 * 1024,
+            |_, _| skip_count += 1,
+            |_line| {
+                lines_seen += 1;
+                Ok(())
+            },
+        );
+        assert!(res.is_ok(), "healthy file must scan without error");
+        assert_eq!(skip_count, 0, "on_skip must not fire on healthy files");
+        assert_eq!(lines_seen, 50, "all lines must be delivered on healthy files");
     }
 }
