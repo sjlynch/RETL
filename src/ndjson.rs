@@ -68,3 +68,49 @@ impl NdjsonWriter {
         replace_file_atomic_backoff(&self.path, final_path)
     }
 }
+
+/// Stream a plain JSONL file line-by-line, calling `on_line` with each raw line
+/// (trailing `\r?\n` stripped, empty lines included).
+///
+/// Mirrors `zstd_jsonl::for_each_line_cfg` swallow-and-warn semantics for
+/// transient read failures: opens via `open_with_backoff`, and a mid-file
+/// `read_line` error is logged at warn level and ends iteration without
+/// aborting the caller. Returns `Ok(true)` when a read error was tolerated
+/// (so the file was only partially consumed) and `Ok(false)` on a clean read,
+/// letting callers (e.g. aggregator shard build) count partial reads.
+///
+/// File-open errors and `on_line` errors are propagated to the caller; only
+/// per-line I/O errors are swallowed.
+pub fn for_each_jsonl_line_cfg(
+    path: &Path,
+    read_buf_bytes: usize,
+    mut on_line: impl FnMut(&str) -> Result<()>,
+) -> Result<bool> {
+    let f = open_with_backoff(path, 16, 50)?;
+    let mut reader = BufReader::with_capacity(read_buf_bytes.max(8 * 1024), f);
+    let mut buf = String::with_capacity(16 * 1024);
+    let mut had_read_error = false;
+    loop {
+        buf.clear();
+        match reader.read_line(&mut buf) {
+            Ok(0) => break,
+            Ok(_) => {
+                if buf.ends_with('\n') {
+                    buf.pop();
+                    if buf.ends_with('\r') { buf.pop(); }
+                }
+                on_line(&buf)?;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "tolerated JSONL read error mid-file; skipping rest of file"
+                );
+                had_read_error = true;
+                break;
+            }
+        }
+    }
+    Ok(had_read_error)
+}
