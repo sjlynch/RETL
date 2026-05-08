@@ -116,8 +116,10 @@ fn for_each_line_attempt(
 
     let mut buf = String::with_capacity(16 * 1024);
     // Sampled cooperative memory backoff: maybe_throttle_low_memory acquires a
-    // global Mutex (see src/mem.rs), which becomes meaningful contention at
-    // sustained line rates. Sample every 4096 lines instead of per line.
+    // global Mutex (see src/mem.rs). Now that bucketing/dedupe carry their own
+    // bounded backpressure channels, this throttle is a coarse safety net —
+    // sample every 65,536 lines instead of 4,096 to keep mutex contention out
+    // of the hot read loop.
     let mut tick: u32 = 0;
     loop {
         buf.clear();
@@ -131,7 +133,7 @@ fn for_each_line_attempt(
         }
         on_line(&buf)?;
         tick = tick.wrapping_add(1);
-        if tick & 0xFFF == 0 {
+        if tick & 0xFFFF == 0 {
             maybe_throttle_low_memory(0.10);
         }
     }
@@ -241,7 +243,9 @@ fn for_each_line_attempt_with_progress(
         on_line(&buf)?;
         if throttle {
             tick = tick.wrapping_add(1);
-            if tick & 0xFFF == 0 {
+            // Coarser sampling now that bucketing/dedupe have explicit
+            // bounded-channel backpressure — see for_each_line_attempt.
+            if tick & 0xFFFF == 0 {
                 maybe_throttle_low_memory(0.10);
             }
         }

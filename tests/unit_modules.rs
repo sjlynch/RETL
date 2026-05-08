@@ -210,6 +210,8 @@ fn bucketing_process_bucket_streaming_drives_adaptive_flush_with_10k_records() {
         micro_min_buf_mb: 0,
         micro_max_buf_mb: 0,
         adapt_cooldown_ms: 1, // re-evaluate fast
+        inflight_bytes: 0,    // disable cap; let tight buffer drive flushes
+        inflight_groups: 8,
     };
 
     let mut groups_seen: usize = 0;
