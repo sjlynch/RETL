@@ -303,6 +303,7 @@ fn dedupe_build_and_merge_groups_by_key_in_sorted_order() {
         adapt_cooldown_ms: 1,
         read_buf_bytes: 8 * 1024,
         write_buf_bytes: 8 * 1024,
+        inflight_bytes: 0, // disable cap so test's tight target_bytes drives flushes
     };
     let runs_dir = dir.path().join("runs");
     let key = KeyExtractor::author_lowercase_fast();
@@ -375,6 +376,7 @@ fn dedupe_single_run_promotes_directly_to_output() {
         adapt_cooldown_ms: 10_000,
         read_buf_bytes: 8 * 1024,
         write_buf_bytes: 8 * 1024,
+        inflight_bytes: 0, // disable cap; the test wants a single big run
     };
     let runs_dir = dir.path().join("runs");
     let key = KeyExtractor::author_lowercase_fast();

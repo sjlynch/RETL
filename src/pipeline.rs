@@ -61,6 +61,9 @@ impl RedditETL {
     pub fn io_buffers(mut self, read_bytes: usize, write_bytes: usize) -> Self { self.opts = self.opts.with_io_buffers(read_bytes, write_bytes); self }
     pub fn timestamps_human_readable(mut self, yes: bool) -> Self { self.opts = self.opts.with_human_timestamps(yes); self }
     pub fn zst_level(mut self, level: i32) -> Self { self.opts = self.opts.with_zst_level(level); self }
+    /// Override the inflight-bytes backpressure budget used by bucketing/dedupe
+    /// producer/consumer pairs. See `ETLOptions::inflight_bytes`.
+    pub fn inflight_bytes(mut self, bytes: usize) -> Self { self.opts = self.opts.with_inflight_bytes(bytes); self }
 
     // -------- Original operations (back-compat) --------
 

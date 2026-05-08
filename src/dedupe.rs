@@ -22,6 +22,11 @@ pub struct DedupeCfg {
     pub adapt_cooldown_ms: u64,
     pub read_buf_bytes: usize,
     pub write_buf_bytes: usize,
+    /// Hard cap on bytes inflight between the line-reader producer and the
+    /// run-writer consumer. Peak in-memory footprint of `build_runs_sorted`
+    /// is bounded by this value (one map being filled + one map awaiting
+    /// disk write). 0 disables the cap and falls back to `max_buf_mb` only.
+    pub inflight_bytes: usize,
 }
 impl Default for DedupeCfg {
     fn default() -> Self {
@@ -33,6 +38,10 @@ impl Default for DedupeCfg {
             adapt_cooldown_ms: 400,
             read_buf_bytes: 4 * 1024 * 1024,
             write_buf_bytes: 4 * 1024 * 1024,
+            // Default backpressure budget: 256 MiB. With channel capacity of 1,
+            // peak inflight = ~2 * (inflight_bytes / 2) = 256 MiB regardless of
+            // available_memory_fraction sampling.
+            inflight_bytes: 256 * 1024 * 1024,
         }
     }
 }
@@ -40,6 +49,12 @@ impl Default for DedupeCfg {
 /// Phase 1: Build **sorted runs** by key. The run files contain the **original** lines
 /// grouped by key (keys are written in sorted order within each run).
 /// Returns the run file paths.
+///
+/// Producer/consumer split: the line-reader runs on the calling thread and
+/// hands completed maps to a disk-writer thread via a bounded crossbeam
+/// channel (capacity 1). Per-flush map size is capped at
+/// `cfg.inflight_bytes / 2`, so peak in-memory footprint is bounded by
+/// `cfg.inflight_bytes` regardless of the free-RAM target.
 pub fn build_runs_sorted(
     input: &Path,
     runs_dir: &Path,
@@ -59,59 +74,106 @@ pub fn build_runs_sorted(
     let mut target_bytes: usize = cfg.min_buf_mb * 1024 * 1024;
     let mut last_eval = Instant::now() - Duration::from_millis(cfg.adapt_cooldown_ms * 2);
 
+    // Hard cap on per-flush bytes. With channel capacity 1, total inflight is
+    // bounded by 2 * per_flush_cap = inflight_bytes.
+    let per_flush_cap = if cfg.inflight_bytes > 0 {
+        (cfg.inflight_bytes / 2).max(1024 * 1024)
+    } else {
+        usize::MAX
+    };
+
     let mut map: ahash::AHashMap<String, Vec<String>> = ahash::AHashMap::with_capacity(64_000);
-    let mut run_paths: Vec<PathBuf> = Vec::new();
     let mut run_idx: usize = 0;
 
-    loop {
-        let n = rdr.read_line(&mut buf)?;
-        if n == 0 { break; }
-        pb.inc_bytes(n as u64);
+    let (tx, rx) = crossbeam_channel::bounded::<(usize, ahash::AHashMap<String, Vec<String>>)>(1);
 
-        if buf.is_empty() { continue; }
-        if let Some(k) = key.key_from_line(&buf) {
-            map.entry(k).or_default().push(buf.clone());
-            buffered_bytes += buf.len() + 1;
-        }
+    let runs_dir_buf = runs_dir.to_path_buf();
+    let write_buf_bytes = cfg.write_buf_bytes;
 
-        if last_eval.elapsed() >= Duration::from_millis(cfg.adapt_cooldown_ms) {
-            let free = available_memory_fraction();
-            let span = (cfg.high_frac - cfg.soft_low_frac).max(0.05f64);
-            let mut scale = ((free - cfg.soft_low_frac) / span).clamp(0.0, 1.0);
-            scale = scale * scale * (3.0 - 2.0 * scale);
-            target_bytes = ((cfg.min_buf_mb as f64 + (cfg.max_buf_mb as f64 - cfg.min_buf_mb as f64) * scale).round() as usize) * 1024 * 1024;
-            last_eval = Instant::now();
-        }
+    let run_paths: Vec<PathBuf> = std::thread::scope(|s| -> Result<Vec<PathBuf>> {
+        let writer_handle = s.spawn(move || -> Result<Vec<(usize, PathBuf)>> {
+            let mut written: Vec<(usize, PathBuf)> = Vec::new();
+            while let Ok((idx, mut m)) = rx.recv() {
+                let run_path = runs_dir_buf.join(format!("run_{:04}.ndjson", idx));
+                write_run_sorted(&run_path, &mut m, write_buf_bytes)?;
+                written.push((idx, run_path));
+            }
+            Ok(written)
+        });
 
-        if buffered_bytes >= target_bytes || is_low_memory(cfg.soft_low_frac) {
+        let producer_result: Result<()> = (|| -> Result<()> {
+            loop {
+                let n = rdr.read_line(&mut buf)?;
+                if n == 0 { break; }
+                pb.inc_bytes(n as u64);
+
+                if buf.is_empty() { continue; }
+                if let Some(k) = key.key_from_line(&buf) {
+                    map.entry(k).or_default().push(buf.clone());
+                    buffered_bytes += buf.len() + 1;
+                }
+
+                if last_eval.elapsed() >= Duration::from_millis(cfg.adapt_cooldown_ms) {
+                    let free = available_memory_fraction();
+                    let span = (cfg.high_frac - cfg.soft_low_frac).max(0.05f64);
+                    let mut scale = ((free - cfg.soft_low_frac) / span).clamp(0.0, 1.0);
+                    scale = scale * scale * (3.0 - 2.0 * scale);
+                    let adaptive = ((cfg.min_buf_mb as f64
+                        + (cfg.max_buf_mb as f64 - cfg.min_buf_mb as f64) * scale)
+                        .round() as usize)
+                        * 1024
+                        * 1024;
+                    // Cap adaptive target by per_flush_cap so the bounded
+                    // channel — not the RAM-fraction sampler — is the
+                    // primary backpressure mechanism.
+                    target_bytes = adaptive.min(per_flush_cap);
+                    last_eval = Instant::now();
+                }
+
+                if buffered_bytes >= target_bytes || is_low_memory(cfg.soft_low_frac) {
+                    if !map.is_empty() {
+                        run_idx += 1;
+                        tracing::debug!(
+                            target = "retl::backpressure",
+                            stage = "dedupe.build_runs_sorted",
+                            buffered_bytes,
+                            target_bytes,
+                            run_idx,
+                            "handing run to writer (bounded channel; producer blocks if full)"
+                        );
+                        let owned = std::mem::replace(
+                            &mut map,
+                            ahash::AHashMap::with_capacity(64_000),
+                        );
+                        // send blocks here when consumer falls behind → backpressure
+                        if tx.send((run_idx, owned)).is_err() {
+                            // writer thread dropped rx (errored); break and let
+                            // join surface the underlying error.
+                            break;
+                        }
+                        buffered_bytes = 0;
+                    }
+                }
+            }
+
             if !map.is_empty() {
                 run_idx += 1;
-                let run_path = runs_dir.join(format!("run_{:04}.ndjson", run_idx));
-                // Audit: peak in-memory map size is bounded by target_bytes,
-                // which scales adaptively up to max_buf_mb (default 8 GiB) when
-                // free RAM is plentiful — i.e. effectively unbounded relative
-                // to the disk-write consumer rate.
-                tracing::debug!(
-                    target = "retl::backpressure",
-                    stage = "dedupe.build_runs_sorted",
-                    buffered_bytes,
-                    target_bytes,
-                    run_idx,
-                    "flushing run (synchronous write_run_sorted)"
-                );
-                write_run_sorted(&run_path, &mut map, cfg.write_buf_bytes)?;
-                buffered_bytes = 0;
-                run_paths.push(run_path);
+                let owned = std::mem::take(&mut map);
+                let _ = tx.send((run_idx, owned));
             }
-        }
-    }
+            Ok(())
+        })();
 
-    if !map.is_empty() {
-        run_idx += 1;
-        let run_path = runs_dir.join(format!("run_{:04}.ndjson", run_idx));
-        write_run_sorted(&run_path, &mut map, cfg.write_buf_bytes)?;
-        run_paths.push(run_path);
-    }
+        // Always close tx so the consumer drains and returns.
+        drop(tx);
+        let writer_result = writer_handle.join().expect("writer thread panicked");
+        // Surface writer errors first, then producer errors.
+        let written = writer_result?;
+        producer_result?;
+        let mut sorted = written;
+        sorted.sort_by_key(|(i, _)| *i);
+        Ok(sorted.into_iter().map(|(_, p)| p).collect())
+    })?;
 
     pb.finish(format!("runs built ({})", run_paths.len()));
     Ok(run_paths)
