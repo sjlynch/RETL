@@ -2,6 +2,7 @@
 //! and the usernames collector for a single monthly file.
 
 use crate::filters::{matches_minimal, matches_subreddit_basic, within_bounds};
+use crate::json_whitelist::WhitelistTokenizer;
 use crate::paths::FileJob;
 use crate::query::QuerySpec;
 use crate::shard::ShardedWriter;
@@ -154,6 +155,13 @@ pub fn stream_job<W: Write + ?Sized>(
 ) -> Result<u64> {
     let mut written: u64 = 0;
     let mut ts_buf = String::new();
+    let mut tok_buf = String::new();
+
+    // Build the streaming tokenizer once per file so the small key-set is
+    // hashed exactly once and the buffers above are reused across every line.
+    let tokenizer: Option<WhitelistTokenizer> = whitelist
+        .as_ref()
+        .map(|fields| WhitelistTokenizer::new(fields.iter().map(|s| s.as_str())));
 
     let mut on_line = |line: &str| -> Result<()> {
         if let Ok(min) = parse_minimal(line) {
@@ -179,9 +187,30 @@ pub fn stream_job<W: Write + ?Sized>(
                 return Ok(());
             }
 
-            // TODO: whitelist-only path also defeats the fast-path passthrough; a
-            // streaming JSON tokenizer would let us emit just the requested fields
-            // without parsing into a Value. Out of scope here.
+            // Whitelist branch — preferred path is the streaming tokenizer
+            // which copies raw value bytes verbatim and never builds a
+            // `serde_json::Value`. If the tokenizer rejects the line as
+            // structurally surprising, fall back to the slow Value path so we
+            // never regress correctness on an odd record.
+            if let Some(tok) = &tokenizer {
+                if tok.tokenize_into(line, &mut tok_buf).is_ok() {
+                    if human_timestamps {
+                        // Compose: run the byte-level timestamp rewriter on the
+                        // already-whitelisted bytes. Merging the two passes is
+                        // possible but premature — defer until profiling shows
+                        // it matters.
+                        rewrite_human_timestamps_bytes(&tok_buf, &mut ts_buf);
+                        writer.write_all(ts_buf.as_bytes())?;
+                    } else {
+                        writer.write_all(tok_buf.as_bytes())?;
+                    }
+                    writer.write_all(b"\n")?;
+                    written += 1;
+                    return Ok(());
+                }
+                // Fall through to slow path on tokenizer error.
+            }
+
             // Slow path: parse Value for whitelisting (and timestamp conversion if both apply).
             let val: Value = serde_json::from_str(line)?;
             let mut out_val = if let Some(fields) = whitelist {
