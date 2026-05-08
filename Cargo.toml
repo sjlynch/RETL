@@ -24,7 +24,7 @@ zstd = "0.13"
 parking_lot = "0.12"
 ahash = "0.8"
 indicatif = "0.17"
-sysinfo = "0.29"
+sysinfo = "0.33"
 aho-corasick = "1"
 
 [features]

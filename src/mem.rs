@@ -1,6 +1,6 @@
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use sysinfo::{System, SystemExt};
+use sysinfo::System;
 
 /// Cached, low-overhead memory watcher.
 /// - Refreshes at most every `REFRESH_EVERY`.
