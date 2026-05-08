@@ -22,6 +22,15 @@ pub struct BucketingCfg {
     pub micro_min_buf_mb: usize,  // min target buffering when RAM is tight
     pub micro_max_buf_mb: usize,  // max target buffering when RAM is plentiful
     pub adapt_cooldown_ms: u64,   // recompute buffer target at this cadence
+    /// Hard cap on bytes inflight between the line-reader producer and the
+    /// `on_group` consumer. Caps the per-bucket flush target so the bounded
+    /// channel — not the RAM-fraction sampler — is the primary backpressure
+    /// mechanism. 0 disables the cap.
+    pub inflight_bytes: usize,
+    /// Bounded channel capacity between producer and on_group consumer.
+    /// Sized for ~8 in-flight per-key groups so producers stall when the
+    /// consumer falls behind.
+    pub inflight_groups: usize,
 }
 
 impl Default for BucketingCfg {
@@ -34,6 +43,10 @@ impl Default for BucketingCfg {
             micro_min_buf_mb: 128,
             micro_max_buf_mb: 4096,
             adapt_cooldown_ms: 400,
+            // Default 256 MiB inflight budget; with channel cap 8 the per-flush
+            // bucket target is capped at ~32 MiB.
+            inflight_bytes: 256 * 1024 * 1024,
+            inflight_groups: 8,
         }
     }
 }
@@ -158,6 +171,12 @@ where
 /// a given key may be flushed **multiple times** (partial groups); design your
 /// downstream to merge if needed (our Stage 6 merge does this).
 ///
+/// Producer/consumer split: line reading and per-bucket assembly run on the
+/// calling thread; `on_group` runs on a worker thread that drains a bounded
+/// `crossbeam_channel` (capacity `cfg.inflight_groups`). Sends block when
+/// the consumer falls behind, so the producer stalls instead of growing
+/// in-memory hash maps to multi-GiB peaks.
+///
 /// `extract_key` must be consistent with Stage 1/2 to preserve routing consistency.
 pub fn process_bucket_streaming<F, E>(
     bucket: &Path,
@@ -167,7 +186,7 @@ pub fn process_bucket_streaming<F, E>(
     extract_key: E,
 ) -> Result<()>
 where
-    F: FnMut(&str, Vec<String>) -> Result<()>,
+    F: FnMut(&str, Vec<String>) -> Result<()> + Send,
     E: Fn(&Value) -> Option<String>,
 {
     // Open the input bucket; skip gracefully if missing.
@@ -200,81 +219,129 @@ where
     let mut last_eval = Instant::now();
     let mut target_bytes: usize = cfg.micro_min_buf_mb * 1024 * 1024;
 
-    // Helper: flush one micro-bucket (by index).
-    let mut flush_bucket = |idx: usize,
-                            maps: &mut [HashMap<String, Vec<String>>],
-                            mb_bytes: &mut [usize],
-                            total_bytes: &mut usize| -> Result<()> {
-        if maps[idx].is_empty() { return Ok(()); }
-        let mut m = HashMap::new();
-        std::mem::swap(&mut m, &mut maps[idx]);
-        let used = mb_bytes[idx];
-        mb_bytes[idx] = 0;
-        if *total_bytes >= used { *total_bytes -= used; } else { *total_bytes = 0; }
-
-        for (k, v) in m.into_iter() {
-            on_group(&k, v)?;
-        }
-        Ok(())
+    // Per-flush byte cap: with channel cap = inflight_groups, total inflight
+    // bytes are bounded by 2 * per_flush_cap (one growing producer-side bucket
+    // + the channel + the consumer's current group).
+    let per_flush_cap = if cfg.inflight_bytes > 0 {
+        (cfg.inflight_bytes / 2).max(1024 * 1024)
+    } else {
+        usize::MAX
     };
 
-    // Helper: flush the largest bucket to quickly free memory.
-    let mut flush_largest = |maps: &mut [HashMap<String, Vec<String>>],
-                             mb_bytes: &mut [usize],
-                             total_bytes: &mut usize| -> Result<()> {
-        if maps.is_empty() { return Ok(()); }
-        let mut max_idx = 0usize;
-        let mut max_val = 0usize;
-        for (i, b) in mb_bytes.iter().enumerate() {
-            if *b > max_val { max_val = *b; max_idx = i; }
-        }
-        if max_val > 0 {
-            flush_bucket(max_idx, maps, mb_bytes, total_bytes)?;
-        }
-        Ok(())
-    };
+    let chan_cap = cfg.inflight_groups.max(1);
+    let (tx, rx) = crossbeam_channel::bounded::<(String, Vec<String>)>(chan_cap);
 
-    for line in r.lines() {
-        let line = line?;
-        if line.is_empty() { continue; }
-        let v: Value = match serde_json::from_str(&line) { Ok(x) => x, Err(_) => continue };
-
-        let key = match extract_key(&v) { Some(x) => x, None => continue };
-        let idx = stable_index(&rs, &key, mb_count);
-
-        let e = maps[idx].entry(key).or_default();
-        e.push(line.clone());
-
-        let add = line.len() + 1;
-        mb_bytes[idx] += add;
-        total_bytes += add;
-
-        // Periodically recompute target based on current free memory.
-        if last_eval.elapsed() >= Duration::from_millis(cfg.adapt_cooldown_ms) {
-            let free = available_memory_fraction();
-            let span = (cfg.high_frac - cfg.soft_low_frac).max(0.05f64);
-            let mut scale = ((free - cfg.soft_low_frac) / span).clamp(0.0, 1.0);
-            // smootherstep
-            scale = scale * scale * (3.0 - 2.0 * scale);
-            target_bytes = ((cfg.micro_min_buf_mb as f64
-                + (cfg.micro_max_buf_mb as f64 - cfg.micro_min_buf_mb as f64) * scale)
-                .round() as usize) * 1024 * 1024;
-            last_eval = Instant::now();
-        }
-
-        // Adaptive flush:
-        if total_bytes >= target_bytes || is_low_memory(cfg.soft_low_frac) {
-            flush_largest(&mut maps, &mut mb_bytes, &mut total_bytes)?;
-            if is_low_memory(cfg.hard_low_frac) {
-                sleep(Duration::from_millis(cfg.backoff_ms));
+    std::thread::scope(|s| -> Result<()> {
+        let consumer_handle = s.spawn(move || -> Result<()> {
+            while let Ok((k, v)) = rx.recv() {
+                on_group(&k, v)?;
             }
-        }
-    }
+            Ok(())
+        });
 
-    // Final flush of any remaining micro-buckets.
-    for i in 0..mb_count {
-        flush_bucket(i, &mut maps, &mut mb_bytes, &mut total_bytes)?;
-    }
+        // Helper: flush one micro-bucket (by index).
+        let send_group = |k: String, v: Vec<String>| -> std::result::Result<(), ()> {
+            // tx.send blocks here when consumer falls behind → backpressure
+            tx.send((k, v)).map_err(|_| ())
+        };
 
-    Ok(())
+        let mut flush_bucket = |idx: usize,
+                                maps: &mut [HashMap<String, Vec<String>>],
+                                mb_bytes: &mut [usize],
+                                total_bytes: &mut usize| -> std::result::Result<(), ()> {
+            if maps[idx].is_empty() { return Ok(()); }
+            let mut m = HashMap::new();
+            std::mem::swap(&mut m, &mut maps[idx]);
+            let used = mb_bytes[idx];
+            mb_bytes[idx] = 0;
+            if *total_bytes >= used { *total_bytes -= used; } else { *total_bytes = 0; }
+            for (k, v) in m.into_iter() {
+                send_group(k, v)?;
+            }
+            Ok(())
+        };
+
+        let mut flush_largest = |maps: &mut [HashMap<String, Vec<String>>],
+                                 mb_bytes: &mut [usize],
+                                 total_bytes: &mut usize| -> std::result::Result<(), ()> {
+            if maps.is_empty() { return Ok(()); }
+            let mut max_idx = 0usize;
+            let mut max_val = 0usize;
+            for (i, b) in mb_bytes.iter().enumerate() {
+                if *b > max_val { max_val = *b; max_idx = i; }
+            }
+            if max_val > 0 {
+                flush_bucket(max_idx, maps, mb_bytes, total_bytes)?;
+            }
+            Ok(())
+        };
+
+        let producer_result: Result<()> = (|| -> Result<()> {
+            for line in r.lines() {
+                let line = line?;
+                if line.is_empty() { continue; }
+                let v: Value = match serde_json::from_str(&line) { Ok(x) => x, Err(_) => continue };
+
+                let key = match extract_key(&v) { Some(x) => x, None => continue };
+                let idx = stable_index(&rs, &key, mb_count);
+
+                let e = maps[idx].entry(key).or_default();
+                e.push(line.clone());
+
+                let add = line.len() + 1;
+                mb_bytes[idx] += add;
+                total_bytes += add;
+
+                if last_eval.elapsed() >= Duration::from_millis(cfg.adapt_cooldown_ms) {
+                    let free = available_memory_fraction();
+                    let span = (cfg.high_frac - cfg.soft_low_frac).max(0.05f64);
+                    let mut scale = ((free - cfg.soft_low_frac) / span).clamp(0.0, 1.0);
+                    scale = scale * scale * (3.0 - 2.0 * scale);
+                    let adaptive = ((cfg.micro_min_buf_mb as f64
+                        + (cfg.micro_max_buf_mb as f64 - cfg.micro_min_buf_mb as f64) * scale)
+                        .round() as usize)
+                        * 1024
+                        * 1024;
+                    // Cap adaptive target by per_flush_cap so the bounded
+                    // channel — not the RAM-fraction sampler — is the
+                    // primary backpressure mechanism.
+                    target_bytes = adaptive.min(per_flush_cap);
+                    last_eval = Instant::now();
+                }
+
+                if total_bytes >= target_bytes || is_low_memory(cfg.soft_low_frac) {
+                    tracing::debug!(
+                        target = "retl::backpressure",
+                        stage = "bucketing.process_bucket_streaming",
+                        buffered_bytes = total_bytes,
+                        target_bytes,
+                        "handing largest micro-bucket to on_group (bounded channel; producer blocks if full)"
+                    );
+                    if flush_largest(&mut maps, &mut mb_bytes, &mut total_bytes).is_err() {
+                        // consumer dropped rx (errored); break and let join surface it
+                        break;
+                    }
+                    if is_low_memory(cfg.hard_low_frac) {
+                        sleep(Duration::from_millis(cfg.backoff_ms));
+                    }
+                }
+            }
+
+            // Final flush of any remaining micro-buckets.
+            for i in 0..mb_count {
+                if flush_bucket(i, &mut maps, &mut mb_bytes, &mut total_bytes).is_err() {
+                    break;
+                }
+            }
+            Ok(())
+        })();
+
+        // Always close tx so the consumer drains and exits.
+        drop(tx);
+        let consumer_result = consumer_handle.join().expect("on_group consumer panicked");
+        // Surface consumer errors first (they have the actual user-callback failure).
+        consumer_result?;
+        producer_result?;
+        Ok(())
+    })
 }

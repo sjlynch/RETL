@@ -26,6 +26,7 @@ ahash = "0.8"
 indicatif = "0.17"
 sysinfo = "0.33"
 aho-corasick = "1"
+crossbeam-channel = "0.5"
 
 [features]
 default = []
