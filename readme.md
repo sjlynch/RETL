@@ -415,6 +415,7 @@ let bad_quick = RedditETL::new()
     .progress(false)
     .check_corpus_integrity(IntegrityMode::Quick { sample_bytes: 64 * 1024 })?;
 
+<<<<<<< HEAD
 let bad_full = RedditETL::new()
     .base_dir("./data")
     .sources(Sources::Comments)
@@ -467,6 +468,134 @@ RETL cooperates under low memory by adaptively throttling certain stages.
   ~~~
 
 ---
+=======
+for (path, err) in bad {
+    eprintln!("{}: {err}", path.display());
+}
+```
+
+## Performance and tuning
+
+Defaults are conservative. The knobs below are the ones that matter on large
+corpora:
+
+- `.parallelism(n)` — Rayon worker threads. CPU-bound work (decompression,
+  parsing) scales with this up to physical core count.
+- `.file_concurrency(n)` — number of monthly files decoded in parallel. The
+  per-file working set is large; raising this is the fastest way to use up
+  RAM. Start at 4–8.
+- `.io_buffers(read, write)` — read/write buffer sizes in bytes. The default
+  is fine for SSD-backed local storage; increase to 1–4 MiB on networked
+  filesystems.
+- `.work_dir(path)` — scratch directory for intermediate shards and
+  `.inprogress` files. Point this at fast local storage if the corpus lives
+  on a network share.
+- `.progress(true)` and `.progress_label("...")` — render an `indicatif`
+  progress bar.
+
+RETL throttles cooperatively when system memory falls below a threshold; you
+do not need to manage this manually.
+
+## Benchmarks
+
+The hot inner loops touched by perf work (record filtering, byte-level
+timestamp rewrite, and zstd line streaming) are covered by a Criterion
+harness at `benches/inner_loops.rs`. CI does not gate PRs on bench output —
+Criterion's noise floor is too high for a binary pass/fail — but contributors
+making perf-sensitive changes should run a local before/after comparison:
+
+```sh
+# Capture a baseline before your change:
+cargo bench --bench inner_loops -- --save-baseline pre
+
+# After your change, compare against `pre`:
+cargo bench --bench inner_loops -- --baseline pre
+```
+
+Criterion will print mean/median/throughput deltas and HTML reports under
+`target/criterion/`.
+
+A starting-point baseline captured on `main` is committed under
+`benches/baselines/main/` so contributors have a reference point without
+rerunning the full suite. The fixture used for all three benchmark groups
+lives at `benches/data/sample.jsonl` (representative Reddit JSONL).
+
+The three benchmark groups:
+
+- `for_each_line_cfg` — streams a precomputed `.zst` and counts lines,
+  varying `read_buf_bytes` across 16K / 64K / 256K to surface buffer-size
+  sensitivity.
+- `matches_minimal` — runs `filters::matches_minimal` against subreddit
+  target lists of size 1, 10, and 100 to track linear-scan cost as the list
+  grows.
+- `rewrite_human_timestamps_bytes` — measures the byte-level timestamp
+  rewrite both on lines that contain all three timestamp keys (matching
+  path) and on lines that contain none (no-match fast-skip).
+
+## Environment variables
+
+- `RUST_LOG` — standard `tracing` filter (e.g. `RUST_LOG=info`).
+- `ETL_EXCLUDE_AUTHORS` — comma-separated authors to add to the default
+  bot/service exclusion list.
+- `ETL_EXCLUDE_AUTHORS_FILE` — path to a newline-separated file of additional
+  authors to exclude.
+
+The merged exclusion list is applied by `.exclude_common_bots()` on a
+`ScanPlan`.
+
+## Fuzzing
+
+RETL ships [cargo-fuzz](https://rust-fuzz.github.io/book/cargo-fuzz.html) targets
+for the two functions that walk attacker-controlled bytes:
+
+- `retl::parse_minimal` (in `src/zstd_jsonl.rs`) — every JSONL line passes
+  through this `serde_json::from_str` wrapper.
+- `retl::rewrite_human_timestamps_bytes` (in `src/streaming.rs`) — a
+  hand-rolled byte scanner that rewrites `"created_utc"`, `"retrieved_on"`,
+  and `"edited"` integer values to RFC3339 strings without going through
+  `serde_json::Value`.
+
+Setup (one-time):
+
+```sh
+cargo install cargo-fuzz
+rustup toolchain install nightly
+```
+
+The `fuzz/` crate is pre-scaffolded — no `cargo fuzz init` needed. Two
+targets live under `fuzz/fuzz_targets/`, each seeded with ~50 inputs at
+`fuzz/corpus/<target>/`:
+
+```sh
+# Walks &str → parse_minimal; any panic/abort is a finding.
+cargo +nightly fuzz run fuzz_parse_minimal -- -max_total_time=300
+
+# Walks &str → rewrite_human_timestamps_bytes, then validates that
+# (a) the output is valid UTF-8 (enforced by the String type),
+# (b) the output round-trips through serde_json::from_str if the input did, and
+# (c) on shallow top-level objects, the byte path matches the slow path
+#     (apply_human_timestamps applied to the parsed Value).
+cargo +nightly fuzz run fuzz_rewrite_timestamps -- -max_total_time=300
+```
+
+The seed corpora include real Reddit-shaped JSONL lines plus adversarial
+inputs: bodies that contain `\"created_utc\":` substrings (must be left
+unchanged), `"`-escaped quotes around the keys, leading zeros / leading
+`+` / lone `-`, very long integer strings, fractional and exponent forms,
+`null`/`true`/`false` values, whitespace before and after the `:`, `i64`
+extrema, and a deliberate `{...{"created_utc": ...}...}` nested-object case.
+
+Triage:
+
+- Any panic, abort, or OOM in either target is a bug — file as a separate
+  task with the failing input.
+- For the timestamp rewriter, a case where the byte path mutates a
+  `"created_utc":` substring inside a JSON string-typed value (rather than
+  leaving it alone) is a correctness bug — file separately.
+
+Fuzzing is **not** wired into CI by default — it runs on demand under
+nightly because libfuzzer is a nightly-only sanitizer.
+>>>>>>> 707a4869d404a4bfd8c7b78d2683d49fa8e1af8d
 
 ## License
 

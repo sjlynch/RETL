@@ -21,6 +21,9 @@ Thumbs.db
 
 # Local datasets & scratch (adjust as needed)
 data/
+# But keep the small JSONL fixture used by `cargo bench`:
+!benches/data/
+!benches/data/**
 etl_work/
 .reddit_etl_work/
 **/_staging/

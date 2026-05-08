@@ -94,8 +94,15 @@ pub use crate::date::iter_year_months;
 pub use crate::filters::{bounds_tuple, within_bounds};
 #[doc(hidden)]
 pub use crate::zstd_jsonl::{MinimalRecord, parse_minimal};
-// Test-only re-exports of the human-timestamp rewriters so fuzz targets and
-// behavioral tests can exercise them directly. Keep `#[doc(hidden)]` to avoid
-// signalling these as part of the supported public API.
+
+// Bench-only re-exports of hot inner-loop functions. Used by `benches/inner_loops.rs`
+// (criterion harness) to defend ahash/byte-rewrite perf changes against regressions.
+// Also exposes human-timestamp rewriters so fuzz targets and behavioral tests can
+// exercise them directly. Keep `#[doc(hidden)]` to avoid signalling these as part
+// of the supported public API.
+#[doc(hidden)]
+pub use crate::filters::matches_minimal;
 #[doc(hidden)]
 pub use crate::streaming::{apply_human_timestamps, rewrite_human_timestamps_bytes};
+#[doc(hidden)]
+pub use crate::zstd_jsonl::for_each_line_cfg;
