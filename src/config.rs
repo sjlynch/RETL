@@ -43,6 +43,11 @@ pub struct ETLOptions {
     /// growing in-memory hash maps to multi-GiB peaks driven by
     /// available_memory_fraction. Defaults to 256 MiB.
     pub inflight_bytes: usize,
+
+    /// Opt-in: when true, `extract_spool_monthly` reads/writes a
+    /// `<out_dir>/_progress.json` sidecar and skips months already
+    /// committed by a prior run. Default false to preserve current behavior.
+    pub resume: bool,
 }
 
 impl Default for ETLOptions {
@@ -77,6 +82,7 @@ impl Default for ETLOptions {
             zst_level: 7,
 
             inflight_bytes: 256 * 1024 * 1024,
+            resume: false,
         }
     }
 }
@@ -173,6 +179,12 @@ impl ETLOptions {
     /// 0 disables the explicit cap and falls back to memory-fraction sampling.
     pub fn with_inflight_bytes(mut self, bytes: usize) -> Self {
         self.inflight_bytes = bytes;
+        self
+    }
+
+    /// Opt in to resumable spool runs (`extract_spool_monthly` only).
+    pub fn with_resume(mut self, yes: bool) -> Self {
+        self.resume = yes;
         self
     }
 }

@@ -18,7 +18,11 @@ use crate::util::{create_with_backoff, replace_file_atomic_backoff};
 ///
 /// Notes:
 ///  - You are responsible for writing line terminators (`\n`) inside the lambda.
-///  - `write_with()` is concurrency-friendly (internal per-part mutex).
+///  - `write_with()` and `flush_all()` take `&self`, so a single
+///    `PartitionWriters` can be shared across threads (e.g. inside a
+///    `rayon::scope`). Each call only locks the partition it routes to,
+///    so writes to distinct partitions proceed in parallel; concurrent
+///    writes that hash to the same partition serialize on its mutex.
 pub struct PartitionWriters {
     writers: Vec<parking_lot::Mutex<BufWriter<File>>>,
     tmp_paths: Vec<PathBuf>,
@@ -69,7 +73,7 @@ impl PartitionWriters {
 
     /// Route this user to a stable partition and write bytes using the provided closure.
     /// The closure receives a `&mut dyn Write`. You must write a full NDJSON line (incl. `\n`).
-    pub fn write_with<F>(&mut self, user: &str, f: F) -> Result<()>
+    pub fn write_with<F>(&self, user: &str, f: F) -> Result<()>
     where
         F: FnOnce(&mut dyn Write) -> Result<()>,
     {
@@ -80,8 +84,8 @@ impl PartitionWriters {
     }
 
     /// Flush all partitions.
-    pub fn flush_all(&mut self) -> Result<()> {
-        for w in &mut self.writers {
+    pub fn flush_all(&self) -> Result<()> {
+        for w in &self.writers {
             w.lock().flush()?;
         }
         Ok(())
