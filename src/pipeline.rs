@@ -1,3 +1,4 @@
+use crate::atomic_write::{ensure_staging_dir, sweep_stale_inprogress, write_jsonl_atomic, write_zst_atomic};
 use crate::config::{ETLOptions, Sources};
 use crate::date::YearMonth;
 use crate::filters::{bounds_tuple, resolve_target_subs_from, matches_minimal, matches_full, within_bounds};
@@ -7,7 +8,7 @@ use crate::query::{normalize_str, QuerySpec};
 use crate::shard::{ShardedWriter, UsernameStream};
 use crate::stitch::{concat_tsvs, stitch_tmp_parts, stitch_tmp_parts_to_json_array, tmp_name_for_job};
 use crate::streaming::{process_file_for_usernames, stream_job};
-use crate::util::{basic_query_allow_all, init_tracing_once, create_with_backoff, default_bot_authors, merge_extra_exclusions};
+use crate::util::{create_with_backoff, default_bot_authors, merge_extra_exclusions, with_thread_pool};
 use crate::zstd_jsonl::{for_each_line_cfg, for_each_line_with_progress_cfg, parse_minimal};
 use crate::kv_shard::ShardedKVWriter;
 use anyhow::{anyhow, Context, Result};
@@ -19,7 +20,6 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
-use zstd::stream::write::Encoder as ZstdEncoder;
 
 #[derive(Clone)]
 pub struct RedditETL {
@@ -60,50 +60,43 @@ impl RedditETL {
     pub fn io_write_buffer(mut self, bytes: usize) -> Self { self.opts = self.opts.with_io_write_buffer(bytes); self }
     pub fn io_buffers(mut self, read_bytes: usize, write_bytes: usize) -> Self { self.opts = self.opts.with_io_buffers(read_bytes, write_bytes); self }
     pub fn timestamps_human_readable(mut self, yes: bool) -> Self { self.opts = self.opts.with_human_timestamps(yes); self }
+    pub fn zst_level(mut self, level: i32) -> Self { self.opts = self.opts.with_zst_level(level); self }
 
     // -------- Original operations (back-compat) --------
 
     pub fn usernames(self) -> Result<UsernameStream> {
         let subreddit = self.opts.subreddit.clone().ok_or_else(|| anyhow!("subreddit is required"))?;
-        init_tracing_once();
-        if let Some(n) = self.opts.parallelism { if n > 0 { rayon::ThreadPoolBuilder::new().num_threads(n).build_global().ok(); } }
+        let parallelism = self.opts.parallelism;
 
-        let work_dir = self.ensure_work_dir()?;
-        let discovered = discover_all(&self.opts.comments_dir, &self.opts.submissions_dir);
-        let files = plan_files(&discovered, self.opts.sources, self.opts.start, self.opts.end);
+        with_thread_pool(parallelism, || {
+            let work_dir = self.ensure_work_dir()?;
+            let discovered = discover_all(&self.opts.comments_dir, &self.opts.submissions_dir);
+            let files = plan_files(&discovered, self.opts.sources, self.opts.start, self.opts.end);
 
-        if files.is_empty() {
-            tracing::warn!("No files found matching selection. Check base_dir and date range.");
-        } else {
-            tracing::info!("Planned {} files for processing.", files.len());
-        }
+            if files.is_empty() {
+                tracing::warn!("No files found matching selection. Check base_dir and date range.");
+            } else {
+                tracing::info!("Planned {} files for processing.", files.len());
+            }
 
-        let shard_writer = ShardedWriter::create(&work_dir, "usernames", self.opts.shard_count)?;
-        let read_buf = self.opts.read_buffer_bytes;
+            let shard_writer = ShardedWriter::create(&work_dir, "usernames", self.opts.shard_count)?;
+            let read_buf = self.opts.read_buffer_bytes;
 
-        let total_bytes = total_compressed_size(&files);
-        let pb = if self.opts.progress {
-            Some(make_progress_bar_labeled(total_bytes, self.opts.progress_label.as_deref()))
-        } else {
-            None
-        };
+            let total_bytes = total_compressed_size(&files);
+            let pb = if self.opts.progress {
+                Some(make_progress_bar_labeled(total_bytes, self.opts.progress_label.as_deref()))
+            } else {
+                None
+            };
 
-        crate::concurrency::for_each_file_limited(&files, self.opts.file_concurrency, |job| {
-            process_file_for_usernames(job, read_buf, &subreddit, &shard_writer, pb.clone())
-                .with_context(|| format!("processing {}", job.path.display()))
-        })?;
+            crate::concurrency::for_each_file_limited(&files, self.opts.file_concurrency, |job| {
+                process_file_for_usernames(job, read_buf, &subreddit, &shard_writer, pb.clone())
+                    .with_context(|| format!("processing {}", job.path.display()))
+            })?;
 
-        let deduped_files = shard_writer.dedup("usernames")?;
-        UsernameStream::from_deduped_files(deduped_files)
-    }
-
-    /// Back-compat: extract with a single subreddit (no advanced query).
-    pub fn extract_to_jsonl(self, out_path: &Path) -> Result<()> {
-        let subreddit = self.opts.subreddit.clone().ok_or_else(|| anyhow!("subreddit is required"))?;
-        let target_vec = vec![subreddit];
-        let targets = Some(&target_vec);
-        let q = basic_query_allow_all();
-        extract_common(&self, &q, targets, "extract_jsonl_tmp", out_path, Finalize::Jsonl)
+            let deduped_files = shard_writer.dedup("usernames")?;
+            UsernameStream::from_deduped_files(deduped_files)
+        })
     }
 
     // -------- Advanced: enter query mode --------
@@ -166,9 +159,9 @@ impl ScanPlan {
 
     pub fn usernames(self) -> Result<UsernameStream> {
         let targets = resolve_target_subs_from(&self.etl.opts.subreddit, &self.query.subreddits);
-        init_tracing_once();
-        if let Some(n) = self.etl.opts.parallelism { if n > 0 { rayon::ThreadPoolBuilder::new().num_threads(n).build_global().ok(); } }
+        let parallelism = self.etl.opts.parallelism;
 
+        with_thread_pool(parallelism, || {
         let work_dir = self.etl.ensure_work_dir()?;
         let discovered = discover_all(&self.etl.opts.comments_dir, &self.etl.opts.submissions_dir);
         let files = plan_files(&discovered, self.etl.opts.sources, self.etl.opts.start, self.etl.opts.end);
@@ -218,6 +211,7 @@ impl ScanPlan {
 
         let deduped = shard_writer.dedup("usernames_q")?;
         UsernameStream::from_deduped_files(deduped)
+        })
     }
 
     /// JS-like lambda: stream **deduped** usernames and invoke a callback for each one.
@@ -249,13 +243,19 @@ impl ScanPlan {
     ///   - comments → `part_RC_YYYY-MM.jsonl`
     ///   - submissions → `part_RS_YYYY-MM.jsonl`
     ///
+    /// Each month is staged as `<out_dir>/_staging/<file>.inprogress` then
+    /// atomically renamed onto the final path so a crashed run never publishes
+    /// a partial file. On entry, leftover `*.inprogress` files from a prior
+    /// crashed run are swept.
+    ///
     /// Returns `(vector_of_paths, total_records_written)`.
-    /// Note: `resume` is accepted for API compatibility but ignored.
-    pub fn extract_spool_monthly(self, out_dir: &Path, _resume: bool) -> Result<(Vec<PathBuf>, u64)> {
-        init_tracing_once();
-        if let Some(n) = self.etl.opts.parallelism { if n > 0 { rayon::ThreadPoolBuilder::new().num_threads(n).build_global().ok(); } }
+    pub fn extract_spool_monthly(self, out_dir: &Path) -> Result<(Vec<PathBuf>, u64)> {
+        let parallelism = self.etl.opts.parallelism;
 
+        with_thread_pool(parallelism, || {
         fs::create_dir_all(out_dir)?;
+        let staging_dir = ensure_staging_dir(out_dir)?;
+        sweep_stale_inprogress(out_dir, true)?;
 
         let targets = resolve_target_subs_from(&self.etl.opts.subreddit, &self.query.subreddits);
         let discovered = discover_all(&self.etl.opts.comments_dir, &self.etl.opts.submissions_dir);
@@ -289,11 +289,15 @@ impl ScanPlan {
             };
             let out_path = out_dir.join(format!("{}_{}.jsonl", prefix, job.ym));
 
-            // Always (re)create the output file.
-            let file = match create_with_backoff(&out_path, 16, 50) {
-                Ok(f) => f,
+            let n = match write_jsonl_atomic(&staging_dir, &out_path, write_buf, |w| {
+                stream_job(
+                    job, w, targets_ref, &self.query, &whitelist,
+                    pb.clone(), bounds, read_buf, human_ts,
+                )
+            }) {
+                Ok(n) => n,
                 Err(e) => {
-                    tracing::warn!(path=%out_path.display(), error=%e, "Skipping month: failed to create spool output after retries");
+                    tracing::warn!(path=%out_path.display(), error=%e, "Skipping month: failed to atomically write spool output");
                     if let Some(pb) = &pb {
                         let sz = fs::metadata(&job.path).map(|m| m.len()).unwrap_or(0);
                         pb.inc(sz);
@@ -301,13 +305,6 @@ impl ScanPlan {
                     return Ok(());
                 }
             };
-            let mut writer = BufWriter::with_capacity(write_buf, file);
-
-            let n = stream_job(
-                job, &mut writer, targets_ref, &self.query, &whitelist,
-                pb.clone(), bounds, read_buf, human_ts
-            )?;
-            writer.flush()?;
             total_written.fetch_add(n, Ordering::Relaxed);
             parts.lock().unwrap().push(out_path);
             Ok(())
@@ -319,11 +316,11 @@ impl ScanPlan {
         list.sort();
         list.dedup();
         Ok((list, total_written.load(Ordering::Relaxed)))
+        })
     }
 
     pub fn count_by_month(self) -> Result<BTreeMap<YearMonth, u64>> {
         let targets = resolve_target_subs_from(&self.etl.opts.subreddit, &self.query.subreddits);
-        init_tracing_once();
 
         let discovered = discover_all(&self.etl.opts.comments_dir, &self.etl.opts.submissions_dir);
         let files = plan_files(&discovered, self.etl.opts.sources, self.etl.opts.start, self.etl.opts.end);
@@ -351,9 +348,9 @@ impl ScanPlan {
 
     pub fn author_counts_to_tsv(self, out_path: &Path) -> Result<()> {
         let targets = resolve_target_subs_from(&self.etl.opts.subreddit, &self.query.subreddits);
-        init_tracing_once();
-        if let Some(n) = self.etl.opts.parallelism { if n > 0 { rayon::ThreadPoolBuilder::new().num_threads(n).build_global().ok(); } }
+        let parallelism = self.etl.opts.parallelism;
 
+        with_thread_pool(parallelism, || {
         let discovered = discover_all(&self.etl.opts.comments_dir, &self.etl.opts.submissions_dir);
         let files = plan_files(&discovered, self.etl.opts.sources, self.etl.opts.start, self.etl.opts.end);
         let work_dir = self.etl.ensure_work_dir()?;
@@ -385,11 +382,11 @@ impl ScanPlan {
         let shards = kv.reduce_sum("author_counts")?;
         concat_tsvs(&shards, out_path, self.etl.opts.write_buffer_bytes)?;
         Ok(())
+        })
     }
 
     pub fn build_first_seen_index_to_tsv(self, out_path: &Path) -> Result<()> {
         let targets = resolve_target_subs_from(&self.etl.opts.subreddit, &self.query.subreddits);
-        init_tracing_once();
 
         let discovered = discover_all(&self.etl.opts.comments_dir, &self.etl.opts.submissions_dir);
         let files = plan_files(&discovered, self.etl.opts.sources, self.etl.opts.start, self.etl.opts.end);
@@ -405,7 +402,7 @@ impl ScanPlan {
                 if let Ok(min) = parse_minimal(line) {
                     if !matches_minimal(&min, targets_ref, &self.query) { return Ok(()); }
                     if !within_bounds(&min, bounds) { return Ok(()); }
-                    if self.etl.opts.progress && self.query.requires_full_parse() {
+                    if self.query.requires_full_parse() {
                         let val: serde_json::Value = serde_json::from_str(line)?;
                         if !matches_full(&val, job.kind, &self.query) { return Ok(()); }
                     }
@@ -426,11 +423,16 @@ impl ScanPlan {
 
     /// Export corpus back to partitioned JSONL or ZST by month/kinds with query filters.
     /// This lives on ScanPlan (advanced query mode).
+    ///
+    /// Each output is staged as `<out_base_dir>/_staging/<file>.inprogress`,
+    /// finalized (zstd frame closed with checksum, or buffer flushed) and
+    /// atomically renamed onto its final path. Stale `*.inprogress` from a
+    /// crashed prior run are swept on entry.
     pub fn export_partitioned(self, out_base_dir: &Path, format: ExportFormat) -> Result<()> {
         let targets = resolve_target_subs_from(&self.etl.opts.subreddit, &self.query.subreddits);
-        init_tracing_once();
-        if let Some(n) = self.etl.opts.parallelism { if n > 0 { rayon::ThreadPoolBuilder::new().num_threads(n).build_global().ok(); } }
+        let parallelism = self.etl.opts.parallelism;
 
+        with_thread_pool(parallelism, || {
         let discovered = discover_all(&self.etl.opts.comments_dir, &self.etl.opts.submissions_dir);
         let files = plan_files(&discovered, self.etl.opts.sources, self.etl.opts.start, self.etl.opts.end);
 
@@ -438,6 +440,8 @@ impl ScanPlan {
         let submissions_dir = out_base_dir.join("submissions");
         fs::create_dir_all(&comments_dir)?;
         fs::create_dir_all(&submissions_dir)?;
+        let staging_dir = ensure_staging_dir(out_base_dir)?;
+        sweep_stale_inprogress(out_base_dir, true)?;
 
         let whitelist = self.etl.opts.whitelist_fields.clone();
         let targets_ref = targets.as_ref();
@@ -451,6 +455,7 @@ impl ScanPlan {
         let read_buf = self.etl.opts.read_buffer_bytes;
         let write_buf = self.etl.opts.write_buffer_bytes;
         let human_ts = self.etl.opts.human_readable_timestamps;
+        let zst_level = self.etl.opts.zst_level;
 
         crate::concurrency::for_each_file_limited(&files, self.etl.opts.file_concurrency, |job| -> Result<()> {
             let (prefix, out_dir) = match job.kind {
@@ -465,20 +470,14 @@ impl ScanPlan {
 
             let written = match format {
                 ExportFormat::Jsonl => {
-                    let file = create_with_backoff(&out_path, 16, 50)
-                        .with_context(|| format!("create {}", out_path.display()))?;
-                    let mut writer = BufWriter::with_capacity(write_buf, file);
-                    let n = stream_job(job, &mut writer, targets_ref, &self.query, &whitelist, pb.clone(), bounds, read_buf, human_ts)?;
-                    writer.flush()?;
-                    n
+                    write_jsonl_atomic(&staging_dir, &out_path, write_buf, |w| {
+                        stream_job(job, w, targets_ref, &self.query, &whitelist, pb.clone(), bounds, read_buf, human_ts)
+                    })?
                 }
                 ExportFormat::Zst => {
-                    let file = create_with_backoff(&out_path, 16, 50)
-                        .with_context(|| format!("create {}", out_path.display()))?;
-                    let mut enc = ZstdEncoder::new(file, 19)?;
-                    let n = stream_job(job, &mut enc, targets_ref, &self.query, &whitelist, pb.clone(), bounds, read_buf, human_ts)?;
-                    enc.finish()?;
-                    n
+                    write_zst_atomic(&staging_dir, &out_path, zst_level, write_buf, |w| {
+                        stream_job(job, w, targets_ref, &self.query, &whitelist, pb.clone(), bounds, read_buf, human_ts)
+                    })?
                 }
             };
 
@@ -488,11 +487,11 @@ impl ScanPlan {
 
         if let Some(pb) = pb { pb.finish_with_message("done"); }
         Ok(())
+        })
     }
 }
 
 /// Shared extraction logic used by:
-///  - `RedditETL::extract_to_jsonl` (single-sub mode)
 ///  - `ScanPlan::extract_to_jsonl`
 ///  - `ScanPlan::extract_to_json`
 /// Keeps progress/date-bounds/streaming consistent and DRY.
@@ -504,9 +503,8 @@ fn extract_common(
     out_path: &Path,
     finalize: Finalize,
 ) -> Result<()> {
-    init_tracing_once();
-    if let Some(n) = etl.opts.parallelism { if n > 0 { rayon::ThreadPoolBuilder::new().num_threads(n).build_global().ok(); } }
-
+    let parallelism = etl.opts.parallelism;
+    with_thread_pool(parallelism, || {
     let discovered = discover_all(&etl.opts.comments_dir, &etl.opts.submissions_dir);
     let files = plan_files(&discovered, etl.opts.sources, etl.opts.start, etl.opts.end);
 
@@ -563,4 +561,5 @@ fn extract_common(
         Finalize::JsonArray { pretty } => stitch_tmp_parts_to_json_array(&tmp_dir, out_path, pretty, write_buf)?,
     }
     Ok(())
+    })
 }

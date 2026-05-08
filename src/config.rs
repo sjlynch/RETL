@@ -33,6 +33,9 @@ pub struct ETLOptions {
 
     // output formatting
     pub human_readable_timestamps: bool, // convert unix timestamps to RFC3339 strings
+
+    // zstd compression level used by partitioned ZST writers
+    pub zst_level: i32,
 }
 
 impl Default for ETLOptions {
@@ -63,6 +66,8 @@ impl Default for ETLOptions {
             write_buffer_bytes: default_write,
 
             human_readable_timestamps: false,
+
+            zst_level: 7,
         }
     }
 }
@@ -143,6 +148,14 @@ impl ETLOptions {
     // Output: human-readable timestamps
     pub fn with_human_timestamps(mut self, yes: bool) -> Self {
         self.human_readable_timestamps = yes;
+        self
+    }
+
+    /// Set the zstd compression level used when writing partitioned `.zst`
+    /// outputs. zstd's accepted range is 1..=22; values outside that band are
+    /// clamped. Default: 7 (good ratio, ~5x faster than 19 on real workloads).
+    pub fn with_zst_level(mut self, level: i32) -> Self {
+        self.zst_level = level.clamp(1, 22);
         self
     }
 }

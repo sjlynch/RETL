@@ -35,7 +35,7 @@ fn apply_human_timestamps(val: &mut Value) {
     }
 }
 
-pub fn stream_job<W: Write>(
+pub fn stream_job<W: Write + ?Sized>(
     job: &FileJob,
     writer: &mut W,
     targets: Option<&Vec<String>>,

@@ -35,7 +35,7 @@ fn aggregate_over_jsonl_inputs() {
         .scan()
         .subreddit("programming")
         .authors(&authors)
-        .extract_spool_monthly(&spool_dir, true)
+        .extract_spool_monthly(&spool_dir)
         .unwrap();
 
     // Expect 4 records (everything except the [deleted] comment).

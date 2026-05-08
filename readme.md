@@ -271,7 +271,7 @@ let (spool_parts, _n) = RedditETL::new()
     .scan()
     .subreddit("programming")
     .allow_pseudo_users()
-    .extract_spool_monthly(Path::new("spool"), /*resume=*/false)?;
+    .extract_spool_monthly(Path::new("spool"))?;
 
 // Step 2: Collect parent IDs
 let ids: ParentIds = RedditETL::new()

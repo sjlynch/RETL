@@ -1,10 +1,5 @@
-use crate::query::{normalize_str, QuerySpec};
+use crate::query::normalize_str;
 use anyhow::{Context, Result};
-
-// Existing helpers
-pub fn basic_query_allow_all() -> QuerySpec {
-    QuerySpec { filter_pseudo_users: true, ..Default::default() }.normalize()
-}
 
 static INIT_ONCE: std::sync::Once = std::sync::Once::new();
 pub fn init_tracing_once() {
@@ -202,6 +197,28 @@ fn copy_with_backoff(src: &Path, dest: &Path, tries: usize, delay_ms: u64) -> Re
     }
     Err(last_err.unwrap_or_else(|| io::Error::new(io::ErrorKind::Other, "copy failed")))
         .with_context(|| format!("copy (retries) {} -> {}", src.display(), dest.display()))
+}
+
+/// Run `f` inside a scoped Rayon thread pool sized to `threads` (when
+/// `Some(n)`, `n > 0`). Avoids `rayon::ThreadPoolBuilder::build_global()`
+/// since that is process-global, only-once, and surprises library callers
+/// who already initialized rayon. With `None` or `Some(0)` the default
+/// global pool is used and `f` is called directly. Errors from `f` flow
+/// through, plus any error building the local pool.
+pub fn with_thread_pool<R: Send>(
+    threads: Option<usize>,
+    f: impl FnOnce() -> Result<R> + Send,
+) -> Result<R> {
+    match threads {
+        Some(n) if n > 0 => {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(n)
+                .build()
+                .with_context(|| format!("build rayon pool with {} threads", n))?;
+            pool.install(f)
+        }
+        _ => f(),
+    }
 }
 
 /// Atomically replace `dest` with `tmp` (Windows-friendly).

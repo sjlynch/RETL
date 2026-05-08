@@ -48,7 +48,7 @@ fn spool_resolve_attach_parents_end_to_end() {
         .scan()
         .subreddit("programming")
         .allow_pseudo_users() // crucial: include "[deleted]" in the spooled RC set
-        .extract_spool_monthly(&spool_dir, /*resume=*/false)
+        .extract_spool_monthly(&spool_dir)
         .unwrap();
 
     assert!(

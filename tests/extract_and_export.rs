@@ -2,7 +2,7 @@
 mod common;
 
 use common::*;
-use retl::{ExportFormat, RedditETL, Sources, YearMonth};
+use retl::{validate_zst_full, ExportFormat, RedditETL, Sources, YearMonth};
 
 /// Extract with a whitelist and human-readable timestamps:
 /// - Focus "programming" in Jan 2006
@@ -72,4 +72,25 @@ fn export_partitioned_zst() {
     assert_eq!(rc_lines, 3, "comments (RC) should have 3 lines");
     assert_eq!(rs_lines, 2, "submissions (RS) should have 2 lines");
     assert_eq!(rc_lines + rs_lines, 5, "total lines should be 5");
+
+    // The encoder now writes a content checksum and is properly finalized; the
+    // full validator must accept both files (this previously failed because the
+    // frame epilogue was never written).
+    validate_zst_full(&rc).expect("RC zst must pass full validation");
+    validate_zst_full(&rs).expect("RS zst must pass full validation");
+
+    // No leftover .inprogress files should remain in the staging dir.
+    let staging = out_dir.join("_staging");
+    if staging.exists() {
+        let leftovers: Vec<_> = std::fs::read_dir(&staging)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".inprogress"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "staging dir should be free of .inprogress on success; found: {:?}",
+            leftovers.iter().map(|e| e.path()).collect::<Vec<_>>()
+        );
+    }
 }

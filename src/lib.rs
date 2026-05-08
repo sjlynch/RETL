@@ -14,6 +14,7 @@ mod streaming;
 mod counting;
 mod util;
 mod mem;
+mod atomic_write;
 mod pipeline;
 
 mod parents;
