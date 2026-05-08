@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "curl -s -m 5 -X POST http://127.0.0.1:5184/api/tasks/t_1778255685150_4xf0v/complete"
+          }
+        ]
+      }
+    ]
+  }
+}
