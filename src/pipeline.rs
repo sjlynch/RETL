@@ -7,7 +7,7 @@ use crate::progress::{make_progress_bar_labeled, total_compressed_size};
 use crate::query::{normalize_str, QuerySpec};
 use crate::shard::{ShardedWriter, UsernameStream};
 use crate::stitch::{concat_tsvs, stitch_tmp_parts, stitch_tmp_parts_to_json_array, tmp_name_for_job};
-use crate::streaming::{process_file_for_usernames, stream_job};
+use crate::streaming::{process_file_for_usernames_with_skip, stream_job};
 use crate::util::{create_with_backoff, default_bot_authors, merge_extra_exclusions, with_thread_pool};
 use crate::zstd_jsonl::{for_each_line_cfg, for_each_line_with_progress_cfg, parse_minimal};
 use crate::kv_shard::ShardedKVWriter;
@@ -94,10 +94,34 @@ impl RedditETL {
                 None
             };
 
+            // Per-run counter of files skipped by the decoder. Surfaced to
+            // observers via tracing at the end of the run. Per-file detail is
+            // already logged by `warn_decode_skip`; this aggregate makes the
+            // total visible without parsing log output.
+            let skip_count = std::sync::Arc::new(AtomicU64::new(0));
+            let skip_count_inner = skip_count.clone();
+
             crate::concurrency::for_each_file_limited(&files, self.opts.file_concurrency, |job| {
-                process_file_for_usernames(job, read_buf, &subreddit, &shard_writer, pb.clone())
-                    .with_context(|| format!("processing {}", job.path.display()))
+                let skip_count_per_call = skip_count_inner.clone();
+                process_file_for_usernames_with_skip(
+                    job,
+                    read_buf,
+                    &subreddit,
+                    &shard_writer,
+                    pb.clone(),
+                    move |_path, _err| { skip_count_per_call.fetch_add(1, Ordering::Relaxed); },
+                )
+                .with_context(|| format!("processing {}", job.path.display()))
             })?;
+
+            let skipped = skip_count.load(Ordering::Relaxed);
+            if skipped > 0 {
+                tracing::warn!(
+                    skipped_files = skipped,
+                    "usernames: {} input file(s) skipped due to zstd decode errors; see prior warnings for paths",
+                    skipped
+                );
+            }
 
             let deduped_files = shard_writer.dedup("usernames")?;
             UsernameStream::from_deduped_files(deduped_files)

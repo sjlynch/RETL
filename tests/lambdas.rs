@@ -19,10 +19,10 @@ fn partition_writers_lambda_routing_and_output() {
     let parts_dir = tmp.path().join("parts");
     fs::create_dir_all(&parts_dir).unwrap();
 
-    let mut pw = PartitionWriters::new(&parts_dir, "lambda", 4, 128 * 1024).unwrap();
+    let pw = PartitionWriters::new(&parts_dir, "lambda", 4, 128 * 1024).unwrap();
 
     // Helper to write a single NDJSON line for a given user
-    let mut write_line = |user: &str, payload: i64| {
+    let write_line = |user: &str, payload: i64| {
         pw.write_with(user, |w| {
             let line = format!("{{\"user\":\"{}\",\"payload\":{}}}\n", user, payload);
             w.write_all(line.as_bytes())?;
