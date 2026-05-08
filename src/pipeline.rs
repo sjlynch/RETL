@@ -7,7 +7,7 @@ use crate::progress::{make_progress_bar_labeled, total_compressed_size};
 use crate::query::{normalize_str, QuerySpec};
 use crate::shard::{ShardedWriter, UsernameStream};
 use crate::stitch::{concat_tsvs, stitch_tmp_parts, stitch_tmp_parts_to_json_array, tmp_name_for_job};
-use crate::streaming::{process_file_for_usernames, stream_job};
+use crate::streaming::{process_file_for_usernames_with_skip, stream_job};
 use crate::util::{create_with_backoff, default_bot_authors, merge_extra_exclusions, with_thread_pool};
 use crate::zstd_jsonl::{for_each_line_cfg, for_each_line_with_progress_cfg, parse_minimal};
 use crate::kv_shard::ShardedKVWriter;
@@ -61,6 +61,11 @@ impl RedditETL {
     pub fn io_buffers(mut self, read_bytes: usize, write_bytes: usize) -> Self { self.opts = self.opts.with_io_buffers(read_bytes, write_bytes); self }
     pub fn timestamps_human_readable(mut self, yes: bool) -> Self { self.opts = self.opts.with_human_timestamps(yes); self }
     pub fn zst_level(mut self, level: i32) -> Self { self.opts = self.opts.with_zst_level(level); self }
+    /// Opt in to resumable spool runs: when enabled, `extract_spool_monthly`
+    /// reads and writes a `<out_dir>/_progress.json` sidecar so a re-run skips
+    /// months already published by a previous (possibly crashed) invocation.
+    /// Default false to preserve existing behavior.
+    pub fn resume(mut self, yes: bool) -> Self { self.opts = self.opts.with_resume(yes); self }
 
     // -------- Original operations (back-compat) --------
 
@@ -89,10 +94,34 @@ impl RedditETL {
                 None
             };
 
+            // Per-run counter of files skipped by the decoder. Surfaced to
+            // observers via tracing at the end of the run. Per-file detail is
+            // already logged by `warn_decode_skip`; this aggregate makes the
+            // total visible without parsing log output.
+            let skip_count = std::sync::Arc::new(AtomicU64::new(0));
+            let skip_count_inner = skip_count.clone();
+
             crate::concurrency::for_each_file_limited(&files, self.opts.file_concurrency, |job| {
-                process_file_for_usernames(job, read_buf, &subreddit, &shard_writer, pb.clone())
-                    .with_context(|| format!("processing {}", job.path.display()))
+                let skip_count_per_call = skip_count_inner.clone();
+                process_file_for_usernames_with_skip(
+                    job,
+                    read_buf,
+                    &subreddit,
+                    &shard_writer,
+                    pb.clone(),
+                    move |_path, _err| { skip_count_per_call.fetch_add(1, Ordering::Relaxed); },
+                )
+                .with_context(|| format!("processing {}", job.path.display()))
             })?;
+
+            let skipped = skip_count.load(Ordering::Relaxed);
+            if skipped > 0 {
+                tracing::warn!(
+                    skipped_files = skipped,
+                    "usernames: {} input file(s) skipped due to zstd decode errors; see prior warnings for paths",
+                    skipped
+                );
+            }
 
             let deduped_files = shard_writer.dedup("usernames")?;
             UsernameStream::from_deduped_files(deduped_files)
@@ -271,6 +300,29 @@ impl ScanPlan {
         let read_buf = self.etl.opts.read_buffer_bytes;
         let write_buf = self.etl.opts.write_buffer_bytes;
         let human_ts = self.etl.opts.human_readable_timestamps;
+        let resume = self.etl.opts.resume;
+
+        // Resume manifest: load on entry, then validate each entry against the
+        // file actually on disk. Stale (missing/size-mismatch) entries are
+        // dropped so those months are re-run.
+        let mut initial_months = if resume {
+            let manifest = crate::progress_manifest::load(out_dir);
+            let mut keep = std::collections::HashMap::new();
+            for (k, v) in manifest.months {
+                // Determine destination by the key's prefix (RC_ → comments, RS_ → submissions).
+                let final_name = format!("part_{}.jsonl", k);
+                let final_path = out_dir.join(&final_name);
+                match fs::metadata(&final_path) {
+                    Ok(meta) if meta.len() == v.size => { keep.insert(k, v); }
+                    _ => {
+                        tracing::info!(key=%k, "dropping stale progress manifest entry; month will be re-run");
+                    }
+                }
+            }
+            keep
+        } else {
+            std::collections::HashMap::new()
+        };
 
         let total_bytes = total_compressed_size(&files);
         let pb = if self.etl.opts.progress {
@@ -282,12 +334,50 @@ impl ScanPlan {
         let total_written = AtomicU64::new(0);
         let parts = Mutex::new(Vec::<PathBuf>::new());
 
+        // Pre-seed `parts` with already-completed months so the returned list
+        // reflects the full set of published outputs (resumed + new).
+        if resume {
+            for key in initial_months.keys() {
+                parts.lock().unwrap().push(out_dir.join(format!("part_{}.jsonl", key)));
+            }
+        }
+
+        // Persist the (pruned) manifest before any work, so a crash mid-prune
+        // cannot resurrect entries we already know are stale.
+        let accumulator = if resume {
+            crate::progress_manifest::save(out_dir, &initial_months)?;
+            Some(crate::progress_manifest::ManifestAccumulator::new(
+                out_dir,
+                std::mem::take(&mut initial_months),
+            ))
+        } else {
+            None
+        };
+        // Snapshot of completed keys for fast skip lookup, before mutation by workers.
+        let completed_keys: std::collections::HashSet<String> = accumulator
+            .as_ref()
+            .map(|a| a.snapshot_keys())
+            .unwrap_or_default();
+
         crate::concurrency::for_each_file_limited(&files, self.etl.opts.file_concurrency, |job| -> Result<()> {
-            let prefix = match job.kind {
-                crate::paths::FileKind::Comment => "part_RC",
-                crate::paths::FileKind::Submission => "part_RS",
+            let (file_prefix, key_prefix) = match job.kind {
+                crate::paths::FileKind::Comment => ("part_RC", "RC"),
+                crate::paths::FileKind::Submission => ("part_RS", "RS"),
             };
-            let out_path = out_dir.join(format!("{}_{}.jsonl", prefix, job.ym));
+            let out_path = out_dir.join(format!("{}_{}.jsonl", file_prefix, job.ym));
+            let key = crate::progress_manifest::month_key(key_prefix, job.ym);
+
+            // Resume fast-path: skip the month entirely if it's already in the
+            // manifest (and the on-disk file matched at load time). Still bump
+            // the progress bar by the input file's compressed size so the user
+            // sees the work accounted for.
+            if resume && completed_keys.contains(&key) {
+                if let Some(pb) = &pb {
+                    let sz = fs::metadata(&job.path).map(|m| m.len()).unwrap_or(0);
+                    pb.inc(sz);
+                }
+                return Ok(());
+            }
 
             let n = match write_jsonl_atomic(&staging_dir, &out_path, write_buf, |w| {
                 stream_job(
@@ -306,7 +396,23 @@ impl ScanPlan {
                 }
             };
             total_written.fetch_add(n, Ordering::Relaxed);
-            parts.lock().unwrap().push(out_path);
+            parts.lock().unwrap().push(out_path.clone());
+
+            // Record completion in the manifest AFTER replace_file_atomic_backoff
+            // succeeded (write_jsonl_atomic only returns Ok once the rename
+            // landed). Best-effort: a failure to rewrite the manifest must not
+            // abort the run — the worst case is a re-run redoing this month.
+            if let Some(acc) = &accumulator {
+                let size = fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
+                let entry = crate::progress_manifest::MonthEntry {
+                    size,
+                    lines: n,
+                    sha256: None,
+                };
+                if let Err(e) = acc.commit(key, entry) {
+                    tracing::warn!(error=%e, "failed to update progress manifest; continuing");
+                }
+            }
             Ok(())
         })?;
 

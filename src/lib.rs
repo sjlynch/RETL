@@ -15,6 +15,7 @@ mod counting;
 mod util;
 mod mem;
 mod atomic_write;
+mod progress_manifest;
 mod pipeline;
 
 mod parents;
@@ -24,6 +25,7 @@ mod partition;
 
 mod bucketing;
 mod json_utils;
+mod json_whitelist;
 mod ndjson;
 mod key_extractor;
 mod dedupe;
@@ -62,6 +64,10 @@ pub use crate::json_utils::{author_lower, subreddit_lower, is_comment_record};
 
 // export NDJSON helpers
 pub use crate::ndjson::{NdjsonReader, NdjsonWriter};
+
+// export streaming whitelist tokenizer for tests/benches
+#[doc(hidden)]
+pub use crate::json_whitelist::{TokenizerError, WhitelistTokenizer};
 
 // export KeyExtractor abstraction
 pub use crate::key_extractor::KeyExtractor;
