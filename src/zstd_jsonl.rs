@@ -115,6 +115,10 @@ fn for_each_line_attempt(
     let mut reader = BufReader::with_capacity(cap, decoder);
 
     let mut buf = String::with_capacity(16 * 1024);
+    // Sampled cooperative memory backoff: maybe_throttle_low_memory acquires a
+    // global Mutex (see src/mem.rs), which becomes meaningful contention at
+    // sustained line rates. Sample every 4096 lines instead of per line.
+    let mut tick: u32 = 0;
     loop {
         buf.clear();
         let n = reader.read_line(&mut buf)?;
@@ -126,8 +130,10 @@ fn for_each_line_attempt(
             if buf.ends_with('\r') { let _ = buf.pop(); }
         }
         on_line(&buf)?;
-        // Cooperative memory backoff
-        maybe_throttle_low_memory(0.10);
+        tick = tick.wrapping_add(1);
+        if tick & 0xFFF == 0 {
+            maybe_throttle_low_memory(0.10);
+        }
     }
     Ok(())
 }
@@ -209,6 +215,8 @@ fn for_each_line_attempt_with_progress(
 
     let mut buf = String::with_capacity(16 * 1024);
     let mut last = 0u64;
+    // Sampled throttle: see for_each_line_attempt for rationale.
+    let mut tick: u32 = 0;
     loop {
         buf.clear();
         let n = reader.read_line(&mut buf)?;
@@ -232,7 +240,10 @@ fn for_each_line_attempt_with_progress(
         }
         on_line(&buf)?;
         if throttle {
-            maybe_throttle_low_memory(0.10);
+            tick = tick.wrapping_add(1);
+            if tick & 0xFFF == 0 {
+                maybe_throttle_low_memory(0.10);
+            }
         }
     }
     Ok(())
@@ -252,10 +263,87 @@ pub fn quick_validate_zst(path: &Path, max_decompressed_bytes: u64) -> Result<()
 }
 
 /// FULL check: decode the entire stream to EOF.
+///
+/// When the file was produced with `Encoder::include_checksum(true)` (zstd
+/// frames carry a trailing XXH64 over the original uncompressed data), the
+/// stock `zstd::Decoder` validates that checksum during decode and surfaces
+/// a mismatch as an error from `read`/`io::copy`. So decoding to EOF here
+/// is sufficient to verify the trailing checksum — no separate XXH64 pass
+/// is needed. (Bit-flips inside compressed payloads typically also fail
+/// earlier with a frame/entropy decode error.)
 pub fn validate_zst_full(path: &Path) -> Result<()> {
     let file = open_with_backoff(path, 16, 50)?;
     let mut decoder = Decoder::new(file)?;
     decoder.window_log_max(31)?;
     io::copy(&mut decoder, &mut io::sink())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn write_zst_with_checksum(path: &Path, payload: &[u8]) {
+        let f = fs::File::create(path).unwrap();
+        let mut enc = zstd::stream::write::Encoder::new(f, 3).unwrap();
+        enc.include_checksum(true).unwrap();
+        enc.write_all(payload).unwrap();
+        enc.finish().unwrap();
+    }
+
+    /// Bit-flipping a byte mid-stream in a checksum-bearing zstd file must:
+    ///   - cause `validate_zst_full` (Full integrity) to return an error
+    ///   - cause `for_each_line_cfg` (the normal scanning path) to log a
+    ///     warning and return Ok (skip the file, don't abort the run)
+    #[test]
+    fn bit_flipped_frame_fails_full_but_scan_skips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("flipped.zst");
+
+        // Enough payload that there's plenty of compressed data mid-stream.
+        let mut payload = Vec::new();
+        for i in 0..2000 {
+            payload.extend_from_slice(
+                format!(
+                    "{{\"id\":\"r{}\",\"author\":\"u{}\",\"subreddit\":\"x\"}}\n",
+                    i, i
+                )
+                .as_bytes(),
+            );
+        }
+        write_zst_with_checksum(&path, &payload);
+
+        // Sanity: original file validates cleanly.
+        validate_zst_full(&path).expect("pristine file should validate");
+
+        // Flip a couple of bytes well past the frame header and well before
+        // the trailing checksum. Two bytes XOR'd with 0xFF makes the entropy
+        // decoder reliably produce an error rather than (rarely) decoding
+        // garbage that happens to checksum-match.
+        let mut bytes = fs::read(&path).unwrap();
+        let n = bytes.len();
+        let off = n / 2;
+        bytes[off] ^= 0xFF;
+        bytes[off + 1] ^= 0xFF;
+        fs::write(&path, &bytes).unwrap();
+
+        // Full integrity must catch this.
+        assert!(
+            validate_zst_full(&path).is_err(),
+            "validate_zst_full must reject a bit-flipped frame"
+        );
+
+        // The normal scan path must skip gracefully (warn + continue), not bubble.
+        let mut lines_seen = 0usize;
+        let res = for_each_line_cfg(&path, 16 * 1024, |_line| {
+            lines_seen += 1;
+            Ok(())
+        });
+        assert!(
+            res.is_ok(),
+            "for_each_line_cfg should skip a corrupt file gracefully, got {:?}",
+            res
+        );
+    }
 }

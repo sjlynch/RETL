@@ -25,6 +25,7 @@ parking_lot = "0.12"
 ahash = "0.8"
 indicatif = "0.17"
 sysinfo = "0.29"
+aho-corasick = "1"
 
 [features]
 default = []
