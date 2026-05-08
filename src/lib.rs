@@ -68,3 +68,20 @@ pub use crate::key_extractor::KeyExtractor;
 
 // export dedupe engine
 pub use crate::dedupe::{DedupeCfg, build_runs_sorted, merge_runs_sorted};
+
+// Test-only re-exports of internals so behavioral tests can drive them directly.
+// Behavior is unchanged; these are additive exports used by tests/*.rs.
+#[doc(hidden)]
+pub use crate::shard::ShardedWriter;
+#[doc(hidden)]
+pub use crate::kv_shard::ShardedKVWriter;
+#[doc(hidden)]
+pub use crate::concurrency::for_each_file_limited;
+#[doc(hidden)]
+pub use crate::paths::{plan_files, discover_all, FileKind, FileJob, Discovered};
+#[doc(hidden)]
+pub use crate::date::iter_year_months;
+#[doc(hidden)]
+pub use crate::filters::{bounds_tuple, within_bounds};
+#[doc(hidden)]
+pub use crate::zstd_jsonl::{MinimalRecord, parse_minimal};
