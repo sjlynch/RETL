@@ -85,3 +85,8 @@ pub use crate::date::iter_year_months;
 pub use crate::filters::{bounds_tuple, within_bounds};
 #[doc(hidden)]
 pub use crate::zstd_jsonl::{MinimalRecord, parse_minimal};
+// Test-only re-exports of the human-timestamp rewriters so fuzz targets and
+// behavioral tests can exercise them directly. Keep `#[doc(hidden)]` to avoid
+// signalling these as part of the supported public API.
+#[doc(hidden)]
+pub use crate::streaming::{apply_human_timestamps, rewrite_human_timestamps_bytes};

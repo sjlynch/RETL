@@ -1,0 +1,33 @@
+[package]
+name = "retl-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1"
+
+[dependencies.retl]
+path = ".."
+
+# Each fuzz target is its own bin. `test = false` / `doc = false` / `bench = false`
+# keep the targets out of `cargo test` / `cargo doc` / `cargo bench`, which is
+# important because they require nightly + libfuzzer instrumentation.
+
+[[bin]]
+name = "fuzz_parse_minimal"
+path = "fuzz_targets/fuzz_parse_minimal.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_rewrite_timestamps"
+path = "fuzz_targets/fuzz_rewrite_timestamps.rs"
+test = false
+doc = false
+bench = false
