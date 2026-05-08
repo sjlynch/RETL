@@ -15,6 +15,7 @@ mod counting;
 mod util;
 mod mem;
 mod atomic_write;
+mod progress_manifest;
 mod pipeline;
 
 mod parents;
