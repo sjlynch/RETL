@@ -35,6 +35,112 @@ fn apply_human_timestamps(val: &mut Value) {
     }
 }
 
+/// Byte-level rewrite of the three timestamp fields directly from the raw JSONL line
+/// into `buf`, without going through `serde_json::Value`.
+///
+/// Looks for the literal byte patterns `"created_utc":`, `"retrieved_on":`, `"edited":`
+/// followed by an optional space and an integer, and replaces the integer with an
+/// RFC3339 string. Non-integer values (`true`/`false`/`null`/floats) are left untouched.
+///
+/// Safety on substring matching: the JSON spec requires `"` inside string values to be
+/// escaped, so the literal byte sequence `"<key>":` cannot appear inside a string value.
+/// That makes a flat byte search safe for the keys we care about.
+fn rewrite_human_timestamps_bytes(line: &str, buf: &mut String) {
+    buf.clear();
+    buf.reserve(line.len() + 64);
+    let bytes = line.as_bytes();
+    let len = bytes.len();
+    let patterns: &[&[u8]] = &[
+        b"\"created_utc\":",
+        b"\"retrieved_on\":",
+        b"\"edited\":",
+    ];
+
+    let mut last = 0usize;
+    let mut i = 0usize;
+    while i < len {
+        if bytes[i] != b'"' {
+            i += 1;
+            continue;
+        }
+
+        let mut matched_len = 0usize;
+        for p in patterns {
+            if i + p.len() <= len && &bytes[i..i + p.len()] == *p {
+                matched_len = p.len();
+                break;
+            }
+        }
+        if matched_len == 0 {
+            i += 1;
+            continue;
+        }
+
+        let value_start = i + matched_len;
+        // Skip optional whitespace (compact serde JSON has none, but be tolerant).
+        let mut j = value_start;
+        while j < len && (bytes[j] == b' ' || bytes[j] == b'\t') {
+            j += 1;
+        }
+
+        let num_start = j;
+        if j < len && bytes[j] == b'-' {
+            j += 1;
+        }
+        let digits_start = j;
+        while j < len && bytes[j].is_ascii_digit() {
+            j += 1;
+        }
+
+        // Not an integer (e.g., true/false/null, or just "edited":false).
+        if j == digits_start {
+            i = value_start;
+            continue;
+        }
+        // Reject fractional / exponent forms — `as_i64` would have rejected them too.
+        if j < len {
+            let c = bytes[j];
+            if c == b'.' || c == b'e' || c == b'E' {
+                i = value_start;
+                continue;
+            }
+        }
+
+        let parsed: Option<i64> = std::str::from_utf8(&bytes[num_start..j])
+            .ok()
+            .and_then(|s| s.parse().ok());
+        let Some(n) = parsed else {
+            i = value_start;
+            continue;
+        };
+
+        let formatted = match OffsetDateTime::from_unix_timestamp(n)
+            .ok()
+            .and_then(|dt| dt.format(&Rfc3339).ok())
+        {
+            Some(s) => s,
+            None => {
+                i = value_start;
+                continue;
+            }
+        };
+
+        // Emit everything up to (and including) the `":` of this key, then the quoted
+        // RFC3339 timestamp, then jump past the original digits. RFC3339 output
+        // contains only characters that are JSON-safe without escaping.
+        buf.push_str(&line[last..value_start]);
+        buf.push('"');
+        buf.push_str(&formatted);
+        buf.push('"');
+        last = j;
+        i = j;
+    }
+
+    if last < len {
+        buf.push_str(&line[last..]);
+    }
+}
+
 pub fn stream_job<W: Write>(
     job: &FileJob,
     writer: &mut W,
@@ -47,6 +153,7 @@ pub fn stream_job<W: Write>(
     human_timestamps: bool,
 ) -> Result<u64> {
     let mut written: u64 = 0;
+    let mut ts_buf = String::new();
 
     let mut on_line = |line: &str| -> Result<()> {
         if let Ok(min) = parse_minimal(line) {
@@ -61,7 +168,21 @@ pub fn stream_job<W: Write>(
                 return Ok(());
             }
 
-            // Parse full value for whitelisting and/or timestamp conversion.
+            // Byte-level fast-path: human timestamps only, no whitelist.
+            // Rewrites `"created_utc"|"retrieved_on"|"edited":<int>` in place without
+            // a `serde_json::Value` round-trip. This is the common export/spool config.
+            if whitelist.is_none() && human_timestamps {
+                rewrite_human_timestamps_bytes(line, &mut ts_buf);
+                writer.write_all(ts_buf.as_bytes())?;
+                writer.write_all(b"\n")?;
+                written += 1;
+                return Ok(());
+            }
+
+            // TODO: whitelist-only path also defeats the fast-path passthrough; a
+            // streaming JSON tokenizer would let us emit just the requested fields
+            // without parsing into a Value. Out of scope here.
+            // Slow path: parse Value for whitelisting (and timestamp conversion if both apply).
             let val: Value = serde_json::from_str(line)?;
             let mut out_val = if let Some(fields) = whitelist {
                 let mut obj = Map::new();
