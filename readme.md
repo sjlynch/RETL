@@ -76,7 +76,7 @@ Add RETL to your Cargo.toml via Git (replace the URL with your repo if needed):
 
 ~~~toml
 [dependencies]
-retl = { git = "https://github.com/yourname/retl", branch = "main" }
+retl = { git = "https://github.com/sjlynch/retl", branch = "main" }
 ~~~
 
 > This repository currently sets `publish = false` in `Cargo.toml`, so installing from crates.io is not expected.
