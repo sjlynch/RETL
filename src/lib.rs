@@ -39,6 +39,9 @@ pub use crate::query::QuerySpec;
 pub use crate::parents::{ParentIds, ParentMaps};
 pub use crate::aggregate::Aggregator;
 
+#[doc(hidden)]
+pub use crate::aggregate::{merge_aggregator_shards_parallel, merge_aggregator_shards_serial};
+
 // Expose multiprogress and progress helpers.
 pub use crate::progress::{set_global_multiprogress, make_count_progress, make_progress_bar_labeled, ProgressScope};
 
