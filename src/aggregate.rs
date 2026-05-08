@@ -3,6 +3,7 @@
 
 use crate::progress::make_count_progress;
 use crate::pipeline::RedditETL;
+use crate::ndjson::for_each_jsonl_line_cfg;
 use crate::util::replace_file_atomic_backoff;
 use anyhow::Result;
 use indicatif::ProgressBar;
@@ -12,7 +13,7 @@ use serde::Serialize;
 use serde_json::Value;
 use std::fs;
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -92,8 +93,9 @@ impl RedditETL {
     ///
     /// Returns `(merged_shards, shard_errors)`: the number of shards that were
     /// successfully built and folded into the final output, and the number of
-    /// inputs whose shard build failed (and were therefore dropped from the
-    /// aggregate). Failures are logged via `tracing::warn!`.
+    /// inputs whose shard build had errors — either fatal (dropped from the
+    /// aggregate) or a tolerated mid-file read error (built and merged from a
+    /// partial read of the input). Failures are logged via `tracing::warn!`.
     pub fn aggregate_jsonls_parallel<A: Aggregator>(
         &self,
         inputs: Vec<PathBuf>,
@@ -113,31 +115,39 @@ impl RedditETL {
             let out_shard = shard_name_for_input(shards_dir, input);
             let tmp_shard = out_shard.with_extension("json.inprogress");
 
-            let result = (|| -> Result<()> {
+            let result = (|| -> Result<bool> {
                 let mut agg = A::default();
-                let f = File::open(input)?;
-                let r = BufReader::new(f);
-                for line in r.lines() {
-                    let line = line?;
-                    if line.is_empty() { continue; }
-                    if let Ok(v) = serde_json::from_str::<Value>(&line) {
-                        agg.ingest(&v);
+                let had_read_error = for_each_jsonl_line_cfg(input, 16 * 1024, |line| {
+                    if !line.is_empty() {
+                        if let Ok(v) = serde_json::from_str::<Value>(line) {
+                            agg.ingest(&v);
+                        }
                     }
-                }
+                    Ok(())
+                })?;
                 let out = File::create(&tmp_shard)?;
                 let mut w = BufWriter::new(out);
                 serde_json::to_writer(&mut w, &agg)?;
                 w.flush()?;
                 drop(w);
                 replace_file_atomic_backoff(&tmp_shard, &out_shard)?;
-                Ok(())
+                Ok(had_read_error)
             })();
 
-            if let Err(e) = result {
-                shard_errors.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(path=%out_shard.display(), error=%e, "failed building aggregate shard");
-                // Best-effort cleanup of any partial temp file.
-                let _ = fs::remove_file(&tmp_shard);
+            match result {
+                Err(e) => {
+                    shard_errors.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(path=%out_shard.display(), error=%e, "failed building aggregate shard");
+                    // Best-effort cleanup of any partial temp file.
+                    let _ = fs::remove_file(&tmp_shard);
+                }
+                // Shard built and will be merged, but the input was only
+                // partially read (a transient I/O error was tolerated mid-file).
+                // Count it so (built, errors) reflects the partial coverage.
+                Ok(true) => {
+                    shard_errors.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(false) => {}
             }
 
             if let Some(pb) = &pb_build { pb.inc(1); }
