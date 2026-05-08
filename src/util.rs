@@ -82,6 +82,31 @@ pub fn merge_extra_exclusions(target: &mut Vec<String>) {
     target.dedup();
 }
 
+// -------- NEW: scoped Rayon thread pool helper --------
+
+/// Run `f` inside a scoped Rayon thread pool sized to `n` threads. If `n` is
+/// `None` (or `Some(0)`), run on the global default pool.
+///
+/// Prefer this over `rayon::ThreadPoolBuilder::build_global()`, which mutates
+/// process-wide state, only succeeds for the first caller, and prevents
+/// different stages from picking different thread counts.
+pub fn with_thread_pool<R, F>(n: Option<usize>, f: F) -> R
+where
+    F: FnOnce() -> R + Send,
+    R: Send,
+{
+    match n {
+        Some(k) if k > 0 => {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(k)
+                .build()
+                .expect("failed to build rayon thread pool");
+            pool.install(f)
+        }
+        _ => f(),
+    }
+}
+
 // -------- NEW: robust open/create with backoff (Windows-friendly) --------
 
 use std::fs;
