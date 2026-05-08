@@ -46,7 +46,7 @@ fn finalize_without_writes_emits_empty_per_partition_files() {
 #[test]
 fn parts_zero_is_clamped_to_one() {
     let dir = tempfile::tempdir().unwrap();
-    let mut pw = PartitionWriters::new(dir.path(), "zero", 0, 64 * 1024).unwrap();
+    let pw = PartitionWriters::new(dir.path(), "zero", 0, 64 * 1024).unwrap();
     // Writes still succeed (the lone partition picks up everything).
     pw.write_with("alice", |w| {
         w.write_all(b"{\"u\":\"alice\"}\n")?;
@@ -68,7 +68,7 @@ fn parts_zero_is_clamped_to_one() {
 #[test]
 fn flush_all_is_idempotent_and_safe_between_writes() {
     let dir = tempfile::tempdir().unwrap();
-    let mut pw = PartitionWriters::new(dir.path(), "flushy", 2, 64 * 1024).unwrap();
+    let pw = PartitionWriters::new(dir.path(), "flushy", 2, 64 * 1024).unwrap();
 
     pw.write_with("k1", |w| { w.write_all(b"line-1\n")?; Ok(()) }).unwrap();
     pw.flush_all().unwrap();
@@ -112,7 +112,7 @@ fn shard_hash_distributes_large_key_universe_across_partitions() {
     // Sanity-check the hash isn't degenerate: 2000 distinct keys over 8
     // partitions should populate every partition.
     let dir = tempfile::tempdir().unwrap();
-    let mut pw = PartitionWriters::new(dir.path(), "spread", 8, 64 * 1024).unwrap();
+    let pw = PartitionWriters::new(dir.path(), "spread", 8, 64 * 1024).unwrap();
     for i in 0..2000 {
         let k = format!("user_{:04}", i);
         pw.write_with(&k, |w| {
@@ -138,4 +138,57 @@ fn shard_hash_distributes_large_key_universe_across_partitions() {
     for (i, n) in &count_per_part {
         assert!(*n > 0, "partition {} got 0 keys, distribution looks degenerate: {:?}", i, count_per_part);
     }
+}
+
+#[test]
+fn concurrent_writes_via_rayon_scope_land_on_correct_partitions() {
+    // Locks in the `&self` concurrency contract: a single PartitionWriters can be
+    // shared across threads and each thread's writes must land in the partition
+    // its key hashes to (no lost or interleaved bytes within a single line).
+    let dir = tempfile::tempdir().unwrap();
+    let pw = PartitionWriters::new(dir.path(), "rayon", 8, 64 * 1024).unwrap();
+    let pw_ref = &pw;
+
+    const PER_THREAD: usize = 250;
+    const THREADS: usize = 8;
+
+    rayon::scope(|s| {
+        for t in 0..THREADS {
+            s.spawn(move |_| {
+                for i in 0..PER_THREAD {
+                    let user = format!("user_t{}_n{:04}", t, i);
+                    // Each line is self-contained (one write_all under the partition lock).
+                    pw_ref
+                        .write_with(&user, |w| {
+                            let line = format!("{{\"u\":\"{}\"}}\n", user);
+                            w.write_all(line.as_bytes())?;
+                            Ok(())
+                        })
+                        .unwrap();
+                }
+            });
+        }
+    });
+
+    let parts = pw.finalize().unwrap();
+    assert_eq!(parts.len(), 8);
+
+    let mut total = 0usize;
+    let mut seen_users: HashMap<String, usize> = HashMap::new();
+    for (i, p) in parts.iter().enumerate() {
+        let body = fs::read_to_string(p).unwrap();
+        for line in body.lines().filter(|s| !s.is_empty()) {
+            // Each line must be intact JSON (no torn writes from concurrent threads
+            // hashing to the same partition).
+            let v: serde_json::Value = serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("torn line in partition {}: {:?} ({})", i, line, e));
+            let user = v.get("u").and_then(|x| x.as_str()).unwrap().to_string();
+            // Same user must always land in the same partition.
+            if let Some(prev) = seen_users.insert(user.clone(), i) {
+                assert_eq!(prev, i, "user {} split across partitions {} and {}", user, prev, i);
+            }
+            total += 1;
+        }
+    }
+    assert_eq!(total, THREADS * PER_THREAD, "every write must land somewhere exactly once");
 }
