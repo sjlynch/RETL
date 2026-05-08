@@ -161,15 +161,71 @@ impl UsernameStream {
         })
     }
 
-    fn open_next(&mut self) -> Result<bool> {
+    /// Try to open the next file. Advances `current_idx` regardless of outcome,
+    /// so a failure yields `Some(Err(_))` once and a subsequent call moves on
+    /// to the file after the bad one instead of looping on the same path.
+    fn open_next(&mut self) -> Option<Result<()>> {
         if self.current_idx >= self.files.len() {
-            return Ok(false);
+            return None;
         }
-        let f = File::open(&self.files[self.current_idx])?;
-        self.reader = Some(BufReader::new(f));
+        let path = self.files[self.current_idx].clone();
         self.current_idx += 1;
-        self.current_file_errors = 0;
-        Ok(true)
+        match File::open(&path) {
+            Ok(f) => {
+                self.reader = Some(BufReader::new(f));
+                self.current_file_errors = 0;
+                Some(Ok(()))
+            }
+            Err(e) => Some(Err(anyhow::Error::from(e).context(format!(
+                "open shard for streaming: {}",
+                path.display()
+            )))),
+        }
+    }
+
+    /// Yield the next username, surfacing per-file open failures to the caller.
+    ///
+    /// `None` is a clean end-of-stream. `Some(Err(_))` means opening the next
+    /// shard failed; the stream has already advanced past it, so calling
+    /// `try_next` again attempts the file after it. The lossy
+    /// `Iterator::next` impl wraps this method and logs+continues on errors.
+    pub fn try_next(&mut self) -> Option<Result<String>> {
+        loop {
+            if self.reader.is_none() {
+                match self.open_next() {
+                    None => return None,
+                    Some(Ok(())) => {}
+                    Some(Err(e)) => return Some(Err(e)),
+                }
+            }
+            if let Some(reader) = &mut self.reader {
+                match Self::step(&mut self.buf, &mut self.current_file_errors, reader) {
+                    ReadStep::Yielded(s) => return Some(Ok(s)),
+                    ReadStep::Empty => continue,
+                    ReadStep::Eof => {
+                        self.reader = None;
+                        continue;
+                    }
+                    ReadStep::Retry => continue,
+                    ReadStep::GiveUp => {
+                        // open_next advanced current_idx already, so the file
+                        // we just exhausted retries on is at current_idx - 1.
+                        let path = self
+                            .files
+                            .get(self.current_idx.saturating_sub(1))
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "<unknown>".to_string());
+                        tracing::warn!(
+                            path = %path,
+                            attempts = self.current_file_errors,
+                            "UsernameStream: read errors exceeded retry bound; advancing to next file",
+                        );
+                        self.reader = None;
+                        continue;
+                    }
+                }
+            }
+        }
     }
 
     fn step<R: BufRead>(buf: &mut String, errors: &mut usize, reader: &mut R) -> ReadStep {
@@ -202,38 +258,22 @@ impl UsernameStream {
 impl Iterator for UsernameStream {
     type Item = String;
 
+    /// Lossy convenience layer over [`UsernameStream::try_next`]: on per-file
+    /// open failures, log a warning and advance to the next file. Read errors
+    /// are already logged and skipped inside `try_next`.
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            if self.reader.is_none() {
-                if self.open_next().ok()? == false {
-                    return None;
-                }
-            }
-            if let Some(reader) = &mut self.reader {
-                match Self::step(&mut self.buf, &mut self.current_file_errors, reader) {
-                    ReadStep::Yielded(s) => return Some(s),
-                    ReadStep::Empty => continue,
-                    ReadStep::Eof => {
-                        self.reader = None;
-                        continue;
-                    }
-                    ReadStep::Retry => continue,
-                    ReadStep::GiveUp => {
-                        // open_next post-increments current_idx, so the file we
-                        // just exhausted retries on is at current_idx - 1.
-                        let path = self
-                            .files
-                            .get(self.current_idx.saturating_sub(1))
-                            .map(|p| p.display().to_string())
-                            .unwrap_or_else(|| "<unknown>".to_string());
-                        tracing::warn!(
-                            path = %path,
-                            attempts = self.current_file_errors,
-                            "UsernameStream: read errors exceeded retry bound; advancing to next file",
-                        );
-                        self.reader = None;
-                        continue;
-                    }
+            match self.try_next()? {
+                Ok(s) => return Some(s),
+                Err(e) => {
+                    // `{:#}` walks the anyhow context chain so the path added
+                    // in `open_next` is included alongside the I/O error.
+                    let chained = format!("{:#}", e);
+                    tracing::warn!(
+                        error = %chained,
+                        "UsernameStream: open failed; advancing to next file",
+                    );
+                    continue;
                 }
             }
         }
@@ -289,6 +329,76 @@ mod tests {
             other => panic!("expected Eof, got {:?}", other),
         }
         assert_eq!(errors, 0, "no errors should have been counted");
+    }
+
+    #[test]
+    fn lossy_iterator_skips_files_that_fail_to_open() {
+        // 'a_' < 'b_' lexically, so after sorting the missing file is opened
+        // first. The lossy `Iterator` impl must log+advance and still surface
+        // the real file's lines instead of silently terminating.
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("a_missing.txt"); // never created
+        let real = dir.path().join("b_real.txt");
+        fs::write(&real, "alice\nbob\n").unwrap();
+
+        let stream =
+            UsernameStream::from_deduped_files(vec![real.clone(), missing.clone()]).unwrap();
+        let got: Vec<String> = stream.collect();
+        assert_eq!(got, vec!["alice", "bob"]);
+    }
+
+    #[test]
+    fn try_next_surfaces_open_errors_and_caller_can_continue() {
+        // Sandwich a missing path between two real files. `try_next` must
+        // yield real lines, then surface a single Err for the missing file
+        // (with the path in the context chain), then continue past it.
+        let dir = tempdir().unwrap();
+        let real_first = dir.path().join("a_real.txt");
+        let missing = dir.path().join("b_missing.txt");
+        let real_last = dir.path().join("c_real.txt");
+        fs::write(&real_first, "alice\n").unwrap();
+        fs::write(&real_last, "carol\n").unwrap();
+
+        let mut stream =
+            UsernameStream::from_deduped_files(vec![real_first, missing, real_last]).unwrap();
+
+        match stream.try_next() {
+            Some(Ok(s)) => assert_eq!(s, "alice"),
+            other => panic!("expected Ok(\"alice\"), got {:?}", other),
+        }
+        match stream.try_next() {
+            Some(Err(e)) => {
+                let chained = format!("{:#}", e);
+                assert!(
+                    chained.contains("b_missing.txt"),
+                    "error chain should include failing path; got: {chained}"
+                );
+            }
+            other => panic!("expected Some(Err) for missing file, got {:?}", other),
+        }
+        match stream.try_next() {
+            Some(Ok(s)) => assert_eq!(s, "carol"),
+            other => panic!("expected Ok(\"carol\"), got {:?}", other),
+        }
+        match stream.try_next() {
+            None => {}
+            other => panic!("expected clean EOF, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn try_next_eventually_drains_all_files_with_only_open_errors() {
+        // All files are missing — every call returns Some(Err), then None.
+        // Guards against a regression where a failed open didn't advance
+        // current_idx and the stream looped on the same path forever.
+        let dir = tempdir().unwrap();
+        let p1 = dir.path().join("missing_1.txt");
+        let p2 = dir.path().join("missing_2.txt");
+
+        let mut stream = UsernameStream::from_deduped_files(vec![p1, p2]).unwrap();
+        assert!(matches!(stream.try_next(), Some(Err(_))));
+        assert!(matches!(stream.try_next(), Some(Err(_))));
+        assert!(stream.try_next().is_none());
     }
 
     #[test]
