@@ -53,6 +53,9 @@ pub use crate::partition::PartitionWriters;
 //export robust file ops from util so binaries can import from crate root.
 pub use crate::util::{open_with_backoff, create_with_backoff, remove_with_backoff, replace_file_atomic_backoff};
 
+// Scoped rayon pool + opt-in tracing init for binaries.
+pub use crate::util::{init_tracing_for_binary, with_thread_pool};
+
 //export bucketing & json utils to application code
 pub use crate::bucketing::{BucketingCfg, partition_stage1, bucketize_shard, process_bucket_streaming};
 pub use crate::json_utils::{author_lower, subreddit_lower, is_comment_record};

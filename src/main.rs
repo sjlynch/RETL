@@ -7,6 +7,8 @@ const DATA_ROOT: &str = "./data";
 const WORK_ROOT: &str = "./etl_work";
 
 fn main() -> Result<()> {
+    retl::init_tracing_for_binary();
+
     let base_dir = PathBuf::from(DATA_ROOT);
     let work_dir = PathBuf::from(WORK_ROOT);
     let hw = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
