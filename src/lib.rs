@@ -27,6 +27,8 @@ mod ndjson;
 mod key_extractor;
 mod dedupe;
 
+mod atomic_write;
+
 pub use crate::config::{ETLOptions, Sources};
 pub use crate::date::YearMonth;
 pub use crate::pipeline::{RedditETL, ExportFormat};
@@ -51,6 +53,10 @@ pub use crate::partition::PartitionWriters;
 
 //export robust file ops from util so binaries can import from crate root.
 pub use crate::util::{open_with_backoff, create_with_backoff, remove_with_backoff, replace_file_atomic_backoff};
+
+// T10 helpers: atomic write helpers, scoped rayon pool, opt-in tracing init.
+pub use crate::atomic_write::{write_atomic, write_zst_atomic};
+pub use crate::util::{init_tracing_for_binary, with_thread_pool};
 
 //export bucketing & json utils to application code
 pub use crate::bucketing::{BucketingCfg, partition_stage1, bucketize_shard, process_bucket_streaming};
