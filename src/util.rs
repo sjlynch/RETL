@@ -238,13 +238,20 @@ fn copy_with_backoff(src: &Path, dest: &Path, tries: usize, delay_ms: u64) -> Re
 
 
 /// Atomically replace `dest` with `tmp` (Windows-friendly).
-/// If rename fails (e.g., due to sharing), fall back to copy+remove.
+///
+/// `std::fs::rename` on Windows is implemented via
+/// `MoveFileExW(MOVEFILE_REPLACE_EXISTING)`, which atomically swaps the
+/// destination if it exists — concurrent readers see either the old contents
+/// or the new contents, never a missing file. We therefore do NOT pre-remove
+/// `dest`: a remove-then-rename sequence opens a window where readers observe
+/// `NotFound`, breaking the "atomic" contract this function advertises.
+///
+/// If rename fails (e.g., due to a sharing violation that doesn't clear within
+/// the retry budget), fall back to copy+remove. `fs::copy` opens the
+/// destination with `CREATE_ALWAYS` on Windows, so it overwrites in place.
 pub fn replace_file_atomic_backoff(tmp: &Path, dest: &Path) -> Result<()> {
     let tries = 20usize;
     let delay_ms = 50u64;
-    if dest.exists() {
-        remove_with_backoff(dest, tries, delay_ms)?;
-    }
     match rename_with_backoff(tmp, dest, tries, delay_ms) {
         Ok(_) => Ok(()),
         Err(_) => {
