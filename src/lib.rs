@@ -39,6 +39,9 @@ pub use crate::query::QuerySpec;
 pub use crate::parents::{ParentIds, ParentMaps};
 pub use crate::aggregate::Aggregator;
 
+#[doc(hidden)]
+pub use crate::aggregate::{merge_aggregator_shards_parallel, merge_aggregator_shards_serial};
+
 // Expose multiprogress and progress helpers.
 pub use crate::progress::{set_global_multiprogress, make_count_progress, make_progress_bar_labeled, ProgressScope};
 
@@ -91,3 +94,8 @@ pub use crate::date::iter_year_months;
 pub use crate::filters::{bounds_tuple, within_bounds};
 #[doc(hidden)]
 pub use crate::zstd_jsonl::{MinimalRecord, parse_minimal};
+// Test-only re-exports of the human-timestamp rewriters so fuzz targets and
+// behavioral tests can exercise them directly. Keep `#[doc(hidden)]` to avoid
+// signalling these as part of the supported public API.
+#[doc(hidden)]
+pub use crate::streaming::{apply_human_timestamps, rewrite_human_timestamps_bytes};

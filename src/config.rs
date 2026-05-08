@@ -37,6 +37,13 @@ pub struct ETLOptions {
     // zstd compression level used by partitioned ZST writers
     pub zst_level: i32,
 
+    /// Bound (in bytes) on data inflight between bucketing/dedupe producers
+    /// and their downstream consumers. Acts as the primary backpressure
+    /// mechanism so producers stall when consumers fall behind, rather than
+    /// growing in-memory hash maps to multi-GiB peaks driven by
+    /// available_memory_fraction. Defaults to 256 MiB.
+    pub inflight_bytes: usize,
+
     /// Opt-in: when true, `extract_spool_monthly` reads/writes a
     /// `<out_dir>/_progress.json` sidecar and skips months already
     /// committed by a prior run. Default false to preserve current behavior.
@@ -74,6 +81,7 @@ impl Default for ETLOptions {
 
             zst_level: 7,
 
+            inflight_bytes: 256 * 1024 * 1024,
             resume: false,
         }
     }
@@ -163,6 +171,14 @@ impl ETLOptions {
     /// clamped. Default: 7 (good ratio, ~5x faster than 19 on real workloads).
     pub fn with_zst_level(mut self, level: i32) -> Self {
         self.zst_level = level.clamp(1, 22);
+        self
+    }
+
+    /// Set the inflight-bytes budget that bounds bucketing/dedupe producers.
+    /// Lower values trade smaller memory peaks for more frequent flushes.
+    /// 0 disables the explicit cap and falls back to memory-fraction sampling.
+    pub fn with_inflight_bytes(mut self, bytes: usize) -> Self {
+        self.inflight_bytes = bytes;
         self
     }
 
