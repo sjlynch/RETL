@@ -12,12 +12,37 @@ pub fn matches_subreddit_basic(min: &MinimalRecord, sub: &str) -> bool {
     if let Some(s) = &min.subreddit { s.eq_ignore_ascii_case(sub) } else { false }
 }
 
+/// Linear scan of a small (<10) list of pre-lowercased targets, comparing to
+/// `needle` case-insensitively. ASCII fast path uses byte-level case folding;
+/// non-ASCII needles fall back to a single Unicode lowercase + equality check.
+#[inline]
+fn list_contains_ci(list: &[String], needle: &str) -> bool {
+    if needle.is_ascii() {
+        list.iter().any(|s| s.eq_ignore_ascii_case(needle))
+    } else {
+        let lower = needle.to_lowercase();
+        list.iter().any(|s| s == &lower)
+    }
+}
+
+/// Case-insensitive byte search for the literal "http" (https is a superset).
+#[inline]
+fn ascii_ci_contains_http(haystack: &[u8]) -> bool {
+    if haystack.len() < 4 { return false; }
+    haystack.windows(4).any(|w|
+        w[0].eq_ignore_ascii_case(&b'h')
+            && w[1].eq_ignore_ascii_case(&b't')
+            && w[2].eq_ignore_ascii_case(&b't')
+            && w[3].eq_ignore_ascii_case(&b'p')
+    )
+}
+
 /// Decide using only fields in MinimalRecord (fast path).
 /// If `targets_opt` is None, accept any subreddit (still rejects missing subreddit).
 pub fn matches_minimal(min: &MinimalRecord, targets_opt: Option<&Vec<String>>, q: &QuerySpec) -> bool {
     if let Some(targets) = targets_opt {
-        match min.subreddit.as_deref().map(|s| s.to_lowercase()) {
-            Some(s) if targets.binary_search(&s).is_ok() => {}
+        match min.subreddit.as_deref() {
+            Some(s) if list_contains_ci(targets, s) => {}
             _ => return false,
         }
     } else if min.subreddit.is_none() {
@@ -25,15 +50,18 @@ pub fn matches_minimal(min: &MinimalRecord, targets_opt: Option<&Vec<String>>, q
     }
 
     if let Some(a) = min.author.as_deref() {
-        let a_low = a.to_lowercase();
-        if q.filter_pseudo_users && (a_low == "[deleted]" || a_low == "[removed]" || a_low.is_empty()) {
+        if q.filter_pseudo_users
+            && (a.is_empty()
+                || a.eq_ignore_ascii_case("[deleted]")
+                || a.eq_ignore_ascii_case("[removed]"))
+        {
             return false;
         }
         if let Some(ref deny) = q.authors_out {
-            if deny.binary_search(&a_low).is_ok() { return false; }
+            if list_contains_ci(deny, a) { return false; }
         }
         if let Some(ref allow) = q.authors_in {
-            if !allow.binary_search(&a_low).is_ok() { return false; }
+            if !list_contains_ci(allow, a) { return false; }
         }
         if let Some(re) = &q.author_regex {
             if !re.is_match(a) { return false; }
@@ -51,28 +79,26 @@ pub fn matches_minimal(min: &MinimalRecord, targets_opt: Option<&Vec<String>>, q
 
     // domains_in can be matched from MinimalRecord now (submissions only).
     if let Some(ref domains) = q.domains_in {
-        match min.domain.as_deref().map(|d| d.to_lowercase()) {
-            Some(dom) if domains.binary_search(&dom).is_ok() => {}
+        match min.domain.as_deref() {
+            Some(dom) if list_contains_ci(domains, dom) => {}
             // when domain filter is set, comments (no domain) are rejected:
             _ => return false,
         }
     }
 
-    // keywords/URL checks on MinimalRecord text (no full parse)
-    if let Some(ref kws) = q.keywords_any {
-        let mut hay = String::new();
-        if let Some(body) = min.body.as_deref() { hay.push_str(&body.to_lowercase()); hay.push(' '); }
-        if let Some(selftext) = min.selftext.as_deref() { hay.push_str(&selftext.to_lowercase()); hay.push(' '); }
-        if let Some(title) = min.title.as_deref() { hay.push_str(&title.to_lowercase()); hay.push(' '); }
-        if !kws.iter().any(|kw| hay.contains(kw)) { return false; }
+    // keywords_any: run the pre-built ASCII-case-insensitive automaton over each
+    // text field's raw bytes — no per-record allocation or to_lowercase pass.
+    if let Some(ac) = q.keywords_automaton() {
+        let matched = min.body.as_deref().map_or(false, |s| ac.is_match(s.as_bytes()))
+            || min.selftext.as_deref().map_or(false, |s| ac.is_match(s.as_bytes()))
+            || min.title.as_deref().map_or(false, |s| ac.is_match(s.as_bytes()));
+        if !matched { return false; }
     }
     if q.contains_url == Some(true) {
-        let mut hay = String::new();
-        if let Some(body) = min.body.as_deref() { hay.push_str(body); hay.push(' '); }
-        if let Some(selftext) = min.selftext.as_deref() { hay.push_str(selftext); hay.push(' '); }
-        if let Some(title) = min.title.as_deref() { hay.push_str(title); hay.push(' '); }
-        let hay = hay.to_lowercase();
-        if !(hay.contains("http://") || hay.contains("https://")) { return false; }
+        let matched = min.body.as_deref().map_or(false, |s| ascii_ci_contains_http(s.as_bytes()))
+            || min.selftext.as_deref().map_or(false, |s| ascii_ci_contains_http(s.as_bytes()))
+            || min.title.as_deref().map_or(false, |s| ascii_ci_contains_http(s.as_bytes()));
+        if !matched { return false; }
     }
 
     true
@@ -82,9 +108,9 @@ pub fn matches_minimal(min: &MinimalRecord, targets_opt: Option<&Vec<String>>, q
 pub fn matches_full(val: &Value, kind: FileKind, q: &QuerySpec) -> bool {
     if let Some(ref domains) = q.domains_in {
         if let FileKind::Submission = kind {
-            let d = val.get("domain").and_then(|v| v.as_str()).map(|s| s.to_lowercase());
+            let d = val.get("domain").and_then(|v| v.as_str());
             match d {
-                Some(dom) if domains.binary_search(&dom).is_ok() => {}
+                Some(dom) if list_contains_ci(domains, dom) => {}
                 _ => return false,
             }
         } else {
