@@ -29,7 +29,8 @@ fn apply_human_timestamp_in_place(map: &mut Map<String, Value>, key: &str) {
     }
 }
 
-fn apply_human_timestamps(val: &mut Value) {
+#[doc(hidden)]
+pub fn apply_human_timestamps(val: &mut Value) {
     if let Some(obj) = val.as_object_mut() {
         // Convert common timestamp fields if they are numeric.
         apply_human_timestamp_in_place(obj, "created_utc");
@@ -49,6 +50,7 @@ fn apply_human_timestamps(val: &mut Value) {
 /// Safety on substring matching: the JSON spec requires `"` inside string values to be
 /// escaped, so the literal byte sequence `"<key>":` cannot appear inside a string value.
 /// That makes a flat byte search safe for the keys we care about.
+#[doc(hidden)]
 pub fn rewrite_human_timestamps_bytes(line: &str, buf: &mut String) {
     buf.clear();
     buf.reserve(line.len() + 64);

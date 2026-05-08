@@ -350,6 +350,59 @@ The three benchmark groups:
 The merged exclusion list is applied by `.exclude_common_bots()` on a
 `ScanPlan`.
 
+## Fuzzing
+
+RETL ships [cargo-fuzz](https://rust-fuzz.github.io/book/cargo-fuzz.html) targets
+for the two functions that walk attacker-controlled bytes:
+
+- `retl::parse_minimal` (in `src/zstd_jsonl.rs`) — every JSONL line passes
+  through this `serde_json::from_str` wrapper.
+- `retl::rewrite_human_timestamps_bytes` (in `src/streaming.rs`) — a
+  hand-rolled byte scanner that rewrites `"created_utc"`, `"retrieved_on"`,
+  and `"edited"` integer values to RFC3339 strings without going through
+  `serde_json::Value`.
+
+Setup (one-time):
+
+```sh
+cargo install cargo-fuzz
+rustup toolchain install nightly
+```
+
+The `fuzz/` crate is pre-scaffolded — no `cargo fuzz init` needed. Two
+targets live under `fuzz/fuzz_targets/`, each seeded with ~50 inputs at
+`fuzz/corpus/<target>/`:
+
+```sh
+# Walks &str → parse_minimal; any panic/abort is a finding.
+cargo +nightly fuzz run fuzz_parse_minimal -- -max_total_time=300
+
+# Walks &str → rewrite_human_timestamps_bytes, then validates that
+# (a) the output is valid UTF-8 (enforced by the String type),
+# (b) the output round-trips through serde_json::from_str if the input did, and
+# (c) on shallow top-level objects, the byte path matches the slow path
+#     (apply_human_timestamps applied to the parsed Value).
+cargo +nightly fuzz run fuzz_rewrite_timestamps -- -max_total_time=300
+```
+
+The seed corpora include real Reddit-shaped JSONL lines plus adversarial
+inputs: bodies that contain `\"created_utc\":` substrings (must be left
+unchanged), `"`-escaped quotes around the keys, leading zeros / leading
+`+` / lone `-`, very long integer strings, fractional and exponent forms,
+`null`/`true`/`false` values, whitespace before and after the `:`, `i64`
+extrema, and a deliberate `{...{"created_utc": ...}...}` nested-object case.
+
+Triage:
+
+- Any panic, abort, or OOM in either target is a bug — file as a separate
+  task with the failing input.
+- For the timestamp rewriter, a case where the byte path mutates a
+  `"created_utc":` substring inside a JSON string-typed value (rather than
+  leaving it alone) is a correctness bug — file separately.
+
+Fuzzing is **not** wired into CI by default — it runs on demand under
+nightly because libfuzzer is a nightly-only sanitizer.
+
 ## License
 
 MIT. See `LICENSE`.

@@ -1,0 +1,7 @@
+# cargo-fuzz scratch / build outputs (mirrors what `cargo fuzz init` writes).
+# Corpus and findings should be committed selectively; the build cache and
+# crash artifacts must NEVER be committed.
+target/
+artifacts/
+coverage/
+Cargo.lock
