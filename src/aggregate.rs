@@ -5,6 +5,7 @@ use crate::progress::make_count_progress;
 use crate::pipeline::RedditETL;
 use crate::util::replace_file_atomic_backoff;
 use anyhow::Result;
+use indicatif::ProgressBar;
 use rayon::prelude::*;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -15,6 +16,15 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// State that ingests JSON records and folds together with peer states.
+///
+/// `merge` MUST be associative: for any states `a`, `b`, `c`,
+/// `(a.merge(b)).merge(c)` and `a.merge(b.merge(c))` must produce equal
+/// final states. Shard merging uses `rayon`'s tree reduction, which splits
+/// the input into adjacent ranges and combines partial results in arbitrary
+/// nesting — non-associative `merge` impls will produce nondeterministic
+/// output. Commutativity is *not* required: adjacent shards are always
+/// combined in left-to-right order.
 pub trait Aggregator: Send + Default + Serialize + DeserializeOwned {
     fn ingest(&mut self, record: &Value);
     fn merge(&mut self, other: Self);
@@ -25,6 +35,54 @@ fn shard_name_for_input(shards_dir: &Path, input: &Path) -> PathBuf {
     // Common case: part_YYYY-MM
     let stem = stem.strip_prefix("part_").unwrap_or(stem);
     shards_dir.join(format!("agg_{}.json", stem))
+}
+
+fn load_shard<A: Aggregator>(shard: &Path) -> Result<A> {
+    let f = File::open(shard)?;
+    let r = BufReader::new(f);
+    let part: A = serde_json::from_reader(r)?;
+    Ok(part)
+}
+
+/// Parallel tree-merge of aggregator shards from disk.
+/// `pb`, if provided, is incremented once per shard as it's loaded.
+///
+/// Uses `try_fold` + `try_reduce` so each rayon worker accumulates an
+/// entire chunk locally (no cross-thread synchronization per shard), then
+/// only the per-worker totals are combined via tree reduction.
+#[doc(hidden)]
+pub fn merge_aggregator_shards_parallel<A: Aggregator>(
+    shards: &[PathBuf],
+    pb: Option<&ProgressBar>,
+) -> Result<A> {
+    shards
+        .par_iter()
+        .try_fold(A::default, |mut acc, shard| -> Result<A> {
+            let part: A = load_shard(shard)?;
+            acc.merge(part);
+            if let Some(pb) = pb { pb.inc(1); }
+            Ok(acc)
+        })
+        .try_reduce(A::default, |mut left, right| {
+            left.merge(right);
+            Ok(left)
+        })
+}
+
+/// Serial fold of aggregator shards from disk. Kept for benchmark
+/// comparisons against the parallel path.
+#[doc(hidden)]
+pub fn merge_aggregator_shards_serial<A: Aggregator>(
+    shards: &[PathBuf],
+    pb: Option<&ProgressBar>,
+) -> Result<A> {
+    let mut total = A::default();
+    for shard in shards {
+        let part: A = load_shard(shard)?;
+        total.merge(part);
+        if let Some(pb) = pb { pb.inc(1); }
+    }
+    Ok(total)
 }
 
 impl RedditETL {
@@ -98,16 +156,12 @@ impl RedditETL {
 
         let pb_merge = if self.opts.progress { Some(make_count_progress(shards.len() as u64, "Aggregate: merge shards")) } else { None };
 
-        let mut total = A::default();
-        let mut merged_shards = 0usize;
-        for shard in shards {
-            let f = File::open(&shard)?;
-            let r = BufReader::new(f);
-            let part: A = serde_json::from_reader(r)?;
-            total.merge(part);
-            merged_shards += 1;
-            if let Some(pb) = &pb_merge { pb.inc(1); }
-        }
+        // Tree-merge shards in parallel. `Aggregator::merge` is required to
+        // be associative (see trait docs); rayon's reduction preserves the
+        // left-to-right ordering of adjacent shards but nests combines
+        // arbitrarily.
+        let total: A = merge_aggregator_shards_parallel(&shards, pb_merge.as_ref())?;
+        let merged_shards = shards.len();
 
         // Atomically publish the final output via tmp + rename so an
         // interrupted run never leaves a half-written `final_out` in place.
