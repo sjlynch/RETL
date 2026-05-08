@@ -346,6 +346,30 @@ RETL cooperates under low memory by adaptively throttling certain stages.
 
 ---
 
+## Benchmarks
+
+The hot inner loops touched by perf work (record filtering, byte-level timestamp rewrite, and zstd line streaming) are covered by a Criterion harness at `benches/inner_loops.rs`. CI does **not** gate PRs on bench output — Criterion's noise floor is too high for a binary pass/fail — but contributors making perf-sensitive changes should run a local before/after comparison:
+
+~~~sh
+# Capture a baseline before your change:
+cargo bench --bench inner_loops -- --save-baseline pre
+
+# After your change, compare against `pre`:
+cargo bench --bench inner_loops -- --baseline pre
+~~~
+
+Criterion will print mean/median/throughput deltas and HTML reports under `target/criterion/`.
+
+A starting-point baseline captured on `main` is committed under `benches/baselines/main/` so contributors have a reference point without rerunning the full suite. The fixture used for all three benchmark groups lives at `benches/data/sample.jsonl` (representative Reddit JSONL).
+
+The three benchmark groups:
+
+- **`for_each_line_cfg`** — streams a precomputed `.zst` and counts lines, varying `read_buf_bytes` across 16K / 64K / 256K to surface buffer-size sensitivity.
+- **`matches_minimal`** — runs `filters::matches_minimal` against subreddit target lists of size 1, 10, and 100 to track linear-scan cost as the list grows.
+- **`rewrite_human_timestamps_bytes`** — measures the byte-level timestamp rewrite both on lines that contain all three timestamp keys (matching path) and on lines that contain none (no-match fast-skip).
+
+---
+
 ## Environment Aids
 
 - **Logging**: respect `RUST_LOG`, e.g.:

@@ -45,7 +45,7 @@ fn apply_human_timestamps(val: &mut Value) {
 /// Safety on substring matching: the JSON spec requires `"` inside string values to be
 /// escaped, so the literal byte sequence `"<key>":` cannot appear inside a string value.
 /// That makes a flat byte search safe for the keys we care about.
-fn rewrite_human_timestamps_bytes(line: &str, buf: &mut String) {
+pub fn rewrite_human_timestamps_bytes(line: &str, buf: &mut String) {
     buf.clear();
     buf.reserve(line.len() + 64);
     let bytes = line.as_bytes();

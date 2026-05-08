@@ -41,3 +41,8 @@ incremental = false
 [dev-dependencies]
 tempfile = "3"
 serial_test = "3"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "inner_loops"
+harness = false
