@@ -115,3 +115,74 @@ pub fn decompress_zst_lines(path: &Path) -> Vec<String> {
     let r = BufReader::new(dec);
     r.lines().map(|l| l.unwrap()).filter(|s| !s.is_empty()).collect()
 }
+
+// -----------------------------------------------------------------------------
+// Helpers added by T11 (tests for zstd corruption / interruption / round-trip).
+// Append-only — do not modify helpers above this line.
+// -----------------------------------------------------------------------------
+
+/// Build a valid `.zst` containing `valid_records` JSONL records (RC-style) and then
+/// **truncate the file** by `truncate_by_bytes` from the END.
+///
+/// The result is a file that is well-formed at the start but missing trailing bytes:
+/// a streaming decoder will succeed for a while and then fail before EOF. Useful for
+/// exercising late/trailing corruption that `IntegrityMode::Quick` sampling can miss.
+///
+/// Records are intentionally chunky (~250 byte payloads) so that even after high
+/// compression the file is large enough that `truncate_by_bytes` (e.g. 256) does not
+/// destroy the entire frame.
+pub fn make_truncated_zst(path: &Path, valid_records: usize, truncate_by_bytes: u64) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut lines = Vec::with_capacity(valid_records);
+    for i in 0..valid_records {
+        lines.push(json!({
+            "id": format!("rec{:06}", i),
+            "author": format!("user_{:04}", i % 256),
+            "subreddit": "programming",
+            "subreddit_id": "t5_x",
+            "link_id": "t3_s1",
+            "parent_id": "t3_s1",
+            "created_utc": 1136073600_i64 + i as i64,
+            "score": (i as i64) % 1000,
+            "ups": (i as i64) % 1000,
+            "controversiality": 0,
+            "stickied": false,
+            "edited": false,
+            "gilded": 0,
+            "distinguished": serde_json::Value::Null,
+            "retrieved_on": 1136075600_i64 + i as i64,
+            "body": format!(
+                "record {} payload — keep this string long enough that even after \
+                 zstd compression the resulting file is comfortably larger than the \
+                 caller's truncation amount, so the truncated tail can be observed \
+                 by a full streaming decode without obliterating the entire frame.",
+                i
+            ),
+        }).to_string());
+    }
+    write_zst_lines(path, &lines);
+
+    let cur_len = fs::metadata(path).unwrap().len();
+    let new_len = cur_len.saturating_sub(truncate_by_bytes);
+    let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    f.set_len(new_len).unwrap();
+}
+
+/// Open a `.zst` file and flip the byte at `byte_offset` (XOR with 0xFF).
+/// Useful for simulating an arbitrary single-bit/byte corruption inside the
+/// compressed stream so that decode errors surface mid-file rather than at EOF.
+pub fn bit_flip_zst(path: &Path, byte_offset: u64) {
+    use std::io::{Read, Seek, SeekFrom, Write as IoWrite};
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    f.seek(SeekFrom::Start(byte_offset)).unwrap();
+    let mut buf = [0u8; 1];
+    f.read_exact(&mut buf).unwrap();
+    buf[0] ^= 0xFF;
+    f.seek(SeekFrom::Start(byte_offset)).unwrap();
+    f.write_all(&buf).unwrap();
+    f.flush().unwrap();
+}

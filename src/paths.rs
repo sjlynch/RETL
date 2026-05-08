@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 /// Type of monthly file.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FileKind {
     Comment,    // RC_YYYY-MM.zst
     Submission, // RS_YYYY-MM.zst

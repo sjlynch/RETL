@@ -59,6 +59,7 @@ where
     E: Sync + Fn(&Value) -> Option<String>,
 {
     use parking_lot::Mutex;
+    use rayon::prelude::*;
     use std::fs::File;
     use std::io::{BufReader, BufWriter};
 
@@ -81,7 +82,7 @@ where
         paths.push(p);
     }
 
-    for p in inputs {
+    inputs.par_iter().try_for_each(|p| -> Result<()> {
         let f = open_with_backoff(p, 16, 50).with_context(|| format!("open {}", p.display()))?;
         let r = BufReader::new(f);
         for line in r.lines() {
@@ -96,7 +97,8 @@ where
                 }
             }
         }
-    }
+        Ok(())
+    })?;
     for w in &writers { w.lock().flush()?; }
     Ok(paths)
 }

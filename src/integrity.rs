@@ -1,6 +1,6 @@
 use crate::paths::{discover_all, plan_files};
 use crate::progress::make_count_progress;
-use crate::util::init_tracing_once;
+use crate::util::{init_tracing_once, with_thread_pool};
 use crate::zstd_jsonl::{quick_validate_zst, validate_zst_full};
 use crate::RedditETL;
 use anyhow::Result;
@@ -28,13 +28,12 @@ impl RedditETL {
     /// - Progress displays one tick per file (not per byte) to avoid noisy output.
     /// - Use `IntegrityMode::Quick { sample_bytes }` for a fast, best-effort pass, or
     ///   `IntegrityMode::Full` to validate the entire stream.
+    ///
+    /// Parallelism is controlled by `.with_parallelism(n)` (passed to a scoped Rayon pool).
+    /// Integrity checks are CPU-bound (decompression), so we run all files through a single
+    /// `par_iter()` and let Rayon schedule them across the pool.
     pub fn check_corpus_integrity(self, mode: IntegrityMode) -> Result<Vec<(PathBuf, String)>> {
         init_tracing_once();
-        if let Some(n) = self.opts.parallelism {
-            if n > 0 {
-                let _ = rayon::ThreadPoolBuilder::new().num_threads(n).build_global();
-            }
-        }
 
         let discovered = discover_all(&self.opts.comments_dir, &self.opts.submissions_dir);
         let files = plan_files(&discovered, self.opts.sources, self.opts.start, self.opts.end);
@@ -51,31 +50,27 @@ impl RedditETL {
 
         let errors = Mutex::new(Vec::<(PathBuf, String)>::new());
 
-        // Bound parallelism to file_concurrency to avoid excessive I/O pressure.
+        let validate = |job: &crate::paths::FileJob| {
+            let res = match mode {
+                IntegrityMode::Quick { sample_bytes } => quick_validate_zst(&job.path, sample_bytes),
+                IntegrityMode::Full => validate_zst_full(&job.path),
+            };
+            if let Err(e) = res {
+                errors.lock().unwrap().push((job.path.clone(), e.to_string()));
+            }
+            if let Some(pb) = &pb {
+                pb.inc(1);
+            }
+        };
+
         if self.opts.file_concurrency <= 1 {
             for job in &files {
-                let res = match mode {
-                    IntegrityMode::Quick { sample_bytes } => quick_validate_zst(&job.path, sample_bytes),
-                    IntegrityMode::Full => validate_zst_full(&job.path),
-                };
-                if let Err(e) = res {
-                    errors.lock().unwrap().push((job.path.clone(), e.to_string()));
-                }
-                if let Some(pb) = &pb { pb.inc(1); }
+                validate(job);
             }
         } else {
-            for chunk in files.chunks(self.opts.file_concurrency) {
-                chunk.par_iter().for_each(|job| {
-                    let res = match mode {
-                        IntegrityMode::Quick { sample_bytes } => quick_validate_zst(&job.path, sample_bytes),
-                        IntegrityMode::Full => validate_zst_full(&job.path),
-                    };
-                    if let Err(e) = res {
-                        errors.lock().unwrap().push((job.path.clone(), e.to_string()));
-                    }
-                    if let Some(pb) = &pb { pb.inc(1); }
-                });
-            }
+            with_thread_pool(self.opts.parallelism, || {
+                files.par_iter().for_each(&validate);
+            });
         }
 
         if let Some(pb) = pb {
