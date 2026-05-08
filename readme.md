@@ -25,6 +25,7 @@
 
 - [Data Layout](#data-layout)
 - [Install](#install)
+- [Command-Line Interface](#command-line-interface)
 - [Quick Start](#quick-start)
 - [Usage Examples](#usage-examples)
   - [Extract to JSONL](#extract-to-jsonl)
@@ -81,16 +82,121 @@ retl = { git = "https://github.com/sjlynch/retl", branch = "main" }
 
 > This repository currently sets `publish = false` in `Cargo.toml`, so installing from crates.io is not expected.
 
-### Build the demo binary
+### Build the CLI binary
 
-This repo also includes a small example binary in `src/main.rs`:
+This repo ships a `retl` binary (`src/main.rs`) that exposes the most common
+ETL operations as subcommands. The original demo lives at
+`examples/quickstart.rs`.
 
 ~~~sh
 cargo build --release
-./target/release/retl
+./target/release/retl --help
 ~~~
 
-The binary demonstrates author collection across a small date window, and is intentionally minimal — the library API is where RETL shines.
+For copy-pasteable per-subcommand invocations, see
+[Command-Line Interface](#command-line-interface) below. The library API is
+still the most flexible surface — the CLI is a thin wrapper over the same
+builder methods.
+
+---
+
+## Command-Line Interface
+
+The `retl` binary exposes five subcommands. All accept a shared set of flags
+(see `retl <subcommand> --help` for the full list):
+
+| Common flag | Purpose |
+| --- | --- |
+| `--data-dir <PATH>` | Corpus base dir (default `./data`). Must contain `comments/` and `submissions/`. |
+| `--work-dir <PATH>` | Scratch directory for sharded writers (default `./etl_work`). |
+| `--start <YYYY-MM>` / `--end <YYYY-MM>` | Inclusive month range. Omit either to leave that side unbounded. |
+| `--source rc\|rs\|both` | Comments only, submissions only, or both (default). |
+| `--subreddit <NAME>` (`-s`) | Subreddit selector. Repeatable; omit for "any subreddit". |
+| `--whitelist a,b,c` | Restrict export to the listed JSON fields (comma-separated). |
+| `--human-timestamps` | Emit `created_utc` as RFC3339 strings. |
+| `--parallelism <N>` / `--file-concurrency <N>` | Rayon threads / concurrent monthly files. |
+| `--no-progress` | Disable progress bars. |
+
+### `scan` — emit unique usernames
+
+Walks the corpus, applies the query selection, and writes one
+deduped username per line to `--out` (or stdout):
+
+~~~sh
+retl scan \
+  --data-dir ./data \
+  --start 2006-01 --end 2006-04 \
+  --subreddit programming --subreddit reddit.com \
+  --out usernames.txt
+~~~
+
+### `export` — extract filtered records
+
+Three formats:
+
+* `--format jsonl` → single stitched `.jsonl` file (default).
+* `--format json`  → single `.json` file containing a JSON array (`--pretty` for pretty-print).
+* `--format spool` → per-source per-month files (`part_RC_YYYY-MM.jsonl`, `part_RS_YYYY-MM.jsonl`) under the directory passed to `--out`. Use this for the parents-pipeline workflow.
+
+~~~sh
+# JSONL with a field whitelist and human timestamps
+retl export \
+  --data-dir ./data \
+  --start 2016-01 --end 2016-03 \
+  --subreddit askscience \
+  --whitelist author,body,created_utc,subreddit,parent_id,link_id,id,score \
+  --human-timestamps \
+  --format jsonl \
+  --out askscience_2016Q1.jsonl
+
+# Spool monthly parts (input for parents pipeline / aggregation)
+retl export --start 2006-01 --end 2006-01 -s programming --format spool --out ./spool
+~~~
+
+### `count` — record counts
+
+Two modes:
+
+* `--mode month` (default) writes `YYYY-MM\tcount` lines to `--out` (or stdout).
+* `--mode author` writes a per-author count TSV to `--out` (required).
+
+~~~sh
+# Records per month, all comments + submissions
+retl count --start 2016-01 --end 2016-12 --subreddit worldnews
+
+# Author-level counts
+retl count --mode author --subreddit programming --start 2006-01 --end 2006-04 --out authors.tsv
+~~~
+
+### `integrity` — validate `.zst` monthly files
+
+~~~sh
+# Quick: decode at most 64 KiB per file
+retl integrity --mode quick --sample-bytes 65536 --source rc --start 2006-02 --end 2006-02
+
+# Full: decode every byte (validates trailing checksum)
+retl integrity --mode full --source both --start 2006-01 --end 2006-04
+~~~
+
+Bad files print one `path<TAB>error` line per failure on stdout and the
+process exits with status `2`.
+
+### `aggregate` — fold JSONL inputs into one JSON
+
+Aggregates one or more JSONL inputs into a single JSON file using a built-in
+record-count aggregator (each input is processed in parallel; per-input shard
+intermediates land under `--shards-dir`, which defaults to `agg_shards/`
+next to `--out`).
+
+~~~sh
+retl aggregate \
+  --out agg.json --pretty \
+  ./spool/part_RC_2006-01.jsonl ./spool/part_RS_2006-01.jsonl
+~~~
+
+For more interesting aggregations, implement `retl::Aggregator` for your own
+type and call `RedditETL::aggregate_jsonls_parallel::<MyAgg>(...)` from a
+small driver — the CLI ships only the simple record-count case.
 
 ---
 
