@@ -126,12 +126,27 @@ fn dedup_single_shard(input: &Path, output: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Maximum consecutive read errors tolerated on a single shard file before
+/// `UsernameStream` gives up on it and advances to the next file. Prevents the
+/// previous behavior where a hard read error spun the iterator forever.
+const MAX_READ_RETRIES_PER_FILE: usize = 3;
+
+#[derive(Debug)]
+enum ReadStep {
+    Yielded(String),
+    Empty,
+    Eof,
+    Retry,
+    GiveUp,
+}
+
 /// A streaming merger that yields deduped usernames from deduped shards.
 pub struct UsernameStream {
     files: Vec<PathBuf>,
     current_idx: usize,
     reader: Option<BufReader<File>>,
     buf: String,
+    current_file_errors: usize,
 }
 
 impl UsernameStream {
@@ -142,6 +157,7 @@ impl UsernameStream {
             current_idx: 0,
             reader: None,
             buf: String::with_capacity(8 * 1024),
+            current_file_errors: 0,
         })
     }
 
@@ -152,7 +168,34 @@ impl UsernameStream {
         let f = File::open(&self.files[self.current_idx])?;
         self.reader = Some(BufReader::new(f));
         self.current_idx += 1;
+        self.current_file_errors = 0;
         Ok(true)
+    }
+
+    fn step<R: BufRead>(buf: &mut String, errors: &mut usize, reader: &mut R) -> ReadStep {
+        buf.clear();
+        match reader.read_line(buf) {
+            Ok(0) => ReadStep::Eof,
+            Ok(_) => {
+                if buf.ends_with('\n') {
+                    let _ = buf.pop();
+                    if buf.ends_with('\r') { let _ = buf.pop(); }
+                }
+                if buf.is_empty() {
+                    ReadStep::Empty
+                } else {
+                    ReadStep::Yielded(buf.clone())
+                }
+            }
+            Err(_) => {
+                *errors += 1;
+                if *errors >= MAX_READ_RETRIES_PER_FILE {
+                    ReadStep::GiveUp
+                } else {
+                    ReadStep::Retry
+                }
+            }
+        }
     }
 }
 
@@ -167,24 +210,108 @@ impl Iterator for UsernameStream {
                 }
             }
             if let Some(reader) = &mut self.reader {
-                self.buf.clear();
-                match reader.read_line(&mut self.buf) {
-                    Ok(0) => {
-                        self.reader = None; // EOF; advance to next file
+                match Self::step(&mut self.buf, &mut self.current_file_errors, reader) {
+                    ReadStep::Yielded(s) => return Some(s),
+                    ReadStep::Empty => continue,
+                    ReadStep::Eof => {
+                        self.reader = None;
                         continue;
                     }
-                    Ok(_) => {
-                        if self.buf.ends_with('\n') {
-                            let _ = self.buf.pop();
-                            if self.buf.ends_with('\r') { let _ = self.buf.pop(); }
-                        }
-                        if !self.buf.is_empty() {
-                            return Some(self.buf.clone());
-                        }
+                    ReadStep::Retry => continue,
+                    ReadStep::GiveUp => {
+                        // open_next post-increments current_idx, so the file we
+                        // just exhausted retries on is at current_idx - 1.
+                        let path = self
+                            .files
+                            .get(self.current_idx.saturating_sub(1))
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "<unknown>".to_string());
+                        tracing::warn!(
+                            path = %path,
+                            attempts = self.current_file_errors,
+                            "UsernameStream: read errors exceeded retry bound; advancing to next file",
+                        );
+                        self.reader = None;
+                        continue;
                     }
-                    Err(_) => continue,
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{self, Cursor, Read};
+    use tempfile::tempdir;
+
+    /// A `Read` impl that always errors. Wrapped in `BufReader` to drive
+    /// `UsernameStream::step` down the `Err(_)` branch deterministically.
+    struct ErroringReader;
+    impl Read for ErroringReader {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::Other, "synthetic read failure"))
+        }
+    }
+
+    #[test]
+    fn streams_lines_in_order_across_files() {
+        let dir = tempdir().unwrap();
+        let p1 = dir.path().join("shard_0000.txt");
+        let p2 = dir.path().join("shard_0001.txt");
+        fs::write(&p1, "alice\nbob\n").unwrap();
+        fs::write(&p2, "carol\n\ndave\r\n").unwrap();
+
+        let stream = UsernameStream::from_deduped_files(vec![p2.clone(), p1.clone()]).unwrap();
+        let got: Vec<String> = stream.collect();
+        // Files are sorted on construction, so shard_0000 comes first, and
+        // empty lines are skipped; trailing \r\n is stripped.
+        assert_eq!(got, vec!["alice", "bob", "carol", "dave"]);
+    }
+
+    #[test]
+    fn step_yields_then_eofs() {
+        let mut reader = Cursor::new(b"hello\nworld\n".to_vec());
+        let mut buf = String::new();
+        let mut errors = 0usize;
+
+        match UsernameStream::step(&mut buf, &mut errors, &mut reader) {
+            ReadStep::Yielded(s) => assert_eq!(s, "hello"),
+            other => panic!("expected Yielded, got {:?}", other),
+        }
+        match UsernameStream::step(&mut buf, &mut errors, &mut reader) {
+            ReadStep::Yielded(s) => assert_eq!(s, "world"),
+            other => panic!("expected Yielded, got {:?}", other),
+        }
+        match UsernameStream::step(&mut buf, &mut errors, &mut reader) {
+            ReadStep::Eof => {}
+            other => panic!("expected Eof, got {:?}", other),
+        }
+        assert_eq!(errors, 0, "no errors should have been counted");
+    }
+
+    #[test]
+    fn step_bounds_retries_on_persistent_read_error() {
+        let mut reader = BufReader::new(ErroringReader);
+        let mut buf = String::new();
+        let mut errors = 0usize;
+
+        // First (MAX-1) errors should signal Retry, leaving the bound intact.
+        for attempt in 1..MAX_READ_RETRIES_PER_FILE {
+            match UsernameStream::step(&mut buf, &mut errors, &mut reader) {
+                ReadStep::Retry => {}
+                other => panic!("attempt {attempt}: expected Retry, got {:?}", other),
+            }
+            assert_eq!(errors, attempt);
+        }
+
+        // The MAX-th error must trip the bound and signal GiveUp so the
+        // iterator advances off the bad file instead of looping forever.
+        match UsernameStream::step(&mut buf, &mut errors, &mut reader) {
+            ReadStep::GiveUp => {}
+            other => panic!("expected GiveUp at bound, got {:?}", other),
+        }
+        assert_eq!(errors, MAX_READ_RETRIES_PER_FILE);
     }
 }
