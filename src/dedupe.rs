@@ -246,7 +246,7 @@ pub fn merge_runs_sorted(
     }
 
     let tmp_out = output.with_extension("ndjson.inprogress");
-    let mut out = crate::util::create_with_backoff(&tmp_out, 16, 50)
+    let out = crate::util::create_with_backoff(&tmp_out, 16, 50)
         .with_context(|| format!("create {}", tmp_out.display()))?;
     let mut out_buf = std::io::BufWriter::with_capacity(cfg.write_buf_bytes, out);
 

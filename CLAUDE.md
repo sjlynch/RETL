@@ -1,0 +1,151 @@
+# CLAUDE.md — orientation for `retl`
+
+`retl` is a streaming ETL toolkit for Reddit's monthly RC (comments) and RS
+(submissions) `.zst` JSONL corpora. It is library-first (`src/lib.rs`); the
+`retl` binary in `src/main.rs` is a thin clap wrapper. `examples/quickstart.rs`
+demonstrates the library API.
+
+## Canonical pipeline
+
+`extract` → `spool` → `parents` → `aggregate`
+
+1. **extract** — discover monthly files, decode the zstd frames as JSONL,
+   filter against a `QuerySpec`, write results.
+2. **spool** — `extract_spool_monthly` writes one file per month to
+   `<out_dir>/_staging/<file>.inprogress`, atomically promotes it on
+   completion, and (when `resume = true`) records `_progress.json`.
+3. **parents** — `ParentIds` collects referenced parent IDs, then
+   `ParentMaps` resolves and stitches parent payloads back onto records.
+4. **aggregate** — `bucketize_shard` → `build_runs_sorted` →
+   `merge_runs_sorted` → `Aggregator` produces sorted, de-duplicated rollups.
+
+`RedditETL` (in `src/pipeline.rs`) is the builder that configures everything;
+`ETLOptions` holds the knobs.
+
+## Minimal-vs-full parse pattern (the hot loop)
+
+The line-level fast path is `zstd_jsonl::MinimalRecord` (a serde struct with
+just the fields we filter on: `subreddit`, `author`, `created_utc`, `score`,
+`id`, plus optional `selftext`/`body`/`title`/`parent_id`/`domain`).
+`parse_minimal(line)` returns it; `filters::matches_minimal` decides
+keep/drop using only that struct.
+
+A full `serde_json::Value` parse is taken **only** when
+`QuerySpec::requires_full_parse()` is true (custom `JsonPointer` keys,
+arbitrary value-level predicates, etc.). Same idea in `KeyExtractor`:
+`key_from_line` uses `parse_minimal` for `author`/`subreddit` keys and falls
+back to `serde_json::Value` for pointer/custom keys.
+
+When you add a new filter or key extractor, prefer extending `MinimalRecord`
+(serde ignores extras, so the cost is trivial) over routing through full
+`Value` parsing.
+
+## Atomic-write invariants
+
+- Every published file is staged at `<out_dir>/_staging/<name>.inprogress`,
+  then promoted to its final path with
+  `util::replace_file_atomic_backoff(tmp, dest)`.
+- Library code **never** writes to a final path directly. If you add a new
+  output, route through `atomic_write::write_jsonl_atomic` /
+  `write_zst_atomic` (or replicate their staging+rename dance) so a crashed
+  run never leaves a partial file readers can mistake for complete output.
+- `replace_file_atomic_backoff` relies on Windows
+  `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` for an atomic swap — readers see
+  either the old or new content, never `NotFound`. Do **not** pre-remove the
+  destination.
+- All open/create/rename/remove go through `*_with_backoff` helpers that
+  retry the transient Windows error codes (5, 32, 33, 225, 433, 1006, 1117,
+  1224, 21) — sharing/AV/USB hiccups. Don't add raw `fs::*` calls in hot
+  publish paths.
+
+## zstd decoding
+
+All decoders set `decoder.window_log_max(31)`. Reddit dumps in later years
+were written with the spec's max window (~2 GiB), and the zstd default
+rejects them with "Frame requires too much memory." If you instantiate a
+decoder, do the same.
+
+`for_each_line_cfg` (and its `_with_skip` / `_with_progress` variants) is
+the canonical reader; prefer it over rolling your own `Decoder`.
+
+## Backpressure invariants
+
+The bucketing/dedupe pipeline is producer→consumer with a bounded crossbeam
+channel between them (see `src/dedupe.rs`):
+
+- Channel capacity is **1**; the producer fills one map while one map is in
+  flight to the writer.
+- `per_flush_cap = inflight_bytes / 2` — the producer flushes a map once
+  it reaches that byte budget. Peak in-memory footprint is bounded by
+  `2 * per_flush_cap = inflight_bytes`.
+- `inflight_bytes` defaults to **256 MiB** and is the primary RAM lever.
+  Lower it for tight environments; do **not** unbound it.
+- `file_concurrency` defaults to **1** because each in-flight zstd frame
+  can hold a multi-GiB decompression window. Bump it only when you've
+  measured RAM headroom.
+
+If you add another stage, give it explicit bounded channels — never
+`unbounded()` between stages on the hot path.
+
+## Resume manifest (`_progress.json`)
+
+When `ETLOptions.resume = true`, `extract_spool_monthly` reads/writes
+`<out_dir>/_progress.json`. Each entry is keyed `RC_YYYY-MM` /
+`RS_YYYY-MM` and stores `{ size, lines, sha256? }`. On re-entry the recorded
+`size` is checked against the on-disk file; mismatches drop the entry and
+re-run that month. Format/version live in `src/progress_manifest.rs`.
+
+## Tracing
+
+`init_tracing_for_binary` (in `util.rs`) is **binary-only**. The library
+must not initialize tracing — the binary owns the subscriber. `main.rs` and
+`examples/quickstart.rs` call it once at startup; nothing else should.
+
+## Taskboard rules (Lattice)
+
+When `$LATTICE_API_URL` is set, "the board" means the Lattice taskboard, not
+Claude Code's task list:
+
+- Create/update tasks via `POST $LATTICE_API_URL/api/tasks/batch`. Do not
+  invent endpoints; check `/api/tasks/...` for what's supported.
+- Lattice routes parallel tasks into separate worktrees; **multiple tasks
+  editing the same lines of the same file conflict at merge time**. When
+  splitting work, partition by file (or by clearly disjoint regions).
+- A task's worktree gets a `LATTICE_TASK.md` with its instructions. Read
+  that first; resume in place if a prior session committed partial work.
+- Lattice merges via `git merge`, so always commit before ending a session.
+- `PATCH /api/tasks/<id>` with `{"description": "..."}` to summarize what
+  actually changed once the task lands in "Ready to Merge".
+
+## Build, test, bench, fuzz
+
+```sh
+cargo build --release
+cargo test
+cargo doc --no-deps --open
+
+cargo bench --bench inner_loops      # criterion harness, defends ahash /
+                                     # byte-rewrite hot loops vs regressions
+cargo bench --bench inner_loops -- --save-baseline <name>
+cargo bench --bench inner_loops -- --baseline <name>
+
+# Fuzz targets live in fuzz/fuzz_targets (cargo-fuzz workspace excluded
+# from the main workspace via Cargo.toml `exclude = ["fuzz"]`).
+cd fuzz && cargo +nightly fuzz run fuzz_parse_minimal
+cd fuzz && cargo +nightly fuzz run fuzz_rewrite_timestamps
+```
+
+## Files worth knowing
+
+- `src/lib.rs` — crate-level rustdoc + public re-exports (read this first).
+- `src/pipeline.rs` — `RedditETL` builder, end-to-end orchestration.
+- `src/streaming.rs` — `stream_job` (per-file scan/write hot loop).
+- `src/zstd_jsonl.rs` — `MinimalRecord`, `parse_minimal`,
+  `for_each_line_cfg`, `window_log_max(31)`.
+- `src/filters.rs` — `matches_minimal` / `matches_full` / `within_bounds`.
+- `src/dedupe.rs` — bounded-channel backpressure, sorted-run dedupe.
+- `src/key_extractor.rs` — `KeyExtractor::key_from_line` fast/slow paths.
+- `src/atomic_write.rs` — staging + atomic publish helpers.
+- `src/progress_manifest.rs` — resume sidecar.
+- `src/util.rs` — `*_with_backoff` I/O retries, `with_thread_pool`,
+  `init_tracing_for_binary`.
