@@ -87,6 +87,18 @@ pub fn build_runs_sorted(
             if !map.is_empty() {
                 run_idx += 1;
                 let run_path = runs_dir.join(format!("run_{:04}.ndjson", run_idx));
+                // Audit: peak in-memory map size is bounded by target_bytes,
+                // which scales adaptively up to max_buf_mb (default 8 GiB) when
+                // free RAM is plentiful — i.e. effectively unbounded relative
+                // to the disk-write consumer rate.
+                tracing::debug!(
+                    target = "retl::backpressure",
+                    stage = "dedupe.build_runs_sorted",
+                    buffered_bytes,
+                    target_bytes,
+                    run_idx,
+                    "flushing run (synchronous write_run_sorted)"
+                );
                 write_run_sorted(&run_path, &mut map, cfg.write_buf_bytes)?;
                 buffered_bytes = 0;
                 run_paths.push(run_path);

@@ -264,6 +264,16 @@ where
 
         // Adaptive flush:
         if total_bytes >= target_bytes || is_low_memory(cfg.soft_low_frac) {
+            // Audit: this branch is the only flush trigger; without explicit
+            // backpressure, total_bytes can ride right up to target_bytes,
+            // which scales to micro_max_buf_mb (default 4 GiB) under high free RAM.
+            tracing::debug!(
+                target = "retl::backpressure",
+                stage = "bucketing.process_bucket_streaming",
+                buffered_bytes = total_bytes,
+                target_bytes,
+                "flushing largest micro-bucket (synchronous handoff to on_group)"
+            );
             flush_largest(&mut maps, &mut mb_bytes, &mut total_bytes)?;
             if is_low_memory(cfg.hard_low_frac) {
                 sleep(Duration::from_millis(cfg.backoff_ms));
