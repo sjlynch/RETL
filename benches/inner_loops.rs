@@ -9,7 +9,7 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use retl::{
     for_each_line_cfg, matches_minimal, parse_minimal, rewrite_human_timestamps_bytes,
-    MinimalRecord, QuerySpec,
+    MinimalRecord, QuerySpec, WhitelistTokenizer,
 };
 use serde_json::Value;
 use std::fs;
@@ -208,10 +208,64 @@ fn bench_rewrite_human_timestamps_bytes(c: &mut Criterion) {
     group.finish();
 }
 
+/// Compare the two-pass `tokenize_into → rewrite_human_timestamps_bytes`
+/// composition against the fused single-pass
+/// `tokenize_and_rewrite_timestamps_into`. The fused method exists to avoid
+/// the second walk over already-projected bytes; the criterion harness here
+/// gates that win against future regressions.
+fn bench_whitelist_with_timestamps(c: &mut Criterion) {
+    let lines = lines_with_all_three_ts();
+    // A realistic Reddit-export whitelist: a handful of small fields that
+    // include the three timestamp keys.
+    let fields = [
+        "id",
+        "author",
+        "subreddit",
+        "body",
+        "score",
+        "created_utc",
+        "retrieved_on",
+        "edited",
+    ];
+    let tok = WhitelistTokenizer::new(fields);
+
+    let total_bytes: u64 = lines.iter().map(|s| s.len() as u64).sum();
+
+    let mut group = c.benchmark_group("whitelist_with_timestamps");
+    group.throughput(Throughput::Bytes(total_bytes));
+
+    group.bench_function("two_pass", |b| {
+        let mut tok_buf = String::with_capacity(4 * 1024);
+        let mut ts_buf = String::with_capacity(4 * 1024);
+        b.iter(|| {
+            for line in lines.iter() {
+                tok.tokenize_into(line, &mut tok_buf)
+                    .expect("tokenize_into");
+                rewrite_human_timestamps_bytes(&tok_buf, &mut ts_buf);
+                black_box(ts_buf.as_str());
+            }
+        });
+    });
+
+    group.bench_function("fused", |b| {
+        let mut buf = String::with_capacity(4 * 1024);
+        b.iter(|| {
+            for line in lines.iter() {
+                tok.tokenize_and_rewrite_timestamps_into(line, &mut buf)
+                    .expect("tokenize_and_rewrite_timestamps_into");
+                black_box(buf.as_str());
+            }
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_for_each_line_cfg,
     bench_matches_minimal,
-    bench_rewrite_human_timestamps_bytes
+    bench_rewrite_human_timestamps_bytes,
+    bench_whitelist_with_timestamps,
 );
 criterion_main!(benches);

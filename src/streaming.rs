@@ -198,17 +198,17 @@ pub fn stream_job<W: Write + ?Sized>(
             // structurally surprising, fall back to the slow Value path so we
             // never regress correctness on an odd record.
             if let Some(tok) = &tokenizer {
-                if tok.tokenize_into(line, &mut tok_buf).is_ok() {
-                    if human_timestamps {
-                        // Compose: run the byte-level timestamp rewriter on the
-                        // already-whitelisted bytes. Merging the two passes is
-                        // possible but premature — defer until profiling shows
-                        // it matters.
-                        rewrite_human_timestamps_bytes(&tok_buf, &mut ts_buf);
-                        writer.write_all(ts_buf.as_bytes())?;
-                    } else {
-                        writer.write_all(tok_buf.as_bytes())?;
-                    }
+                let tok_result = if human_timestamps {
+                    // Fused single-pass: project whitelisted keys AND rewrite
+                    // the three timestamp keys' integer values to RFC3339 in
+                    // one walk over the raw line bytes. Replaces the older
+                    // tokenize_into → rewrite_human_timestamps_bytes chain.
+                    tok.tokenize_and_rewrite_timestamps_into(line, &mut tok_buf)
+                } else {
+                    tok.tokenize_into(line, &mut tok_buf)
+                };
+                if tok_result.is_ok() {
+                    writer.write_all(tok_buf.as_bytes())?;
                     writer.write_all(b"\n")?;
                     written += 1;
                     return Ok(());

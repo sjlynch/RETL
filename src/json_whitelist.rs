@@ -20,6 +20,18 @@
 //! and the caller falls back to the slow path so we never regress correctness.
 
 use ahash::AHashSet;
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
+
+/// Top-level keys whose integer values are rewritten to RFC3339 strings by
+/// [`WhitelistTokenizer::tokenize_and_rewrite_timestamps_into`]. Mirrors the
+/// list in `streaming::rewrite_human_timestamps_bytes`.
+const TIMESTAMP_KEYS: &[&[u8]] = &[b"created_utc", b"retrieved_on", b"edited"];
+
+#[inline]
+fn is_timestamp_key(key: &[u8]) -> bool {
+    TIMESTAMP_KEYS.iter().any(|k| *k == key)
+}
 
 #[derive(Debug)]
 pub enum TokenizerError {
@@ -165,6 +177,167 @@ impl WhitelistTokenizer {
         // Trailing whitespace (none in compact serde output) is tolerated, but
         // any non-ws content after the closing brace means the line wasn't a
         // single top-level object.
+        let tail = skip_ws(bytes, i);
+        if tail != bytes.len() {
+            out.clear();
+            return Err(TokenizerError::Malformed);
+        }
+
+        out.push('}');
+        Ok(())
+    }
+
+    /// Like [`tokenize_into`], but additionally rewrites integer values of the
+    /// three timestamp keys (`created_utc`, `retrieved_on`, `edited`) into
+    /// quoted RFC3339 strings as it copies them to `out`. This fuses the
+    /// whitelist projection and the byte-level human-timestamp rewrite into a
+    /// single pass over the raw JSON line, replacing the two-pass
+    /// `tokenize_into` followed by `rewrite_human_timestamps_bytes` chain in
+    /// `streaming::stream_job` when both transforms are enabled.
+    ///
+    /// Behavior matches the two-pass composition byte-for-byte at the JSON
+    /// value level: non-integer values for the timestamp keys (null, bool,
+    /// floats, strings) are emitted verbatim, integers outside the
+    /// `OffsetDateTime` range are emitted verbatim, and non-timestamp keys are
+    /// always emitted verbatim. On any structural surprise the method returns
+    /// [`TokenizerError::Malformed`] and the caller falls back to the slow
+    /// `serde_json::Value` path.
+    pub fn tokenize_and_rewrite_timestamps_into(
+        &self,
+        line: &str,
+        out: &mut String,
+    ) -> Result<(), TokenizerError> {
+        out.clear();
+        let bytes = line.as_bytes();
+        let mut i = skip_ws(bytes, 0);
+        if i >= bytes.len() || bytes[i] != b'{' {
+            return Err(TokenizerError::Malformed);
+        }
+        i += 1;
+        out.push('{');
+
+        let mut first_pair = true;
+        let mut emitted_any = false;
+        loop {
+            i = skip_ws(bytes, i);
+            if i >= bytes.len() {
+                out.clear();
+                return Err(TokenizerError::Malformed);
+            }
+            if bytes[i] == b'}' {
+                i += 1;
+                break;
+            }
+            if !first_pair {
+                if bytes[i] != b',' {
+                    out.clear();
+                    return Err(TokenizerError::Malformed);
+                }
+                i += 1;
+                i = skip_ws(bytes, i);
+            }
+            first_pair = false;
+
+            // Key string.
+            if i >= bytes.len() || bytes[i] != b'"' {
+                out.clear();
+                return Err(TokenizerError::Malformed);
+            }
+            let key_quoted_start = i;
+            let key_content_start = i + 1;
+            let (key_content_end, key_has_escape) = match scan_string_body(bytes, i + 1) {
+                Some(v) => v,
+                None => {
+                    out.clear();
+                    return Err(TokenizerError::Malformed);
+                }
+            };
+            let key_quoted_end = key_content_end + 1;
+            i = key_quoted_end;
+
+            // ':' separator.
+            i = skip_ws(bytes, i);
+            if i >= bytes.len() || bytes[i] != b':' {
+                out.clear();
+                return Err(TokenizerError::Malformed);
+            }
+            i += 1;
+            i = skip_ws(bytes, i);
+
+            // Value (any JSON value).
+            let value_start = i;
+            let value_end = match skip_value(bytes, i) {
+                Some(e) => e,
+                None => {
+                    out.clear();
+                    return Err(TokenizerError::Malformed);
+                }
+            };
+            i = value_end;
+
+            // Membership test (decoding escaped keys when needed). For the
+            // timestamp special-case we also need the canonical key bytes,
+            // so retain them when we had to decode.
+            let decoded_key: Option<Vec<u8>>;
+            let matched = if key_has_escape {
+                let raw = &bytes[key_quoted_start..key_quoted_end];
+                match serde_json::from_slice::<String>(raw) {
+                    Ok(decoded) => {
+                        let m = self.keys.contains(decoded.as_bytes());
+                        decoded_key = Some(decoded.into_bytes());
+                        m
+                    }
+                    Err(_) => {
+                        out.clear();
+                        return Err(TokenizerError::Malformed);
+                    }
+                }
+            } else {
+                decoded_key = None;
+                self.keys.contains(&bytes[key_content_start..key_content_end])
+            };
+
+            if matched {
+                if emitted_any {
+                    out.push(',');
+                }
+                emitted_any = true;
+                // SAFETY: the slice is from the original `&str`, valid UTF-8.
+                out.push_str(unsafe {
+                    std::str::from_utf8_unchecked(&bytes[key_quoted_start..key_quoted_end])
+                });
+                out.push(':');
+
+                let canonical_key: &[u8] = match &decoded_key {
+                    Some(d) => d.as_slice(),
+                    None => &bytes[key_content_start..key_content_end],
+                };
+
+                let mut rewrote = false;
+                if is_timestamp_key(canonical_key) {
+                    let v_bytes = &bytes[value_start..value_end];
+                    // Plain ASCII slice; from_utf8 is essentially a length check.
+                    if let Ok(s) = std::str::from_utf8(v_bytes) {
+                        if let Ok(n) = s.parse::<i64>() {
+                            if let Ok(dt) = OffsetDateTime::from_unix_timestamp(n) {
+                                if let Ok(formatted) = dt.format(&Rfc3339) {
+                                    out.push('"');
+                                    out.push_str(&formatted);
+                                    out.push('"');
+                                    rewrote = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                if !rewrote {
+                    out.push_str(unsafe {
+                        std::str::from_utf8_unchecked(&bytes[value_start..value_end])
+                    });
+                }
+            }
+        }
+
         let tail = skip_ws(bytes, i);
         if tail != bytes.len() {
             out.clear();
@@ -437,6 +610,151 @@ mod tests {
         let tok = WhitelistTokenizer::new(["a"]);
         let mut out = String::new();
         assert!(tok.tokenize_into(line, &mut out).is_err());
+    }
+
+    // ---------------------------------------------------------------------
+    // Fused tokenize + rewrite-timestamps tests. The fused path must agree
+    // with the two-pass composition (tokenize_into → rewrite_human_timestamps_bytes)
+    // at the JSON-value level on every input the streaming pipeline could see.
+    // ---------------------------------------------------------------------
+
+    /// Reference: existing two-pass composition. Mirrors stream_job's
+    /// whitelist + human_timestamps branch.
+    fn two_pass(line: &str, fields: &[&str]) -> String {
+        let tok = WhitelistTokenizer::new(fields.iter().copied());
+        let mut a = String::new();
+        tok.tokenize_into(line, &mut a).unwrap();
+        let mut b = String::new();
+        crate::streaming::rewrite_human_timestamps_bytes(&a, &mut b);
+        b
+    }
+
+    #[test]
+    fn fused_rewrites_all_three_timestamp_keys() {
+        let line = r#"{"created_utc":1136074600,"retrieved_on":1234567890,"edited":1136074800,"id":"x"}"#;
+        let fields = ["created_utc", "retrieved_on", "edited", "id"];
+        let tok = WhitelistTokenizer::new(fields);
+        let mut out = String::new();
+        tok.tokenize_and_rewrite_timestamps_into(line, &mut out)
+            .unwrap();
+        let expected = two_pass(line, &fields);
+        assert!(equal_as_json(&out, &expected), "out={} expected={}", out, expected);
+        // And explicitly: the integer must have become a quoted RFC3339 string.
+        let got: Value = serde_json::from_str(&out).unwrap();
+        assert!(got.get("created_utc").unwrap().is_string());
+        assert!(got.get("retrieved_on").unwrap().is_string());
+        assert!(got.get("edited").unwrap().is_string());
+        assert!(got.get("id").unwrap().is_string());
+    }
+
+    #[test]
+    fn fused_leaves_timestamp_key_untouched_when_not_whitelisted() {
+        // created_utc not in the whitelist — must be dropped, not rewritten.
+        let line = r#"{"created_utc":1136074600,"id":"abc"}"#;
+        let tok = WhitelistTokenizer::new(["id"]);
+        let mut out = String::new();
+        tok.tokenize_and_rewrite_timestamps_into(line, &mut out)
+            .unwrap();
+        assert!(equal_as_json(&out, &two_pass(line, &["id"])));
+        assert_eq!(out, r#"{"id":"abc"}"#);
+    }
+
+    #[test]
+    fn fused_leaves_non_integer_timestamp_values_alone() {
+        // null, bool, string, float — all must round-trip verbatim.
+        let line = r#"{"edited":null,"created_utc":false,"retrieved_on":"2006-01-01T00:00:00Z"}"#;
+        let fields = ["edited", "created_utc", "retrieved_on"];
+        let tok = WhitelistTokenizer::new(fields);
+        let mut out = String::new();
+        tok.tokenize_and_rewrite_timestamps_into(line, &mut out)
+            .unwrap();
+        assert!(equal_as_json(&out, &two_pass(line, &fields)));
+        let got: Value = serde_json::from_str(&out).unwrap();
+        assert!(got.get("edited").unwrap().is_null());
+        assert_eq!(got.get("created_utc").unwrap().as_bool(), Some(false));
+        assert_eq!(
+            got.get("retrieved_on").unwrap().as_str(),
+            Some("2006-01-01T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn fused_leaves_float_timestamp_alone() {
+        // A fractional `created_utc` is not a JSON integer and must not be
+        // rewritten. Two-pass composition does the same.
+        let line = r#"{"created_utc":1.5}"#;
+        let tok = WhitelistTokenizer::new(["created_utc"]);
+        let mut out = String::new();
+        tok.tokenize_and_rewrite_timestamps_into(line, &mut out)
+            .unwrap();
+        assert!(equal_as_json(&out, &two_pass(line, &["created_utc"])));
+        assert_eq!(out, r#"{"created_utc":1.5}"#);
+    }
+
+    #[test]
+    fn fused_handles_negative_epoch() {
+        let line = r#"{"created_utc":-17280000}"#;
+        let tok = WhitelistTokenizer::new(["created_utc"]);
+        let mut out = String::new();
+        tok.tokenize_and_rewrite_timestamps_into(line, &mut out)
+            .unwrap();
+        let got: Value = serde_json::from_str(&out).unwrap();
+        let s = got.get("created_utc").unwrap().as_str().unwrap();
+        assert!(s.starts_with("1969"), "expected 1969 RFC3339, got {}", s);
+    }
+
+    #[test]
+    fn fused_rewrites_timestamp_keys_only() {
+        // A non-timestamp integer field must be emitted verbatim, even though
+        // it's whitelisted.
+        let line = r#"{"score":42,"created_utc":1136074600}"#;
+        let fields = ["score", "created_utc"];
+        let tok = WhitelistTokenizer::new(fields);
+        let mut out = String::new();
+        tok.tokenize_and_rewrite_timestamps_into(line, &mut out)
+            .unwrap();
+        assert!(equal_as_json(&out, &two_pass(line, &fields)));
+        let got: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(got.get("score").unwrap().as_i64(), Some(42));
+        assert!(got.get("created_utc").unwrap().is_string());
+    }
+
+    #[test]
+    fn fused_preserves_nested_value_bytes() {
+        // Nested object/array values are emitted verbatim as raw bytes.
+        let line = r#"{"created_utc":1136074600,"meta":{"a":[1,2,3]}}"#;
+        let fields = ["created_utc", "meta"];
+        let tok = WhitelistTokenizer::new(fields);
+        let mut out = String::new();
+        tok.tokenize_and_rewrite_timestamps_into(line, &mut out)
+            .unwrap();
+        assert!(equal_as_json(&out, &two_pass(line, &fields)));
+    }
+
+    #[test]
+    fn fused_malformed_returns_error_and_clears_buf() {
+        let line = r#"{"created_utc":}"#;
+        let tok = WhitelistTokenizer::new(["created_utc"]);
+        let mut out = String::from("leftover");
+        assert!(tok
+            .tokenize_and_rewrite_timestamps_into(line, &mut out)
+            .is_err());
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn fused_handles_unicode_escaped_timestamp_key() {
+        // JSON-encoded "created_utc" with the leading 'c' as a \u escape. The
+        // tokenizer must decode the key, recognize it as a timestamp key, and
+        // rewrite the integer.
+        let line = "{\"\\u0063reated_utc\":1136074600}";
+        let tok = WhitelistTokenizer::new(["created_utc"]);
+        let mut out = String::new();
+        tok.tokenize_and_rewrite_timestamps_into(line, &mut out)
+            .unwrap();
+        let got: Value = serde_json::from_str(&out).unwrap();
+        let s = got.get("created_utc").unwrap().as_str().unwrap();
+        assert!(s.contains('T'), "expected RFC3339, got {}", s);
     }
 
     #[test]
