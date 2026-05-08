@@ -4,7 +4,9 @@
 //! Read that returns Err on every call would spin forever. With real files
 //! the OS-level read advances past invalid UTF-8 byte sequences anyway, so
 //! we drive the iterator over:
-//!   - a missing file path (open_next() returns Err -> iterator returns None)
+//!   - a missing file path (open_next() returns Err -> lossy iterator logs
+//!     a warning, advances past the bad file, and returns None when the file
+//!     list is exhausted; callers using try_next() can observe the Err)
 //!   - a file containing invalid UTF-8 (read_line returns Err but bytes are
 //!     consumed; iterator must reach EOF and terminate)
 //!   - a deduped file containing valid lines + a UTF-8 error in the middle.
@@ -49,8 +51,9 @@ fn username_stream_terminates_when_file_does_not_exist() {
             it.collect()
         },
     );
-    // open_next() returns Err for a missing file; the iterator's `.ok()?` short-circuits to None,
-    // so we get an empty stream rather than a panic or hang.
+    // open_next() returns Err for the missing file; the lossy Iterator impl
+    // logs a warning and advances past it, then returns None when the file
+    // list is exhausted. Net result: an empty stream, no panic, no hang.
     assert!(result.is_empty(), "got: {:?}", result);
 }
 
