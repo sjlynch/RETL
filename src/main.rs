@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
 use std::io::{self, BufWriter, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -39,6 +39,11 @@ enum Command {
     Integrity(IntegrityArgs),
     /// Aggregate JSONL inputs into a single JSON file (built-in record-count).
     Aggregate(AggregateArgs),
+    /// Resolve and attach parent comments/submissions onto a spool directory.
+    Parents(ParentsArgs),
+    /// Build a per-author "first-seen" timestamp index TSV.
+    #[command(name = "first-seen")]
+    FirstSeen(FirstSeenArgs),
 }
 
 // -----------------------------------------------------------------------------
@@ -90,6 +95,11 @@ struct CommonOpts {
     /// Subreddit name (repeat for multiple). If none given, all subreddits match.
     #[arg(long = "subreddit", short = 's')]
     subreddits: Vec<String>,
+
+    /// Inflight bytes budget for bucketing/dedupe producer/consumer pairs.
+    /// 0 disables the explicit cap and falls back to memory-fraction sampling.
+    #[arg(long)]
+    inflight_bytes: Option<usize>,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug)]
@@ -129,12 +139,20 @@ struct ExportArgs {
     /// Output format.
     #[arg(long, value_enum, default_value_t = ExportFmt::Jsonl)]
     format: ExportFmt,
-    /// Output destination — file for `jsonl`/`json`, directory for `spool`.
+    /// Output destination — file for `jsonl`/`json` (use `-` for stdout),
+    /// directory for `spool`.
     #[arg(long, short)]
     out: PathBuf,
     /// Pretty-print the JSON array (only with `--format json`).
     #[arg(long)]
     pretty: bool,
+    /// zstd compression level for `.zst` outputs. Clamped to 1..=22 by the library.
+    #[arg(long)]
+    zst_level: Option<i32>,
+    /// Resume a prior `--format spool` run by skipping months already published
+    /// (requires the same `--out` directory and a populated `_progress.json`).
+    #[arg(long)]
+    resume: bool,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug)]
@@ -155,6 +173,7 @@ struct CountArgs {
     #[arg(long, value_enum, default_value_t = CountMode::Month)]
     mode: CountMode,
     /// Output file (default stdout for `month`, required for `author`).
+    /// Pass `-` to stream to stdout when `--mode month`.
     #[arg(long, short)]
     out: Option<PathBuf>,
 }
@@ -199,6 +218,54 @@ struct AggregateArgs {
     /// Pretty-print the final JSON.
     #[arg(long)]
     pretty: bool,
+}
+
+#[derive(Args, Debug)]
+struct ParentsArgs {
+    /// Spool directory containing `part_RC_YYYY-MM.jsonl` /
+    /// `part_RS_YYYY-MM.jsonl` files produced by `retl export --format spool`.
+    #[arg(long)]
+    spool: PathBuf,
+    /// Cache directory for resolved parent shards.
+    #[arg(long)]
+    cache: PathBuf,
+    /// Output directory for spool files with `parent` payloads attached.
+    #[arg(long, short)]
+    out: PathBuf,
+    /// Reuse cache shards and skip already-attached output files.
+    #[arg(long)]
+    resume: bool,
+    /// Months of slack added on each side of the spool's date range when
+    /// scanning the corpus to resolve parent payloads.
+    #[arg(long, default_value_t = 1)]
+    window_months: u32,
+    /// Path to corpus base dir (containing `comments/` and `submissions/`).
+    #[arg(long, default_value = "./data")]
+    data_dir: PathBuf,
+    /// Scratch directory for sharded writers and stitched intermediates.
+    #[arg(long, default_value = "./etl_work")]
+    work_dir: PathBuf,
+    /// Number of Rayon worker threads (defaults to the global pool).
+    #[arg(long)]
+    parallelism: Option<usize>,
+    /// Number of monthly files processed concurrently.
+    #[arg(long)]
+    file_concurrency: Option<usize>,
+    /// Disable progress bars.
+    #[arg(long)]
+    no_progress: bool,
+    /// Inflight bytes budget for bucketing/dedupe producer/consumer pairs.
+    #[arg(long)]
+    inflight_bytes: Option<usize>,
+}
+
+#[derive(Args, Debug)]
+struct FirstSeenArgs {
+    #[command(flatten)]
+    common: CommonOpts,
+    /// Output TSV file: `<author>\t<earliest_created_utc>` per line.
+    #[arg(long, short)]
+    out: PathBuf,
 }
 
 // -----------------------------------------------------------------------------
@@ -254,6 +321,9 @@ fn build_etl(common: &CommonOpts) -> Result<RedditETL> {
     if common.human_timestamps {
         etl = etl.timestamps_human_readable(true);
     }
+    if let Some(b) = common.inflight_bytes {
+        etl = etl.inflight_bytes(b);
+    }
     Ok(etl)
 }
 
@@ -302,13 +372,37 @@ fn run_scan(args: ScanArgs) -> Result<()> {
 }
 
 fn run_export(args: ExportArgs) -> Result<()> {
-    let etl = build_etl(&args.common)?;
+    let mut etl = build_etl(&args.common)?;
+    if let Some(level) = args.zst_level {
+        etl = etl.zst_level(level);
+    }
+    if args.resume {
+        etl = etl.resume(true);
+    }
+    let work_dir = args.common.work_dir.clone();
     let scan = plan!(etl, args.common.subreddits);
+    let to_stdout = args.out == Path::new("-");
 
     match args.format {
-        ExportFmt::Jsonl => scan.extract_to_jsonl(&args.out)?,
-        ExportFmt::Json => scan.extract_to_json(&args.out, args.pretty)?,
+        ExportFmt::Jsonl => {
+            if to_stdout {
+                stream_extract_to_stdout(&work_dir, "stdout.jsonl", |p| scan.extract_to_jsonl(p))?;
+            } else {
+                scan.extract_to_jsonl(&args.out)?;
+            }
+        }
+        ExportFmt::Json => {
+            let pretty = args.pretty;
+            if to_stdout {
+                stream_extract_to_stdout(&work_dir, "stdout.json", |p| scan.extract_to_json(p, pretty))?;
+            } else {
+                scan.extract_to_json(&args.out, pretty)?;
+            }
+        }
         ExportFmt::Spool => {
+            if to_stdout {
+                anyhow::bail!("--out - is not valid for --format spool (it expects a directory)");
+            }
             fs::create_dir_all(&args.out)
                 .with_context(|| format!("creating spool dir {}", args.out.display()))?;
             let (parts, n) = scan.extract_spool_monthly(&args.out)?;
@@ -318,6 +412,42 @@ fn run_export(args: ExportArgs) -> Result<()> {
     Ok(())
 }
 
+/// Run an extraction that writes to a file path, then stream the resulting
+/// file to stdout and remove it. Used to honor `--out -` for
+/// `extract_to_jsonl` / `extract_to_json`, which only know how to write to a
+/// `Path`.
+fn stream_extract_to_stdout(
+    work_dir: &Path,
+    file_stem: &str,
+    extract: impl FnOnce(&Path) -> Result<()>,
+) -> Result<()> {
+    let lib_tmp = work_dir.join("lib_tmp");
+    fs::create_dir_all(&lib_tmp)
+        .with_context(|| format!("creating work_dir {}", lib_tmp.display()))?;
+    let tmp_path = lib_tmp.join(format!("retl_export_{}_{}", std::process::id(), file_stem));
+    let _ = fs::remove_file(&tmp_path);
+
+    let result = extract(&tmp_path);
+
+    if let Err(e) = result {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+
+    let copy_result = (|| -> Result<()> {
+        let mut f = fs::File::open(&tmp_path)
+            .with_context(|| format!("opening export tempfile {}", tmp_path.display()))?;
+        let stdout = io::stdout();
+        let mut w = stdout.lock();
+        io::copy(&mut f, &mut w).context("streaming export to stdout")?;
+        w.flush()?;
+        Ok(())
+    })();
+
+    let _ = fs::remove_file(&tmp_path);
+    copy_result
+}
+
 fn run_count(args: CountArgs) -> Result<()> {
     let etl = build_etl(&args.common)?;
     let scan = plan!(etl, args.common.subreddits);
@@ -325,24 +455,23 @@ fn run_count(args: CountArgs) -> Result<()> {
     match args.mode {
         CountMode::Month => {
             let counts = scan.count_by_month()?;
-            match args.out {
-                Some(path) => {
-                    let f = fs::File::create(&path)
-                        .with_context(|| format!("creating output file {}", path.display()))?;
-                    let mut w = BufWriter::new(f);
-                    for (ym, n) in &counts {
-                        writeln!(w, "{ym}\t{n}")?;
-                    }
-                    w.flush()?;
+            let to_stdout = args.out.as_deref().map_or(true, |p| p == Path::new("-"));
+            if to_stdout {
+                let stdout = io::stdout();
+                let mut w = stdout.lock();
+                for (ym, n) in &counts {
+                    writeln!(w, "{ym}\t{n}")?;
                 }
-                None => {
-                    let stdout = io::stdout();
-                    let mut w = stdout.lock();
-                    for (ym, n) in &counts {
-                        writeln!(w, "{ym}\t{n}")?;
-                    }
-                    w.flush()?;
+                w.flush()?;
+            } else {
+                let path = args.out.unwrap();
+                let f = fs::File::create(&path)
+                    .with_context(|| format!("creating output file {}", path.display()))?;
+                let mut w = BufWriter::new(f);
+                for (ym, n) in &counts {
+                    writeln!(w, "{ym}\t{n}")?;
                 }
+                w.flush()?;
             }
         }
         CountMode::Author => {
@@ -401,6 +530,111 @@ fn run_aggregate(args: AggregateArgs) -> Result<()> {
     Ok(())
 }
 
+fn run_first_seen(args: FirstSeenArgs) -> Result<()> {
+    let etl = build_etl(&args.common)?;
+    let scan = plan!(etl, args.common.subreddits);
+    scan.build_first_seen_index_to_tsv(&args.out)?;
+    Ok(())
+}
+
+/// Discover spool parts in `dir`, parsing `part_RC_YYYY-MM.jsonl` and
+/// `part_RS_YYYY-MM.jsonl` filenames. Returns `(sorted_paths, min, max)`.
+fn discover_spool_parts(dir: &Path) -> Result<(Vec<PathBuf>, YearMonth, YearMonth)> {
+    let entries = fs::read_dir(dir)
+        .with_context(|| format!("reading spool dir {}", dir.display()))?;
+    let mut parts: Vec<(YearMonth, PathBuf)> = Vec::new();
+    for e in entries {
+        let e = e?;
+        let name = e.file_name().to_string_lossy().into_owned();
+        let stem = name
+            .strip_prefix("part_RC_")
+            .or_else(|| name.strip_prefix("part_RS_"))
+            .and_then(|s| s.strip_suffix(".jsonl"));
+        if let Some(stem) = stem {
+            if let Ok(ym) = stem.parse::<YearMonth>() {
+                parts.push((ym, e.path()));
+            }
+        }
+    }
+    if parts.is_empty() {
+        anyhow::bail!(
+            "no part_RC_YYYY-MM.jsonl or part_RS_YYYY-MM.jsonl files found in {}",
+            dir.display()
+        );
+    }
+    parts.sort_by(|a, b| a.1.cmp(&b.1));
+    let min_ym = parts.iter().map(|(ym, _)| *ym).min().unwrap();
+    let max_ym = parts.iter().map(|(ym, _)| *ym).max().unwrap();
+    Ok((parts.into_iter().map(|(_, p)| p).collect(), min_ym, max_ym))
+}
+
+fn run_parents(args: ParentsArgs) -> Result<()> {
+    let (spool_parts, min_ym, max_ym) = discover_spool_parts(&args.spool)?;
+
+    let mut wstart = min_ym;
+    let mut wend = max_ym;
+    for _ in 0..args.window_months {
+        if let Some(p) = wstart.prev() {
+            wstart = p;
+        }
+        if let Some(n) = wend.next() {
+            wend = n;
+        }
+    }
+
+    fs::create_dir_all(&args.cache)
+        .with_context(|| format!("creating cache dir {}", args.cache.display()))?;
+    fs::create_dir_all(&args.out)
+        .with_context(|| format!("creating output dir {}", args.out.display()))?;
+    fs::create_dir_all(&args.work_dir)
+        .with_context(|| format!("creating work_dir {}", args.work_dir.display()))?;
+    let lib_tmp = args.work_dir.join("lib_tmp");
+    fs::create_dir_all(&lib_tmp)
+        .with_context(|| format!("creating work_dir {}", lib_tmp.display()))?;
+
+    let build = |sources: Option<Sources>, range: Option<(YearMonth, YearMonth)>| -> RedditETL {
+        let mut etl = RedditETL::new()
+            .base_dir(&args.data_dir)
+            .work_dir(&lib_tmp)
+            .progress(!args.no_progress);
+        if let Some(s) = sources {
+            etl = etl.sources(s);
+        }
+        if let Some((s, e)) = range {
+            etl = etl.date_range(Some(s), Some(e));
+        }
+        if let Some(p) = args.parallelism {
+            etl = etl.parallelism(p);
+        }
+        if let Some(fc) = args.file_concurrency {
+            etl = etl.file_concurrency(fc);
+        }
+        if let Some(b) = args.inflight_bytes {
+            etl = etl.inflight_bytes(b);
+        }
+        etl
+    };
+
+    let ids = build(None, None).collect_parent_ids_from_jsonls(spool_parts.clone())?;
+    let parents = build(Some(Sources::Both), Some((wstart, wend)))
+        .resolve_parent_maps(&ids, &args.cache, args.resume)?;
+    let attached = build(None, None).attach_parents_jsonls_parallel(
+        spool_parts,
+        &args.out,
+        &parents,
+        args.resume,
+    )?;
+
+    eprintln!(
+        "Attached parents to {} file(s) in {} (resolved over {}..={})",
+        attached.len(),
+        args.out.display(),
+        wstart,
+        wend
+    );
+    Ok(())
+}
+
 // -----------------------------------------------------------------------------
 // Entry point.
 // -----------------------------------------------------------------------------
@@ -414,5 +648,7 @@ fn main() -> Result<()> {
         Command::Count(a) => run_count(a),
         Command::Integrity(a) => run_integrity(a),
         Command::Aggregate(a) => run_aggregate(a),
+        Command::Parents(a) => run_parents(a),
+        Command::FirstSeen(a) => run_first_seen(a),
     }
 }
