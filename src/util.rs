@@ -13,14 +13,6 @@ pub fn init_tracing_for_binary() {
     });
 }
 
-/// Back-compat alias for [`init_tracing_for_binary`]. Pre-existing library
-/// callers route through here while they migrate to a no-op + explicit
-/// binary-side init.
-#[doc(hidden)]
-pub fn init_tracing_once() {
-    init_tracing_for_binary();
-}
-
 // -------- NEW: default bot/service accounts + merging from env/file --------
 
 /// Returns a normalized (lowercase) default list of bot/service authors to exclude.
