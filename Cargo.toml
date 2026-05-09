@@ -36,6 +36,12 @@ crossbeam-channel = "0.5"
 [features]
 default = []
 
+# Exposes test-only hooks (e.g. the bounded-channel buffered-bytes metric on
+# `process_bucket_streaming`) that integration tests use to assert backpressure
+# invariants. Carries no overhead in production builds — gated parameters are
+# entirely absent from the function signatures when this feature is off.
+test-utils = []
+
 [profile.release]
 opt-level = 3
 lto = "fat"
@@ -55,3 +61,7 @@ criterion = { version = "0.5", features = ["html_reports"] }
 [[bench]]
 name = "inner_loops"
 harness = false
+
+[[test]]
+name = "backpressure_bucketing"
+required-features = ["test-utils"]
