@@ -62,7 +62,7 @@ pub use crate::util::{open_with_backoff, create_with_backoff, remove_with_backof
 pub use crate::util::{init_tracing_for_binary, with_thread_pool};
 
 //export bucketing & json utils to application code
-pub use crate::bucketing::{BucketingCfg, partition_stage1, bucketize_shard, process_bucket_streaming};
+pub use crate::bucketing::{BucketingCfg, partition_stage1, bucketize_shards, process_bucket_streaming};
 pub use crate::json_utils::{author_lower, subreddit_lower, is_comment_record};
 
 // export NDJSON helpers
