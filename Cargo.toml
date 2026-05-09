@@ -35,9 +35,14 @@ crossbeam-channel = "0.5"
 
 [features]
 default = []
-# Exposes test-only injection points (e.g. `set_available_memory_fraction_for_tests`)
-# so integration tests under `tests/` can drive code paths that depend on
-# process-global state. Off by default; production binaries carry no overhead.
+# Exposes test-only injection points and hooks used by integration tests:
+#   * `set_available_memory_fraction_for_tests` (see `src/mem.rs`) lets tests
+#     drive process-global memory-pressure state deterministically.
+#   * the bounded-channel buffered-bytes metric on `process_bucket_streaming`
+#     lets tests assert backpressure invariants.
+# Off by default; production builds (`--no-default-features`) carry no
+# overhead — gated parameters are absent from function signatures when the
+# feature is off.
 test-utils = []
 
 [profile.release]
@@ -65,4 +70,11 @@ harness = false
 [[test]]
 name = "mem_throttle"
 path = "tests/mem_throttle.rs"
+required-features = ["test-utils"]
+
+# `backpressure_bucketing` asserts the bounded-channel invariants on
+# `process_bucket_streaming` using the `test-utils`-gated buffered-bytes
+# metric. Run with `cargo test --features test-utils`.
+[[test]]
+name = "backpressure_bucketing"
 required-features = ["test-utils"]
