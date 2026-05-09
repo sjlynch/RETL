@@ -26,6 +26,7 @@
 - [Data Layout](#data-layout)
 - [Install](#install)
 - [Command-Line Interface](#command-line-interface)
+- [Quick CLI start](#quick-cli-start)
 - [Quick Start](#quick-start)
 - [Usage Examples](#usage-examples)
   - [Extract to JSONL](#extract-to-jsonl)
@@ -35,9 +36,12 @@
   - [Author Analytics (TSV)](#author-analytics-tsv)
   - [Parents Pipeline (Attach Parent Content)](#parents-pipeline-attach-parent-content)
   - [Integrity Checks](#integrity-checks)
-- [Performance & Tuning](#performance--tuning)
-- [Environment Aids](#environment-aids)
+- [Performance and tuning](#performance-and-tuning)
+- [Benchmarks](#benchmarks)
+- [Environment variables](#environment-variables)
+- [Fuzzing](#fuzzing)
 - [License](#license)
+- [Project Goals](#project-goals)
 
 ---
 
@@ -197,6 +201,46 @@ retl aggregate \
 For more interesting aggregations, implement `retl::Aggregator` for your own
 type and call `RedditETL::aggregate_jsonls_parallel::<MyAgg>(...)` from a
 small driver — the CLI ships only the simple record-count case.
+
+---
+
+## Quick CLI start
+
+If you just want to drive RETL from a shell, build the binary once and use
+the subcommands directly:
+
+~~~sh
+cargo build --release
+./target/release/retl --help
+./target/release/retl export --help
+~~~
+
+Count comments in `r/programming` for one month:
+
+~~~sh
+./target/release/retl count \
+  --data-dir ./data \
+  --start 2006-01 --end 2006-01 \
+  --subreddit programming
+~~~
+
+Export filtered records to JSONL with a field whitelist and human-readable
+timestamps:
+
+~~~sh
+./target/release/retl export \
+  --data-dir ./data \
+  --start 2016-01 --end 2016-03 \
+  --subreddit askscience \
+  --whitelist author,body,created_utc,subreddit,parent_id,link_id,id,score \
+  --human-timestamps \
+  --format jsonl \
+  --out askscience_2016Q1.jsonl
+~~~
+
+See [Command-Line Interface](#command-line-interface) for every subcommand
+and flag. The library API below exposes the same builder methods if you need
+finer-grained control or want to embed RETL in a larger Rust program.
 
 ---
 
@@ -415,7 +459,6 @@ let bad_quick = RedditETL::new()
     .progress(false)
     .check_corpus_integrity(IntegrityMode::Quick { sample_bytes: 64 * 1024 })?;
 
-<<<<<<< HEAD
 let bad_full = RedditETL::new()
     .base_dir("./data")
     .sources(Sources::Comments)
@@ -425,54 +468,6 @@ let bad_full = RedditETL::new()
 ~~~
 
 ---
-
-## Performance & Tuning
-
-- **Parallelism**: set Rayon threads based on your hardware:
-  ~~~rust
-  .parallelism(24)
-  ~~~
-- **File concurrency**: limit how many monthly files are decoded at once (helps with RAM/IO pressure):
-  ~~~rust
-  .file_concurrency(4)
-  ~~~
-- **Buffers**: tune read/write buffers if you’re IO‑bound:
-  ~~~rust
-  .io_buffers(256 * 1024, 256 * 1024)
-  ~~~
-- **Work directory**: point scratch space to fast storage:
-  ~~~rust
-  .work_dir("/mnt/nvme/etl_tmp")
-  ~~~
-- **Progress**: toggle progress bars and custom labels:
-  ~~~rust
-  .progress(true).progress_label("Counting")
-  ~~~
-
-RETL cooperates under low memory by adaptively throttling certain stages.
-
----
-
-## Environment Aids
-
-- **Logging**: respect `RUST_LOG`, e.g.:
-  ~~~sh
-  RUST_LOG=info cargo run --release
-  ~~~
-- **Exclude bots**: start from a conservative default list and extend via env/file:
-  - `ETL_EXCLUDE_AUTHORS="bot_a, bot_b, service_c"`
-  - `ETL_EXCLUDE_AUTHORS_FILE=/path/to/extra_exclusions.txt`
-  Then use:
-  ~~~rust
-  .exclude_common_bots()
-  ~~~
-
----
-=======
-for (path, err) in bad {
-    eprintln!("{}: {err}", path.display());
-}
-```
 
 ## Performance and tuning
 
@@ -496,6 +491,8 @@ corpora:
 RETL throttles cooperatively when system memory falls below a threshold; you
 do not need to manage this manually.
 
+---
+
 ## Benchmarks
 
 The hot inner loops touched by perf work (record filtering, byte-level
@@ -504,13 +501,13 @@ harness at `benches/inner_loops.rs`. CI does not gate PRs on bench output —
 Criterion's noise floor is too high for a binary pass/fail — but contributors
 making perf-sensitive changes should run a local before/after comparison:
 
-```sh
+~~~sh
 # Capture a baseline before your change:
 cargo bench --bench inner_loops -- --save-baseline pre
 
 # After your change, compare against `pre`:
 cargo bench --bench inner_loops -- --baseline pre
-```
+~~~
 
 Criterion will print mean/median/throughput deltas and HTML reports under
 `target/criterion/`.
@@ -532,6 +529,8 @@ The three benchmark groups:
   rewrite both on lines that contain all three timestamp keys (matching
   path) and on lines that contain none (no-match fast-skip).
 
+---
+
 ## Environment variables
 
 - `RUST_LOG` — standard `tracing` filter (e.g. `RUST_LOG=info`).
@@ -542,6 +541,8 @@ The three benchmark groups:
 
 The merged exclusion list is applied by `.exclude_common_bots()` on a
 `ScanPlan`.
+
+---
 
 ## Fuzzing
 
@@ -557,16 +558,16 @@ for the two functions that walk attacker-controlled bytes:
 
 Setup (one-time):
 
-```sh
+~~~sh
 cargo install cargo-fuzz
 rustup toolchain install nightly
-```
+~~~
 
 The `fuzz/` crate is pre-scaffolded — no `cargo fuzz init` needed. Two
 targets live under `fuzz/fuzz_targets/`, each seeded with ~50 inputs at
 `fuzz/corpus/<target>/`:
 
-```sh
+~~~sh
 # Walks &str → parse_minimal; any panic/abort is a finding.
 cargo +nightly fuzz run fuzz_parse_minimal -- -max_total_time=300
 
@@ -576,7 +577,7 @@ cargo +nightly fuzz run fuzz_parse_minimal -- -max_total_time=300
 # (c) on shallow top-level objects, the byte path matches the slow path
 #     (apply_human_timestamps applied to the parsed Value).
 cargo +nightly fuzz run fuzz_rewrite_timestamps -- -max_total_time=300
-```
+~~~
 
 The seed corpora include real Reddit-shaped JSONL lines plus adversarial
 inputs: bodies that contain `\"created_utc\":` substrings (must be left
@@ -595,7 +596,8 @@ Triage:
 
 Fuzzing is **not** wired into CI by default — it runs on demand under
 nightly because libfuzzer is a nightly-only sanitizer.
->>>>>>> 707a4869d404a4bfd8c7b78d2683d49fa8e1af8d
+
+---
 
 ## License
 
