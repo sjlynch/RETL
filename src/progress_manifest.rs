@@ -120,11 +120,6 @@ impl ManifestAccumulator {
         save(&self.out_dir, &snapshot)
     }
 
-    /// Snapshot the set of currently-known month keys.
-    pub fn snapshot_keys(&self) -> std::collections::HashSet<String> {
-        self.months.lock().keys().cloned().collect()
-    }
-
     /// Snapshot of current entries (for tests / inspection).
     #[cfg(test)]
     pub fn snapshot(&self) -> HashMap<String, MonthEntry> {
