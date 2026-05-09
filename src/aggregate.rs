@@ -17,6 +17,12 @@ use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// Read buffer for ingesting JSONL into per-shard aggregate state. Smaller
+/// than the corpus-scan buffer because aggregate inputs are stitched JSONL
+/// (one record per line, already filtered) — large reads add latency without
+/// throughput.
+const AGGREGATE_INGEST_BUF_BYTES: usize = 16 * 1024;
+
 /// State that ingests JSON records and folds together with peer states.
 ///
 /// `merge` MUST be associative: for any states `a`, `b`, `c`,
@@ -86,6 +92,130 @@ pub fn merge_aggregator_shards_serial<A: Aggregator>(
     Ok(total)
 }
 
+/// Phase 1: build per-input aggregator shards in parallel.
+///
+/// Each input is ingested into a fresh `A::default()` and atomically written
+/// to `<shards_dir>/agg_<stem>.json` via the staging + rename dance. Per-input
+/// failures are surfaced via `tracing::warn!` and counted, not propagated, so
+/// one bad input doesn't sink the run.
+///
+/// Returns the count of inputs that hit a fatal shard-build error or a
+/// tolerated mid-file read error (built and will merge, but from a partial
+/// read of the input).
+fn build_aggregate_shards<A: Aggregator>(
+    inputs: &[PathBuf],
+    shards_dir: &Path,
+    progress: bool,
+) -> usize {
+    let pb_build = if progress {
+        Some(make_count_progress(inputs.len() as u64, "Aggregate: build shards"))
+    } else {
+        None
+    };
+
+    let shard_errors = AtomicUsize::new(0);
+    inputs.par_iter().for_each(|input| {
+        let out_shard = shard_name_for_input(shards_dir, input);
+        let tmp_shard = out_shard.with_extension("json.inprogress");
+
+        let result = (|| -> Result<bool> {
+            let mut agg = A::default();
+            let had_read_error = for_each_jsonl_line_cfg(input, AGGREGATE_INGEST_BUF_BYTES, |line| {
+                if !line.is_empty() {
+                    if let Ok(v) = serde_json::from_str::<Value>(line) {
+                        agg.ingest(&v);
+                    }
+                }
+                Ok(())
+            })?;
+            let out = File::create(&tmp_shard)?;
+            let mut w = BufWriter::new(out);
+            serde_json::to_writer(&mut w, &agg)?;
+            w.flush()?;
+            drop(w);
+            replace_file_atomic_backoff(&tmp_shard, &out_shard)?;
+            Ok(had_read_error)
+        })();
+
+        match result {
+            Err(e) => {
+                shard_errors.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(path=%out_shard.display(), error=%e, "failed building aggregate shard");
+                // Best-effort cleanup of any partial temp file.
+                let _ = fs::remove_file(&tmp_shard);
+            }
+            // Shard built and will be merged, but the input was only
+            // partially read (a transient I/O error was tolerated mid-file).
+            // Count it so (built, errors) reflects the partial coverage.
+            Ok(true) => {
+                shard_errors.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(false) => {}
+        }
+
+        if let Some(pb) = &pb_build { pb.inc(1); }
+    });
+
+    if let Some(pb) = pb_build { pb.finish_with_message("Aggregate: shard build done"); }
+
+    shard_errors.into_inner()
+}
+
+/// Phases 2 + 3: discover shards in `shards_dir`, tree-merge them, and
+/// atomically publish the merged result to `final_out`.
+///
+/// Only `*.json` shards are considered — leftover `*.inprogress` temps from
+/// prior failures are skipped. The final output goes through the same
+/// staging + `replace_file_atomic_backoff` dance as the shards so an
+/// interrupted run never leaves a half-written `final_out` in place.
+///
+/// Returns the number of shards successfully folded into the final output.
+fn publish_aggregated_final<A: Aggregator>(
+    shards_dir: &Path,
+    final_out: &Path,
+    pretty: bool,
+    progress: bool,
+) -> Result<usize> {
+    // Merge shards. Only consider successfully-written shard files
+    // (skip any leftover `.inprogress` temps from prior failures).
+    let mut shards: Vec<PathBuf> = fs::read_dir(shards_dir)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
+        .collect();
+    shards.sort();
+
+    let pb_merge = if progress {
+        Some(make_count_progress(shards.len() as u64, "Aggregate: merge shards"))
+    } else {
+        None
+    };
+
+    // Tree-merge shards in parallel. `Aggregator::merge` is required to
+    // be associative (see trait docs); rayon's reduction preserves the
+    // left-to-right ordering of adjacent shards but nests combines
+    // arbitrarily.
+    let total: A = merge_aggregator_shards_parallel(&shards, pb_merge.as_ref())?;
+    let merged_shards = shards.len();
+
+    // Atomically publish the final output via tmp + rename so an
+    // interrupted run never leaves a half-written `final_out` in place.
+    let tmp_final = final_out.with_extension("json.inprogress");
+    {
+        let out = File::create(&tmp_final)?;
+        let mut w = BufWriter::new(out);
+        if pretty {
+            serde_json::to_writer_pretty(&mut w, &total)?;
+        } else {
+            serde_json::to_writer(&mut w, &total)?;
+        }
+        w.flush()?;
+    }
+    replace_file_atomic_backoff(&tmp_final, final_out)?;
+
+    if let Some(pb) = pb_merge { pb.finish_with_message("Aggregate: final written"); }
+    Ok(merged_shards)
+}
+
 impl RedditETL {
     /// Build per-file aggregation shards in parallel, then merge into `final_out`.
     /// - Always rebuilds shards (no resume behavior).
@@ -105,90 +235,8 @@ impl RedditETL {
         pretty: bool,
     ) -> Result<(usize, usize)> {
         fs::create_dir_all(shards_dir)?;
-
-        let pb_build = if self.opts.progress { Some(make_count_progress(inputs.len() as u64, "Aggregate: build shards")) } else { None };
-
-        // Build shards in parallel (always rebuild). Per-input failures are
-        // surfaced via tracing and counted, not silently swallowed.
-        let shard_errors = AtomicUsize::new(0);
-        inputs.par_iter().for_each(|input| {
-            let out_shard = shard_name_for_input(shards_dir, input);
-            let tmp_shard = out_shard.with_extension("json.inprogress");
-
-            let result = (|| -> Result<bool> {
-                let mut agg = A::default();
-                let had_read_error = for_each_jsonl_line_cfg(input, 16 * 1024, |line| {
-                    if !line.is_empty() {
-                        if let Ok(v) = serde_json::from_str::<Value>(line) {
-                            agg.ingest(&v);
-                        }
-                    }
-                    Ok(())
-                })?;
-                let out = File::create(&tmp_shard)?;
-                let mut w = BufWriter::new(out);
-                serde_json::to_writer(&mut w, &agg)?;
-                w.flush()?;
-                drop(w);
-                replace_file_atomic_backoff(&tmp_shard, &out_shard)?;
-                Ok(had_read_error)
-            })();
-
-            match result {
-                Err(e) => {
-                    shard_errors.fetch_add(1, Ordering::Relaxed);
-                    tracing::warn!(path=%out_shard.display(), error=%e, "failed building aggregate shard");
-                    // Best-effort cleanup of any partial temp file.
-                    let _ = fs::remove_file(&tmp_shard);
-                }
-                // Shard built and will be merged, but the input was only
-                // partially read (a transient I/O error was tolerated mid-file).
-                // Count it so (built, errors) reflects the partial coverage.
-                Ok(true) => {
-                    shard_errors.fetch_add(1, Ordering::Relaxed);
-                }
-                Ok(false) => {}
-            }
-
-            if let Some(pb) = &pb_build { pb.inc(1); }
-        });
-        let shard_errors = shard_errors.into_inner();
-
-        if let Some(pb) = pb_build { pb.finish_with_message("Aggregate: shard build done"); }
-
-        // Merge shards. Only consider successfully-written shard files
-        // (skip any leftover `.inprogress` temps from prior failures).
-        let mut shards: Vec<PathBuf> = fs::read_dir(shards_dir)?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
-            .collect();
-        shards.sort();
-
-        let pb_merge = if self.opts.progress { Some(make_count_progress(shards.len() as u64, "Aggregate: merge shards")) } else { None };
-
-        // Tree-merge shards in parallel. `Aggregator::merge` is required to
-        // be associative (see trait docs); rayon's reduction preserves the
-        // left-to-right ordering of adjacent shards but nests combines
-        // arbitrarily.
-        let total: A = merge_aggregator_shards_parallel(&shards, pb_merge.as_ref())?;
-        let merged_shards = shards.len();
-
-        // Atomically publish the final output via tmp + rename so an
-        // interrupted run never leaves a half-written `final_out` in place.
-        let tmp_final = final_out.with_extension("json.inprogress");
-        {
-            let out = File::create(&tmp_final)?;
-            let mut w = BufWriter::new(out);
-            if pretty {
-                serde_json::to_writer_pretty(&mut w, &total)?;
-            } else {
-                serde_json::to_writer(&mut w, &total)?;
-            }
-            w.flush()?;
-        }
-        replace_file_atomic_backoff(&tmp_final, final_out)?;
-
-        if let Some(pb) = pb_merge { pb.finish_with_message("Aggregate: final written"); }
+        let shard_errors = build_aggregate_shards::<A>(&inputs, shards_dir, self.opts.progress);
+        let merged_shards = publish_aggregated_final::<A>(shards_dir, final_out, pretty, self.opts.progress)?;
         Ok((merged_shards, shard_errors))
     }
 }
