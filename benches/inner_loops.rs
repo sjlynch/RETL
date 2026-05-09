@@ -8,7 +8,8 @@
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use retl::{
-    for_each_line_cfg, matches_minimal, parse_minimal, rewrite_human_timestamps_bytes,
+    bucketize_shards, for_each_line_cfg, matches_minimal, parse_minimal, partition_stage1,
+    process_bucket_streaming, rewrite_human_timestamps_bytes, BucketingCfg, KeyExtractor,
     MinimalRecord, QuerySpec, WhitelistTokenizer,
 };
 use serde_json::Value;
@@ -261,11 +262,186 @@ fn bench_whitelist_with_timestamps(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// `bucketing` group
+//
+// Defends the perf change that dropped per-line `serde_json::Value` parses in
+// `partition_stage1`, `bucketize_shards`, and `process_bucket_streaming` in
+// favor of `KeyExtractor::key_from_line` (which uses the `MinimalRecord` fast
+// path), and that parallelized stage 2 across input shards via rayon.
+//
+// Each bench:
+//   - materializes a plain NDJSON fixture once into a temp dir (replicated
+//     fixture lines, ~tens of MB) so the inner-loop work dominates per-iter
+//     overhead.
+//   - runs the full stage on that fixture inside `b.iter`.
+//
+// Compare baselines:
+//   cargo bench --bench inner_loops -- --save-baseline pre  (before change)
+//   cargo bench --bench inner_loops -- --baseline pre       (after change)
+//
+// Perf bound: the new code path elides ~1-3 KiB of per-line allocations per
+// record (the `serde_json::Value` DOM), so we expect ≥2x throughput
+// improvement on these benches.
+// ---------------------------------------------------------------------------
+
+/// Replication factor for the bucketing fixtures. Bigger than ZST_REPLICAS
+/// since these benches run plain NDJSON (no decompression overhead) so we
+/// need more rows for the per-line work to dominate.
+const BUCKETING_REPLICAS: usize = 1500;
+
+/// Materialize a plain NDJSON fixture (fixture lines replicated `BUCKETING_REPLICAS`
+/// times) at a stable temp path. Built once per process; reused by every bucketing
+/// bench. Returns `(path, total_bytes)`.
+fn ndjson_fixture() -> &'static (PathBuf, u64) {
+    static F: OnceLock<(PathBuf, u64)> = OnceLock::new();
+    F.get_or_init(|| {
+        let dir = std::env::temp_dir().join("retl-bench-fixtures");
+        fs::create_dir_all(&dir).expect("create bench fixture dir");
+        let path = dir.join(format!("inner_loops_bucketing_x{BUCKETING_REPLICAS}.jsonl"));
+        let bytes_per_pass: u64 = lines().iter().map(|l| l.len() as u64 + 1).sum();
+        let total = bytes_per_pass * BUCKETING_REPLICAS as u64;
+        if !path.exists() {
+            let f = fs::File::create(&path).expect("create ndjson fixture");
+            let mut w = std::io::BufWriter::with_capacity(1 << 20, f);
+            for _ in 0..BUCKETING_REPLICAS {
+                for line in lines() {
+                    w.write_all(line.as_bytes()).expect("write line");
+                    w.write_all(b"\n").expect("write newline");
+                }
+            }
+            w.flush().expect("flush ndjson fixture");
+        }
+        (path, total)
+    })
+}
+
+fn bench_partition_stage1(c: &mut Criterion) {
+    let (in_path, total_bytes) = ndjson_fixture();
+    let inputs = vec![in_path.clone()];
+
+    let mut group = c.benchmark_group("bucketing/partition_stage1");
+    group.throughput(Throughput::Bytes(*total_bytes));
+    group.sample_size(10);
+
+    let key = KeyExtractor::author_lowercase_fast();
+    group.bench_function("author_lower_fast/8shards", |b| {
+        b.iter_with_setup(
+            || {
+                let dir = tempfile::Builder::new()
+                    .prefix("retl-bench-stage1-")
+                    .tempdir()
+                    .expect("tempdir");
+                dir
+            },
+            |dir| {
+                let out = dir.path();
+                let paths = partition_stage1(&inputs, out, 8, &key)
+                    .expect("partition_stage1");
+                black_box(paths);
+            },
+        );
+    });
+
+    group.finish();
+}
+
+fn bench_bucketize_shards(c: &mut Criterion) {
+    let (in_path, total_bytes) = ndjson_fixture();
+
+    // Materialize stage1 shards once, outside the timed region.
+    static SHARDS: OnceLock<(tempfile::TempDir, Vec<PathBuf>)> = OnceLock::new();
+    let (_keep, shards) = SHARDS.get_or_init(|| {
+        let dir = tempfile::Builder::new()
+            .prefix("retl-bench-stage1-fixture-")
+            .tempdir()
+            .expect("tempdir");
+        let key = KeyExtractor::author_lowercase_fast();
+        let paths = partition_stage1(&[in_path.clone()], dir.path(), 8, &key)
+            .expect("partition_stage1 fixture");
+        (dir, paths)
+    });
+
+    let mut group = c.benchmark_group("bucketing/bucketize_shards");
+    group.throughput(Throughput::Bytes(*total_bytes));
+    group.sample_size(10);
+
+    let key = KeyExtractor::author_lowercase_fast();
+    group.bench_function("author_lower_fast/4buckets", |b| {
+        b.iter_with_setup(
+            || {
+                tempfile::Builder::new()
+                    .prefix("retl-bench-stage2-")
+                    .tempdir()
+                    .expect("tempdir")
+            },
+            |dir| {
+                let out = dir.path();
+                let paths = bucketize_shards(shards, out, 4, &key)
+                    .expect("bucketize_shards");
+                black_box(paths);
+            },
+        );
+    });
+
+    group.finish();
+}
+
+fn bench_process_bucket_streaming(c: &mut Criterion) {
+    let (in_path, total_bytes) = ndjson_fixture();
+
+    let mut group = c.benchmark_group("bucketing/process_bucket_streaming");
+    group.throughput(Throughput::Bytes(*total_bytes));
+    group.sample_size(10);
+
+    // Generous in-memory budget so flush/backpressure overhead doesn't
+    // dominate; this bench is about the per-line read+key-extract loop.
+    let cfg = BucketingCfg {
+        soft_low_frac: 0.0,
+        hard_low_frac: 0.0,
+        high_frac: 1.0,
+        backoff_ms: 0,
+        micro_min_buf_mb: 256,
+        micro_max_buf_mb: 256,
+        adapt_cooldown_ms: 1_000,
+        inflight_bytes: 0,
+        inflight_groups: 8,
+    };
+    let key = KeyExtractor::author_lowercase_fast();
+
+    group.bench_function("author_lower_fast/4microbuckets", |b| {
+        b.iter(|| {
+            let mut groups: u64 = 0;
+            process_bucket_streaming(
+                in_path,
+                4,
+                &cfg,
+                |_k, v| {
+                    groups += v.len() as u64;
+                    Ok(())
+                },
+                &key,
+                // Match the cfg-gated `buffered_bytes_metric` parameter when
+                // benches are run under `--features test-utils`.
+                #[cfg(feature = "test-utils")]
+                None,
+            )
+            .expect("process_bucket_streaming");
+            black_box(groups);
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_for_each_line_cfg,
     bench_matches_minimal,
     bench_rewrite_human_timestamps_bytes,
     bench_whitelist_with_timestamps,
+    bench_partition_stage1,
+    bench_bucketize_shards,
+    bench_process_bucket_streaming,
 );
 criterion_main!(benches);

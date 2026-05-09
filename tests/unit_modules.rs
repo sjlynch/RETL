@@ -11,7 +11,7 @@ mod common;
 
 use common::*;
 use retl::{
-    build_runs_sorted, bucketize_shard, merge_runs_sorted, partition_stage1,
+    build_runs_sorted, bucketize_shards, merge_runs_sorted, partition_stage1,
     process_bucket_streaming, BucketingCfg, DedupeCfg, KeyExtractor, NdjsonReader,
     NdjsonWriter, ShardedKVWriter,
 };
@@ -135,11 +135,12 @@ fn bucketing_partition_stage1_routes_all_records_and_is_deterministic() {
 
     // Run partition twice; bytes/line counts and per-shard totals must match exactly.
     fn run(in_path: &std::path::Path, out: &std::path::Path) -> Vec<PathBuf> {
+        let key = KeyExtractor::author_lowercase_fast();
         partition_stage1(
             std::slice::from_ref(&in_path.to_path_buf()),
             out,
             8,
-            |v: &Value| v.get("author").and_then(|a| a.as_str()).map(|s| s.to_lowercase()),
+            &key,
         )
         .unwrap()
     }
@@ -214,6 +215,7 @@ fn bucketing_process_bucket_streaming_drives_adaptive_flush_with_10k_records() {
         inflight_groups: 8,
     };
 
+    let key = KeyExtractor::author_lowercase_fast();
     let mut groups_seen: usize = 0;
     let mut totals: BTreeMap<String, usize> = BTreeMap::new();
     process_bucket_streaming(
@@ -225,7 +227,12 @@ fn bucketing_process_bucket_streaming_drives_adaptive_flush_with_10k_records() {
             *totals.entry(k.to_string()).or_insert(0) += v.len();
             Ok(())
         },
-        |v: &Value| v.get("author").and_then(|a| a.as_str()).map(|s| s.to_lowercase()),
+        &key,
+        // The `test-utils` feature adds a buffered-bytes metric arg used by
+        // tests/backpressure_bucketing.rs. This test doesn't observe that
+        // metric, but must still pass `None` when the feature is enabled.
+        #[cfg(feature = "test-utils")]
+        None,
     )
     .unwrap();
 
@@ -266,11 +273,12 @@ fn bucketing_bucketize_shard_splits_into_n_buckets() {
     let shard = dir.path().join("stage1_0000.jsonl");
     write_ndjson(&shard, &lines);
 
-    let buckets = bucketize_shard(
-        &shard,
+    let key = KeyExtractor::author_lowercase_fast();
+    let buckets = bucketize_shards(
+        std::slice::from_ref(&shard),
         &dir.path().join("buckets"),
         4,
-        |v: &Value| v.get("author").and_then(|a| a.as_str()).map(|s| s.to_lowercase()),
+        &key,
     )
     .unwrap();
 
