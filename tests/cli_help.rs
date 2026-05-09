@@ -19,7 +19,33 @@ fn root_help_lists_all_subcommands() {
         .and(contains("export"))
         .and(contains("count"))
         .and(contains("integrity"))
-        .and(contains("aggregate"));
+        .and(contains("aggregate"))
+        .and(contains("parents"))
+        .and(contains("first-seen"));
+    assert.stdout(pred);
+}
+
+#[test]
+fn parents_help_advertises_required_flags() {
+    let assert = retl().args(["parents", "--help"]).assert().success();
+    let pred = contains("--spool")
+        .and(contains("--cache"))
+        .and(contains("--out"))
+        .and(contains("--window-months"))
+        .and(contains("--resume"));
+    assert.stdout(pred);
+}
+
+#[test]
+fn first_seen_help_advertises_out() {
+    let assert = retl().args(["first-seen", "--help"]).assert().success();
+    assert.stdout(contains("--out"));
+}
+
+#[test]
+fn export_help_advertises_zst_level_and_resume() {
+    let assert = retl().args(["export", "--help"]).assert().success();
+    let pred = contains("--zst-level").and(contains("--resume"));
     assert.stdout(pred);
 }
 

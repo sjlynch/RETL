@@ -1,6 +1,6 @@
 use crate::paths::{discover_all, plan_files};
 use crate::progress::make_count_progress;
-use crate::util::{init_tracing_once, with_thread_pool};
+use crate::util::with_thread_pool;
 use crate::zstd_jsonl::{quick_validate_zst, validate_zst_full};
 use crate::RedditETL;
 use anyhow::Result;
@@ -33,8 +33,6 @@ impl RedditETL {
     /// Integrity checks are CPU-bound (decompression), so we run all files through a single
     /// `par_iter()` and let Rayon schedule them across the pool.
     pub fn check_corpus_integrity(self, mode: IntegrityMode) -> Result<Vec<(PathBuf, String)>> {
-        init_tracing_once();
-
         let discovered = discover_all(&self.opts.comments_dir, &self.opts.submissions_dir);
         let files = plan_files(&discovered, self.opts.sources, self.opts.start, self.opts.end);
 

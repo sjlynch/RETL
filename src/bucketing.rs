@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use ahash::RandomState;
-use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
 use std::hash::{BuildHasher, Hash, Hasher};
@@ -9,6 +8,10 @@ use std::path::{Path, PathBuf};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "test-utils")]
+use std::sync::{atomic::{AtomicUsize, Ordering as AtomicOrdering}, Arc};
+
+use crate::key_extractor::KeyExtractor;
 use crate::mem::{available_memory_fraction, is_low_memory};
 use crate::util::open_with_backoff;
 
@@ -58,19 +61,19 @@ fn stable_index(state: &RandomState, key: &str, parts: usize) -> usize {
     (h.finish() as usize) % parts.max(1)
 }
 
-/// Stage 1: shard arbitrary NDJSON inputs by a key extractor into `shards` files.
+/// Stage 1: shard arbitrary NDJSON inputs by `key` into `shards` files.
 /// Output files are named: `stage1_XXXX.jsonl`.
 ///
-/// `extract_key(&Value) -> Option<String>` decides which key to route on (e.g., author).
-pub fn partition_stage1<E>(
+/// `key` decides which routing key to use (e.g. author). Avoids the
+/// per-line `serde_json::Value` DOM parse by going through
+/// [`KeyExtractor::key_from_line`], which uses the `MinimalRecord` fast path
+/// for the common Reddit fields.
+pub fn partition_stage1(
     inputs: &[PathBuf],
     out_dir: &Path,
     shards: usize,
-    extract_key: E,
-) -> Result<Vec<PathBuf>>
-where
-    E: Sync + Fn(&Value) -> Option<String>,
-{
+    key: &KeyExtractor,
+) -> Result<Vec<PathBuf>> {
     use parking_lot::Mutex;
     use rayon::prelude::*;
     use std::fs::File;
@@ -97,17 +100,26 @@ where
 
     inputs.par_iter().try_for_each(|p| -> Result<()> {
         let f = open_with_backoff(p, 16, 50).with_context(|| format!("open {}", p.display()))?;
-        let r = BufReader::new(f);
-        for line in r.lines() {
-            let line = line?;
+        let mut r = BufReader::new(f);
+        // Reusable line buffer — avoids the per-line String allocation from
+        // `BufReader::lines()` (mirrors `zstd_jsonl::for_each_line_attempt`).
+        let mut line = String::with_capacity(16 * 1024);
+        loop {
+            line.clear();
+            let n = r.read_line(&mut line)?;
+            if n == 0 { break; }
+            // Strip trailing \r?\n so the slice fed to KeyExtractor matches
+            // what extractors see in the rest of the pipeline.
+            if line.ends_with('\n') {
+                line.pop();
+                if line.ends_with('\r') { line.pop(); }
+            }
             if line.is_empty() { continue; }
-            if let Ok(v) = serde_json::from_str::<Value>(&line) {
-                if let Some(key) = extract_key(&v) {
-                    let idx = stable_index(&rs, &key, shards);
-                    let mut w = writers[idx].lock();
-                    w.write_all(line.as_bytes())?;
-                    w.write_all(b"\n")?;
-                }
+            if let Some(k) = key.key_from_line(&line) {
+                let idx = stable_index(&rs, &k, shards);
+                let mut w = writers[idx].lock();
+                w.write_all(line.as_bytes())?;
+                w.write_all(b"\n")?;
             }
         }
         Ok(())
@@ -116,13 +128,21 @@ where
     Ok(paths)
 }
 
-/// Stage 2: re-bucket a Stage 1 shard into `buckets` files by the **same key extractor**.
+/// Stage 2: re-bucket Stage 1 shards into `buckets` files by the **same key**.
 /// Output files are named: `bucket_XXXX.jsonl`.
-pub fn bucketize_shard<E>(shard: &Path, out_dir: &Path, buckets: usize, extract_key: E) -> Result<Vec<PathBuf>>
-where
-    E: Fn(&Value) -> Option<String>,
-{
+///
+/// Parallelizes across the input shards via rayon — Stage 1 was parallelized
+/// previously; Stage 2 now matches it. Drops the per-line
+/// `serde_json::Value` parse (uses [`KeyExtractor::key_from_line`]) and reads
+/// lines into a reusable `String` buffer.
+pub fn bucketize_shards(
+    shards: &[PathBuf],
+    out_dir: &Path,
+    buckets: usize,
+    key: &KeyExtractor,
+) -> Result<Vec<PathBuf>> {
     use parking_lot::Mutex;
+    use rayon::prelude::*;
     use std::fs::File;
     use std::io::{BufReader, BufWriter};
 
@@ -145,20 +165,30 @@ where
         paths.push(p);
     }
 
-    let f = open_with_backoff(shard, 16, 50).with_context(|| format!("open {}", shard.display()))?;
-    let r = BufReader::new(f);
-    for line in r.lines() {
-        let line = line?;
-        if line.is_empty() { continue; }
-        if let Ok(v) = serde_json::from_str::<Value>(&line) {
-            if let Some(key) = extract_key(&v) {
-                let idx = stable_index(&rs, &key, buckets);
+    shards.par_iter().try_for_each(|shard| -> Result<()> {
+        let f = open_with_backoff(shard, 16, 50)
+            .with_context(|| format!("open {}", shard.display()))?;
+        let mut r = BufReader::new(f);
+        let mut line = String::with_capacity(16 * 1024);
+        loop {
+            line.clear();
+            let n = r.read_line(&mut line)?;
+            if n == 0 { break; }
+            if line.ends_with('\n') {
+                line.pop();
+                if line.ends_with('\r') { line.pop(); }
+            }
+            if line.is_empty() { continue; }
+            if let Some(k) = key.key_from_line(&line) {
+                let idx = stable_index(&rs, &k, buckets);
                 let mut w = writers[idx].lock();
                 w.write_all(line.as_bytes())?;
                 w.write_all(b"\n")?;
             }
         }
-    }
+        Ok(())
+    })?;
+
     for w in &writers { w.lock().flush()?; }
     Ok(paths)
 }
@@ -177,17 +207,28 @@ where
 /// the consumer falls behind, so the producer stalls instead of growing
 /// in-memory hash maps to multi-GiB peaks.
 ///
-/// `extract_key` must be consistent with Stage 1/2 to preserve routing consistency.
-pub fn process_bucket_streaming<F, E>(
+/// `key` must be consistent with Stage 1/2 to preserve routing consistency.
+/// Lines are read into a reusable `String` buffer and the routing key is
+/// extracted via [`KeyExtractor::key_from_line`] — no per-line
+/// `serde_json::Value` allocation.
+///
+/// The `buffered_bytes_metric` parameter is a test-only hook gated behind
+/// `cfg(any(test, feature="test-utils"))` — when `Some`, the producer writes
+/// the current in-memory buffered byte count to the supplied atomic after
+/// every line and after every flush, so tests can verify the bounded channel
+/// caps memory. Production builds (no `test-utils`) do not see this argument
+/// at all and carry zero overhead.
+pub fn process_bucket_streaming<F>(
     bucket: &Path,
     micro_buckets: usize,
     cfg: &BucketingCfg,
     mut on_group: F,
-    extract_key: E,
+    key: &KeyExtractor,
+    #[cfg(feature = "test-utils")]
+    buffered_bytes_metric: Option<Arc<AtomicUsize>>,
 ) -> Result<()>
 where
     F: FnMut(&str, Vec<String>) -> Result<()> + Send,
-    E: Fn(&Value) -> Option<String>,
 {
     // Open the input bucket; skip gracefully if missing.
     let file = match open_with_backoff(bucket, 16, 50) {
@@ -200,7 +241,7 @@ where
             return Err(e).with_context(|| format!("open {}", bucket.display()));
         }
     };
-    let r = BufReader::new(file);
+    let mut r = BufReader::new(file);
 
     // Deterministic sharding for micro-buckets (in-memory).
     let rs = RandomState::with_seeds(
@@ -277,20 +318,34 @@ where
         };
 
         let producer_result: Result<()> = (|| -> Result<()> {
-            for line in r.lines() {
-                let line = line?;
+            // Reusable line buffer — avoids the per-line String allocation
+            // from `BufReader::lines()` and the per-line
+            // `serde_json::from_str::<Value>` DOM parse.
+            let mut line = String::with_capacity(16 * 1024);
+            loop {
+                line.clear();
+                let n = r.read_line(&mut line)?;
+                if n == 0 { break; }
+                if line.ends_with('\n') {
+                    line.pop();
+                    if line.ends_with('\r') { line.pop(); }
+                }
                 if line.is_empty() { continue; }
-                let v: Value = match serde_json::from_str(&line) { Ok(x) => x, Err(_) => continue };
 
-                let key = match extract_key(&v) { Some(x) => x, None => continue };
-                let idx = stable_index(&rs, &key, mb_count);
-
-                let e = maps[idx].entry(key).or_default();
-                e.push(line.clone());
+                let k = match key.key_from_line(&line) { Some(x) => x, None => continue };
+                let idx = stable_index(&rs, &k, mb_count);
 
                 let add = line.len() + 1;
+                let entry = maps[idx].entry(k).or_default();
+                entry.push(line.clone());
+
                 mb_bytes[idx] += add;
                 total_bytes += add;
+
+                #[cfg(feature = "test-utils")]
+                if let Some(m) = buffered_bytes_metric.as_ref() {
+                    m.store(total_bytes, AtomicOrdering::Relaxed);
+                }
 
                 if last_eval.elapsed() >= Duration::from_millis(cfg.adapt_cooldown_ms) {
                     let free = available_memory_fraction();
@@ -320,6 +375,10 @@ where
                     if flush_largest(&mut maps, &mut mb_bytes, &mut total_bytes).is_err() {
                         // consumer dropped rx (errored); break and let join surface it
                         break;
+                    }
+                    #[cfg(feature = "test-utils")]
+                    if let Some(m) = buffered_bytes_metric.as_ref() {
+                        m.store(total_bytes, AtomicOrdering::Relaxed);
                     }
                     if is_low_memory(cfg.hard_low_frac) {
                         sleep(Duration::from_millis(cfg.backoff_ms));
