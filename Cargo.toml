@@ -35,11 +35,14 @@ crossbeam-channel = "0.5"
 
 [features]
 default = []
-
-# Exposes test-only hooks (e.g. the bounded-channel buffered-bytes metric on
-# `process_bucket_streaming`) that integration tests use to assert backpressure
-# invariants. Carries no overhead in production builds — gated parameters are
-# entirely absent from the function signatures when this feature is off.
+# Exposes test-only injection points and hooks used by integration tests:
+#   * `set_available_memory_fraction_for_tests` (see `src/mem.rs`) lets tests
+#     drive process-global memory-pressure state deterministically.
+#   * the bounded-channel buffered-bytes metric on `process_bucket_streaming`
+#     lets tests assert backpressure invariants.
+# Off by default; production builds (`--no-default-features`) carry no
+# overhead — gated parameters are absent from function signatures when the
+# feature is off.
 test-utils = []
 
 [profile.release]
@@ -62,6 +65,16 @@ criterion = { version = "0.5", features = ["html_reports"] }
 name = "inner_loops"
 harness = false
 
+# `mem_throttle` drives a test-only setter that lives behind the `test-utils`
+# feature gate (see `src/mem.rs`). Run with `cargo test --features test-utils`.
+[[test]]
+name = "mem_throttle"
+path = "tests/mem_throttle.rs"
+required-features = ["test-utils"]
+
+# `backpressure_bucketing` asserts the bounded-channel invariants on
+# `process_bucket_streaming` using the `test-utils`-gated buffered-bytes
+# metric. Run with `cargo test --features test-utils`.
 [[test]]
 name = "backpressure_bucketing"
 required-features = ["test-utils"]
