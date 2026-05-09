@@ -1,10 +1,10 @@
+use crate::shard_common;
 use ahash::RandomState;
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::hash::{BuildHasher, Hash, Hasher};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
@@ -26,20 +26,13 @@ impl ShardedKVWriter {
             let p = dir.join(format!("kv_{:04}.tmp", i));
             shards.push(Mutex::new(BufWriter::new(File::create(p)?)));
         }
-        let state = RandomState::with_seeds(
-            0x0123_4567_89ab_cdef,
-            0xfedc_ba98_7654_3210,
-            0xcafe_babe_dead_beef,
-            0xface_feed_0bad_f00d,
-        );
+        let state = shard_common::seeded_state("kv");
         Ok(Self { base_dir: dir, shards, count, state })
     }
 
     #[inline]
     fn shard_index(&self, k: &str) -> usize {
-        let mut h = self.state.build_hasher();
-        k.hash(&mut h);
-        (h.finish() as usize) % self.count
+        shard_common::shard_index(&self.state, k, self.count)
     }
 
     pub fn write_kv(&self, key: &str, val: i64) -> Result<()> {

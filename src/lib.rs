@@ -100,6 +100,7 @@ mod config;
 mod date;
 mod paths;
 mod zstd_jsonl;
+mod shard_common;
 mod shard;
 mod query;
 mod kv_shard;
