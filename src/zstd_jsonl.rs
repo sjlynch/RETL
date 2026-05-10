@@ -353,35 +353,7 @@ fn for_each_line_attempt<'borrow, 'cb: 'borrow>(
     Ok(())
 }
 
-// ----------------------------- Integrity checks ----------------------------------
-
-/// QUICK check: attempt to decode up to `max_decompressed_bytes` and stop.
-pub fn quick_validate_zst(path: &Path, max_decompressed_bytes: u64) -> Result<()> {
-    let file = open_with_backoff(path, 16, 50)?;
-    let mut decoder = Decoder::new(file)?;
-    decoder.window_log_max(ZSTD_WINDOW_LOG_MAX)?;
-    let mut limited = decoder.take(max_decompressed_bytes);
-    // Discard output; we only care about whether decoding produces an error.
-    io::copy(&mut limited, &mut io::sink())?;
-    Ok(())
-}
-
-/// FULL check: decode the entire stream to EOF.
-///
-/// When the file was produced with `Encoder::include_checksum(true)` (zstd
-/// frames carry a trailing XXH64 over the original uncompressed data), the
-/// stock `zstd::Decoder` validates that checksum during decode and surfaces
-/// a mismatch as an error from `read`/`io::copy`. So decoding to EOF here
-/// is sufficient to verify the trailing checksum — no separate XXH64 pass
-/// is needed. (Bit-flips inside compressed payloads typically also fail
-/// earlier with a frame/entropy decode error.)
-pub fn validate_zst_full(path: &Path) -> Result<()> {
-    let file = open_with_backoff(path, 16, 50)?;
-    let mut decoder = Decoder::new(file)?;
-    decoder.window_log_max(ZSTD_WINDOW_LOG_MAX)?;
-    io::copy(&mut decoder, &mut io::sink())?;
-    Ok(())
-}
+pub use crate::integrity::{quick_validate_zst, validate_zst_full};
 
 #[cfg(test)]
 mod tests {
