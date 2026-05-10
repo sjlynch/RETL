@@ -110,7 +110,6 @@ mod progress;
 mod stitch;
 mod concurrency;
 mod streaming;
-mod counting;
 mod util;
 mod mem;
 mod atomic_write;

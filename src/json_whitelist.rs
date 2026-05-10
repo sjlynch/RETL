@@ -67,6 +67,70 @@ impl WhitelistTokenizer {
     /// fields to `out`. `out` is cleared on entry. On error `out` is left empty
     /// and the caller should use the slow path.
     pub fn tokenize_into(&self, line: &str, out: &mut String) -> Result<(), TokenizerError> {
+        self.tokenize_with(line, out, |_key, raw, out| {
+            // SAFETY: bytes are a sub-slice of the original `&str`, which is
+            // valid UTF-8. `from_utf8_unchecked` avoids re-validating.
+            out.push_str(unsafe { std::str::from_utf8_unchecked(raw) });
+        })
+    }
+
+    /// Like [`tokenize_into`], but additionally rewrites integer values of the
+    /// three timestamp keys (`created_utc`, `retrieved_on`, `edited`) into
+    /// quoted RFC3339 strings as it copies them to `out`. This fuses the
+    /// whitelist projection and the byte-level human-timestamp rewrite into a
+    /// single pass over the raw JSON line, replacing the two-pass
+    /// `tokenize_into` followed by `rewrite_human_timestamps_bytes` chain in
+    /// `streaming::stream_job` when both transforms are enabled.
+    ///
+    /// Behavior matches the two-pass composition byte-for-byte at the JSON
+    /// value level: non-integer values for the timestamp keys (null, bool,
+    /// floats, strings) are emitted verbatim, integers outside the
+    /// `OffsetDateTime` range are emitted verbatim, and non-timestamp keys are
+    /// always emitted verbatim. On any structural surprise the method returns
+    /// [`TokenizerError::Malformed`] and the caller falls back to the slow
+    /// `serde_json::Value` path.
+    pub fn tokenize_and_rewrite_timestamps_into(
+        &self,
+        line: &str,
+        out: &mut String,
+    ) -> Result<(), TokenizerError> {
+        self.tokenize_with(line, out, |key, raw, out| {
+            if is_timestamp_key(key) {
+                // Plain ASCII slice; from_utf8 is essentially a length check.
+                if let Ok(s) = std::str::from_utf8(raw) {
+                    if let Ok(n) = s.parse::<i64>() {
+                        if let Ok(dt) = OffsetDateTime::from_unix_timestamp(n) {
+                            if let Ok(formatted) = dt.format(&Rfc3339) {
+                                out.push('"');
+                                out.push_str(&formatted);
+                                out.push('"');
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+            // SAFETY: bytes are a sub-slice of the original `&str`, valid UTF-8.
+            out.push_str(unsafe { std::str::from_utf8_unchecked(raw) });
+        })
+    }
+
+    /// Shared parser body for the two public methods. Walks `line` once,
+    /// emitting a compact JSON object of whitelisted top-level fields to
+    /// `out`. For each matched pair the key bytes (verbatim from the input)
+    /// and `:` are written, then `emit_value` is invoked with the canonical
+    /// (escape-decoded) key bytes and the raw value bytes, and decides what
+    /// to write for the value.
+    #[inline]
+    fn tokenize_with<F>(
+        &self,
+        line: &str,
+        out: &mut String,
+        emit_value: F,
+    ) -> Result<(), TokenizerError>
+    where
+        F: Fn(&[u8], &[u8], &mut String),
+    {
         out.clear();
         let bytes = line.as_bytes();
         let mut i = skip_ws(bytes, 0);
@@ -143,141 +207,9 @@ impl WhitelistTokenizer {
             // Membership test. Plain ASCII keys (the common case) hit the fast
             // raw-byte path. If the JSON key contains a backslash escape the
             // key bytes don't equal their decoded form, so we ask serde_json
-            // for the canonical decoding before checking the whitelist.
-            let matched = if key_has_escape {
-                let raw = &bytes[key_quoted_start..key_quoted_end];
-                match serde_json::from_slice::<String>(raw) {
-                    Ok(decoded) => self.keys.contains(decoded.as_bytes()),
-                    Err(_) => {
-                        out.clear();
-                        return Err(TokenizerError::Malformed);
-                    }
-                }
-            } else {
-                self.keys.contains(&bytes[key_content_start..key_content_end])
-            };
-
-            if matched {
-                if emitted_any {
-                    out.push(',');
-                }
-                emitted_any = true;
-                // SAFETY: bytes are a sub-slice of the original `&str`, which is
-                // valid UTF-8. `from_utf8_unchecked` avoids re-validating.
-                out.push_str(unsafe {
-                    std::str::from_utf8_unchecked(&bytes[key_quoted_start..key_quoted_end])
-                });
-                out.push(':');
-                out.push_str(unsafe {
-                    std::str::from_utf8_unchecked(&bytes[value_start..value_end])
-                });
-            }
-        }
-
-        // Trailing whitespace (none in compact serde output) is tolerated, but
-        // any non-ws content after the closing brace means the line wasn't a
-        // single top-level object.
-        let tail = skip_ws(bytes, i);
-        if tail != bytes.len() {
-            out.clear();
-            return Err(TokenizerError::Malformed);
-        }
-
-        out.push('}');
-        Ok(())
-    }
-
-    /// Like [`tokenize_into`], but additionally rewrites integer values of the
-    /// three timestamp keys (`created_utc`, `retrieved_on`, `edited`) into
-    /// quoted RFC3339 strings as it copies them to `out`. This fuses the
-    /// whitelist projection and the byte-level human-timestamp rewrite into a
-    /// single pass over the raw JSON line, replacing the two-pass
-    /// `tokenize_into` followed by `rewrite_human_timestamps_bytes` chain in
-    /// `streaming::stream_job` when both transforms are enabled.
-    ///
-    /// Behavior matches the two-pass composition byte-for-byte at the JSON
-    /// value level: non-integer values for the timestamp keys (null, bool,
-    /// floats, strings) are emitted verbatim, integers outside the
-    /// `OffsetDateTime` range are emitted verbatim, and non-timestamp keys are
-    /// always emitted verbatim. On any structural surprise the method returns
-    /// [`TokenizerError::Malformed`] and the caller falls back to the slow
-    /// `serde_json::Value` path.
-    pub fn tokenize_and_rewrite_timestamps_into(
-        &self,
-        line: &str,
-        out: &mut String,
-    ) -> Result<(), TokenizerError> {
-        out.clear();
-        let bytes = line.as_bytes();
-        let mut i = skip_ws(bytes, 0);
-        if i >= bytes.len() || bytes[i] != b'{' {
-            return Err(TokenizerError::Malformed);
-        }
-        i += 1;
-        out.push('{');
-
-        let mut first_pair = true;
-        let mut emitted_any = false;
-        loop {
-            i = skip_ws(bytes, i);
-            if i >= bytes.len() {
-                out.clear();
-                return Err(TokenizerError::Malformed);
-            }
-            if bytes[i] == b'}' {
-                i += 1;
-                break;
-            }
-            if !first_pair {
-                if bytes[i] != b',' {
-                    out.clear();
-                    return Err(TokenizerError::Malformed);
-                }
-                i += 1;
-                i = skip_ws(bytes, i);
-            }
-            first_pair = false;
-
-            // Key string.
-            if i >= bytes.len() || bytes[i] != b'"' {
-                out.clear();
-                return Err(TokenizerError::Malformed);
-            }
-            let key_quoted_start = i;
-            let key_content_start = i + 1;
-            let (key_content_end, key_has_escape) = match scan_string_body(bytes, i + 1) {
-                Some(v) => v,
-                None => {
-                    out.clear();
-                    return Err(TokenizerError::Malformed);
-                }
-            };
-            let key_quoted_end = key_content_end + 1;
-            i = key_quoted_end;
-
-            // ':' separator.
-            i = skip_ws(bytes, i);
-            if i >= bytes.len() || bytes[i] != b':' {
-                out.clear();
-                return Err(TokenizerError::Malformed);
-            }
-            i += 1;
-            i = skip_ws(bytes, i);
-
-            // Value (any JSON value).
-            let value_start = i;
-            let value_end = match skip_value(bytes, i) {
-                Some(e) => e,
-                None => {
-                    out.clear();
-                    return Err(TokenizerError::Malformed);
-                }
-            };
-            i = value_end;
-
-            // Membership test (decoding escaped keys when needed). For the
-            // timestamp special-case we also need the canonical key bytes,
-            // so retain them when we had to decode.
+            // for the canonical decoding before checking the whitelist. The
+            // decoded bytes are retained so `emit_value` can also see the
+            // canonical key (needed for the timestamp-rewrite special case).
             let decoded_key: Option<Vec<u8>>;
             let matched = if key_has_escape {
                 let raw = &bytes[key_quoted_start..key_quoted_end];
@@ -302,7 +234,8 @@ impl WhitelistTokenizer {
                     out.push(',');
                 }
                 emitted_any = true;
-                // SAFETY: the slice is from the original `&str`, valid UTF-8.
+                // SAFETY: bytes are a sub-slice of the original `&str`, which is
+                // valid UTF-8. `from_utf8_unchecked` avoids re-validating.
                 out.push_str(unsafe {
                     std::str::from_utf8_unchecked(&bytes[key_quoted_start..key_quoted_end])
                 });
@@ -313,31 +246,13 @@ impl WhitelistTokenizer {
                     None => &bytes[key_content_start..key_content_end],
                 };
 
-                let mut rewrote = false;
-                if is_timestamp_key(canonical_key) {
-                    let v_bytes = &bytes[value_start..value_end];
-                    // Plain ASCII slice; from_utf8 is essentially a length check.
-                    if let Ok(s) = std::str::from_utf8(v_bytes) {
-                        if let Ok(n) = s.parse::<i64>() {
-                            if let Ok(dt) = OffsetDateTime::from_unix_timestamp(n) {
-                                if let Ok(formatted) = dt.format(&Rfc3339) {
-                                    out.push('"');
-                                    out.push_str(&formatted);
-                                    out.push('"');
-                                    rewrote = true;
-                                }
-                            }
-                        }
-                    }
-                }
-                if !rewrote {
-                    out.push_str(unsafe {
-                        std::str::from_utf8_unchecked(&bytes[value_start..value_end])
-                    });
-                }
+                emit_value(canonical_key, &bytes[value_start..value_end], out);
             }
         }
 
+        // Trailing whitespace (none in compact serde output) is tolerated, but
+        // any non-ws content after the closing brace means the line wasn't a
+        // single top-level object.
         let tail = skip_ws(bytes, i);
         if tail != bytes.len() {
             out.clear();

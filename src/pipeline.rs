@@ -1,20 +1,21 @@
 use crate::atomic_write::{ensure_staging_dir, sweep_stale_inprogress, write_jsonl_atomic, write_zst_atomic};
 use crate::config::{ETLOptions, Sources};
 use crate::date::YearMonth;
-use crate::filters::{bounds_tuple, resolve_target_subs_from, matches_minimal, matches_full, within_bounds};
-use crate::paths::{discover_all, plan_files};
+use crate::filters::{bounds_tuple, resolve_target_subs_from, matches_minimal, matches_full, within_bounds, ym_from_epoch};
+use crate::paths::{discover_all, plan_files, FileJob, FileKind};
 use crate::progress::{make_progress_bar_labeled, total_compressed_size};
+use crate::progress_manifest::{ManifestAccumulator, MonthEntry};
 use crate::query::{normalize_str, QuerySpec};
 use crate::shard::{ShardedWriter, UsernameStream};
 use crate::stitch::{concat_tsvs, stitch_tmp_parts, stitch_tmp_parts_to_json_array, tmp_name_for_job};
 use crate::streaming::{process_file_for_usernames_with_skip, stream_job};
 use crate::util::{create_with_backoff, default_bot_authors, merge_extra_exclusions, with_thread_pool};
-use crate::zstd_jsonl::{for_each_line_cfg, for_each_line_with_progress_cfg, parse_minimal};
+use crate::zstd_jsonl::{for_each_line_cfg, for_each_line_with_progress_cfg, parse_minimal, MinimalRecord};
 use crate::kv_shard::ShardedKVWriter;
 use anyhow::{anyhow, Context, Result};
-use rayon::prelude::*;
+use indicatif::ProgressBar;
 use regex::Regex;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -147,19 +148,39 @@ impl RedditETL {
 pub struct ScanPlan { etl: RedditETL, query: QuerySpec }
 
 impl ScanPlan {
+    /// Common implementation for setters that map an iterator of strings into
+    /// an `Option<Vec<String>>` field on the [`QuerySpec`], then renormalize.
+    /// `set_field` writes the collected list onto the chosen field; `norm` is
+    /// applied per-element before collection (e.g. `normalize_str`, lowercase).
+    fn set_string_list<I, S>(
+        mut self,
+        set_field: impl FnOnce(&mut QuerySpec, Vec<String>),
+        iter: I,
+        norm: fn(&str) -> String,
+    ) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let v: Vec<String> = iter.into_iter().map(|s| norm(s.as_ref())).collect();
+        set_field(&mut self.query, v);
+        self.query = self.query.normalize();
+        self
+    }
+
     pub fn subreddit(mut self, s: impl AsRef<str>) -> Self { self.query.subreddits = Some(vec![normalize_str(s.as_ref())]); self }
-    pub fn subreddits<I, S>(mut self, iter: I) -> Self where I: IntoIterator<Item = S>, S: AsRef<str> {
-        self.query.subreddits = Some(iter.into_iter().map(|s| normalize_str(s.as_ref())).collect()); self.query = self.query.normalize(); self
+    pub fn subreddits<I, S>(self, iter: I) -> Self where I: IntoIterator<Item = S>, S: AsRef<str> {
+        self.set_string_list(|q, v| q.subreddits = Some(v), iter, normalize_str)
     }
     pub fn author(mut self, author: impl AsRef<str>) -> Self { self.query.authors_in = Some(vec![normalize_str(author.as_ref())]); self.query = self.query.normalize(); self }
-    pub fn authors<I, S>(mut self, iter: I) -> Self where I: IntoIterator<Item = S>, S: AsRef<str> {
-        self.query.authors_in = Some(iter.into_iter().map(|s| normalize_str(s.as_ref())).collect()); self.query = self.query.normalize(); self
+    pub fn authors<I, S>(self, iter: I) -> Self where I: IntoIterator<Item = S>, S: AsRef<str> {
+        self.set_string_list(|q, v| q.authors_in = Some(v), iter, normalize_str)
     }
-    pub fn authors_in<I, S>(mut self, iter: I) -> Self where I: IntoIterator<Item = S>, S: AsRef<str> {
-        self.query.authors_in = Some(iter.into_iter().map(|s| normalize_str(s.as_ref())).collect()); self.query = self.query.normalize(); self
+    pub fn authors_in<I, S>(self, iter: I) -> Self where I: IntoIterator<Item = S>, S: AsRef<str> {
+        self.set_string_list(|q, v| q.authors_in = Some(v), iter, normalize_str)
     }
-    pub fn authors_out<I, S>(mut self, iter: I) -> Self where I: IntoIterator<Item = S>, S: AsRef<str> {
-        self.query.authors_out = Some(iter.into_iter().map(|s| normalize_str(s.as_ref())).collect()); self.query = self.query.normalize(); self
+    pub fn authors_out<I, S>(self, iter: I) -> Self where I: IntoIterator<Item = S>, S: AsRef<str> {
+        self.set_string_list(|q, v| q.authors_out = Some(v), iter, normalize_str)
     }
     /// Alias for authors_out: exclude the provided authors (normalized).
     pub fn exclude_authors<I, S>(self, iter: I) -> Self where I: IntoIterator<Item = S>, S: AsRef<str> {
@@ -176,11 +197,11 @@ impl ScanPlan {
     pub fn author_regex(mut self, re: Regex) -> Self { self.query.author_regex = Some(re); self }
     pub fn min_score(mut self, v: i64) -> Self { self.query.min_score = Some(v); self }
     pub fn max_score(mut self, v: i64) -> Self { self.query.max_score = Some(v); self }
-    pub fn keywords_any<I, S>(mut self, iter: I) -> Self where I: IntoIterator<Item = S>, S: AsRef<str> {
-        self.query.keywords_any = Some(iter.into_iter().map(|s| s.as_ref().to_lowercase()).collect()); self.query = self.query.normalize(); self
+    pub fn keywords_any<I, S>(self, iter: I) -> Self where I: IntoIterator<Item = S>, S: AsRef<str> {
+        self.set_string_list(|q, v| q.keywords_any = Some(v), iter, lowercase_str)
     }
-    pub fn domains_in<I, S>(mut self, iter: I) -> Self where I: IntoIterator<Item = S>, S: AsRef<str> {
-        self.query.domains_in = Some(iter.into_iter().map(|s| s.as_ref().to_lowercase()).collect()); self.query = self.query.normalize(); self
+    pub fn domains_in<I, S>(self, iter: I) -> Self where I: IntoIterator<Item = S>, S: AsRef<str> {
+        self.set_string_list(|q, v| q.domains_in = Some(v), iter, lowercase_str)
     }
     pub fn contains_url(mut self, yes: bool) -> Self { self.query.contains_url = Some(yes); self }
     pub fn allow_pseudo_users(mut self) -> Self { self.query.filter_pseudo_users = false; self }
@@ -190,59 +211,22 @@ impl ScanPlan {
     }
 
     pub fn usernames(self) -> Result<UsernameStream> {
-        let targets = resolve_target_subs_from(&self.etl.opts.subreddit, &self.query.subreddits);
         let parallelism = self.etl.opts.parallelism;
-
         with_thread_pool(parallelism, || {
-        let work_dir = self.etl.ensure_work_dir()?;
-        let discovered = discover_all(&self.etl.opts.comments_dir, &self.etl.opts.submissions_dir);
-        let files = plan_files(&discovered, self.etl.opts.sources, self.etl.opts.start, self.etl.opts.end);
-        let shard_writer = ShardedWriter::create(&work_dir, "usernames_q", self.etl.opts.shard_count)?;
-        let targets_ref = targets.as_ref();
-        let bounds = bounds_tuple(self.etl.opts.start, self.etl.opts.end);
-        let read_buf = self.etl.opts.read_buffer_bytes;
+            let work_dir = self.etl.ensure_work_dir()?;
+            let shard_writer = ShardedWriter::create(&work_dir, "usernames_q", self.etl.opts.shard_count)?;
 
-        let total_bytes = total_compressed_size(&files);
-        let pb = if self.etl.opts.progress {
-            Some(make_progress_bar_labeled(total_bytes, self.etl.opts.progress_label.as_deref()))
-        } else {
-            None
-        };
+            scan_records(&self.etl, &self.query, /*show_progress=*/true, |min, _kind, _line| {
+                if let Some(a) = min.author.as_deref() {
+                    let a = a.trim();
+                    if a.is_empty() { return Ok(()); }
+                    shard_writer.write(a)?;
+                }
+                Ok(())
+            })?;
 
-        crate::concurrency::for_each_file_limited(&files, self.etl.opts.file_concurrency, |job| -> Result<()> {
-            // progress-aware reader when enabled
-            if let Some(pb) = &pb {
-                for_each_line_with_progress_cfg(&job.path, read_buf, |delta| pb.inc(delta), |line| {
-                    if let Ok(min) = parse_minimal(line) {
-                        if !matches_minimal(&min, targets_ref, &self.query) { return Ok(()); }
-                        if !within_bounds(&min, bounds) { return Ok(()); }
-                        if let Some(a) = min.author.as_deref() {
-                            let a = a.trim();
-                            if a.is_empty() { return Ok(()); }
-                            shard_writer.write(a)?;
-                        }
-                    }
-                    Ok(())
-                })?;
-            } else {
-                for_each_line_cfg(&job.path, read_buf, |line| {
-                    if let Ok(min) = parse_minimal(line) {
-                        if !matches_minimal(&min, targets_ref, &self.query) { return Ok(()); }
-                        if !within_bounds(&min, bounds) { return Ok(()); }
-                        if let Some(a) = min.author.as_deref() {
-                            let a = a.trim();
-                            if a.is_empty() { return Ok(()); }
-                            shard_writer.write(a)?;
-                        }
-                    }
-                    Ok(())
-                })?;
-            }
-            Ok(())
-        })?;
-
-        let deduped = shard_writer.dedup("usernames_q")?;
-        UsernameStream::from_deduped_files(deduped)
+            let deduped = shard_writer.dedup("usernames_q")?;
+            UsernameStream::from_deduped_files(deduped)
         })
     }
 
@@ -285,244 +269,145 @@ impl ScanPlan {
         let parallelism = self.etl.opts.parallelism;
 
         with_thread_pool(parallelism, || {
-        fs::create_dir_all(out_dir)?;
-        let staging_dir = ensure_staging_dir(out_dir)?;
-        sweep_stale_inprogress(out_dir, true)?;
+            fs::create_dir_all(out_dir)?;
+            let staging_dir = ensure_staging_dir(out_dir)?;
+            sweep_stale_inprogress(out_dir, true)?;
 
-        let targets = resolve_target_subs_from(&self.etl.opts.subreddit, &self.query.subreddits);
-        let discovered = discover_all(&self.etl.opts.comments_dir, &self.etl.opts.submissions_dir);
-        let files = plan_files(&discovered, self.etl.opts.sources, self.etl.opts.start, self.etl.opts.end);
+            let targets = resolve_target_subs_from(&self.etl.opts.subreddit, &self.query.subreddits);
+            let discovered = discover_all(&self.etl.opts.comments_dir, &self.etl.opts.submissions_dir);
+            let files = plan_files(&discovered, self.etl.opts.sources, self.etl.opts.start, self.etl.opts.end);
 
-        if files.is_empty() {
-            return Ok((Vec::new(), 0));
-        }
+            if files.is_empty() {
+                return Ok((Vec::new(), 0));
+            }
 
-        let whitelist = self.etl.opts.whitelist_fields.clone();
-        let targets_ref = targets.as_ref();
-        let bounds = bounds_tuple(self.etl.opts.start, self.etl.opts.end);
-        let read_buf = self.etl.opts.read_buffer_bytes;
-        let write_buf = self.etl.opts.write_buffer_bytes;
-        let human_ts = self.etl.opts.human_readable_timestamps;
-        let resume = self.etl.opts.resume;
+            let resume = self.etl.opts.resume;
+            // Resume manifest: load on entry, validate each entry against the
+            // file actually on disk, and snapshot the surviving keys before any
+            // worker mutates the accumulator.
+            let (initial_months, completed_keys) = if resume {
+                load_and_validate_manifest(out_dir)?
+            } else {
+                (HashMap::new(), HashSet::new())
+            };
 
-        // Resume manifest: load on entry, then validate each entry against the
-        // file actually on disk. Stale (missing/size-mismatch) entries are
-        // dropped so those months are re-run.
-        let mut initial_months = if resume {
-            let manifest = crate::progress_manifest::load(out_dir);
-            let mut keep = std::collections::HashMap::new();
-            for (k, v) in manifest.months {
-                // Determine destination by the key's prefix (RC_ → comments, RS_ → submissions).
-                let final_name = format!("part_{}.jsonl", k);
-                let final_path = out_dir.join(&final_name);
-                match fs::metadata(&final_path) {
-                    Ok(meta) if meta.len() == v.size => { keep.insert(k, v); }
-                    _ => {
-                        tracing::info!(key=%k, "dropping stale progress manifest entry; month will be re-run");
+            let total_bytes = total_compressed_size(&files);
+            let pb = if self.etl.opts.progress {
+                Some(make_progress_bar_labeled(total_bytes, self.etl.opts.progress_label.as_deref()))
+            } else {
+                None
+            };
+
+            let total_written = AtomicU64::new(0);
+            let parts = Mutex::new(Vec::<PathBuf>::new());
+
+            // Pre-seed `parts` with already-completed months so the returned
+            // list reflects the full set of published outputs (resumed + new).
+            if resume {
+                let mut guard = parts.lock().unwrap();
+                for key in &completed_keys {
+                    guard.push(out_dir.join(format!("part_{}.jsonl", key)));
+                }
+            }
+
+            // Persist the (pruned) manifest before any work, so a crash mid-
+            // prune cannot resurrect entries we already know are stale.
+            let accumulator = if resume {
+                crate::progress_manifest::save(out_dir, &initial_months)?;
+                Some(ManifestAccumulator::new(out_dir, initial_months))
+            } else {
+                None
+            };
+
+            let whitelist = self.etl.opts.whitelist_fields.clone();
+            let targets_ref = targets.as_ref();
+            let bounds = bounds_tuple(self.etl.opts.start, self.etl.opts.end);
+            let read_buf = self.etl.opts.read_buffer_bytes;
+            let write_buf = self.etl.opts.write_buffer_bytes;
+            let human_ts = self.etl.opts.human_readable_timestamps;
+
+            crate::concurrency::for_each_file_limited(&files, self.etl.opts.file_concurrency, |job| -> Result<()> {
+                let outcome = process_month(
+                    job,
+                    out_dir,
+                    &staging_dir,
+                    targets_ref,
+                    &self.query,
+                    &whitelist,
+                    pb.as_ref(),
+                    bounds,
+                    read_buf,
+                    write_buf,
+                    human_ts,
+                    resume,
+                    &completed_keys,
+                )?;
+
+                if let Some(month) = outcome {
+                    total_written.fetch_add(month.lines, Ordering::Relaxed);
+                    parts.lock().unwrap().push(month.out_path.clone());
+                    if let Some(acc) = &accumulator {
+                        if let Err(e) = commit_entry_to_manifest(acc, month) {
+                            tracing::warn!(error=%e, "failed to update progress manifest; continuing");
+                        }
                     }
                 }
-            }
-            keep
-        } else {
-            std::collections::HashMap::new()
-        };
+                Ok(())
+            })?;
 
-        let total_bytes = total_compressed_size(&files);
-        let pb = if self.etl.opts.progress {
-            Some(make_progress_bar_labeled(total_bytes, self.etl.opts.progress_label.as_deref()))
-        } else {
-            None
-        };
+            if let Some(pb) = pb { pb.finish_with_message("done"); }
 
-        let total_written = AtomicU64::new(0);
-        let parts = Mutex::new(Vec::<PathBuf>::new());
-
-        // Pre-seed `parts` with already-completed months so the returned list
-        // reflects the full set of published outputs (resumed + new).
-        if resume {
-            for key in initial_months.keys() {
-                parts.lock().unwrap().push(out_dir.join(format!("part_{}.jsonl", key)));
-            }
-        }
-
-        // Persist the (pruned) manifest before any work, so a crash mid-prune
-        // cannot resurrect entries we already know are stale.
-        let accumulator = if resume {
-            crate::progress_manifest::save(out_dir, &initial_months)?;
-            Some(crate::progress_manifest::ManifestAccumulator::new(
-                out_dir,
-                std::mem::take(&mut initial_months),
-            ))
-        } else {
-            None
-        };
-        // Snapshot of completed keys for fast skip lookup, before mutation by workers.
-        let completed_keys: std::collections::HashSet<String> = accumulator
-            .as_ref()
-            .map(|a| a.snapshot_keys())
-            .unwrap_or_default();
-
-        crate::concurrency::for_each_file_limited(&files, self.etl.opts.file_concurrency, |job| -> Result<()> {
-            let (file_prefix, key_prefix) = match job.kind {
-                crate::paths::FileKind::Comment => ("part_RC", "RC"),
-                crate::paths::FileKind::Submission => ("part_RS", "RS"),
-            };
-            let out_path = out_dir.join(format!("{}_{}.jsonl", file_prefix, job.ym));
-            let key = crate::progress_manifest::month_key(key_prefix, job.ym);
-
-            // Resume fast-path: skip the month entirely if it's already in the
-            // manifest (and the on-disk file matched at load time). Still bump
-            // the progress bar by the input file's compressed size so the user
-            // sees the work accounted for.
-            if resume && completed_keys.contains(&key) {
-                if let Some(pb) = &pb {
-                    let sz = fs::metadata(&job.path).map(|m| m.len()).unwrap_or(0);
-                    pb.inc(sz);
-                }
-                return Ok(());
-            }
-
-            let n = match write_jsonl_atomic(&staging_dir, &out_path, write_buf, |w| {
-                stream_job(
-                    job, w, targets_ref, &self.query, &whitelist,
-                    pb.clone(), bounds, read_buf, human_ts,
-                )
-            }) {
-                Ok(n) => n,
-                Err(e) => {
-                    tracing::warn!(path=%out_path.display(), error=%e, "Skipping month: failed to atomically write spool output");
-                    if let Some(pb) = &pb {
-                        let sz = fs::metadata(&job.path).map(|m| m.len()).unwrap_or(0);
-                        pb.inc(sz);
-                    }
-                    return Ok(());
-                }
-            };
-            total_written.fetch_add(n, Ordering::Relaxed);
-            parts.lock().unwrap().push(out_path.clone());
-
-            // Record completion in the manifest AFTER replace_file_atomic_backoff
-            // succeeded (write_jsonl_atomic only returns Ok once the rename
-            // landed). Best-effort: a failure to rewrite the manifest must not
-            // abort the run — the worst case is a re-run redoing this month.
-            if let Some(acc) = &accumulator {
-                let size = fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
-                let entry = crate::progress_manifest::MonthEntry {
-                    size,
-                    lines: n,
-                    sha256: None,
-                };
-                if let Err(e) = acc.commit(key, entry) {
-                    tracing::warn!(error=%e, "failed to update progress manifest; continuing");
-                }
-            }
-            Ok(())
-        })?;
-
-        if let Some(pb) = pb { pb.finish_with_message("done"); }
-
-        let mut list = parts.into_inner().unwrap();
-        list.sort();
-        list.dedup();
-        Ok((list, total_written.load(Ordering::Relaxed)))
+            let mut list = parts.into_inner().unwrap();
+            list.sort();
+            list.dedup();
+            Ok((list, total_written.load(Ordering::Relaxed)))
         })
     }
 
     pub fn count_by_month(self) -> Result<BTreeMap<YearMonth, u64>> {
-        let targets = resolve_target_subs_from(&self.etl.opts.subreddit, &self.query.subreddits);
-
-        let discovered = discover_all(&self.etl.opts.comments_dir, &self.etl.opts.submissions_dir);
-        let files = plan_files(&discovered, self.etl.opts.sources, self.etl.opts.start, self.etl.opts.end);
-
-        let targets_ref = targets.as_ref();
-        let mut total = BTreeMap::<YearMonth, u64>::new();
-        let bounds = bounds_tuple(self.etl.opts.start, self.etl.opts.end);
-        let read_buf = self.etl.opts.read_buffer_bytes;
-
-        if self.etl.opts.file_concurrency <= 1 {
-            for job in &files {
-                let part = crate::counting::count_for_job(job, targets_ref, &self.query, bounds, read_buf)?;
-                crate::counting::merge_counts(&mut total, part);
+        let total = Mutex::new(BTreeMap::<YearMonth, u64>::new());
+        scan_records(&self.etl, &self.query, /*show_progress=*/false, |min, _kind, _line| {
+            if let Some(ts) = min.created_utc {
+                let ym = ym_from_epoch(ts);
+                *total.lock().unwrap().entry(ym).or_insert(0) += 1;
             }
-        } else {
-            for chunk in files.chunks(self.etl.opts.file_concurrency) {
-                let parts = chunk.par_iter().map(|job| {
-                    crate::counting::count_for_job(job, targets_ref, &self.query, bounds, read_buf)
-                }).collect::<Result<Vec<_>>>()?;
-                for p in parts { crate::counting::merge_counts(&mut total, p); }
-            }
-        }
-        Ok(total)
+            Ok(())
+        })?;
+        Ok(total.into_inner().unwrap())
     }
 
     pub fn author_counts_to_tsv(self, out_path: &Path) -> Result<()> {
-        let targets = resolve_target_subs_from(&self.etl.opts.subreddit, &self.query.subreddits);
         let parallelism = self.etl.opts.parallelism;
-
         with_thread_pool(parallelism, || {
-        let discovered = discover_all(&self.etl.opts.comments_dir, &self.etl.opts.submissions_dir);
-        let files = plan_files(&discovered, self.etl.opts.sources, self.etl.opts.start, self.etl.opts.end);
-        let work_dir = self.etl.ensure_work_dir()?;
-        let kv = ShardedKVWriter::create(&work_dir, "author_counts", self.etl.opts.shard_count)?;
+            let work_dir = self.etl.ensure_work_dir()?;
+            let kv = ShardedKVWriter::create(&work_dir, "author_counts", self.etl.opts.shard_count)?;
 
-        let targets_ref = targets.as_ref();
-        let bounds = bounds_tuple(self.etl.opts.start, self.etl.opts.end);
-        let read_buf = self.etl.opts.read_buffer_bytes;
-
-        crate::concurrency::for_each_file_limited(&files, self.etl.opts.file_concurrency, |job| -> Result<()> {
-            for_each_line_cfg(&job.path, read_buf, |line| {
-                if let Ok(min) = parse_minimal(line) {
-                    if !matches_minimal(&min, targets_ref, &self.query) { return Ok(()); }
-                    if !within_bounds(&min, bounds) { return Ok(()); }
-                    if self.query.requires_full_parse() {
-                        let val: serde_json::Value = serde_json::from_str(line)?;
-                        if !matches_full(&val, job.kind, &self.query) { return Ok(()); }
-                    }
-                    if let Some(a) = min.author.as_deref() {
-                        let a = a.trim();
-                        if a.is_empty() { return Ok(()); }
-                        kv.write_kv(a, 1)?;
-                    }
+            scan_records(&self.etl, &self.query, /*show_progress=*/false, |min, _kind, _line| {
+                if let Some(a) = min.author.as_deref() {
+                    let a = a.trim();
+                    if a.is_empty() { return Ok(()); }
+                    kv.write_kv(a, 1)?;
                 }
                 Ok(())
-            })
-        })?;
+            })?;
 
-        let shards = kv.reduce_sum("author_counts")?;
-        concat_tsvs(&shards, out_path, self.etl.opts.write_buffer_bytes)?;
-        Ok(())
+            let shards = kv.reduce_sum("author_counts")?;
+            concat_tsvs(&shards, out_path, self.etl.opts.write_buffer_bytes)?;
+            Ok(())
         })
     }
 
     pub fn build_first_seen_index_to_tsv(self, out_path: &Path) -> Result<()> {
-        let targets = resolve_target_subs_from(&self.etl.opts.subreddit, &self.query.subreddits);
-
-        let discovered = discover_all(&self.etl.opts.comments_dir, &self.etl.opts.submissions_dir);
-        let files = plan_files(&discovered, self.etl.opts.sources, self.etl.opts.start, self.etl.opts.end);
         let work_dir = self.etl.ensure_work_dir()?;
         let kv = ShardedKVWriter::create(&work_dir, "first_seen", self.etl.opts.shard_count)?;
 
-        let targets_ref = targets.as_ref();
-        let bounds = bounds_tuple(self.etl.opts.start, self.etl.opts.end);
-        let read_buf = self.etl.opts.read_buffer_bytes;
-
-        crate::concurrency::for_each_file_limited(&files, self.etl.opts.file_concurrency, |job| -> Result<()> {
-            for_each_line_cfg(&job.path, read_buf, |line| {
-                if let Ok(min) = parse_minimal(line) {
-                    if !matches_minimal(&min, targets_ref, &self.query) { return Ok(()); }
-                    if !within_bounds(&min, bounds) { return Ok(()); }
-                    if self.query.requires_full_parse() {
-                        let val: serde_json::Value = serde_json::from_str(line)?;
-                        if !matches_full(&val, job.kind, &self.query) { return Ok(()); }
-                    }
-                    if let (Some(a), Some(ts)) = (min.author.as_deref(), min.created_utc) {
-                        let a = a.trim();
-                        if a.is_empty() { return Ok(()); }
-                        kv.write_kv(a, ts)?;
-                    }
-                }
-                Ok(())
-            })
+        scan_records(&self.etl, &self.query, /*show_progress=*/false, |min, _kind, _line| {
+            if let (Some(a), Some(ts)) = (min.author.as_deref(), min.created_utc) {
+                let a = a.trim();
+                if a.is_empty() { return Ok(()); }
+                kv.write_kv(a, ts)?;
+            }
+            Ok(())
         })?;
 
         let shards = kv.reduce_min("first_seen")?;
@@ -568,8 +453,8 @@ impl ScanPlan {
 
         crate::concurrency::for_each_file_limited(&files, self.etl.opts.file_concurrency, |job| -> Result<()> {
             let (prefix, out_dir) = match job.kind {
-                crate::paths::FileKind::Comment => ("RC", &comments_dir),
-                crate::paths::FileKind::Submission => ("RS", &submissions_dir),
+                FileKind::Comment => ("RC", &comments_dir),
+                FileKind::Submission => ("RS", &submissions_dir),
             };
             let file_name = match format {
                 ExportFormat::Jsonl => format!("{}_{}.jsonl", prefix, job.ym),
@@ -598,6 +483,182 @@ impl ScanPlan {
         Ok(())
         })
     }
+}
+
+#[inline]
+fn lowercase_str(s: &str) -> String {
+    s.to_lowercase()
+}
+
+/// Shared scan+filter+emit loop for [`ScanPlan`] methods.
+///
+/// Encapsulates file discovery/planning, optional progress-bar setup, the
+/// `for_each_file_limited` per-file fan-out, and the line-level
+/// `parse_minimal` → `matches_minimal` → `within_bounds` →
+/// (optional) `matches_full` filtering ladder. The caller owns whatever
+/// accumulator the matched records feed into and supplies it through
+/// interior mutability inside `on_record`.
+///
+/// Callers are responsible for entering `with_thread_pool` themselves when
+/// they want bounded parallelism that *also* covers post-scan reductions like
+/// `dedup` / `reduce_sum` (which use rayon `par_iter` internally). Methods
+/// that historically don't enter a scoped pool — e.g. `count_by_month`,
+/// `build_first_seen_index_to_tsv` — call this helper directly so the
+/// per-file fan-out runs on the global rayon pool, matching the prior shape.
+fn scan_records<F>(
+    etl: &RedditETL,
+    query: &QuerySpec,
+    show_progress: bool,
+    on_record: F,
+) -> Result<()>
+where
+    F: Sync + Send + Fn(&MinimalRecord, FileKind, &str) -> Result<()>,
+{
+    let targets = resolve_target_subs_from(&etl.opts.subreddit, &query.subreddits);
+    let targets_ref = targets.as_ref();
+    let bounds = bounds_tuple(etl.opts.start, etl.opts.end);
+    let read_buf = etl.opts.read_buffer_bytes;
+
+    let discovered = discover_all(&etl.opts.comments_dir, &etl.opts.submissions_dir);
+    let files = plan_files(&discovered, etl.opts.sources, etl.opts.start, etl.opts.end);
+
+    let pb = if show_progress && etl.opts.progress {
+        let total_bytes = total_compressed_size(&files);
+        Some(make_progress_bar_labeled(total_bytes, etl.opts.progress_label.as_deref()))
+    } else {
+        None
+    };
+
+    crate::concurrency::for_each_file_limited(&files, etl.opts.file_concurrency, |job| -> Result<()> {
+        let kind = job.kind;
+        let line_cb = |line: &str| -> Result<()> {
+            if let Ok(min) = parse_minimal(line) {
+                if !matches_minimal(&min, targets_ref, query) { return Ok(()); }
+                if !within_bounds(&min, bounds) { return Ok(()); }
+                if query.requires_full_parse() {
+                    let val: serde_json::Value = serde_json::from_str(line)?;
+                    if !matches_full(&val, kind, query) { return Ok(()); }
+                }
+                on_record(&min, kind, line)?;
+            }
+            Ok(())
+        };
+        if let Some(pb) = &pb {
+            for_each_line_with_progress_cfg(&job.path, read_buf, |delta| pb.inc(delta), line_cb)
+        } else {
+            for_each_line_cfg(&job.path, read_buf, line_cb)
+        }
+    })?;
+
+    if let Some(pb) = pb { pb.finish_with_message("done"); }
+    Ok(())
+}
+
+// ----------------- extract_spool_monthly helpers -----------------
+
+/// Result of a single month's atomic publish — used by the orchestration
+/// shell in `extract_spool_monthly` to update both the returned `parts` list
+/// and the on-disk progress manifest.
+struct MonthResult {
+    out_path: PathBuf,
+    key: String,
+    lines: u64,
+}
+
+/// Load `_progress.json`, validate each entry against the on-disk file size,
+/// drop mismatches with a `tracing::info` warning, and return the surviving
+/// entries plus a snapshot of completed keys for fast skip-lookup.
+fn load_and_validate_manifest(
+    out_dir: &Path,
+) -> Result<(HashMap<String, MonthEntry>, HashSet<String>)> {
+    let manifest = crate::progress_manifest::load(out_dir);
+    let mut keep: HashMap<String, MonthEntry> = HashMap::new();
+    for (k, v) in manifest.months {
+        // Determine destination by the key's prefix (RC_ → comments, RS_ → submissions).
+        let final_name = format!("part_{}.jsonl", k);
+        let final_path = out_dir.join(&final_name);
+        match fs::metadata(&final_path) {
+            Ok(meta) if meta.len() == v.size => {
+                keep.insert(k, v);
+            }
+            _ => {
+                tracing::info!(key=%k, "dropping stale progress manifest entry; month will be re-run");
+            }
+        }
+    }
+    let completed_keys: HashSet<String> = keep.keys().cloned().collect();
+    Ok((keep, completed_keys))
+}
+
+/// Per-month closure body: skip if the month is already published (resume
+/// fast-path), otherwise atomically write the spool output via
+/// `write_jsonl_atomic`. Returns `Ok(None)` on resume-skip or transient atomic
+/// write failure (already logged); `Ok(Some(MonthResult))` on a successful
+/// publish whose entry the caller should commit to the manifest.
+#[allow(clippy::too_many_arguments)]
+fn process_month(
+    job: &FileJob,
+    out_dir: &Path,
+    staging_dir: &Path,
+    targets: Option<&Vec<String>>,
+    query: &QuerySpec,
+    whitelist: &Option<Vec<String>>,
+    pb: Option<&ProgressBar>,
+    bounds: Option<(YearMonth, YearMonth)>,
+    read_buf: usize,
+    write_buf: usize,
+    human_ts: bool,
+    resume: bool,
+    completed_keys: &HashSet<String>,
+) -> Result<Option<MonthResult>> {
+    let (file_prefix, key_prefix) = match job.kind {
+        FileKind::Comment => ("part_RC", "RC"),
+        FileKind::Submission => ("part_RS", "RS"),
+    };
+    let out_path = out_dir.join(format!("{}_{}.jsonl", file_prefix, job.ym));
+    let key = crate::progress_manifest::month_key(key_prefix, job.ym);
+
+    // Resume fast-path: skip the month entirely if it's already in the
+    // manifest (and the on-disk file matched at load time). Still bump the
+    // progress bar by the input file's compressed size so the user sees the
+    // work accounted for.
+    if resume && completed_keys.contains(&key) {
+        if let Some(pb) = pb {
+            let sz = fs::metadata(&job.path).map(|m| m.len()).unwrap_or(0);
+            pb.inc(sz);
+        }
+        return Ok(None);
+    }
+
+    let n = match write_jsonl_atomic(staging_dir, &out_path, write_buf, |w| {
+        stream_job(
+            job, w, targets, query, whitelist,
+            pb.cloned(), bounds, read_buf, human_ts,
+        )
+    }) {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!(path=%out_path.display(), error=%e, "Skipping month: failed to atomically write spool output");
+            if let Some(pb) = pb {
+                let sz = fs::metadata(&job.path).map(|m| m.len()).unwrap_or(0);
+                pb.inc(sz);
+            }
+            return Ok(None);
+        }
+    };
+
+    Ok(Some(MonthResult { out_path, key, lines: n }))
+}
+
+/// Atomically commit a month's manifest entry after a successful publish.
+/// `write_jsonl_atomic` only returns Ok once the rename landed, so the size
+/// stat is taken from the published path. Best-effort: a manifest rewrite
+/// failure must not abort the run — at worst, a subsequent re-run redoes
+/// this month.
+fn commit_entry_to_manifest(acc: &ManifestAccumulator, result: MonthResult) -> Result<()> {
+    let size = fs::metadata(&result.out_path).map(|m| m.len()).unwrap_or(0);
+    let entry = MonthEntry { size, lines: result.lines, sha256: None };
+    acc.commit(result.key, entry)
 }
 
 /// Shared extraction logic used by:
