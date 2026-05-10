@@ -7,7 +7,7 @@
 //! unreadable file at the published path.
 
 use anyhow::{Context, Result};
-use std::fs;
+use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use zstd::stream::write::Encoder as ZstdEncoder;
@@ -16,6 +16,11 @@ use crate::util::{create_with_backoff, remove_with_backoff, replace_file_atomic_
 
 /// Directory used to stage `*.inprogress` files under an output root.
 pub const STAGING_DIR_NAME: &str = "_staging";
+
+/// Extension appended to staged filenames during atomic writes. The published
+/// path is the final destination; a crashed run leaves `<dest>.inprogress` in
+/// the staging dir, never a partial file at the published path.
+pub(crate) const INPROGRESS_EXT: &str = ".inprogress";
 
 /// Build the staging directory path for a given output root, creating it.
 pub fn ensure_staging_dir(out_root: &Path) -> Result<PathBuf> {
@@ -48,7 +53,7 @@ pub fn sweep_stale_inprogress(out_root: &Path, delete: bool) -> Result<usize> {
         let is_inprogress = path
             .file_name()
             .and_then(|s| s.to_str())
-            .map(|s| s.ends_with(".inprogress"))
+            .map(|s| s.ends_with(INPROGRESS_EXT))
             .unwrap_or(false);
         if !is_inprogress {
             continue;
@@ -71,24 +76,28 @@ pub fn sweep_stale_inprogress(out_root: &Path, delete: bool) -> Result<usize> {
     Ok(count)
 }
 
-/// Atomically write a JSONL file: stage to `<staging_dir>/<filename>.inprogress`,
-/// invoke `body` to fill the buffer, flush, then rename onto `final_dest`.
+/// Stage a write under `<staging_dir>/<dest_filename>.inprogress`, run `body`
+/// against a buffered writer, then atomically promote the staged file onto
+/// `final_dest`. Caller is responsible for any encoder finalization (e.g.
+/// closing a zstd frame) before returning from `body`; this helper only
+/// flushes the underlying buffer.
 ///
-/// Returns whatever the body returns (typically a record count).
-pub fn write_jsonl_atomic<T, F>(
+/// On a `body` error the staged file is removed so we never leave a partial
+/// `<dest>.inprogress` behind a successful return path.
+fn stage_and_execute<T, F>(
     staging_dir: &Path,
     final_dest: &Path,
     write_buf_bytes: usize,
     body: F,
 ) -> Result<T>
 where
-    F: FnOnce(&mut dyn Write) -> Result<T>,
+    F: FnOnce(&mut BufWriter<File>) -> Result<T>,
 {
     let file_name = final_dest
         .file_name()
         .ok_or_else(|| anyhow::anyhow!("final_dest has no file name: {}", final_dest.display()))?;
     let mut staged = staging_dir.join(file_name);
-    staged.as_mut_os_string().push(".inprogress");
+    staged.as_mut_os_string().push(INPROGRESS_EXT);
 
     fs::create_dir_all(staging_dir)
         .with_context(|| format!("create staging dir {}", staging_dir.display()))?;
@@ -97,8 +106,14 @@ where
         .with_context(|| format!("create staged {}", staged.display()))?;
     let mut writer = BufWriter::with_capacity(write_buf_bytes, file);
 
-    let result = body(&mut writer)
-        .with_context(|| format!("write staged {}", staged.display()))?;
+    let result = match body(&mut writer) {
+        Ok(v) => v,
+        Err(e) => {
+            drop(writer);
+            let _ = remove_with_backoff(&staged, 8, 50);
+            return Err(e).with_context(|| format!("write staged {}", staged.display()));
+        }
+    };
 
     writer
         .flush()
@@ -113,13 +128,32 @@ where
     Ok(result)
 }
 
+/// Atomically write a JSONL file: stage to `<staging_dir>/<filename>.inprogress`,
+/// invoke `body` to fill the buffer, flush, then rename onto `final_dest`.
+///
+/// Returns whatever the body returns (typically a record count).
+pub fn write_jsonl_atomic<T, F>(
+    staging_dir: &Path,
+    final_dest: &Path,
+    write_buf_bytes: usize,
+    body: F,
+) -> Result<T>
+where
+    F: FnOnce(&mut dyn Write) -> Result<T>,
+{
+    stage_and_execute(staging_dir, final_dest, write_buf_bytes, |writer| {
+        body(writer)
+    })
+}
+
 /// Atomically write a `.zst` file with a checksum-protected zstd frame.
 ///
 /// Stages to `<staging_dir>/<filename>.inprogress`, runs `body` against a
 /// `ZstdEncoder` configured with `include_checksum(true)` so `validate_zst_full`
-/// can detect silent corruption. The encoder is explicitly finished (RAII via
-/// `auto_finish()` inside the helper) before the atomic rename — this is the
-/// fix for unreadable `.zst` outputs where the frame was never closed.
+/// can detect silent corruption. The encoder is explicitly finished before the
+/// atomic rename — this is the fix for unreadable `.zst` outputs where the
+/// frame was never closed. On `body` error the encoder is dropped without
+/// finishing and the staged file is cleaned up.
 pub fn write_zst_atomic<T, F>(
     staging_dir: &Path,
     final_dest: &Path,
@@ -130,49 +164,17 @@ pub fn write_zst_atomic<T, F>(
 where
     F: FnOnce(&mut dyn Write) -> Result<T>,
 {
-    let file_name = final_dest
-        .file_name()
-        .ok_or_else(|| anyhow::anyhow!("final_dest has no file name: {}", final_dest.display()))?;
-    let mut staged = staging_dir.join(file_name);
-    staged.as_mut_os_string().push(".inprogress");
+    stage_and_execute(staging_dir, final_dest, write_buf_bytes, |writer| {
+        // Build the encoder over a mutable reference to the staged BufWriter so
+        // we can finish() it before stage_and_execute flushes/renames.
+        let mut enc = ZstdEncoder::new(writer.by_ref(), level)
+            .context("zstd encoder init")?;
+        enc.include_checksum(true)
+            .context("enable zstd content checksum")?;
 
-    fs::create_dir_all(staging_dir)
-        .with_context(|| format!("create staging dir {}", staging_dir.display()))?;
+        let result = body(&mut enc)?;
 
-    let file = create_with_backoff(&staged, 16, 50)
-        .with_context(|| format!("create staged {}", staged.display()))?;
-    let buf = BufWriter::with_capacity(write_buf_bytes, file);
-
-    // Build the encoder. We explicitly call finish() at the end of the happy
-    // path so the trailing frame epilogue is written before rename. If `body`
-    // returns Err the encoder is dropped without finish() and the staged file
-    // is removed — better to leave nothing than a half-frame at the dest.
-    let mut enc = ZstdEncoder::new(buf, level)
-        .with_context(|| format!("zstd encoder init for {}", staged.display()))?;
-    enc.include_checksum(true)
-        .with_context(|| "enable zstd content checksum")?;
-
-    let result = match body(&mut enc) {
-        Ok(v) => v,
-        Err(e) => {
-            // drop encoder without finishing, then clean up the partial staged file
-            drop(enc);
-            let _ = remove_with_backoff(&staged, 8, 50);
-            return Err(e).with_context(|| format!("write staged {}", staged.display()));
-        }
-    };
-
-    let mut buf = enc
-        .finish()
-        .with_context(|| format!("finish zstd frame for {}", staged.display()))?;
-    buf.flush()
-        .with_context(|| format!("flush staged {}", staged.display()))?;
-    drop(buf);
-
-    if let Some(parent) = final_dest.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create dest parent {}", parent.display()))?;
-    }
-    replace_file_atomic_backoff(&staged, final_dest)?;
-    Ok(result)
+        enc.finish().context("finish zstd frame")?;
+        Ok(result)
+    })
 }

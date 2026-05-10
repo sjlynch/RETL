@@ -12,6 +12,24 @@ use zstd::stream::read::Decoder;
 use crate::mem::maybe_throttle_low_memory;
 use crate::util::open_with_backoff;
 
+/// Prevents "Frame requires too much memory" on large Reddit dumps.
+///
+/// Late-year Reddit dumps were written with the spec's max window (~2 GiB);
+/// the zstd default rejects them with that error. Every decoder in this
+/// module passes this through `decoder.window_log_max(...)`.
+const ZSTD_WINDOW_LOG_MAX: u32 = 31;
+
+/// Fire the cooperative-throttle callback every 65 536 lines.
+///
+/// Used as a bit-mask on a wrapping `u32` tick counter
+/// (`tick & THROTTLE_SAMPLE_MASK == 0`). Bucketing/dedupe carry their own
+/// bounded-channel backpressure, so this throttle is a coarse safety net —
+/// sample less often to keep mutex contention out of the hot read loop.
+const THROTTLE_SAMPLE_MASK: u32 = 0xFFFF;
+
+/// Default `BufReader` capacity when callers do not specify one.
+const DEFAULT_READ_BUF_BYTES: usize = 16 * 1024;
+
 /// Minimal line-level schema for fast filtering.
 /// Extra fields are ignored by serde.
 /// NOTE: includes `score` to enable fast numeric filters.
@@ -68,102 +86,184 @@ pub fn parse_minimal(line: &str) -> Result<MinimalRecord> {
 
 // ----------------------------- Streaming ----------------------------------
 
-/// Stream a zstd JSONL file line-by-line; call `on_line` with raw &str (default buffers).
+/// Options for [`for_each_line_with_opts`].
 ///
-/// We request `window_log_max(31)` up front to avoid "Frame requires too much memory"
-/// on very large frames. If it still fails (e.g., checksum/corruption), log a single
-/// warning and skip the file (do not abort the run).
-#[allow(dead_code)]
-pub fn for_each_line(path: &Path, on_line: impl FnMut(&str) -> Result<()>) -> Result<()> {
-    for_each_line_with_skip(path, |_, _| {}, on_line)
+/// Every field has a sensible default (`None`/`true`); callers fill in only
+/// the knobs they actually use. Lifetime `'a` ties the trait-object callbacks
+/// to the caller's stack.
+pub struct LineStreamOpts<'a> {
+    /// `BufReader` capacity in bytes. `None` → [`DEFAULT_READ_BUF_BYTES`].
+    pub read_buf_bytes: Option<usize>,
+    /// If `Some`, called with the delta of compressed bytes read after each
+    /// line, plus a final flush at EOF. On a decode error the file's full
+    /// length is reported so progress bars stay monotonic.
+    pub progress: Option<&'a mut dyn FnMut(u64)>,
+    /// If `Some`, called once when the file is skipped due to a decode error.
+    /// The error is also logged via tracing/stderr; the outer call still
+    /// returns `Ok(())`.
+    pub on_skip: Option<&'a mut dyn FnMut(&Path, &anyhow::Error)>,
+    /// Sample [`maybe_throttle_low_memory`] every
+    /// [`THROTTLE_SAMPLE_MASK`]+1 lines. Set `false` for stages that briefly
+    /// allocate a lot (e.g., parent-cache builds) where the backoff would
+    /// otherwise dominate runtime.
+    pub throttle: bool,
 }
 
-/// Tunable version: choose BufReader capacity via `read_buf_bytes`.
-/// Same corruption handling and skip semantics as `for_each_line`.
+impl<'a> Default for LineStreamOpts<'a> {
+    fn default() -> Self {
+        Self {
+            read_buf_bytes: None,
+            progress: None,
+            on_skip: None,
+            throttle: true,
+        }
+    }
+}
+
+/// Stream a zstd JSONL file line-by-line using `opts`, calling `on_line`
+/// with each raw `&str` (newline already stripped).
+///
+/// We request `window_log_max(ZSTD_WINDOW_LOG_MAX)` up front to avoid
+/// "Frame requires too much memory" on very large frames. If decoding
+/// still fails (e.g., checksum/corruption), we log a single warning,
+/// invoke `opts.on_skip` (if set), advance progress to the file's size
+/// (if a progress callback is set), and return `Ok(())` — corruption
+/// never aborts the run.
+pub fn for_each_line_with_opts(
+    path: &Path,
+    opts: LineStreamOpts<'_>,
+    mut on_line: impl FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    let LineStreamOpts {
+        read_buf_bytes,
+        mut progress,
+        mut on_skip,
+        throttle,
+    } = opts;
+    let result = for_each_line_attempt(
+        path,
+        read_buf_bytes,
+        progress.as_deref_mut(),
+        throttle,
+        &mut on_line,
+    );
+    match result {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            warn_decode_skip(path, &e);
+            if let Some(cb) = on_skip.as_deref_mut() {
+                cb(path, &e);
+            }
+            // Keep progress bars monotonic on skip.
+            if let Some(cb) = progress.as_deref_mut() {
+                if let Ok(meta) = fs::metadata(path) {
+                    cb(meta.len());
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Tunable line-stream entry point used throughout the library.
+///
+/// Thin shim over [`for_each_line_with_opts`] for callers that only need a
+/// custom `BufReader` capacity.
 pub fn for_each_line_cfg(
     path: &Path,
     read_buf_bytes: usize,
     on_line: impl FnMut(&str) -> Result<()>,
 ) -> Result<()> {
-    for_each_line_cfg_with_skip(path, read_buf_bytes, |_, _| {}, on_line)
+    for_each_line_with_opts(
+        path,
+        LineStreamOpts {
+            read_buf_bytes: Some(read_buf_bytes),
+            ..Default::default()
+        },
+        on_line,
+    )
 }
 
-/// Like `for_each_line`, but invokes `on_skip(path, &error)` when the file is
-/// skipped due to a decode error so callers can record per-file metrics, alert,
-/// or escalate. The decode error is still logged via `warn_decode_skip` and the
-/// outer `Result` is still `Ok(())` — corruption never aborts the run.
-#[allow(dead_code)]
-pub fn for_each_line_with_skip(
-    path: &Path,
-    mut on_skip: impl FnMut(&Path, &anyhow::Error),
-    mut on_line: impl FnMut(&str) -> Result<()>,
-) -> Result<()> {
-    match for_each_line_attempt(path, &mut on_line, Some(31), None) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            warn_decode_skip(path, &e);
-            on_skip(path, &e);
-            Ok(())
-        }
-    }
-}
-
-/// Like `for_each_line_cfg`, but invokes `on_skip(path, &error)` when the file
-/// is skipped due to a decode error. See `for_each_line_with_skip` for details.
+/// Like [`for_each_line_cfg`] but reports skip events to the caller.
 pub fn for_each_line_cfg_with_skip(
     path: &Path,
     read_buf_bytes: usize,
     mut on_skip: impl FnMut(&Path, &anyhow::Error),
-    mut on_line: impl FnMut(&str) -> Result<()>,
+    on_line: impl FnMut(&str) -> Result<()>,
 ) -> Result<()> {
-    match for_each_line_attempt(path, &mut on_line, Some(31), Some(read_buf_bytes)) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            warn_decode_skip(path, &e);
-            on_skip(path, &e);
-            Ok(())
-        }
-    }
+    for_each_line_with_opts(
+        path,
+        LineStreamOpts {
+            read_buf_bytes: Some(read_buf_bytes),
+            on_skip: Some(&mut on_skip),
+            ..Default::default()
+        },
+        on_line,
+    )
 }
 
-fn for_each_line_attempt(
+/// Like [`for_each_line_cfg`] but additionally calls
+/// `on_progress(delta_bytes_read)` after each line and at EOF.
+///
+/// On corruption, advances progress by the file's size before returning
+/// `Ok(())` so progress bars stay monotonic.
+pub fn for_each_line_with_progress_cfg(
     path: &Path,
-    on_line: &mut impl FnMut(&str) -> Result<()>,
-    window_log_max: Option<u32>,
-    read_buf_bytes: Option<usize>,
+    read_buf_bytes: usize,
+    mut on_progress: impl FnMut(u64),
+    on_line: impl FnMut(&str) -> Result<()>,
 ) -> Result<()> {
-    let file = open_with_backoff(path, 16, 50)?;
-    let mut decoder = Decoder::new(file)?;
-    if let Some(log) = window_log_max {
-        decoder.window_log_max(log)?;
-    }
-    let cap = read_buf_bytes.unwrap_or(16 * 1024);
-    let mut reader = BufReader::with_capacity(cap, decoder);
+    for_each_line_with_opts(
+        path,
+        LineStreamOpts {
+            read_buf_bytes: Some(read_buf_bytes),
+            progress: Some(&mut on_progress),
+            ..Default::default()
+        },
+        on_line,
+    )
+}
 
-    let mut buf = String::with_capacity(16 * 1024);
-    // Sampled cooperative memory backoff: maybe_throttle_low_memory acquires a
-    // global Mutex (see src/mem.rs). Now that bucketing/dedupe carry their own
-    // bounded backpressure channels, this throttle is a coarse safety net —
-    // sample every 65,536 lines instead of 4,096 to keep mutex contention out
-    // of the hot read loop.
-    let mut tick: u32 = 0;
-    loop {
-        buf.clear();
-        let n = reader.read_line(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        if buf.ends_with('\n') {
-            let _ = buf.pop();
-            if buf.ends_with('\r') { let _ = buf.pop(); }
-        }
-        on_line(&buf)?;
-        tick = tick.wrapping_add(1);
-        if tick & 0xFFFF == 0 {
-            maybe_throttle_low_memory(0.10);
-        }
-    }
-    Ok(())
+/// Progress-aware streaming **without** the per-line memory throttle.
+///
+/// Useful for stages that briefly use more RAM (e.g., building parent
+/// caches) where the backoff would otherwise dominate runtime.
+pub fn for_each_line_with_progress_cfg_no_throttle(
+    path: &Path,
+    read_buf_bytes: usize,
+    mut on_progress: impl FnMut(u64),
+    on_line: impl FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    for_each_line_with_opts(
+        path,
+        LineStreamOpts {
+            read_buf_bytes: Some(read_buf_bytes),
+            progress: Some(&mut on_progress),
+            throttle: false,
+            ..Default::default()
+        },
+        on_line,
+    )
+}
+
+/// Like [`for_each_line_with_progress_cfg`] but reports skip events to the caller.
+pub fn for_each_line_with_progress_cfg_with_skip(
+    path: &Path,
+    read_buf_bytes: usize,
+    mut on_skip: impl FnMut(&Path, &anyhow::Error),
+    mut on_progress: impl FnMut(u64),
+    on_line: impl FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    for_each_line_with_opts(
+        path,
+        LineStreamOpts {
+            read_buf_bytes: Some(read_buf_bytes),
+            progress: Some(&mut on_progress),
+            on_skip: Some(&mut on_skip),
+            ..Default::default()
+        },
+        on_line,
+    )
 }
 
 /// A `Read` wrapper that counts compressed bytes read.
@@ -179,109 +279,52 @@ impl<R: Read> Read for CountingReader<R> {
     }
 }
 
-/// Same as `for_each_line` but calls `on_progress(delta_bytes_read)` after each line
-/// and allows a custom BufReader capacity via `read_buf_bytes`.
-/// On corruption, logs a warning, **advances the progress by the file's size**,
-/// and skips the file.
-pub fn for_each_line_with_progress_cfg(
-    path: &Path,
-    read_buf_bytes: usize,
-    on_progress: impl FnMut(u64),
-    on_line: impl FnMut(&str) -> Result<()>,
-) -> Result<()> {
-    for_each_line_with_progress_cfg_with_skip(path, read_buf_bytes, |_, _| {}, on_progress, on_line)
-}
-
-/// NEW: progress-aware streaming **without** per-line memory throttle.
-/// Useful for stages that briefly use more RAM (e.g., building parent caches)
-/// where the backoff would otherwise dominate runtime.
-pub fn for_each_line_with_progress_cfg_no_throttle(
-    path: &Path,
-    read_buf_bytes: usize,
-    on_progress: impl FnMut(u64),
-    on_line: impl FnMut(&str) -> Result<()>,
-) -> Result<()> {
-    for_each_line_with_progress_cfg_no_throttle_with_skip(path, read_buf_bytes, |_, _| {}, on_progress, on_line)
-}
-
-/// Like `for_each_line_with_progress_cfg`, but invokes `on_skip(path, &error)`
-/// when the file is skipped due to a decode error. See `for_each_line_with_skip`
-/// for details.
-pub fn for_each_line_with_progress_cfg_with_skip(
-    path: &Path,
-    read_buf_bytes: usize,
-    mut on_skip: impl FnMut(&Path, &anyhow::Error),
-    mut on_progress: impl FnMut(u64),
-    mut on_line: impl FnMut(&str) -> Result<()>,
-) -> Result<()> {
-    match for_each_line_attempt_with_progress(path, Some(read_buf_bytes), &mut on_progress, &mut on_line, Some(31), /*throttle=*/true) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            warn_decode_skip(path, &e);
-            on_skip(path, &e);
-            if let Ok(meta) = fs::metadata(path) {
-                on_progress(meta.len());
-            }
-            Ok(())
-        }
-    }
-}
-
-/// Like `for_each_line_with_progress_cfg_no_throttle`, but invokes
-/// `on_skip(path, &error)` when the file is skipped due to a decode error.
-/// See `for_each_line_with_skip` for details.
-#[allow(dead_code)]
-pub fn for_each_line_with_progress_cfg_no_throttle_with_skip(
-    path: &Path,
-    read_buf_bytes: usize,
-    mut on_skip: impl FnMut(&Path, &anyhow::Error),
-    mut on_progress: impl FnMut(u64),
-    mut on_line: impl FnMut(&str) -> Result<()>,
-) -> Result<()> {
-    match for_each_line_attempt_with_progress(path, Some(read_buf_bytes), &mut on_progress, &mut on_line, Some(31), /*throttle=*/false) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            warn_decode_skip(path, &e);
-            on_skip(path, &e);
-            if let Ok(meta) = fs::metadata(path) {
-                on_progress(meta.len());
-            }
-            Ok(())
-        }
-    }
-}
-
-fn for_each_line_attempt_with_progress(
+/// Single inner read loop. The two former `_attempt` paths only differed on
+/// whether the file was wrapped in `CountingReader` to drive a progress
+/// callback — we always wrap it now (the atomic add lands once per
+/// `BufReader` refill, ~every 16 KiB, which is noise next to zstd decode
+/// cost), and only invoke the callback when one is set.
+///
+/// The two lifetime parameters decouple the *borrow* lifetime from the
+/// trait-object lifetime; without that, lifetime elision would tie the
+/// trait object's lifetime to the borrow, which then forces the caller's
+/// borrow to span the entire owning struct's lifetime and conflicts with
+/// reusing the same callback on the post-error fallback path.
+fn for_each_line_attempt<'borrow, 'cb: 'borrow>(
     path: &Path,
     read_buf_bytes: Option<usize>,
-    on_progress: &mut impl FnMut(u64),
-    on_line: &mut impl FnMut(&str) -> Result<()>,
-    window_log_max: Option<u32>,
+    mut on_progress: Option<&'borrow mut (dyn FnMut(u64) + 'cb)>,
     throttle: bool,
+    on_line: &mut impl FnMut(&str) -> Result<()>,
 ) -> Result<()> {
     let file = open_with_backoff(path, 16, 50)?;
     let counter = Arc::new(AtomicU64::new(0));
     let cnt = CountingReader { inner: file, counter: counter.clone() };
 
     let mut decoder = Decoder::new(cnt)?;
-    if let Some(log) = window_log_max {
-        decoder.window_log_max(log)?;
-    }
-    let cap = read_buf_bytes.unwrap_or(16 * 1024);
+    decoder.window_log_max(ZSTD_WINDOW_LOG_MAX)?;
+
+    let cap = read_buf_bytes.unwrap_or(DEFAULT_READ_BUF_BYTES);
     let mut reader = BufReader::with_capacity(cap, decoder);
 
-    let mut buf = String::with_capacity(16 * 1024);
-    let mut last = 0u64;
-    // Sampled throttle: see for_each_line_attempt for rationale.
+    let mut buf = String::with_capacity(DEFAULT_READ_BUF_BYTES);
+    let mut last: u64 = 0;
+    // Sampled cooperative memory backoff: maybe_throttle_low_memory acquires a
+    // global Mutex (see src/mem.rs). Now that bucketing/dedupe carry their own
+    // bounded backpressure channels, this throttle is a coarse safety net —
+    // sample every THROTTLE_SAMPLE_MASK+1 lines to keep mutex contention out
+    // of the hot read loop.
     let mut tick: u32 = 0;
     loop {
         buf.clear();
         let n = reader.read_line(&mut buf)?;
         if n == 0 {
-            // final progress flush
-            let cur = counter.load(Ordering::Relaxed);
-            if cur > last {
-                on_progress(cur - last);
+            // Final progress flush at EOF.
+            if let Some(cb) = on_progress.as_deref_mut() {
+                let cur = counter.load(Ordering::Relaxed);
+                if cur > last {
+                    cb(cur - last);
+                }
             }
             break;
         }
@@ -289,18 +332,20 @@ fn for_each_line_attempt_with_progress(
             let _ = buf.pop();
             if buf.ends_with('\r') { let _ = buf.pop(); }
         }
-        // progress
-        let cur = counter.load(Ordering::Relaxed);
-        if cur > last {
-            on_progress(cur - last);
-            last = cur;
+        // Per-line progress delta (preserves prior cadence: drained before
+        // the user's `on_line` callback runs so "bytes read" never lags
+        // "lines seen").
+        if let Some(cb) = on_progress.as_deref_mut() {
+            let cur = counter.load(Ordering::Relaxed);
+            if cur > last {
+                cb(cur - last);
+                last = cur;
+            }
         }
         on_line(&buf)?;
         if throttle {
             tick = tick.wrapping_add(1);
-            // Coarser sampling now that bucketing/dedupe have explicit
-            // bounded-channel backpressure — see for_each_line_attempt.
-            if tick & 0xFFFF == 0 {
+            if tick & THROTTLE_SAMPLE_MASK == 0 {
                 maybe_throttle_low_memory(0.10);
             }
         }
@@ -314,7 +359,7 @@ fn for_each_line_attempt_with_progress(
 pub fn quick_validate_zst(path: &Path, max_decompressed_bytes: u64) -> Result<()> {
     let file = open_with_backoff(path, 16, 50)?;
     let mut decoder = Decoder::new(file)?;
-    decoder.window_log_max(31)?;
+    decoder.window_log_max(ZSTD_WINDOW_LOG_MAX)?;
     let mut limited = decoder.take(max_decompressed_bytes);
     // Discard output; we only care about whether decoding produces an error.
     io::copy(&mut limited, &mut io::sink())?;
@@ -333,7 +378,7 @@ pub fn quick_validate_zst(path: &Path, max_decompressed_bytes: u64) -> Result<()
 pub fn validate_zst_full(path: &Path) -> Result<()> {
     let file = open_with_backoff(path, 16, 50)?;
     let mut decoder = Decoder::new(file)?;
-    decoder.window_log_max(31)?;
+    decoder.window_log_max(ZSTD_WINDOW_LOG_MAX)?;
     io::copy(&mut decoder, &mut io::sink())?;
     Ok(())
 }
