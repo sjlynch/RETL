@@ -61,12 +61,3 @@ impl KeyExtractor {
     }
 }
 
-/// Convenience helper when you want to adapt a `KeyExtractor` to `Fn(&Value)->Option<String>`.
-pub fn extractor_from_value_adapter(ex: &KeyExtractor) -> impl '_ + Fn(&Value) -> Option<String> {
-    move |v| ex.key_from_value(v)
-}
-
-/// Convenience helper when you need a line-based closure (serde-only for pointer/custom).
-pub fn extractor_from_line_adapter(ex: &KeyExtractor) -> impl '_ + Fn(&str) -> Option<String> {
-    move |s| ex.key_from_line(s)
-}

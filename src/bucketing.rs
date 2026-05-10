@@ -264,7 +264,7 @@ where
             tx.send((k, v)).map_err(|_| ())
         };
 
-        let mut flush_bucket = |idx: usize,
+        let flush_bucket = |idx: usize,
                                 maps: &mut [HashMap<String, Vec<String>>],
                                 mb_bytes: &mut [usize],
                                 total_bytes: &mut usize| -> std::result::Result<(), ()> {
@@ -280,7 +280,7 @@ where
             Ok(())
         };
 
-        let mut flush_largest = |maps: &mut [HashMap<String, Vec<String>>],
+        let flush_largest = |maps: &mut [HashMap<String, Vec<String>>],
                                  mb_bytes: &mut [usize],
                                  total_bytes: &mut usize| -> std::result::Result<(), ()> {
             if maps.is_empty() { return Ok(()); }

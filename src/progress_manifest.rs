@@ -120,9 +120,4 @@ impl ManifestAccumulator {
         save(&self.out_dir, &snapshot)
     }
 
-    /// Snapshot of current entries (for tests / inspection).
-    #[cfg(test)]
-    pub fn snapshot(&self) -> HashMap<String, MonthEntry> {
-        self.months.lock().clone()
-    }
 }

@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use serde_json::json;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
@@ -44,7 +46,7 @@ pub fn read_lines(path: &Path) -> Vec<String> {
 /// All timestamps are in Jan 2006 to keep tests small and deterministic.
 pub fn make_corpus_basic() -> PathBuf {
     let dir = tempfile::tempdir().unwrap();
-    let base = dir.into_path();
+    let base = dir.keep();
 
     // Submissions (RS_2006-01): s1 (bob), s2 (AutoModerator on nytimes.com)
     let rs_2006_01 = base.join("submissions").join("RS_2006-01.zst");
@@ -203,7 +205,7 @@ use retl::YearMonth;
 /// record-level `within_bounds` checks match plan-level filenames.
 pub fn make_corpus_multi_month(months: &[YearMonth]) -> PathBuf {
     let dir = tempfile::tempdir().unwrap();
-    let base = dir.into_path();
+    let base = dir.keep();
 
     for ym in months {
         let label = format!("{:04}-{:02}", ym.year, ym.month);
@@ -264,7 +266,7 @@ pub fn make_corpus_multi_month(months: &[YearMonth]) -> PathBuf {
 /// threshold and to stress dedupe with non-trivial run sizes.
 pub fn make_corpus_n_records(n: usize) -> PathBuf {
     let dir = tempfile::tempdir().unwrap();
-    let base = dir.into_path();
+    let base = dir.keep();
     let rc_path = base.join("comments").join("RC_2006-01.zst");
 
     let distinct = (n / 4).max(1);

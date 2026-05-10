@@ -87,7 +87,7 @@ fn assert_serde_json_accepts(line: &str) {
 /// Build a one-month, comments-only corpus from `lines`. All lines must be
 /// JSONL records (no embedded `\n`). Returns the corpus base dir.
 fn make_corpus_from_lines(lines: &[String]) -> PathBuf {
-    let dir = tempfile::tempdir().unwrap().into_path();
+    let dir = tempfile::tempdir().unwrap().keep();
     let rc_path = dir.join("comments").join("RC_2006-01.zst");
     write_zst_lines(&rc_path, lines);
     // The pipeline's discover_all walks both comments_dir and submissions_dir;

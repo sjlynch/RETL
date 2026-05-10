@@ -114,7 +114,6 @@ pub fn tmp_name_for_job(job: &FileJob) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
 
     /// A temp part containing invalid UTF-8 must cause stitching to return
     /// `Err` instead of silently truncating the JSON array. Regression test

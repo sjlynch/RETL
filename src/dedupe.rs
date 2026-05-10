@@ -212,7 +212,7 @@ pub fn merge_runs_sorted(
     if runs.is_empty() {
         // Nothing to write.
         let tmp = output.with_extension("ndjson.inprogress");
-        let mut w = NdjsonWriter::create(&tmp, cfg.write_buf_bytes)?;
+        let w = NdjsonWriter::create(&tmp, cfg.write_buf_bytes)?;
         w.finish_atomic(output)?;
         return Ok(());
     }

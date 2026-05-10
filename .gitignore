@@ -58,3 +58,6 @@ coverage/
 # lattice-managed (do not remove)
 .claude/settings.local.json
 .lattice/
+
+# lattice-managed (do not remove)
+.pi/extensions/lattice-complete.ts

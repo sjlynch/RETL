@@ -15,7 +15,6 @@
 use retl::PartitionWriters;
 use std::collections::HashMap;
 use std::fs;
-use std::io::Write as _;
 
 #[test]
 fn finalize_without_writes_emits_empty_per_partition_files() {

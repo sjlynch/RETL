@@ -9,7 +9,6 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use common::*;
 use retl::{
     build_runs_sorted, bucketize_shards, merge_runs_sorted, partition_stage1,
     process_bucket_streaming, BucketingCfg, DedupeCfg, KeyExtractor, NdjsonReader,

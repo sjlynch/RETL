@@ -19,7 +19,7 @@ use std::path::PathBuf;
 /// Build a corpus of 4 RC records with controlled author/score values so
 /// boundary checks land exactly where we want them.
 fn corpus_with_scores() -> PathBuf {
-    let dir = tempfile::tempdir().unwrap().into_path();
+    let dir = tempfile::tempdir().unwrap().keep();
     let rc = dir.join("comments").join("RC_2006-01.zst");
     let lines: Vec<String> = vec![
         json!({"subreddit":"programming","author":"u_neg","id":"c0","body":"x","parent_id":"t3_s1","created_utc":1136074600_i64,"score":-5_i64}).to_string(),
@@ -87,7 +87,7 @@ fn min_and_max_score_combine_as_a_closed_interval() {
 /// Keyword search must hit `selftext` and `title` on submission records, not
 /// only `body` on comments.
 fn corpus_with_keywords_in_submissions() -> PathBuf {
-    let dir = tempfile::tempdir().unwrap().into_path();
+    let dir = tempfile::tempdir().unwrap().keep();
     let rs = dir.join("submissions").join("RS_2006-01.zst");
     let lines: Vec<String> = vec![
         // Match in title only.
@@ -152,7 +152,7 @@ fn keywords_any_is_case_insensitive() {
 /// `ascii_ci_contains_http` looks for the literal "http" sequence so https
 /// is naturally a superset, but we lock that in with an explicit test.
 fn corpus_with_https_only() -> PathBuf {
-    let dir = tempfile::tempdir().unwrap().into_path();
+    let dir = tempfile::tempdir().unwrap().keep();
     let rc = dir.join("comments").join("RC_2006-01.zst");
     let lines: Vec<String> = vec![
         json!({"subreddit":"programming","author":"u_https","id":"c1","body":"see HTTPS://example.com today","parent_id":"t3_s1","created_utc":1136074600_i64,"score":1_i64}).to_string(),

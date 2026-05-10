@@ -28,7 +28,7 @@ use std::path::PathBuf;
 /// Minimal "programming" corpus that lets the caller control the exact JSON
 /// the rewriter sees. Only the comment file is populated.
 fn build_corpus_with_lines(lines: Vec<String>) -> PathBuf {
-    let dir = tempfile::tempdir().unwrap().into_path();
+    let dir = tempfile::tempdir().unwrap().keep();
     let rc = dir.join("comments").join("RC_2006-01.zst");
     write_zst_lines(&rc, &lines);
     // empty submissions dir so plan_files for Both still works

@@ -50,12 +50,6 @@ impl ShardedKVWriter {
         Ok(())
     }
 
-    fn shard_paths(&self) -> Vec<PathBuf> {
-        (0..self.count)
-            .map(|i| self.base_dir.join(format!("kv_{:04}.tmp", i)))
-            .collect()
-    }
-
     pub fn reduce_sum(self, prefix: &str) -> Result<Vec<PathBuf>> {
         // Ensure on-disk buffers are flushed before we move fields out of `self`.
         self.flush_all()?;
