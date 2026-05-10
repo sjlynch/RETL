@@ -1,10 +1,10 @@
+use crate::shard_common;
 use ahash::RandomState;
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
 use rayon::prelude::*;
 use std::collections::HashSet;
 use std::fs::{self, File};
-use std::hash::{BuildHasher, Hash, Hasher};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
@@ -29,12 +29,7 @@ impl ShardedWriter {
             shards.push(Mutex::new(BufWriter::new(file)));
         }
 
-        let state = RandomState::with_seeds(
-            0x1234_5678_9abc_def0,
-            0x0fed_cba9_8765_4321,
-            0xdead_beef_cafe_babe,
-            0x0bad_f00d_face_feed,
-        );
+        let state = shard_common::seeded_state("usernames");
 
         Ok(Self {
             base_dir: shards_dir,
@@ -46,9 +41,7 @@ impl ShardedWriter {
 
     #[inline]
     fn shard_index(&self, s: &str) -> usize {
-        let mut hasher = self.state.build_hasher();
-        s.hash(&mut hasher);
-        (hasher.finish() as usize) % self.count
+        shard_common::shard_index(&self.state, s, self.count)
     }
 
     pub fn write(&self, key: &str) -> Result<()> {
