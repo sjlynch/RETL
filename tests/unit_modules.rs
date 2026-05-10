@@ -204,13 +204,15 @@ fn bucketing_process_bucket_streaming_drives_adaptive_flush_with_10k_records() {
     // Force adaptive flushes by setting a very tight buffer target.
     // micro_min_buf_mb=0 and micro_max_buf_mb=0 means ~0-byte target — flush every line group.
     let cfg = BucketingCfg {
-        soft_low_frac: 0.999, // pretend we're "low" so the soft-low branch triggers too
+        mem: retl::AdaptiveMemCfg {
+            soft_low_frac: 0.999, // pretend we're "low" so the soft-low branch triggers too
+            high_frac: 1.0,
+            adapt_cooldown_ms: 1, // re-evaluate fast
+        },
         hard_low_frac: 0.0,   // never trigger the hard backoff sleep
-        high_frac: 1.0,
         backoff_ms: 0,
         micro_min_buf_mb: 0,
         micro_max_buf_mb: 0,
-        adapt_cooldown_ms: 1, // re-evaluate fast
         inflight_bytes: 0,    // disable cap; let tight buffer drive flushes
         inflight_groups: 8,
     };
@@ -306,11 +308,9 @@ fn dedupe_build_and_merge_groups_by_key_in_sorted_order() {
 
     // Tight memory target -> multiple runs -> merge has real work.
     let cfg = DedupeCfg {
+        mem: retl::AdaptiveMemCfg { soft_low_frac: 0.999, high_frac: 1.0, adapt_cooldown_ms: 1 },
         min_buf_mb: 0,
         max_buf_mb: 0,
-        soft_low_frac: 0.999,
-        high_frac: 1.0,
-        adapt_cooldown_ms: 1,
         read_buf_bytes: 8 * 1024,
         write_buf_bytes: 8 * 1024,
         inflight_bytes: 0, // disable cap so test's tight target_bytes drives flushes
@@ -379,11 +379,9 @@ fn dedupe_single_run_promotes_directly_to_output() {
 
     // Generous buffer -> exactly one run; merge_runs_sorted promotes it directly.
     let cfg = DedupeCfg {
+        mem: retl::AdaptiveMemCfg { soft_low_frac: 0.0, high_frac: 1.0, adapt_cooldown_ms: 10_000 },
         min_buf_mb: 64,
         max_buf_mb: 64,
-        soft_low_frac: 0.0,
-        high_frac: 1.0,
-        adapt_cooldown_ms: 10_000,
         read_buf_bytes: 8 * 1024,
         write_buf_bytes: 8 * 1024,
         inflight_bytes: 0, // disable cap; the test wants a single big run
