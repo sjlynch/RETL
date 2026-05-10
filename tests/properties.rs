@@ -352,13 +352,12 @@ fn run_dedupe_pipeline(lines: &[String], dir: &Path, label: &str) -> Vec<String>
         // Tight buffers so even small inputs may produce >1 run, exercising
         // the k-way merge path. The actual default would coalesce everything
         // into a single run for tiny inputs.
+        mem: retl::AdaptiveMemCfg { soft_low_frac: 0.0, high_frac: 1.0, adapt_cooldown_ms: 1 },
         min_buf_mb: 0,
         max_buf_mb: 0,
-        soft_low_frac: 0.0,
-        high_frac: 1.0,
-        adapt_cooldown_ms: 1,
         read_buf_bytes: 8 * 1024,
         write_buf_bytes: 8 * 1024,
+        inflight_bytes: 0, // disable cap; tight min/max_buf_mb drives flushes
     };
     let runs = build_runs_sorted(&in_path, &runs_dir, &key, &cfg).unwrap();
     let out_path = dir.join(format!("{}_out.ndjson", label));

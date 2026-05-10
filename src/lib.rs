@@ -118,6 +118,7 @@ mod progress_manifest;
 mod pipeline;
 
 mod parents;
+mod parents_ids;
 mod aggregate;
 mod integrity;
 mod partition;
@@ -183,6 +184,7 @@ pub use crate::key_extractor::KeyExtractor;
 
 // export dedupe engine
 pub use crate::dedupe::{DedupeCfg, build_runs_sorted, merge_runs_sorted};
+pub use crate::mem::AdaptiveMemCfg;
 
 // Test-only re-exports of internals so behavioral tests can drive them directly.
 // Behavior is unchanged; these are additive exports used by tests/*.rs.
