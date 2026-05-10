@@ -1,5 +1,5 @@
 use crate::key_extractor::KeyExtractor;
-use crate::mem::{available_memory_fraction, is_low_memory};
+use crate::mem::{available_memory_fraction, is_low_memory, AdaptiveMemCfg};
 use crate::ndjson::{NdjsonReader, NdjsonWriter};
 use crate::progress::ProgressScope;
 use crate::util::{open_with_backoff, remove_with_backoff, replace_file_atomic_backoff, smoothstep_memory_fraction};
@@ -15,11 +15,10 @@ use std::time::{Duration, Instant};
 /// Configuration for the generic dedupe engine.
 #[derive(Clone, Debug)]
 pub struct DedupeCfg {
+    /// Shared adaptive-memory policy (soft_low_frac, high_frac, adapt_cooldown_ms).
+    pub mem: AdaptiveMemCfg,
     pub min_buf_mb: usize,
     pub max_buf_mb: usize,
-    pub soft_low_frac: f64,
-    pub high_frac: f64,
-    pub adapt_cooldown_ms: u64,
     pub read_buf_bytes: usize,
     pub write_buf_bytes: usize,
     /// Hard cap on bytes inflight between the line-reader producer and the
@@ -31,11 +30,9 @@ pub struct DedupeCfg {
 impl Default for DedupeCfg {
     fn default() -> Self {
         Self {
+            mem: AdaptiveMemCfg::default(),
             min_buf_mb: 512,
             max_buf_mb: 8192,
-            soft_low_frac: 0.18,
-            high_frac: 0.85,
-            adapt_cooldown_ms: 400,
             read_buf_bytes: 4 * 1024 * 1024,
             write_buf_bytes: 4 * 1024 * 1024,
             // Default backpressure budget: 256 MiB. With channel capacity of 1,
@@ -72,7 +69,7 @@ pub fn build_runs_sorted(
     let mut buf = String::with_capacity(64 * 1024);
     let mut buffered_bytes: usize = 0;
     let mut target_bytes: usize = cfg.min_buf_mb * 1024 * 1024;
-    let mut last_eval = Instant::now() - Duration::from_millis(cfg.adapt_cooldown_ms * 2);
+    let mut last_eval = Instant::now() - Duration::from_millis(cfg.mem.adapt_cooldown_ms * 2);
 
     // Hard cap on per-flush bytes. With channel capacity 1, total inflight is
     // bounded by 2 * per_flush_cap = inflight_bytes.
@@ -113,11 +110,11 @@ pub fn build_runs_sorted(
                     buffered_bytes += buf.len() + 1;
                 }
 
-                if last_eval.elapsed() >= Duration::from_millis(cfg.adapt_cooldown_ms) {
+                if last_eval.elapsed() >= Duration::from_millis(cfg.mem.adapt_cooldown_ms) {
                     let scale = smoothstep_memory_fraction(
                         available_memory_fraction(),
-                        cfg.soft_low_frac,
-                        cfg.high_frac,
+                        cfg.mem.soft_low_frac,
+                        cfg.mem.high_frac,
                     );
                     let adaptive = ((cfg.min_buf_mb as f64
                         + (cfg.max_buf_mb as f64 - cfg.min_buf_mb as f64) * scale)
@@ -131,7 +128,7 @@ pub fn build_runs_sorted(
                     last_eval = Instant::now();
                 }
 
-                if buffered_bytes >= target_bytes || is_low_memory(cfg.soft_low_frac) {
+                if buffered_bytes >= target_bytes || is_low_memory(cfg.mem.soft_low_frac) {
                     if !map.is_empty() {
                         run_idx += 1;
                         tracing::debug!(
