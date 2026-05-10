@@ -13,9 +13,30 @@ use crate::zstd_jsonl::{
 use anyhow::Result;
 use indicatif::ProgressBar;
 use serde_json::{Map, Value};
-use std::io::Write;
+use std::io::{self, Write};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
+
+/// The three JSON keys the byte-level rewriter targets, with their `":` suffix
+/// pre-baked so the search can flat-scan the line for an anchored byte sequence.
+const TIMESTAMP_KEY_PATTERNS: &[&[u8]] = &[
+    b"\"created_utc\":",
+    b"\"retrieved_on\":",
+    b"\"edited\":",
+];
+
+/// Append `buf` followed by a newline to `writer` and bump the running record count.
+#[inline]
+fn write_and_count<W: Write + ?Sized>(
+    writer: &mut W,
+    buf: &[u8],
+    written: &mut u64,
+) -> io::Result<()> {
+    writer.write_all(buf)?;
+    writer.write_all(b"\n")?;
+    *written += 1;
+    Ok(())
+}
 
 fn apply_human_timestamp_in_place(map: &mut Map<String, Value>, key: &str) {
     if let Some(v) = map.get_mut(key) {
@@ -40,6 +61,80 @@ pub fn apply_human_timestamps(val: &mut Value) {
     }
 }
 
+/// Find the next occurrence of one of `"created_utc":`, `"retrieved_on":`,
+/// `"edited":` in `bytes[start..]` whose value is an integer literal, and
+/// return `(value_start, value_end)`:
+///
+/// - `value_start` is the byte position immediately after the key's `":` —
+///   so `bytes[..value_start]` preserves the key and colon verbatim. Any
+///   whitespace and optional `-` sign between the colon and the digits sit
+///   inside `[value_start..value_end]` and get replaced on rewrite.
+/// - `value_end` is one past the last digit.
+///
+/// Keys whose value is not an integer literal (`null`, `false`, a float in
+/// `1.5` / `1e3` form) are skipped and the search continues. Returns `None`
+/// when no remaining match exists.
+fn find_timestamp_field(bytes: &[u8], start: usize) -> Option<(usize, usize)> {
+    let len = bytes.len();
+    let mut i = start;
+    while i < len {
+        if bytes[i] != b'"' {
+            i += 1;
+            continue;
+        }
+        let matched_len = TIMESTAMP_KEY_PATTERNS
+            .iter()
+            .find(|p| i + p.len() <= len && &bytes[i..i + p.len()] == **p)
+            .map(|p| p.len())
+            .unwrap_or(0);
+        if matched_len == 0 {
+            i += 1;
+            continue;
+        }
+        let value_start = i + matched_len;
+
+        // Walk past optional whitespace (compact serde never emits any), an
+        // optional `-`, then the digit run. Mirrors what `as_i64` accepts.
+        let mut j = value_start;
+        while j < len && (bytes[j] == b' ' || bytes[j] == b'\t') {
+            j += 1;
+        }
+        if j < len && bytes[j] == b'-' {
+            j += 1;
+        }
+        let digits_start = j;
+        while j < len && bytes[j].is_ascii_digit() {
+            j += 1;
+        }
+
+        // No digits → not an integer (e.g. `false`, `null`).
+        // Trailing `.`/`e`/`E` → float; `as_i64` would reject too.
+        let is_integer = j > digits_start
+            && !matches!(bytes.get(j), Some(b'.') | Some(b'e') | Some(b'E'));
+        if !is_integer {
+            i = value_start;
+            continue;
+        }
+        return Some((value_start, j));
+    }
+    None
+}
+
+/// Parse a Unix-timestamp `i64` from a slice produced by `find_timestamp_field`.
+/// The slice may begin with optional space/tab whitespace and an optional `-`
+/// sign followed by ASCII digits. Returns `None` only on i64 overflow — the
+/// slice is otherwise guaranteed well-formed by the caller.
+///
+/// (Spec'd as `u64` in the original task brief, but `i64` is required to keep
+/// the negative-epoch test in `tests/human_timestamps_edge_cases.rs` passing.)
+fn parse_unix_digits(bytes: &[u8]) -> Option<i64> {
+    std::str::from_utf8(bytes).ok().and_then(|s| {
+        s.trim_start_matches(|c: char| c == ' ' || c == '\t')
+            .parse::<i64>()
+            .ok()
+    })
+}
+
 /// Byte-level rewrite of the three timestamp fields directly from the raw JSONL line
 /// into `buf`, without going through `serde_json::Value`.
 ///
@@ -55,94 +150,28 @@ pub fn rewrite_human_timestamps_bytes(line: &str, buf: &mut String) {
     buf.clear();
     buf.reserve(line.len() + 64);
     let bytes = line.as_bytes();
-    let len = bytes.len();
-    let patterns: &[&[u8]] = &[
-        b"\"created_utc\":",
-        b"\"retrieved_on\":",
-        b"\"edited\":",
-    ];
-
     let mut last = 0usize;
     let mut i = 0usize;
-    while i < len {
-        if bytes[i] != b'"' {
-            i += 1;
-            continue;
-        }
 
-        let mut matched_len = 0usize;
-        for p in patterns {
-            if i + p.len() <= len && &bytes[i..i + p.len()] == *p {
-                matched_len = p.len();
-                break;
-            }
+    while let Some((value_start, value_end)) = find_timestamp_field(bytes, i) {
+        // RFC3339 output contains only characters that are JSON-safe without escaping.
+        let formatted = parse_unix_digits(&bytes[value_start..value_end])
+            .and_then(|n| OffsetDateTime::from_unix_timestamp(n).ok())
+            .and_then(|dt| dt.format(&Rfc3339).ok());
+        if let Some(s) = formatted {
+            buf.push_str(&line[last..value_start]);
+            buf.push('"');
+            buf.push_str(&s);
+            buf.push('"');
+            last = value_end;
         }
-        if matched_len == 0 {
-            i += 1;
-            continue;
-        }
-
-        let value_start = i + matched_len;
-        // Skip optional whitespace (compact serde JSON has none, but be tolerant).
-        let mut j = value_start;
-        while j < len && (bytes[j] == b' ' || bytes[j] == b'\t') {
-            j += 1;
-        }
-
-        let num_start = j;
-        if j < len && bytes[j] == b'-' {
-            j += 1;
-        }
-        let digits_start = j;
-        while j < len && bytes[j].is_ascii_digit() {
-            j += 1;
-        }
-
-        // Not an integer (e.g., true/false/null, or just "edited":false).
-        if j == digits_start {
-            i = value_start;
-            continue;
-        }
-        // Reject fractional / exponent forms — `as_i64` would have rejected them too.
-        if j < len {
-            let c = bytes[j];
-            if c == b'.' || c == b'e' || c == b'E' {
-                i = value_start;
-                continue;
-            }
-        }
-
-        let parsed: Option<i64> = std::str::from_utf8(&bytes[num_start..j])
-            .ok()
-            .and_then(|s| s.parse().ok());
-        let Some(n) = parsed else {
-            i = value_start;
-            continue;
-        };
-
-        let formatted = match OffsetDateTime::from_unix_timestamp(n)
-            .ok()
-            .and_then(|dt| dt.format(&Rfc3339).ok())
-        {
-            Some(s) => s,
-            None => {
-                i = value_start;
-                continue;
-            }
-        };
-
-        // Emit everything up to (and including) the `":` of this key, then the quoted
-        // RFC3339 timestamp, then jump past the original digits. RFC3339 output
-        // contains only characters that are JSON-safe without escaping.
-        buf.push_str(&line[last..value_start]);
-        buf.push('"');
-        buf.push_str(&formatted);
-        buf.push('"');
-        last = j;
-        i = j;
+        // Advance past the integer either way; nothing inside a digit run can
+        // start a new `"<key>":` match, so this is byte-equivalent to the
+        // original `i = value_start` on parse/format failure.
+        i = value_end;
     }
 
-    if last < len {
+    if last < bytes.len() {
         buf.push_str(&line[last..]);
     }
 }
@@ -175,9 +204,7 @@ pub fn stream_job<W: Write + ?Sized>(
 
             // Fast-path: raw line when no transforms needed.
             if whitelist.is_none() && !human_timestamps {
-                writer.write_all(line.as_bytes())?;
-                writer.write_all(b"\n")?;
-                written += 1;
+                write_and_count(writer, line.as_bytes(), &mut written)?;
                 return Ok(());
             }
 
@@ -186,9 +213,7 @@ pub fn stream_job<W: Write + ?Sized>(
             // a `serde_json::Value` round-trip. This is the common export/spool config.
             if whitelist.is_none() && human_timestamps {
                 rewrite_human_timestamps_bytes(line, &mut ts_buf);
-                writer.write_all(ts_buf.as_bytes())?;
-                writer.write_all(b"\n")?;
-                written += 1;
+                write_and_count(writer, ts_buf.as_bytes(), &mut written)?;
                 return Ok(());
             }
 
@@ -208,9 +233,7 @@ pub fn stream_job<W: Write + ?Sized>(
                     tok.tokenize_into(line, &mut tok_buf)
                 };
                 if tok_result.is_ok() {
-                    writer.write_all(tok_buf.as_bytes())?;
-                    writer.write_all(b"\n")?;
-                    written += 1;
+                    write_and_count(writer, tok_buf.as_bytes(), &mut written)?;
                     return Ok(());
                 }
                 // Fall through to slow path on tokenizer error.

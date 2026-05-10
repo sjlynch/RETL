@@ -4,6 +4,7 @@ use crate::paths::{discover_all, plan_files, FileKind};
 use crate::progress::{make_count_progress, make_progress_bar_labeled, total_compressed_size};
 use crate::pipeline::RedditETL;
 use crate::mem::{available_memory_fraction, is_low_memory};
+use crate::shard_common;
 use crate::util::replace_file_atomic_backoff;
 use crate::zstd_jsonl::{
     for_each_line_with_progress_cfg_no_throttle,
@@ -15,13 +16,18 @@ use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::fs::File;
-use std::hash::{BuildHasher, Hash, Hasher};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ahash::{AHashSet, RandomState};
+
+/// Per-worker FIFO cache caps for `attach_parents_jsonls_parallel`.
+/// FIFO eviction (no bump-on-hit) is intentional: see comment in
+/// `attach_parents_jsonls_parallel`.
+const COMMENT_SHARD_CACHE_CAP: usize = 8;
+const SUBMISSION_SHARD_CACHE_CAP: usize = 6;
 
 struct IdShardWriter {
     base_dir: PathBuf,
@@ -39,19 +45,12 @@ impl IdShardWriter {
             let p = dir.join(format!("{kind}_ids_{:04}.tmp", i));
             writers.push(parking_lot::Mutex::new(BufWriter::new(File::create(p)?)));
         }
-        let rs = RandomState::with_seeds(
-            0x2200_1100_3300_4400,
-            0x5500_6600_7700_8800,
-            0x9900_aa00_bb00_cc00,
-            0xdd00_ee00_ff00_0123,
-        );
+        let rs = shard_common::seeded_state("parent_ids");
         Ok(Self { base_dir: dir, count, rs, kind, writers })
     }
     #[inline]
     fn idx(&self, id: &str) -> usize {
-        let mut h = self.rs.build_hasher();
-        id.hash(&mut h);
-        (h.finish() as usize) % self.count
+        shard_common::shard_index(&self.rs, id, self.count)
     }
     #[inline]
     fn write(&self, id: &str) -> Result<()> {
@@ -93,9 +92,7 @@ struct IdShards {
 impl IdShards {
     #[inline]
     fn idx(&self, id: &str) -> usize {
-        let mut h = self.rs.build_hasher();
-        id.hash(&mut h);
-        (h.finish() as usize) % self.count
+        shard_common::shard_index(&self.rs, id, self.count)
     }
     #[inline]
     fn path_for(&self, idx: usize) -> PathBuf {
@@ -191,6 +188,53 @@ impl ParentMaps {
             FileKind::Submission => self.submission_shards.as_ref()?,
         };
         map.get(&own_month)
+    }
+}
+
+/// Per-rayon-worker FIFO cache of parsed parent shard JSON files.
+///
+/// `attach_parents_jsonls_parallel` previously open-coded this for both the
+/// comment side (`HashMap<String, String>`) and the submission side
+/// (`HashMap<String, (String, String)>`). The two were byte-for-byte identical
+/// apart from the value type. This generic helper owns the eviction +
+/// load-on-miss logic so each `load_*_shard_value` closure becomes a thin
+/// own-month-first / fallback wrapper.
+///
+/// Eviction is plain FIFO with **no bump-on-hit** — same as the prior inline
+/// implementation. Bumping on hit would require an `O(n)` `VecDeque` rescan
+/// and is unnecessary in practice because shard load order is dominated by
+/// own-month locality (the same shards stay hot naturally).
+struct WorkerShardCache<V> {
+    cache: HashMap<PathBuf, HashMap<String, V>>,
+    order: VecDeque<PathBuf>,
+    cap: usize,
+}
+
+impl<V: serde::de::DeserializeOwned + Clone> WorkerShardCache<V> {
+    fn new(cap: usize) -> Self {
+        Self {
+            cache: HashMap::new(),
+            order: VecDeque::new(),
+            cap,
+        }
+    }
+
+    fn get(&mut self, path: &Path, id: &str) -> Result<Option<V>> {
+        if !self.cache.contains_key(path) {
+            if self.cache.len() >= self.cap {
+                if let Some(old) = self.order.pop_front() {
+                    self.cache.remove(&old);
+                }
+            }
+            let file = File::open(path)
+                .with_context(|| format!("open parent shard {}", path.display()))?;
+            let rdr = BufReader::new(file);
+            let map: HashMap<String, V> = serde_json::from_reader(rdr)
+                .with_context(|| format!("parse parent shard {}", path.display()))?;
+            self.cache.insert(path.to_path_buf(), map);
+            self.order.push_back(path.to_path_buf());
+        }
+        Ok(self.cache.get(path).and_then(|m| m.get(id).cloned()))
     }
 }
 
@@ -611,17 +655,11 @@ impl RedditETL {
                     return Ok(out_path);
                 }
 
-                // Per-worker FIFO caches. Note: we deliberately do NOT bump
-                // entries on hit (would cost O(n) on a VecDeque). Plain FIFO
-                // is sufficient because shard load order is dominated by
-                // own-month locality — the same shards stay hot naturally.
-                let mut c_cache: HashMap<PathBuf, HashMap<String, String>> = HashMap::new();
-                let mut c_order: VecDeque<PathBuf> = VecDeque::new();
-                let c_cap: usize = 8;
-
-                let mut s_cache: HashMap<PathBuf, HashMap<String, (String, String)>> = HashMap::new();
-                let mut s_order: VecDeque<PathBuf> = VecDeque::new();
-                let s_cap: usize = 6;
+                // Per-worker FIFO caches of parsed shard JSON. See
+                // `WorkerShardCache` for why eviction is plain FIFO with no
+                // bump-on-hit.
+                let mut c_cache = WorkerShardCache::<String>::new(COMMENT_SHARD_CACHE_CAP);
+                let mut s_cache = WorkerShardCache::<(String, String)>::new(SUBMISSION_SHARD_CACHE_CAP);
 
                 // Resolve a comment-parent id by looking in the own-month
                 // shard first; if absent, fall back to scanning other months
@@ -633,37 +671,16 @@ impl RedditETL {
                     }
                     let Some(idx) = comment_shards else { return Ok(None); };
 
-                    let try_shard = |p: &Path,
-                                     c_cache: &mut HashMap<PathBuf, HashMap<String, String>>,
-                                     c_order: &mut VecDeque<PathBuf>|
-                     -> Result<Option<String>> {
-                        if !c_cache.contains_key(p) {
-                            if c_cache.len() >= c_cap {
-                                if let Some(old) = c_order.pop_front() {
-                                    c_cache.remove(&old);
-                                }
-                            }
-                            let file = File::open(p)
-                                .with_context(|| format!("open parent shard {}", p.display()))?;
-                            let rdr = BufReader::new(file);
-                            let map: HashMap<String, String> = serde_json::from_reader(rdr)
-                                .with_context(|| format!("parse parent shard {}", p.display()))?;
-                            c_cache.insert(p.to_path_buf(), map);
-                            c_order.push_back(p.to_path_buf());
-                        }
-                        Ok(c_cache.get(p).and_then(|m| m.get(comment_id).cloned()))
-                    };
-
                     if let Some(ym) = own_ym {
                         if let Some(p) = idx.get(&ym) {
-                            if let Some(v) = try_shard(p, &mut c_cache, &mut c_order)? {
+                            if let Some(v) = c_cache.get(p, comment_id)? {
                                 return Ok(Some(v));
                             }
                         }
                     }
                     for (ym, p) in idx {
                         if Some(*ym) == own_ym { continue; }
-                        if let Some(v) = try_shard(p, &mut c_cache, &mut c_order)? {
+                        if let Some(v) = c_cache.get(p, comment_id)? {
                             return Ok(Some(v));
                         }
                     }
@@ -676,37 +693,16 @@ impl RedditETL {
                     }
                     let Some(idx) = submission_shards else { return Ok(None); };
 
-                    let try_shard = |p: &Path,
-                                     s_cache: &mut HashMap<PathBuf, HashMap<String, (String, String)>>,
-                                     s_order: &mut VecDeque<PathBuf>|
-                     -> Result<Option<(String, String)>> {
-                        if !s_cache.contains_key(p) {
-                            if s_cache.len() >= s_cap {
-                                if let Some(old) = s_order.pop_front() {
-                                    s_cache.remove(&old);
-                                }
-                            }
-                            let file = File::open(p)
-                                .with_context(|| format!("open parent shard {}", p.display()))?;
-                            let rdr = BufReader::new(file);
-                            let map: HashMap<String, (String, String)> = serde_json::from_reader(rdr)
-                                .with_context(|| format!("parse parent shard {}", p.display()))?;
-                            s_cache.insert(p.to_path_buf(), map);
-                            s_order.push_back(p.to_path_buf());
-                        }
-                        Ok(s_cache.get(p).and_then(|m| m.get(submission_id).cloned()))
-                    };
-
                     if let Some(ym) = own_ym {
                         if let Some(p) = idx.get(&ym) {
-                            if let Some(v) = try_shard(p, &mut s_cache, &mut s_order)? {
+                            if let Some(v) = s_cache.get(p, submission_id)? {
                                 return Ok(Some(v));
                             }
                         }
                     }
                     for (ym, p) in idx {
                         if Some(*ym) == own_ym { continue; }
-                        if let Some(v) = try_shard(p, &mut s_cache, &mut s_order)? {
+                        if let Some(v) = s_cache.get(p, submission_id)? {
                             return Ok(Some(v));
                         }
                     }

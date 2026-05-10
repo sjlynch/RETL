@@ -2,7 +2,7 @@ use crate::key_extractor::KeyExtractor;
 use crate::mem::{available_memory_fraction, is_low_memory};
 use crate::ndjson::{NdjsonReader, NdjsonWriter};
 use crate::progress::ProgressScope;
-use crate::util::{open_with_backoff, remove_with_backoff, replace_file_atomic_backoff};
+use crate::util::{open_with_backoff, remove_with_backoff, replace_file_atomic_backoff, smoothstep_memory_fraction};
 use anyhow::{Context, Result};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -114,10 +114,11 @@ pub fn build_runs_sorted(
                 }
 
                 if last_eval.elapsed() >= Duration::from_millis(cfg.adapt_cooldown_ms) {
-                    let free = available_memory_fraction();
-                    let span = (cfg.high_frac - cfg.soft_low_frac).max(0.05f64);
-                    let mut scale = ((free - cfg.soft_low_frac) / span).clamp(0.0, 1.0);
-                    scale = scale * scale * (3.0 - 2.0 * scale);
+                    let scale = smoothstep_memory_fraction(
+                        available_memory_fraction(),
+                        cfg.soft_low_frac,
+                        cfg.high_frac,
+                    );
                     let adaptive = ((cfg.min_buf_mb as f64
                         + (cfg.max_buf_mb as f64 - cfg.min_buf_mb as f64) * scale)
                         .round() as usize)
@@ -239,6 +240,27 @@ pub fn merge_runs_sorted(
     impl PartialOrd for HeapItem { fn partial_cmp(&self, o: &Self) -> Option<Ordering> { Some(self.cmp(o)) } }
     impl PartialEq for HeapItem { fn eq(&self, o: &Self) -> bool { self.key == o.key && self.run_idx == o.run_idx } }
 
+    // Read one line from `reader`, strip CRLF, extract its key, and build a
+    // HeapItem for it. Returns `Ok(None)` at EOF or when the line has no
+    // extractable key (silently skipped, matching the original behaviour).
+    // `read_bytes` and `pb` are updated on every successful read so progress
+    // accounting stays consistent across the three call sites below.
+    fn advance_reader(
+        reader: &mut BufReader<File>,
+        run_idx: usize,
+        key: &KeyExtractor,
+        read_bytes: &mut u64,
+        pb: &ProgressScope,
+    ) -> Result<Option<HeapItem>> {
+        let mut s = String::new();
+        let n = reader.read_line(&mut s)?;
+        if n == 0 { return Ok(None); }
+        *read_bytes += n as u64;
+        pb.inc_bytes(n as u64);
+        if s.ends_with('\n') { s.pop(); if s.ends_with('\r') { s.pop(); } }
+        Ok(key.key_from_line(&s).map(|k| HeapItem { key: k, run_idx, line: s }))
+    }
+
     let mut readers: Vec<(BufReader<File>, u64)> = Vec::with_capacity(runs.len()); // (reader, bytes_read)
     for p in runs {
         let f = open_with_backoff(p, 16, 50).with_context(|| format!("open {}", p.display()))?;
@@ -255,15 +277,8 @@ pub fn merge_runs_sorted(
     // Prime heap
     for i in 0..readers.len() {
         let (r, read_bytes) = &mut readers[i];
-        let mut s = String::new();
-        let n = r.read_line(&mut s)?;
-        if n > 0 {
-            *read_bytes += n as u64;
-            pb.inc_bytes(n as u64);
-            if s.ends_with('\n') { s.pop(); if s.ends_with('\r') { s.pop(); } }
-            if let Some(k) = key.key_from_line(&s) {
-                heap.push(HeapItem { key: k, run_idx: i, line: s });
-            }
+        if let Some(item) = advance_reader(r, i, key, read_bytes, &pb)? {
+            heap.push(item);
         }
     }
 
@@ -278,33 +293,20 @@ pub fn merge_runs_sorted(
         // Pull next from the run we just popped from
         {
             let (r, read_bytes) = &mut readers[top.run_idx];
-            let mut s = String::new();
-            let n = r.read_line(&mut s)?;
-            if n > 0 {
-                *read_bytes += n as u64;
-                pb.inc_bytes(n as u64);
-                if s.ends_with('\n') { s.pop(); if s.ends_with('\r') { s.pop(); } }
-                if let Some(k) = key.key_from_line(&s) {
-                    heap.push(HeapItem { key: k, run_idx: top.run_idx, line: s });
-                }
+            if let Some(item) = advance_reader(r, top.run_idx, key, read_bytes, &pb)? {
+                heap.push(item);
             }
         }
 
         // While heap top matches current key, accumulate and advance
         while heap.peek().map(|h| h.key.as_str()) == Some(current_key.as_str()) {
             let item = heap.pop().unwrap();
+            let run_idx = item.run_idx;
             group_lines.push(item.line);
 
-            let (r, read_bytes) = &mut readers[item.run_idx];
-            let mut s = String::new();
-            let n = r.read_line(&mut s)?;
-            if n > 0 {
-                *read_bytes += n as u64;
-                pb.inc_bytes(n as u64);
-                if s.ends_with('\n') { s.pop(); if s.ends_with('\r') { s.pop(); } }
-                if let Some(k) = key.key_from_line(&s) {
-                    heap.push(HeapItem { key: k, run_idx: item.run_idx, line: s });
-                }
+            let (r, read_bytes) = &mut readers[run_idx];
+            if let Some(item) = advance_reader(r, run_idx, key, read_bytes, &pb)? {
+                heap.push(item);
             }
         }
 

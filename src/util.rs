@@ -115,117 +115,110 @@ use std::path::Path;
 use std::thread::sleep;
 use std::time::Duration;
 
+// Named Windows error codes commonly seen on filter-driver / sharing /
+// removable-volume hiccups. Used by `is_retriable_io_error` below; named so
+// the retry classification reads as documentation rather than a wall of magic
+// integers. Values match the Win32 `ERROR_*` constants of the same name.
+const WIN_ERR_ACCESS_DENIED: i32 = 5;       // ERROR_ACCESS_DENIED — often AV/share
+const WIN_ERR_NOT_READY: i32 = 21;          // ERROR_NOT_READY — device not ready
+const WIN_ERR_SHARING_VIOLATION: i32 = 32;  // ERROR_SHARING_VIOLATION
+const WIN_ERR_LOCK_VIOLATION: i32 = 33;     // ERROR_LOCK_VIOLATION
+const WIN_ERR_VIRUS_INFECTED: i32 = 225;    // ERROR_VIRUS_INFECTED — AV/PUA blocked
+const WIN_ERR_NO_SUCH_DEVICE: i32 = 433;    // ERROR_NO_SUCH_DEVICE
+const WIN_ERR_FILE_INVALID: i32 = 1006;     // ERROR_FILE_INVALID — volume changed
+const WIN_ERR_IO_DEVICE: i32 = 1117;        // ERROR_IO_DEVICE
+const WIN_ERR_USER_MAPPED_FILE: i32 = 1224; // ERROR_USER_MAPPED_FILE
+
 /// Return true for transient/retriable I/O errors often seen on Windows when
 /// filter drivers (AV/backup), USB/NAS volumes, or sharing violations occur.
 fn is_retriable_io_error(e: &io::Error) -> bool {
-    match e.raw_os_error() {
-        // Common Windows transient codes:
-        //   5   = Access is denied (often AV/share)
-        //   32  = Sharing violation
-        //   33  = Lock violation
-        //   225 = AV/PUA blocked file
-        //   433 = A device which does not exist was specified
-        //   1006= Volume externally altered; handle invalid
-        //   1117= I/O device error
-        //   1224= The requested operation cannot be performed on a file with a user-mapped section open
-        //   21  = Device not ready
-        Some(5)   | Some(32)  | Some(33)  | Some(225) |
-        Some(433) | Some(1006)| Some(1117)| Some(1224)|
-        Some(21) => true,
-        _ => false,
+    matches!(
+        e.raw_os_error(),
+        Some(WIN_ERR_ACCESS_DENIED)
+            | Some(WIN_ERR_NOT_READY)
+            | Some(WIN_ERR_SHARING_VIOLATION)
+            | Some(WIN_ERR_LOCK_VIOLATION)
+            | Some(WIN_ERR_VIRUS_INFECTED)
+            | Some(WIN_ERR_NO_SUCH_DEVICE)
+            | Some(WIN_ERR_FILE_INVALID)
+            | Some(WIN_ERR_IO_DEVICE)
+            | Some(WIN_ERR_USER_MAPPED_FILE)
+    )
+}
+
+/// Generic retry-with-backoff loop used by the `*_with_backoff` family.
+/// Calls `f` up to `tries` times; on a retriable I/O error, sleeps
+/// `delay_ms * attempt_number` milliseconds before retrying. Non-retriable
+/// errors return immediately. After exhausting retries, returns the last
+/// retriable error seen.
+fn with_backoff<T, F>(tries: usize, delay_ms: u64, mut f: F) -> io::Result<T>
+where
+    F: FnMut() -> io::Result<T>,
+{
+    let tries = tries.max(1);
+    let mut last_err: Option<io::Error> = None;
+    for i in 0..tries {
+        match f() {
+            Ok(v) => return Ok(v),
+            Err(e) if is_retriable_io_error(&e) => {
+                last_err = Some(e);
+                sleep(Duration::from_millis(delay_ms.saturating_mul((i + 1) as u64)));
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
     }
+    Err(last_err.unwrap_or_else(|| io::Error::new(io::ErrorKind::Other, "with_backoff: retries exhausted")))
 }
 
 /// Open a file with retries/backoff for transient errors.
 pub fn open_with_backoff(path: &Path, tries: usize, delay_ms: u64) -> io::Result<File> {
-    let mut last_err: Option<io::Error> = None;
-    let tries = tries.max(1);
-    for i in 0..tries {
-        match File::open(path) {
-            Ok(f) => return Ok(f),
-            Err(e) if is_retriable_io_error(&e) => {
-                last_err = Some(e);
-                sleep(Duration::from_millis(delay_ms.saturating_mul((i + 1) as u64)));
-                continue;
-            }
-            Err(e) => return Err(e),
-        }
-    }
-    Err(last_err.unwrap_or_else(|| io::Error::new(io::ErrorKind::Other, "open failed")))
+    with_backoff(tries, delay_ms, || File::open(path))
 }
 
 /// Create a file with retries/backoff for transient errors.
 pub fn create_with_backoff(path: &Path, tries: usize, delay_ms: u64) -> io::Result<File> {
-    let mut last_err: Option<io::Error> = None;
-    let tries = tries.max(1);
-    for i in 0..tries {
-        match File::create(path) {
-            Ok(f) => return Ok(f),
-            Err(e) if is_retriable_io_error(&e) => {
-                last_err = Some(e);
-                sleep(Duration::from_millis(delay_ms.saturating_mul((i + 1) as u64)));
-                continue;
-            }
-            Err(e) => return Err(e),
-        }
-    }
-    Err(last_err.unwrap_or_else(|| io::Error::new(io::ErrorKind::Other, "create failed")))
+    with_backoff(tries, delay_ms, || File::create(path))
 }
 
 /// Remove a file with retries/backoff for transient errors.
 /// Succeeds if the file doesn't exist.
 pub fn remove_with_backoff(path: &Path, tries: usize, delay_ms: u64) -> Result<()> {
-    let mut last_err: Option<io::Error> = None;
-    for i in 0..tries.max(1) {
-        match fs::remove_file(path) {
-            Ok(_) => return Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(e) if is_retriable_io_error(&e) => {
-                last_err = Some(e);
-                sleep(Duration::from_millis(delay_ms.saturating_mul((i + 1) as u64)));
-                continue;
-            }
-            Err(e) => return Err(e).with_context(|| format!("remove {}", path.display())),
-        }
-    }
-    Err(last_err.unwrap_or_else(|| io::Error::new(io::ErrorKind::Other, "remove failed")))
-        .with_context(|| format!("remove (retries) {}", path.display()))
+    with_backoff(tries, delay_ms, || match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    })
+    .with_context(|| format!("remove {}", path.display()))
 }
 
 /// Rename a file with retries/backoff for transient errors.
 fn rename_with_backoff(src: &Path, dest: &Path, tries: usize, delay_ms: u64) -> Result<()> {
-    let mut last_err: Option<io::Error> = None;
-    for i in 0..tries.max(1) {
-        match fs::rename(src, dest) {
-            Ok(_) => return Ok(()),
-            Err(e) if is_retriable_io_error(&e) => {
-                last_err = Some(e);
-                sleep(Duration::from_millis(delay_ms.saturating_mul((i + 1) as u64)));
-                continue;
-            }
-            Err(e) => return Err(e).with_context(|| format!("rename {} -> {}", src.display(), dest.display())),
-        }
-    }
-    Err(last_err.unwrap_or_else(|| io::Error::new(io::ErrorKind::Other, "rename failed")))
-        .with_context(|| format!("rename (retries) {} -> {}", src.display(), dest.display()))
+    with_backoff(tries, delay_ms, || fs::rename(src, dest))
+        .with_context(|| format!("rename {} -> {}", src.display(), dest.display()))
 }
 
 /// Copy a file with retries/backoff for transient errors.
 fn copy_with_backoff(src: &Path, dest: &Path, tries: usize, delay_ms: u64) -> Result<()> {
-    let mut last_err: Option<io::Error> = None;
-    for i in 0..tries.max(1) {
-        match fs::copy(src, dest) {
-            Ok(_) => return Ok(()),
-            Err(e) if is_retriable_io_error(&e) => {
-                last_err = Some(e);
-                sleep(Duration::from_millis(delay_ms.saturating_mul((i + 1) as u64)));
-                continue;
-            }
-            Err(e) => return Err(e).with_context(|| format!("copy {} -> {}", src.display(), dest.display())),
-        }
-    }
-    Err(last_err.unwrap_or_else(|| io::Error::new(io::ErrorKind::Other, "copy failed")))
-        .with_context(|| format!("copy (retries) {} -> {}", src.display(), dest.display()))
+    with_backoff(tries, delay_ms, || fs::copy(src, dest))
+        .map(|_| ())
+        .with_context(|| format!("copy {} -> {}", src.display(), dest.display()))
+}
+
+/// Smoothstep curve mapping a measured free-memory fraction onto `[0.0, 1.0]`,
+/// used by adaptive buffer sizing in dedupe and bucketing.
+///
+/// - At or below `soft_low`, returns `0.0` (favor smaller buffers).
+/// - At or above `high`, returns `1.0` (favor larger buffers).
+/// - Between the two, applies the cubic smoothstep `s*s*(3 - 2*s)` to soften
+///   the transition.
+///
+/// `(high - soft_low)` is floored at `0.05` to keep the divisor non-degenerate
+/// when callers are configured with overlapping thresholds.
+pub(crate) fn smoothstep_memory_fraction(free: f64, soft_low: f64, high: f64) -> f64 {
+    let span = (high - soft_low).max(0.05);
+    let scale = ((free - soft_low) / span).clamp(0.0, 1.0);
+    scale * scale * (3.0 - 2.0 * scale)
 }
 
 

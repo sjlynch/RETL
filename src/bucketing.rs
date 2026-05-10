@@ -13,7 +13,7 @@ use std::sync::{atomic::{AtomicUsize, Ordering as AtomicOrdering}, Arc};
 
 use crate::key_extractor::KeyExtractor;
 use crate::mem::{available_memory_fraction, is_low_memory};
-use crate::util::open_with_backoff;
+use crate::util::{open_with_backoff, smoothstep_memory_fraction};
 
 /// Adaptive streaming configuration used during micro-bucket processing.
 #[derive(Clone, Debug)]
@@ -61,17 +61,21 @@ fn stable_index(state: &RandomState, key: &str, parts: usize) -> usize {
     (h.finish() as usize) % parts.max(1)
 }
 
-/// Stage 1: shard arbitrary NDJSON inputs by `key` into `shards` files.
-/// Output files are named: `stage1_XXXX.jsonl`.
+/// Shared shard-router used by both Stage 1 (`partition_stage1`) and
+/// Stage 2 (`bucketize_shards`). Creates `shards.max(1)` mutex-guarded
+/// `BufWriter<File>`s named `{file_prefix}_{:04}.jsonl` under `out_dir`,
+/// then `par_iter`s over `inputs`, hashing each line's routing key with
+/// `state` + [`stable_index`] and appending the line to the indexed writer.
+/// All writers are flushed before return.
 ///
-/// `key` decides which routing key to use (e.g. author). Avoids the
-/// per-line `serde_json::Value` DOM parse by going through
-/// [`KeyExtractor::key_from_line`], which uses the `MinimalRecord` fast path
-/// for the common Reddit fields.
-pub fn partition_stage1(
+/// `state` is the per-stage `RandomState` — Stage 1 and Stage 2 must use
+/// different seeds, otherwise re-bucketing in Stage 2 is a no-op.
+fn route_lines_to_shards(
     inputs: &[PathBuf],
     out_dir: &Path,
     shards: usize,
+    state: RandomState,
+    file_prefix: &str,
     key: &KeyExtractor,
 ) -> Result<Vec<PathBuf>> {
     use parking_lot::Mutex;
@@ -81,18 +85,11 @@ pub fn partition_stage1(
 
     fs::create_dir_all(out_dir)?;
 
-    // Deterministic sharding state for Stage 1.
-    let rs = RandomState::with_seeds(
-        0x1111_2222_3333_4444,
-        0x5555_6666_7777_8888,
-        0x9999_aaaa_bbbb_cccc,
-        0xdddd_eeee_ffff_1234,
-    );
-
-    let mut writers: Vec<Mutex<BufWriter<File>>> = Vec::with_capacity(shards);
-    let mut paths: Vec<PathBuf> = Vec::with_capacity(shards);
-    for i in 0..shards.max(1) {
-        let p = out_dir.join(format!("stage1_{:04}.jsonl", i));
+    let shard_count = shards.max(1);
+    let mut writers: Vec<Mutex<BufWriter<File>>> = Vec::with_capacity(shard_count);
+    let mut paths: Vec<PathBuf> = Vec::with_capacity(shard_count);
+    for i in 0..shard_count {
+        let p = out_dir.join(format!("{}_{:04}.jsonl", file_prefix, i));
         let f = std::fs::File::create(&p).with_context(|| format!("create {}", p.display()))?;
         writers.push(Mutex::new(BufWriter::new(f)));
         paths.push(p);
@@ -116,7 +113,7 @@ pub fn partition_stage1(
             }
             if line.is_empty() { continue; }
             if let Some(k) = key.key_from_line(&line) {
-                let idx = stable_index(&rs, &k, shards);
+                let idx = stable_index(&state, &k, shards);
                 let mut w = writers[idx].lock();
                 w.write_all(line.as_bytes())?;
                 w.write_all(b"\n")?;
@@ -126,6 +123,30 @@ pub fn partition_stage1(
     })?;
     for w in &writers { w.lock().flush()?; }
     Ok(paths)
+}
+
+/// Stage 1: shard arbitrary NDJSON inputs by `key` into `shards` files.
+/// Output files are named: `stage1_XXXX.jsonl`.
+///
+/// `key` decides which routing key to use (e.g. author). Avoids the
+/// per-line `serde_json::Value` DOM parse by going through
+/// [`KeyExtractor::key_from_line`], which uses the `MinimalRecord` fast path
+/// for the common Reddit fields.
+pub fn partition_stage1(
+    inputs: &[PathBuf],
+    out_dir: &Path,
+    shards: usize,
+    key: &KeyExtractor,
+) -> Result<Vec<PathBuf>> {
+    // Deterministic sharding state for Stage 1. Distinct from Stage 2's
+    // seeds so a key landing in shard `i` here will redistribute on Stage 2.
+    let rs = RandomState::with_seeds(
+        0x1111_2222_3333_4444,
+        0x5555_6666_7777_8888,
+        0x9999_aaaa_bbbb_cccc,
+        0xdddd_eeee_ffff_1234,
+    );
+    route_lines_to_shards(inputs, out_dir, shards, rs, "stage1", key)
 }
 
 /// Stage 2: re-bucket Stage 1 shards into `buckets` files by the **same key**.
@@ -141,56 +162,16 @@ pub fn bucketize_shards(
     buckets: usize,
     key: &KeyExtractor,
 ) -> Result<Vec<PathBuf>> {
-    use parking_lot::Mutex;
-    use rayon::prelude::*;
-    use std::fs::File;
-    use std::io::{BufReader, BufWriter};
-
-    fs::create_dir_all(out_dir)?;
-
-    // Deterministic sharding for Stage 2.
+    // Deterministic sharding for Stage 2. Seeds intentionally differ from
+    // Stage 1 so re-bucketing actually redistributes keys across the
+    // bucket files; do not unify these.
     let rs = RandomState::with_seeds(
         0xabcdef01_abcdef02,
         0xabcdef03_abcdef04,
         0xabcdef05_abcdef06,
         0xabcdef07_abcdef08,
     );
-
-    let mut writers: Vec<Mutex<BufWriter<File>>> = Vec::with_capacity(buckets);
-    let mut paths: Vec<PathBuf> = Vec::with_capacity(buckets);
-    for i in 0..buckets.max(1) {
-        let p = out_dir.join(format!("bucket_{:04}.jsonl", i));
-        let f = std::fs::File::create(&p).with_context(|| format!("create {}", p.display()))?;
-        writers.push(Mutex::new(BufWriter::new(f)));
-        paths.push(p);
-    }
-
-    shards.par_iter().try_for_each(|shard| -> Result<()> {
-        let f = open_with_backoff(shard, 16, 50)
-            .with_context(|| format!("open {}", shard.display()))?;
-        let mut r = BufReader::new(f);
-        let mut line = String::with_capacity(16 * 1024);
-        loop {
-            line.clear();
-            let n = r.read_line(&mut line)?;
-            if n == 0 { break; }
-            if line.ends_with('\n') {
-                line.pop();
-                if line.ends_with('\r') { line.pop(); }
-            }
-            if line.is_empty() { continue; }
-            if let Some(k) = key.key_from_line(&line) {
-                let idx = stable_index(&rs, &k, buckets);
-                let mut w = writers[idx].lock();
-                w.write_all(line.as_bytes())?;
-                w.write_all(b"\n")?;
-            }
-        }
-        Ok(())
-    })?;
-
-    for w in &writers { w.lock().flush()?; }
-    Ok(paths)
+    route_lines_to_shards(shards, out_dir, buckets, rs, "bucket", key)
 }
 
 /// Stage 3: **in-memory** micro-bucket streaming with adaptive memory.
@@ -348,10 +329,11 @@ where
                 }
 
                 if last_eval.elapsed() >= Duration::from_millis(cfg.adapt_cooldown_ms) {
-                    let free = available_memory_fraction();
-                    let span = (cfg.high_frac - cfg.soft_low_frac).max(0.05f64);
-                    let mut scale = ((free - cfg.soft_low_frac) / span).clamp(0.0, 1.0);
-                    scale = scale * scale * (3.0 - 2.0 * scale);
+                    let scale = smoothstep_memory_fraction(
+                        available_memory_fraction(),
+                        cfg.soft_low_frac,
+                        cfg.high_frac,
+                    );
                     let adaptive = ((cfg.micro_min_buf_mb as f64
                         + (cfg.micro_max_buf_mb as f64 - cfg.micro_min_buf_mb as f64) * scale)
                         .round() as usize)
