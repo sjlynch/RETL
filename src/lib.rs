@@ -117,6 +117,7 @@ mod progress_manifest;
 mod pipeline;
 
 mod parents;
+mod parents_ids;
 mod aggregate;
 mod integrity;
 mod partition;
