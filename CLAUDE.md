@@ -139,13 +139,29 @@ cd fuzz && cargo +nightly fuzz run fuzz_rewrite_timestamps
 
 - `src/lib.rs` — crate-level rustdoc + public re-exports (read this first).
 - `src/pipeline.rs` — `RedditETL` builder, end-to-end orchestration.
+- `src/query.rs` — `QuerySpec`, `ScanPlan`, `normalize_str` (moved from `pipeline.rs`).
 - `src/streaming.rs` — `stream_job` (per-file scan/write hot loop).
 - `src/zstd_jsonl.rs` — `MinimalRecord`, `parse_minimal`,
   `for_each_line_cfg`, `window_log_max(31)`.
 - `src/filters.rs` — `matches_minimal` / `matches_full` / `within_bounds`.
 - `src/dedupe.rs` — bounded-channel backpressure, sorted-run dedupe.
-- `src/key_extractor.rs` — `KeyExtractor::key_from_line` fast/slow paths.
+- `src/key_extractor.rs` — `KeyExtractor::key_from_line`: `MinimalRecord` fast path for author/subreddit keys, `Value` slow path for pointer/custom keys.
 - `src/atomic_write.rs` — staging + atomic publish helpers.
 - `src/progress_manifest.rs` — resume sidecar.
 - `src/util.rs` — `*_with_backoff` I/O retries, `with_thread_pool`,
   `init_tracing_for_binary`.
+- `src/bin_args.rs` — clap `Cli`, `Command`, and `*Args` structs for the binary.
+- `src/bin_helpers.rs` — shared CLI helpers: `build_etl`, `ensure_dirs`, `plan!` macro, `discover_spool_parts`.
+- `src/bin_handlers.rs` — per-subcommand `run_*` handlers.
+- `src/paths.rs` — `discover_all`, `plan_files`, `FileKind`, `FileJob`.
+- `src/date.rs` — `YearMonth` type and year-month string parsing.
+- `src/mem.rs` — `available_memory_fraction`, `is_low_memory`, `smoothstep_memory_fraction`, `maybe_throttle_low_memory`.
+- `src/concurrency.rs` — semaphore-bounded rayon job-stealing helper.
+- `src/progress.rs` — `make_progress_bar_labeled`, `make_count_progress`, `ProgressScope`.
+- `src/shard_common.rs` — `seeded_state`/`shard_index` shared by `ShardedWriter`, `ShardedKVWriter`, `IdShardWriter`.
+- `src/kv_shard.rs` — `ShardedKVWriter`: key-value sharded writer used by the parents pipeline.
+- `src/stitch.rs` — `stitch_tmp_parts`, `stitch_tmp_parts_to_json_array`, `concat_tsvs`.
+- `src/integrity.rs` — file-level integrity runner (`quick_validate_zst`, `validate_zst_full`).
+- `src/partition.rs` — `PartitionWriters`: per-partition concurrent output for `export_partitioned`.
+- `src/ndjson.rs` — `NdjsonReader`/`NdjsonWriter`: plain JSONL I/O without zstd.
+- `src/json_utils.rs` — small JSON utility helpers.
