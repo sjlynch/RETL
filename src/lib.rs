@@ -102,6 +102,7 @@ mod paths;
 mod zstd_jsonl;
 mod shard_common;
 mod shard;
+mod username_stream;
 mod query;
 mod kv_shard;
 
