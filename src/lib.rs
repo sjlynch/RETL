@@ -102,6 +102,7 @@ mod paths;
 mod zstd_jsonl;
 mod shard_common;
 mod shard;
+mod username_stream;
 mod query;
 mod kv_shard;
 
@@ -115,8 +116,10 @@ mod mem;
 mod atomic_write;
 mod progress_manifest;
 mod pipeline;
+mod pipeline_exec;
 
 mod parents;
+mod parents_ids;
 mod aggregate;
 mod integrity;
 mod partition;
@@ -130,7 +133,8 @@ mod dedupe;
 
 pub use crate::config::{ETLOptions, Sources};
 pub use crate::date::YearMonth;
-pub use crate::pipeline::{RedditETL, ExportFormat};
+pub use crate::pipeline::RedditETL;
+pub use crate::pipeline_exec::ExportFormat;
 pub use crate::shard::UsernameStream;
 pub use crate::query::QuerySpec;
 
@@ -182,6 +186,7 @@ pub use crate::key_extractor::KeyExtractor;
 
 // export dedupe engine
 pub use crate::dedupe::{DedupeCfg, build_runs_sorted, merge_runs_sorted};
+pub use crate::mem::AdaptiveMemCfg;
 
 // Test-only re-exports of internals so behavioral tests can drive them directly.
 // Behavior is unchanged; these are additive exports used by tests/*.rs.

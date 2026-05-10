@@ -12,19 +12,18 @@ use std::time::{Duration, Instant};
 use std::sync::{atomic::{AtomicUsize, Ordering as AtomicOrdering}, Arc};
 
 use crate::key_extractor::KeyExtractor;
-use crate::mem::{available_memory_fraction, is_low_memory};
+use crate::mem::{available_memory_fraction, is_low_memory, AdaptiveMemCfg};
 use crate::util::{open_with_backoff, smoothstep_memory_fraction};
 
 /// Adaptive streaming configuration used during micro-bucket processing.
 #[derive(Clone, Debug)]
 pub struct BucketingCfg {
-    pub soft_low_frac: f64,       // when below, prefer smaller buffers
+    /// Shared adaptive-memory policy (soft_low_frac, high_frac, adapt_cooldown_ms).
+    pub mem: AdaptiveMemCfg,
     pub hard_low_frac: f64,       // when below, yield briefly
-    pub high_frac: f64,           // when above, allow larger buffers
     pub backoff_ms: u64,          // sleep when under hard threshold
     pub micro_min_buf_mb: usize,  // min target buffering when RAM is tight
     pub micro_max_buf_mb: usize,  // max target buffering when RAM is plentiful
-    pub adapt_cooldown_ms: u64,   // recompute buffer target at this cadence
     /// Hard cap on bytes inflight between the line-reader producer and the
     /// `on_group` consumer. Caps the per-bucket flush target so the bounded
     /// channel — not the RAM-fraction sampler — is the primary backpressure
@@ -39,13 +38,11 @@ pub struct BucketingCfg {
 impl Default for BucketingCfg {
     fn default() -> Self {
         Self {
-            soft_low_frac: 0.18,
+            mem: AdaptiveMemCfg::default(),
             hard_low_frac: 0.10,
-            high_frac: 0.85,
             backoff_ms: 25,
             micro_min_buf_mb: 128,
             micro_max_buf_mb: 4096,
-            adapt_cooldown_ms: 400,
             // Default 256 MiB inflight budget; with channel cap 8 the per-flush
             // bucket target is capped at ~32 MiB.
             inflight_bytes: 256 * 1024 * 1024,
@@ -328,11 +325,11 @@ where
                     m.store(total_bytes, AtomicOrdering::Relaxed);
                 }
 
-                if last_eval.elapsed() >= Duration::from_millis(cfg.adapt_cooldown_ms) {
+                if last_eval.elapsed() >= Duration::from_millis(cfg.mem.adapt_cooldown_ms) {
                     let scale = smoothstep_memory_fraction(
                         available_memory_fraction(),
-                        cfg.soft_low_frac,
-                        cfg.high_frac,
+                        cfg.mem.soft_low_frac,
+                        cfg.mem.high_frac,
                     );
                     let adaptive = ((cfg.micro_min_buf_mb as f64
                         + (cfg.micro_max_buf_mb as f64 - cfg.micro_min_buf_mb as f64) * scale)
@@ -346,7 +343,7 @@ where
                     last_eval = Instant::now();
                 }
 
-                if total_bytes >= target_bytes || is_low_memory(cfg.soft_low_frac) {
+                if total_bytes >= target_bytes || is_low_memory(cfg.mem.soft_low_frac) {
                     tracing::debug!(
                         target = "retl::backpressure",
                         stage = "bucketing.process_bucket_streaming",

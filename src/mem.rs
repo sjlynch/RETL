@@ -94,6 +94,29 @@ pub fn maybe_throttle_low_memory(threshold: f64) {
     }
 }
 
+/// Shared adaptive-memory tuning knobs embedded in both `DedupeCfg` and
+/// `BucketingCfg`. Centralises the three fields so a policy change only
+/// touches one place.
+#[derive(Clone, Debug)]
+pub struct AdaptiveMemCfg {
+    /// Available-fraction below which the engine prefers smaller buffers.
+    pub soft_low_frac: f64,
+    /// Available-fraction above which the engine allows larger buffers.
+    pub high_frac: f64,
+    /// Minimum milliseconds between adaptive target recomputations.
+    pub adapt_cooldown_ms: u64,
+}
+
+impl Default for AdaptiveMemCfg {
+    fn default() -> Self {
+        Self {
+            soft_low_frac: 0.18,
+            high_frac: 0.85,
+            adapt_cooldown_ms: 400,
+        }
+    }
+}
+
 /// Test-only setter that overrides the cached available-memory fraction.
 ///
 /// Stamps `LAST_CHECK_MS` to "now" so the next read uses the injected value
