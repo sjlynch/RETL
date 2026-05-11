@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 #[cfg(feature = "test-utils")]
 use std::sync::{atomic::{AtomicUsize, Ordering as AtomicOrdering}, Arc};
 
+use crate::config::ETLOptions;
 use crate::key_extractor::KeyExtractor;
 use crate::mem::{available_memory_fraction, is_low_memory, AdaptiveMemCfg};
 use crate::util::{open_with_backoff, smoothstep_memory_fraction};
@@ -47,6 +48,16 @@ impl Default for BucketingCfg {
             // bucket target is capped at ~32 MiB.
             inflight_bytes: 256 * 1024 * 1024,
             inflight_groups: 8,
+        }
+    }
+}
+
+impl From<&ETLOptions> for BucketingCfg {
+    fn from(opts: &ETLOptions) -> Self {
+        Self {
+            mem: opts.adaptive_mem.clone(),
+            inflight_bytes: opts.inflight_bytes,
+            ..Self::default()
         }
     }
 }

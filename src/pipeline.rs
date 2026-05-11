@@ -1,5 +1,6 @@
 use crate::config::{ETLOptions, Sources};
 use crate::date::YearMonth;
+use crate::mem::AdaptiveMemCfg;
 use crate::query::{normalize_str, QuerySpec};
 use crate::util::{default_bot_authors, merge_extra_exclusions};
 use anyhow::Result;
@@ -41,6 +42,8 @@ impl RedditETL {
     /// Override the inflight-bytes backpressure budget used by bucketing/dedupe
     /// producer/consumer pairs. See `ETLOptions::inflight_bytes`.
     pub fn inflight_bytes(mut self, bytes: usize) -> Self { self.opts = self.opts.with_inflight_bytes(bytes); self }
+    /// Override the adaptive-memory policy used by bucketing/dedupe producers.
+    pub fn adaptive_mem(mut self, cfg: AdaptiveMemCfg) -> Self { self.opts = self.opts.with_adaptive_mem(cfg); self }
     /// Opt in to resumable spool runs: when enabled, `extract_spool_monthly`
     /// reads and writes a `<out_dir>/_progress.json` sidecar so a re-run skips
     /// months already published by a previous (possibly crashed) invocation.

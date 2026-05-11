@@ -472,13 +472,52 @@ let bad_full = RedditETL::new()
 ## Performance and tuning
 
 Defaults are conservative. The knobs below are the ones that matter on large
-corpora:
+corpora.
+
+### What to expect
+
+Representative run, measured on a 16-core Ryzen 9 5950X workstation with
+64 GB RAM and a PCIe 4.0 NVMe SSD, with `file_concurrency = 4` and local
+`work_dir`/spool/cache directories:
+
+- One typical comments month (`RC_2018-06.zst`) takes about 10–15 minutes
+  wall-clock, peaks around 18–24 GB RSS, and can consume 75–125 GB of scratch
+  disk while staging spool/cache/work files.
+- A 12-year comments+submissions scan is an overnight-to-weekend job on this
+  class of machine: roughly 24–48 hours when inputs and scratch are on local
+  NVMe, longer on HDDs or network shares.
+- Compressed input size is not the runtime footprint. Reddit zstd frames can
+  require multi-GiB decoded windows, and each concurrently decoded monthly
+  file carries its own window and parser buffers.
+- `work_dir` + parent cache + spool output can temporarily balloon to several
+  times the compressed input size. Put all three on fast local storage with
+  ample free space; avoid mixing them with a slow network-mounted corpus path.
+
+Suggested starting points for `.file_concurrency(n)` by total system RAM:
+
+| RAM | Start with |
+| --- | --- |
+| < 16 GB | 1 |
+| 16–31 GB | 2 |
+| 32–63 GB | 4 |
+| 64–127 GB | 8 |
+| ≥ 128 GB | 8–12, then measure |
+
+### Tuning knobs
 
 - `.parallelism(n)` — Rayon worker threads. CPU-bound work (decompression,
   parsing) scales with this up to physical core count.
 - `.file_concurrency(n)` — number of monthly files decoded in parallel. The
   per-file working set is large; raising this is the fastest way to use up
-  RAM. Start at 4–8.
+  RAM.
+- `.inflight_bytes(bytes)` — hard cap for producer→consumer backpressure in
+  bucketing/dedupe. Lower it to reduce peaks; raise only after measuring RAM.
+- `.adaptive_mem(AdaptiveMemCfg { soft_low_frac, high_frac, adapt_cooldown_ms })`
+  — cooperative buffer policy. `soft_low_frac` is the available-memory fraction
+  below which RETL shrinks buffers and flushes sooner, `high_frac` is the
+  fraction above which it allows larger buffers, and `adapt_cooldown_ms` is the
+  minimum interval between target-size recomputations. Defaults are `0.18`,
+  `0.85`, and `400` ms.
 - `.io_buffers(read, write)` — read/write buffer sizes in bytes. The default
   is fine for SSD-backed local storage; increase to 1–4 MiB on networked
   filesystems.
@@ -488,8 +527,9 @@ corpora:
 - `.progress(true)` and `.progress_label("...")` — render an `indicatif`
   progress bar.
 
-RETL throttles cooperatively when system memory falls below a threshold; you
-do not need to manage this manually.
+RETL throttles cooperatively when system memory falls below the configured
+thresholds; you usually do not need to manage this manually beyond picking a
+reasonable `file_concurrency` and scratch location.
 
 ---
 

@@ -1,3 +1,4 @@
+use crate::config::ETLOptions;
 use crate::key_extractor::KeyExtractor;
 use crate::mem::{available_memory_fraction, is_low_memory, AdaptiveMemCfg};
 use crate::ndjson::{NdjsonReader, NdjsonWriter};
@@ -11,6 +12,11 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+const MAP_INITIAL_CAPACITY: usize = 64_000;
+const BYTES_PER_MB: usize = 1024 * 1024;
+
+type RunMap = ahash::AHashMap<String, Vec<String>>;
 
 /// Configuration for the generic dedupe engine.
 #[derive(Clone, Debug)]
@@ -33,12 +39,24 @@ impl Default for DedupeCfg {
             mem: AdaptiveMemCfg::default(),
             min_buf_mb: 512,
             max_buf_mb: 8192,
-            read_buf_bytes: 4 * 1024 * 1024,
-            write_buf_bytes: 4 * 1024 * 1024,
+            read_buf_bytes: 4 * BYTES_PER_MB,
+            write_buf_bytes: 4 * BYTES_PER_MB,
             // Default backpressure budget: 256 MiB. With channel capacity of 1,
             // peak inflight = ~2 * (inflight_bytes / 2) = 256 MiB regardless of
             // available_memory_fraction sampling.
-            inflight_bytes: 256 * 1024 * 1024,
+            inflight_bytes: 256 * BYTES_PER_MB,
+        }
+    }
+}
+
+impl From<&ETLOptions> for DedupeCfg {
+    fn from(opts: &ETLOptions) -> Self {
+        Self {
+            mem: opts.adaptive_mem.clone(),
+            read_buf_bytes: opts.read_buffer_bytes,
+            write_buf_bytes: opts.write_buffer_bytes,
+            inflight_bytes: opts.inflight_bytes,
+            ..Self::default()
         }
     }
 }
@@ -66,23 +84,15 @@ pub fn build_runs_sorted(
     let mut rdr = NdjsonReader::open(input, cfg.read_buf_bytes)
         .with_context(|| format!("open {}", input.display()))?;
 
-    let mut buf = String::with_capacity(64 * 1024);
-    let mut buffered_bytes: usize = 0;
-    let mut target_bytes: usize = cfg.min_buf_mb * 1024 * 1024;
-    let mut last_eval = Instant::now() - Duration::from_millis(cfg.mem.adapt_cooldown_ms * 2);
-
     // Hard cap on per-flush bytes. With channel capacity 1, total inflight is
     // bounded by 2 * per_flush_cap = inflight_bytes.
     let per_flush_cap = if cfg.inflight_bytes > 0 {
-        (cfg.inflight_bytes / 2).max(1024 * 1024)
+        (cfg.inflight_bytes / 2).max(BYTES_PER_MB)
     } else {
         usize::MAX
     };
 
-    let mut map: ahash::AHashMap<String, Vec<String>> = ahash::AHashMap::with_capacity(64_000);
-    let mut run_idx: usize = 0;
-
-    let (tx, rx) = crossbeam_channel::bounded::<(usize, ahash::AHashMap<String, Vec<String>>)>(1);
+    let (tx, rx) = crossbeam_channel::bounded::<(usize, RunMap)>(1);
 
     let runs_dir_buf = runs_dir.to_path_buf();
     let write_buf_bytes = cfg.write_buf_bytes;
@@ -98,69 +108,15 @@ pub fn build_runs_sorted(
             Ok(written)
         });
 
-        let producer_result: Result<()> = (|| -> Result<()> {
-            loop {
-                let n = rdr.read_line(&mut buf)?;
-                if n == 0 { break; }
-                pb.inc_bytes(n as u64);
-
-                if buf.is_empty() { continue; }
-                if let Some(k) = key.key_from_line(&buf) {
-                    map.entry(k).or_default().push(buf.clone());
-                    buffered_bytes += buf.len() + 1;
-                }
-
-                if last_eval.elapsed() >= Duration::from_millis(cfg.mem.adapt_cooldown_ms) {
-                    let scale = smoothstep_memory_fraction(
-                        available_memory_fraction(),
-                        cfg.mem.soft_low_frac,
-                        cfg.mem.high_frac,
-                    );
-                    let adaptive = ((cfg.min_buf_mb as f64
-                        + (cfg.max_buf_mb as f64 - cfg.min_buf_mb as f64) * scale)
-                        .round() as usize)
-                        * 1024
-                        * 1024;
-                    // Cap adaptive target by per_flush_cap so the bounded
-                    // channel — not the RAM-fraction sampler — is the
-                    // primary backpressure mechanism.
-                    target_bytes = adaptive.min(per_flush_cap);
-                    last_eval = Instant::now();
-                }
-
-                if buffered_bytes >= target_bytes || is_low_memory(cfg.mem.soft_low_frac) {
-                    if !map.is_empty() {
-                        run_idx += 1;
-                        tracing::debug!(
-                            target = "retl::backpressure",
-                            stage = "dedupe.build_runs_sorted",
-                            buffered_bytes,
-                            target_bytes,
-                            run_idx,
-                            "handing run to writer (bounded channel; producer blocks if full)"
-                        );
-                        let owned = std::mem::replace(
-                            &mut map,
-                            ahash::AHashMap::with_capacity(64_000),
-                        );
-                        // send blocks here when consumer falls behind → backpressure
-                        if tx.send((run_idx, owned)).is_err() {
-                            // writer thread dropped rx (errored); break and let
-                            // join surface the underlying error.
-                            break;
-                        }
-                        buffered_bytes = 0;
-                    }
-                }
-            }
-
-            if !map.is_empty() {
-                run_idx += 1;
-                let owned = std::mem::take(&mut map);
-                let _ = tx.send((run_idx, owned));
-            }
-            Ok(())
-        })();
+        let producer_result = run_producer(
+            cfg,
+            &mut rdr,
+            key,
+            per_flush_cap,
+            tx.clone(),
+            &pb,
+            cfg.mem.clone(),
+        );
 
         // Always close tx so the consumer drains and returns.
         drop(tx);
@@ -177,9 +133,87 @@ pub fn build_runs_sorted(
     Ok(run_paths)
 }
 
+fn run_producer(
+    cfg: &DedupeCfg,
+    rdr: &mut NdjsonReader,
+    key: &KeyExtractor,
+    per_flush_cap: usize,
+    tx: crossbeam_channel::Sender<(usize, RunMap)>,
+    pb: &ProgressScope,
+    adaptive_mem: AdaptiveMemCfg,
+) -> Result<()> {
+    let mut buf = String::with_capacity(64 * 1024);
+    let mut buffered_bytes: usize = 0;
+    let mut target_bytes: usize = cfg.min_buf_mb * BYTES_PER_MB;
+    let mut last_eval = Instant::now() - Duration::from_millis(adaptive_mem.adapt_cooldown_ms * 2);
+    let mut map: RunMap = ahash::AHashMap::with_capacity(MAP_INITIAL_CAPACITY);
+    let mut run_idx: usize = 0;
+
+    loop {
+        let n = rdr.read_line(&mut buf)?;
+        if n == 0 { break; }
+        pb.inc_bytes(n as u64);
+
+        if buf.is_empty() { continue; }
+        if let Some(k) = key.key_from_line(&buf) {
+            map.entry(k).or_default().push(buf.clone());
+            buffered_bytes += buf.len() + 1;
+        }
+
+        if last_eval.elapsed() >= Duration::from_millis(adaptive_mem.adapt_cooldown_ms) {
+            let scale = smoothstep_memory_fraction(
+                available_memory_fraction(),
+                adaptive_mem.soft_low_frac,
+                adaptive_mem.high_frac,
+            );
+            let adaptive = ((cfg.min_buf_mb as f64
+                + (cfg.max_buf_mb as f64 - cfg.min_buf_mb as f64) * scale)
+                .round() as usize)
+                * BYTES_PER_MB;
+            // Cap adaptive target by per_flush_cap so the bounded
+            // channel — not the RAM-fraction sampler — is the
+            // primary backpressure mechanism.
+            target_bytes = adaptive.min(per_flush_cap);
+            last_eval = Instant::now();
+        }
+
+        if buffered_bytes >= target_bytes || is_low_memory(adaptive_mem.soft_low_frac) {
+            if !map.is_empty() {
+                run_idx += 1;
+                tracing::debug!(
+                    target = "retl::backpressure",
+                    stage = "dedupe.build_runs_sorted",
+                    buffered_bytes,
+                    target_bytes,
+                    run_idx,
+                    "handing run to writer (bounded channel; producer blocks if full)"
+                );
+                let owned = std::mem::replace(
+                    &mut map,
+                    ahash::AHashMap::with_capacity(MAP_INITIAL_CAPACITY),
+                );
+                // send blocks here when consumer falls behind → backpressure
+                if tx.send((run_idx, owned)).is_err() {
+                    // writer thread dropped rx (errored); break and let
+                    // join surface the underlying error.
+                    break;
+                }
+                buffered_bytes = 0;
+            }
+        }
+    }
+
+    if !map.is_empty() {
+        run_idx += 1;
+        let owned = std::mem::take(&mut map);
+        let _ = tx.send((run_idx, owned));
+    }
+    Ok(())
+}
+
 fn write_run_sorted(
     run_path: &Path,
-    buf_map: &mut ahash::AHashMap<String, Vec<String>>,
+    buf_map: &mut RunMap,
     write_buf: usize,
 ) -> Result<()> {
     let mut keys: Vec<String> = buf_map.keys().cloned().collect();

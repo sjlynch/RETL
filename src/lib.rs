@@ -18,7 +18,8 @@
 //!    - [`ETLOptions`] / [`Sources`] — base dirs, date range, parallelism,
 //!      `file_concurrency` (default `1` to bound peak RAM on giant zstd
 //!      windows), `inflight_bytes` (default 256 MiB; cap on producer→consumer
-//!      backpressure), `resume`, IO buffer sizes, `zst_level`.
+//!      backpressure), `adaptive_mem` thresholds, `resume`, IO buffer sizes,
+//!      `zst_level`.
 //!    - [`YearMonth`] / `iter_year_months` — inclusive month range cursors.
 //!    - [`QuerySpec`] — subreddit / author / regex / keyword / domain / score
 //!      filters; exposes `requires_full_parse()` to choose between the

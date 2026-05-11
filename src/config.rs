@@ -1,4 +1,5 @@
 use crate::date::YearMonth;
+use crate::mem::AdaptiveMemCfg;
 use std::path::{Path, PathBuf};
 
 /// Data source toggle (comments, submissions, both).
@@ -44,6 +45,11 @@ pub struct ETLOptions {
     /// available_memory_fraction. Defaults to 256 MiB.
     pub inflight_bytes: usize,
 
+    /// Adaptive-memory policy shared by bucketing/dedupe producers. Controls
+    /// the free-memory fractions used to shrink/grow producer buffers and the
+    /// minimum cooldown between target recomputations.
+    pub adaptive_mem: AdaptiveMemCfg,
+
     /// Opt-in: when true, `extract_spool_monthly` reads/writes a
     /// `<out_dir>/_progress.json` sidecar and skips months already
     /// committed by a prior run. Default false to preserve current behavior.
@@ -82,6 +88,7 @@ impl Default for ETLOptions {
             zst_level: 7,
 
             inflight_bytes: 256 * 1024 * 1024,
+            adaptive_mem: AdaptiveMemCfg::default(),
             resume: false,
         }
     }
@@ -179,6 +186,14 @@ impl ETLOptions {
     /// 0 disables the explicit cap and falls back to memory-fraction sampling.
     pub fn with_inflight_bytes(mut self, bytes: usize) -> Self {
         self.inflight_bytes = bytes;
+        self
+    }
+
+    /// Override the adaptive-memory policy used by bucketing/dedupe
+    /// producers. This tunes cooperative throttling thresholds without
+    /// changing the hard `inflight_bytes` backpressure cap.
+    pub fn with_adaptive_mem(mut self, cfg: AdaptiveMemCfg) -> Self {
+        self.adaptive_mem = cfg;
         self
     }
 
