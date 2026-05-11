@@ -413,11 +413,14 @@ Collect parent IDs from your spooled JSONL, resolve parent contents by scanning 
 use retl::{ParentIds, ParentMaps, RedditETL, Sources, YearMonth};
 use std::path::Path;
 
+let resume = true; // reuse completed spool/progress entries, parent-cache shards, and attached outputs
+
 let (spool_parts, _n) = RedditETL::new()
     .base_dir("./data")
     .sources(Sources::Both)
     .date_range(Some(YearMonth::new(2006, 1)), Some(YearMonth::new(2006, 1)))
     .progress(true)
+    .resume(resume)
     .scan()
     .subreddit("programming")
     .allow_pseudo_users()
@@ -429,21 +432,23 @@ let ids: ParentIds = RedditETL::new()
     .progress(true)
     .collect_parent_ids_from_jsonls(spool_parts.clone())?;
 
-// Step 3: Resolve to cache over ±1 month window
+// Step 3: Resolve to cache over a ±3 month window (the CLI default)
 let parents: ParentMaps = RedditETL::new()
     .base_dir("./data")
-    .date_range(Some(YearMonth::new(2005, 12)), Some(YearMonth::new(2006, 2)))
+    .date_range(Some(YearMonth::new(2005, 10)), Some(YearMonth::new(2006, 4)))
     .progress(true)
-    .resolve_parent_maps(&ids, Path::new("parents_cache"), /*resume=*/true)?;
+    .resolve_parent_maps(&ids, Path::new("parents_cache"), resume)?;
 
-// Step 4: Attach parent payloads
+// Step 4: Attach parent payloads; resume skips outputs that already exist
 let _out_paths = RedditETL::new()
     .base_dir("./data")
     .progress(true)
-    .attach_parents_jsonls_parallel(spool_parts, Path::new("spool_with_parents"), &parents, /*resume=*/false)?;
+    .attach_parents_jsonls_parallel(spool_parts, Path::new("spool_with_parents"), &parents, resume)?;
 ~~~
 
-Each comment will receive a `"parent"` object containing either the parent comment’s body (`t1_...`) or the submission’s title/selftext (`t3_...`).
+Resolved comments receive a `"parent"` object containing either the parent comment’s body (`t1_...`) or the submission’s title/selftext (`t3_...`). If a referenced parent cannot be resolved from the cache/window, `retl` leaves the `"parent"` key absent rather than writing an empty object; the CLI reports resolved/unresolved totals and warns when more than 5% are unresolved.
+
+The `parents` CLI uses `--window-months 3` by default, scanning three extra months on each side of the spool range. Larger windows catch more old cross-month parents, but scan more corpus bytes and create/use more parent-cache shard files; smaller windows are faster and lighter but can leave more parents unresolved.
 
 ### Integrity Checks
 

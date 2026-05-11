@@ -230,7 +230,7 @@ pub(crate) struct ParentsArgs {
     pub(crate) resume: bool,
     /// Months of slack added on each side of the spool's date range when
     /// scanning the corpus to resolve parent payloads.
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = 3)]
     pub(crate) window_months: u32,
     /// Path to corpus base dir (containing `comments/` and `submissions/`).
     #[arg(long, default_value = "./data")]

@@ -2,7 +2,8 @@
 mod common;
 
 use common::*;
-use retl::{ParentIds, ParentMaps, RedditETL, Sources, YearMonth};
+use retl::{ParentAttachStats, ParentIds, ParentMaps, RedditETL, Sources, YearMonth};
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 
@@ -103,6 +104,45 @@ fn spool_resolve_attach_parents_end_to_end() {
     //   RS_2006-01.jsonl -> 2 submissions
     // Total = 5
     assert_eq!(total_lines, 5, "expected 5 total lines after parent attachment");
+}
+
+#[test]
+fn unresolved_parent_is_absent_and_counted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input = tmp.path().join("part_RC_2006-01.jsonl");
+    fs::write(
+        &input,
+        r#"{"id":"c_missing","body":"child","parent_id":"t1_missing","created_utc":1136073600}"#,
+    )
+    .unwrap();
+
+    let parents = ParentMaps {
+        comments: HashMap::new(),
+        submissions: HashMap::new(),
+        comment_shards: Some(HashMap::new()),
+        submission_shards: Some(HashMap::new()),
+    };
+
+    let (attached_paths, stats) = RedditETL::new()
+        .progress(false)
+        .attach_parents_jsonls_parallel_with_stats(
+            vec![input],
+            &tmp.path().join("attached"),
+            &parents,
+            false,
+        )
+        .unwrap();
+
+    assert_eq!(
+        stats,
+        ParentAttachStats {
+            resolved: 0,
+            unresolved: 1,
+        }
+    );
+    let line = fs::read_to_string(&attached_paths[0]).unwrap();
+    let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+    assert!(v.get("parent").is_none(), "unresolved parent must be absent");
 }
 
 fn count_jsonl_lines(paths: &[std::path::PathBuf]) -> usize {

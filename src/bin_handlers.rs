@@ -219,22 +219,36 @@ pub(crate) fn run_parents(args: ParentsArgs) -> Result<()> {
     };
 
     let ids = build(None, None).collect_parent_ids_from_jsonls(spool_parts.clone())?;
-    let parents = build(Some(Sources::Both), Some((wstart, wend)))
-        .resolve_parent_maps(&ids, &args.cache, args.resume)?;
-    let attached = build(None, None).attach_parents_jsonls_parallel(
+    let parents = build(Some(Sources::Both), Some((wstart, wend))).resolve_parent_maps(
+        &ids,
+        &args.cache,
+        args.resume,
+    )?;
+    let (attached, stats) = build(None, None).attach_parents_jsonls_parallel_with_stats(
         spool_parts,
         &args.out,
         &parents,
         args.resume,
     )?;
 
+    if stats.total() > 0 && stats.unresolved_rate() > 0.05 {
+        tracing::warn!(
+            resolved = stats.resolved,
+            unresolved = stats.unresolved,
+            unresolved_rate = stats.unresolved_rate(),
+            window_months = args.window_months,
+            "more than 5% of parent lookups were unresolved; consider a larger --window-months"
+        );
+    }
+
     eprintln!(
-        "Attached parents to {} file(s) in {} (resolved over {}..={})",
+        "Attached parents to {} file(s) in {} (resolved over {}..={}; parents resolved={}, unresolved={})",
         attached.len(),
         args.out.display(),
         wstart,
-        wend
+        wend,
+        stats.resolved,
+        stats.unresolved
     );
     Ok(())
 }
-

@@ -138,7 +138,7 @@ pub use crate::pipeline_exec::ExportFormat;
 pub use crate::shard::UsernameStream;
 pub use crate::query::QuerySpec;
 
-pub use crate::parents::{ParentIds, ParentMaps};
+pub use crate::parents::{ParentAttachStats, ParentIds, ParentMaps};
 pub use crate::aggregate::Aggregator;
 
 #[doc(hidden)]
