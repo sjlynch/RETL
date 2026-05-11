@@ -34,6 +34,9 @@ enum Finalize {
     JsonArray { pretty: bool },
 }
 
+const FILE_PREFIX_RC: &str = "part_RC";
+const FILE_PREFIX_RS: &str = "part_RS";
+
 // -------- Original operations (back-compat) --------
 
 impl RedditETL {
@@ -217,21 +220,21 @@ impl ScanPlan {
             let human_ts = self.etl.opts.human_readable_timestamps;
 
             crate::concurrency::for_each_file_limited(&files, self.etl.opts.file_concurrency, |job| -> Result<()> {
-                let outcome = process_month(
-                    job,
+                let ctx = MonthJobCtx {
                     out_dir,
-                    &staging_dir,
-                    targets_ref,
-                    &self.query,
-                    &whitelist,
-                    pb.as_ref(),
+                    staging_dir: &staging_dir,
+                    targets: targets_ref,
+                    query: &self.query,
+                    whitelist: &whitelist,
+                    pb: pb.as_ref(),
                     bounds,
                     read_buf,
                     write_buf,
                     human_ts,
                     resume,
-                    &completed_keys,
-                )?;
+                    completed_keys: &completed_keys,
+                };
+                let outcome = process_month(job, &ctx)?;
 
                 if let Some(month) = outcome {
                     total_written.fetch_add(month.lines, Ordering::Relaxed);
@@ -386,6 +389,21 @@ struct MonthResult {
     lines: u64,
 }
 
+struct MonthJobCtx<'a> {
+    out_dir: &'a Path,
+    staging_dir: &'a Path,
+    targets: Option<&'a Vec<String>>,
+    query: &'a QuerySpec,
+    whitelist: &'a Option<Vec<String>>,
+    pb: Option<&'a ProgressBar>,
+    bounds: Option<(YearMonth, YearMonth)>,
+    read_buf: usize,
+    write_buf: usize,
+    human_ts: bool,
+    resume: bool,
+    completed_keys: &'a HashSet<String>,
+}
+
 /// Load `_progress.json`, validate each entry against the on-disk file size,
 /// drop mismatches with a `tracing::info` warning, and return the surviving
 /// entries plus a snapshot of completed keys for fast skip-lookup.
@@ -415,51 +433,36 @@ fn load_and_validate_manifest(
 /// `write_jsonl_atomic`. Returns `Ok(None)` on resume-skip or transient atomic
 /// write failure (already logged); `Ok(Some(MonthResult))` on a successful
 /// publish whose entry the caller should commit to the manifest.
-#[allow(clippy::too_many_arguments)]
-fn process_month(
-    job: &FileJob,
-    out_dir: &Path,
-    staging_dir: &Path,
-    targets: Option<&Vec<String>>,
-    query: &QuerySpec,
-    whitelist: &Option<Vec<String>>,
-    pb: Option<&ProgressBar>,
-    bounds: Option<(YearMonth, YearMonth)>,
-    read_buf: usize,
-    write_buf: usize,
-    human_ts: bool,
-    resume: bool,
-    completed_keys: &HashSet<String>,
-) -> Result<Option<MonthResult>> {
+fn process_month(job: &FileJob, ctx: &MonthJobCtx<'_>) -> Result<Option<MonthResult>> {
     let (file_prefix, key_prefix) = match job.kind {
-        FileKind::Comment => ("part_RC", "RC"),
-        FileKind::Submission => ("part_RS", "RS"),
+        FileKind::Comment => (FILE_PREFIX_RC, "RC"),
+        FileKind::Submission => (FILE_PREFIX_RS, "RS"),
     };
-    let out_path = out_dir.join(format!("{}_{}.jsonl", file_prefix, job.ym));
+    let out_path = ctx.out_dir.join(format!("{}_{}.jsonl", file_prefix, job.ym));
     let key = crate::progress_manifest::month_key(key_prefix, job.ym);
 
     // Resume fast-path: skip the month entirely if it's already in the
     // manifest (and the on-disk file matched at load time). Still bump the
     // progress bar by the input file's compressed size so the user sees the
     // work accounted for.
-    if resume && completed_keys.contains(&key) {
-        if let Some(pb) = pb {
+    if ctx.resume && ctx.completed_keys.contains(&key) {
+        if let Some(pb) = ctx.pb {
             let sz = fs::metadata(&job.path).map(|m| m.len()).unwrap_or(0);
             pb.inc(sz);
         }
         return Ok(None);
     }
 
-    let n = match write_jsonl_atomic(staging_dir, &out_path, write_buf, |w| {
+    let n = match write_jsonl_atomic(ctx.staging_dir, &out_path, ctx.write_buf, |w| {
         stream_job(
-            job, w, targets, query, whitelist,
-            pb.cloned(), bounds, read_buf, human_ts,
+            job, w, ctx.targets, ctx.query, ctx.whitelist,
+            ctx.pb.cloned(), ctx.bounds, ctx.read_buf, ctx.human_ts,
         )
     }) {
         Ok(n) => n,
         Err(e) => {
             tracing::warn!(path=%out_path.display(), error=%e, "Skipping month: failed to atomically write spool output");
-            if let Some(pb) = pb {
+            if let Some(pb) = ctx.pb {
                 let sz = fs::metadata(&job.path).map(|m| m.len()).unwrap_or(0);
                 pb.inc(sz);
             }
