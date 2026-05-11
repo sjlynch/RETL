@@ -217,13 +217,6 @@ pub fn merge_runs_sorted(
         return Ok(());
     }
 
-    if runs.len() == 1 {
-        // Single run already sorted — promote to final.
-        replace_file_atomic_backoff(&runs[0], output)?;
-        let _ = fs::remove_file(&runs[0]);
-        return Ok(());
-    }
-
     let total_merge_bytes: u64 = runs.iter().map(|p| fs::metadata(p).map(|m| m.len()).unwrap_or(0)).sum();
     let pb = ProgressScope::bytes("Dedupe: merge runs", total_merge_bytes);
 

@@ -16,6 +16,7 @@ fn retl() -> Command {
 fn root_help_lists_all_subcommands() {
     let assert = retl().arg("--help").assert().success();
     let pred = contains("scan")
+        .and(contains("dedupe"))
         .and(contains("export"))
         .and(contains("count"))
         .and(contains("integrity"))
@@ -46,6 +47,13 @@ fn first_seen_help_advertises_out() {
 fn export_help_advertises_zst_level_and_resume() {
     let assert = retl().args(["export", "--help"]).assert().success();
     let pred = contains("--zst-level").and(contains("--resume"));
+    assert.stdout(pred);
+}
+
+#[test]
+fn dedupe_help_advertises_key_and_out() {
+    let assert = retl().args(["dedupe", "--help"]).assert().success();
+    let pred = contains("--key").and(contains("--out")).and(contains("json:/pointer"));
     assert.stdout(pred);
 }
 
