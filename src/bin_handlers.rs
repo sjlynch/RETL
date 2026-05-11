@@ -154,7 +154,7 @@ pub(crate) fn run_aggregate(args: AggregateArgs) -> Result<()> {
         args.inputs,
         &shards_dir,
         &args.out,
-        true,
+        false,
         args.pretty,
     )?;
     eprintln!(

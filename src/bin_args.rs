@@ -142,8 +142,9 @@ pub(crate) struct ExportArgs {
     /// zstd compression level for `.zst` outputs. Clamped to 1..=22 by the library.
     #[arg(long)]
     pub(crate) zst_level: Option<i32>,
-    /// Resume a prior `--format spool` run by skipping months already published
-    /// (requires the same `--out` directory and a populated `_progress.json`).
+    /// Resume a prior export. `jsonl`/`json` reuse per-month `.part_*.jsonl`
+    /// files and `_progress.json` in `--work-dir`; `spool` reuses part files
+    /// and `_progress.json` in `--out`.
     #[arg(long)]
     pub(crate) resume: bool,
 }
@@ -225,7 +226,9 @@ pub(crate) struct ParentsArgs {
     /// Output directory for spool files with `parent` payloads attached.
     #[arg(long, short)]
     pub(crate) out: PathBuf,
-    /// Reuse cache shards and skip already-attached output files.
+    /// Resume the parents pipeline by reusing cache shards and skipping
+    /// already-attached output files. `export` is the other CLI subcommand that
+    /// supports `--resume`; aggregate/count/scan/integrity/first-seen do not.
     #[arg(long)]
     pub(crate) resume: bool,
     /// Months of slack added on each side of the spool's date range when

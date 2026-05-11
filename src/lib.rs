@@ -131,7 +131,7 @@ mod ndjson;
 mod key_extractor;
 mod dedupe;
 
-pub use crate::config::{ETLOptions, Sources};
+pub use crate::config::{BuildError, ETLOptions, Sources};
 pub use crate::date::YearMonth;
 pub use crate::pipeline::RedditETL;
 pub use crate::pipeline_exec::ExportFormat;
@@ -197,7 +197,7 @@ pub use crate::kv_shard::ShardedKVWriter;
 #[doc(hidden)]
 pub use crate::concurrency::for_each_file_limited;
 #[doc(hidden)]
-pub use crate::paths::{plan_files, discover_all, FileKind, FileJob, Discovered};
+pub use crate::paths::{plan_files, discover_all, FileKind, FileJob, Discovered, PlanningError, SourceStatus, plan_files_checked};
 #[doc(hidden)]
 pub use crate::date::iter_year_months;
 #[doc(hidden)]

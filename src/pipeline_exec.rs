@@ -2,21 +2,21 @@ use crate::atomic_write::{ensure_staging_dir, sweep_stale_inprogress, write_json
 use crate::date::YearMonth;
 use crate::filters::{bounds_tuple, matches_full, matches_minimal, resolve_target_subs_from, within_bounds, ym_from_epoch};
 use crate::kv_shard::ShardedKVWriter;
-use crate::paths::{discover_all, plan_files, FileJob, FileKind};
+use crate::paths::{discover_all, plan_files_checked, FileJob, FileKind};
 use crate::pipeline::{RedditETL, ScanPlan};
 use crate::progress::{make_progress_bar_labeled, total_compressed_size};
 use crate::progress_manifest::{ManifestAccumulator, MonthEntry};
 use crate::query::QuerySpec;
 use crate::shard::{ShardedWriter, UsernameStream};
-use crate::stitch::{concat_tsvs, stitch_tmp_parts, stitch_tmp_parts_to_json_array, tmp_name_for_job};
+use crate::stitch::{concat_tsvs, stitch_tmp_parts, stitch_tmp_parts_to_json_array};
 use crate::streaming::{process_file_for_usernames_with_skip, stream_job};
-use crate::util::{create_with_backoff, with_thread_pool};
+use crate::util::with_thread_pool;
 use crate::zstd_jsonl::{for_each_line_cfg, for_each_line_with_progress_cfg, parse_minimal, MinimalRecord};
 use anyhow::{anyhow, Context, Result};
 use indicatif::ProgressBar;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
-use std::io::{BufWriter, Write};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -43,14 +43,8 @@ impl RedditETL {
 
         with_thread_pool(parallelism, || {
             let work_dir = self.ensure_work_dir()?;
-            let discovered = discover_all(&self.opts.comments_dir, &self.opts.submissions_dir);
-            let files = plan_files(&discovered, self.opts.sources, self.opts.start, self.opts.end);
-
-            if files.is_empty() {
-                tracing::warn!("No files found matching selection. Check base_dir and date range.");
-            } else {
-                tracing::info!("Planned {} files for processing.", files.len());
-            }
+            let files = plan_pipeline_files(&self)?;
+            tracing::info!("Planned {} files for processing.", files.len());
 
             let shard_writer = ShardedWriter::create(&work_dir, "usernames", self.opts.shard_count)?;
             let read_buf = self.opts.read_buffer_bytes;
@@ -164,12 +158,7 @@ impl ScanPlan {
             sweep_stale_inprogress(out_dir, true)?;
 
             let targets = resolve_target_subs_from(&self.etl.opts.subreddit, &self.query.subreddits);
-            let discovered = discover_all(&self.etl.opts.comments_dir, &self.etl.opts.submissions_dir);
-            let files = plan_files(&discovered, self.etl.opts.sources, self.etl.opts.start, self.etl.opts.end);
-
-            if files.is_empty() {
-                return Ok((Vec::new(), 0));
-            }
+            let files = plan_pipeline_files(&self.etl)?;
 
             let resume = self.etl.opts.resume;
             // Resume manifest: load on entry, validate each entry against the
@@ -317,8 +306,7 @@ impl ScanPlan {
         let parallelism = self.etl.opts.parallelism;
 
         with_thread_pool(parallelism, || {
-        let discovered = discover_all(&self.etl.opts.comments_dir, &self.etl.opts.submissions_dir);
-        let files = plan_files(&discovered, self.etl.opts.sources, self.etl.opts.start, self.etl.opts.end);
+        let files = plan_pipeline_files(&self.etl)?;
 
         let comments_dir = out_base_dir.join("comments");
         let submissions_dir = out_base_dir.join("submissions");
@@ -384,6 +372,21 @@ struct MonthResult {
     out_path: PathBuf,
     key: String,
     lines: u64,
+}
+
+fn plan_pipeline_files(etl: &RedditETL) -> Result<Vec<FileJob>> {
+    if let Some(err) = etl.opts.build_error.clone() {
+        return Err(err.into());
+    }
+    let discovered = discover_all(&etl.opts.comments_dir, &etl.opts.submissions_dir);
+    Ok(plan_files_checked(
+        &discovered,
+        &etl.opts.comments_dir,
+        &etl.opts.submissions_dir,
+        etl.opts.sources,
+        etl.opts.start,
+        etl.opts.end,
+    )?)
 }
 
 /// Load `_progress.json`, validate each entry against the on-disk file size,
@@ -481,6 +484,51 @@ fn commit_entry_to_manifest(acc: &ManifestAccumulator, result: MonthResult) -> R
     acc.commit(result.key, entry)
 }
 
+fn export_part_key(job: &FileJob) -> String {
+    let prefix = match job.kind {
+        FileKind::Comment => "RC",
+        FileKind::Submission => "RS",
+    };
+    crate::progress_manifest::month_key(prefix, job.ym)
+}
+
+fn export_part_path(tmp_dir: &Path, key: &str) -> PathBuf {
+    tmp_dir.join(format!(".part_{}.jsonl", key))
+}
+
+fn load_and_validate_export_manifest(tmp_dir: &Path) -> Result<(HashMap<String, MonthEntry>, HashSet<String>)> {
+    let manifest = crate::progress_manifest::load(tmp_dir);
+    let mut keep: HashMap<String, MonthEntry> = HashMap::new();
+    for (k, v) in manifest.months {
+        let part_path = export_part_path(tmp_dir, &k);
+        match validate_jsonl_part(&part_path) {
+            Ok(entry) if entry.size == v.size => { keep.insert(k, entry); }
+            _ => tracing::info!(key=%k, "dropping stale extract progress entry; month will be re-run"),
+        }
+    }
+    let completed_keys: HashSet<String> = keep.keys().cloned().collect();
+    Ok((keep, completed_keys))
+}
+
+fn validate_jsonl_part(path: &Path) -> Result<MonthEntry> {
+    let file = fs::File::open(path).with_context(|| format!("opening extract resume part {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut buf = String::new();
+    let mut lines = 0_u64;
+    loop {
+        buf.clear();
+        let n = reader.read_line(&mut buf)?;
+        if n == 0 { break; }
+        let line = buf.trim_end_matches(['\r', '\n']);
+        if line.is_empty() { continue; }
+        let _: serde_json::Value = serde_json::from_str(line)
+            .with_context(|| format!("validating JSONL part {}", path.display()))?;
+        lines += 1;
+    }
+    let size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    Ok(MonthEntry { size, lines, sha256: None })
+}
+
 /// Shared extraction logic used by:
 ///  - `ScanPlan::extract_to_jsonl`
 ///  - `ScanPlan::extract_to_json`
@@ -495,29 +543,30 @@ fn extract_common(
 ) -> Result<()> {
     let parallelism = etl.opts.parallelism;
     with_thread_pool(parallelism, || {
-    let discovered = discover_all(&etl.opts.comments_dir, &etl.opts.submissions_dir);
-    let files = plan_files(&discovered, etl.opts.sources, etl.opts.start, etl.opts.end);
-
-    match finalize {
-        Finalize::Jsonl => {
-            if files.is_empty() {
-                tracing::warn!("No files found matching selection. Nothing to extract.");
-                return Ok(());
-            }
-        }
-        Finalize::JsonArray { .. } => {
-            if files.is_empty() {
-                let mut w = BufWriter::with_capacity(etl.opts.write_buffer_bytes, create_with_backoff(out_path, 16, 50)?);
-                w.write_all(b"[]")?;
-                w.flush()?;
-                return Ok(());
-            }
-        }
-    }
+    let files = plan_pipeline_files(etl)?;
 
     let work_dir = etl.ensure_work_dir()?;
     let tmp_dir = work_dir.join(tmp_dir_name);
+    if !etl.opts.resume && tmp_dir.exists() {
+        fs::remove_dir_all(&tmp_dir).with_context(|| format!("clearing extract work dir {}", tmp_dir.display()))?;
+    }
     fs::create_dir_all(&tmp_dir)?;
+    let staging_dir = ensure_staging_dir(&tmp_dir)?;
+    sweep_stale_inprogress(&tmp_dir, true)?;
+
+    let resume = etl.opts.resume;
+    let (initial_months, completed_keys) = if resume {
+        load_and_validate_export_manifest(&tmp_dir)?
+    } else {
+        (HashMap::new(), HashSet::new())
+    };
+    let accumulator = if resume {
+        crate::progress_manifest::save(&tmp_dir, &initial_months)?;
+        Some(ManifestAccumulator::new(&tmp_dir, initial_months))
+    } else {
+        None
+    };
+
     let whitelist = etl.opts.whitelist_fields.clone();
 
     let total_bytes = total_compressed_size(&files);
@@ -534,13 +583,49 @@ fn extract_common(
     let human_ts = etl.opts.human_readable_timestamps;
 
     crate::concurrency::for_each_file_limited(&files, etl.opts.file_concurrency, |job| -> Result<()> {
-        let tmp_file = tmp_dir.join(tmp_name_for_job(job));
-        let file = create_with_backoff(&tmp_file, 16, 50)
-            .with_context(|| format!("create {}", tmp_file.display()))?;
-        let mut writer = BufWriter::with_capacity(write_buf, file);
+        let key = export_part_key(job);
+        let tmp_file = export_part_path(&tmp_dir, &key);
 
-        stream_job(job, &mut writer, targets_ref, query, &whitelist, pb.clone(), bounds, read_buf, human_ts)?;
-        writer.flush()?;
+        if resume && completed_keys.contains(&key) {
+            if let Some(pb) = &pb {
+                let sz = fs::metadata(&job.path).map(|m| m.len()).unwrap_or(0);
+                pb.inc(sz);
+            }
+            return Ok(());
+        }
+
+        if resume && tmp_file.exists() {
+            match validate_jsonl_part(&tmp_file) {
+                Ok(entry) => {
+                    if let Some(acc) = &accumulator {
+                        if let Err(e) = acc.commit(key.clone(), entry) {
+                            tracing::warn!(error=%e, key=%key, "failed to update extract progress manifest; continuing");
+                        }
+                    }
+                    if let Some(pb) = &pb {
+                        let sz = fs::metadata(&job.path).map(|m| m.len()).unwrap_or(0);
+                        pb.inc(sz);
+                    }
+                    return Ok(());
+                }
+                Err(e) => {
+                    tracing::info!(path=%tmp_file.display(), error=%e, "resume part failed validation; rebuilding");
+                    let _ = fs::remove_file(&tmp_file);
+                }
+            }
+        }
+
+        let lines = write_jsonl_atomic(&staging_dir, &tmp_file, write_buf, |w| {
+            stream_job(job, w, targets_ref, query, &whitelist, pb.clone(), bounds, read_buf, human_ts)
+        })?;
+
+        if let Some(acc) = &accumulator {
+            let size = fs::metadata(&tmp_file).map(|m| m.len()).unwrap_or(0);
+            let entry = MonthEntry { size, lines, sha256: None };
+            if let Err(e) = acc.commit(key, entry) {
+                tracing::warn!(error=%e, "failed to update extract progress manifest; continuing");
+            }
+        }
         Ok(())
     })?;
 
@@ -583,8 +668,7 @@ where
     let bounds = bounds_tuple(etl.opts.start, etl.opts.end);
     let read_buf = etl.opts.read_buffer_bytes;
 
-    let discovered = discover_all(&etl.opts.comments_dir, &etl.opts.submissions_dir);
-    let files = plan_files(&discovered, etl.opts.sources, etl.opts.start, etl.opts.end);
+    let files = plan_pipeline_files(etl)?;
 
     let pb = if show_progress && etl.opts.progress {
         let total_bytes = total_compressed_size(&files);

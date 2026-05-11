@@ -7,15 +7,118 @@
 //! - `count_by_month`: returns an empty BTreeMap (no panic).
 //! - `extract_to_jsonl`: still creates the output file (an empty one) when
 //!   files were planned but no records survived filtering.
-//! - `extract_to_json`: writes "[]" when no input files exist for the date
-//!   range (covered elsewhere) AND when files exist but nothing matches.
+//! - `extract_to_json`: errors when no input files exist for the date range,
+//!   but writes "[]" when files exist and filtering matches no records.
 
 #[path = "common/mod.rs"]
 mod common;
 
 use common::*;
-use retl::{ExportFormat, RedditETL, Sources, YearMonth};
+use retl::{BuildError, ExportFormat, PlanningError, RedditETL, Sources, YearMonth};
 use std::fs;
+
+#[test]
+fn extract_errors_when_selected_source_dirs_are_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path();
+    let out = base.join("out.jsonl");
+
+    let err = RedditETL::new()
+        .base_dir(base)
+        .sources(Sources::Both)
+        .progress(false)
+        .scan()
+        .extract_to_jsonl(&out)
+        .unwrap_err();
+
+    let planning = err.downcast_ref::<PlanningError>().expect("PlanningError");
+    match planning {
+        PlanningError::NoSourceFiles { statuses, .. } => {
+            assert_eq!(statuses.len(), 2);
+            assert!(statuses.iter().all(|s| !s.exists));
+            assert!(planning.to_string().contains("does not exist"));
+            assert!(planning.to_string().contains("RC_YYYY-MM.zst"));
+            assert!(planning.to_string().contains("RS_YYYY-MM.zst"));
+        }
+        other => panic!("unexpected planning error: {other:?}"),
+    }
+}
+
+#[test]
+fn extract_errors_when_selected_source_dirs_exist_but_have_no_matching_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path();
+    fs::create_dir_all(base.join("comments")).unwrap();
+    fs::create_dir_all(base.join("submissions")).unwrap();
+    fs::write(base.join("comments").join("not_a_dump.txt"), "x").unwrap();
+    let out = base.join("out.jsonl");
+
+    let err = RedditETL::new()
+        .base_dir(base)
+        .sources(Sources::Both)
+        .progress(false)
+        .scan()
+        .extract_to_jsonl(&out)
+        .unwrap_err();
+
+    let planning = err.downcast_ref::<PlanningError>().expect("PlanningError");
+    match planning {
+        PlanningError::NoSourceFiles { statuses, .. } => {
+            assert_eq!(statuses.len(), 2);
+            assert!(statuses.iter().all(|s| s.exists));
+            assert!(planning.to_string().contains("exists but contains no files matching"));
+            assert!(planning.to_string().contains("RC_YYYY-MM.zst"));
+            assert!(planning.to_string().contains("RS_YYYY-MM.zst"));
+        }
+        other => panic!("unexpected planning error: {other:?}"),
+    }
+}
+
+#[test]
+fn extract_errors_when_date_range_excludes_available_corpus() {
+    let base = make_corpus_basic();
+    let out = base.join("out.jsonl");
+
+    let err = RedditETL::new()
+        .base_dir(&base)
+        .sources(Sources::Both)
+        .date_range(Some(YearMonth::new(1999, 1)), Some(YearMonth::new(1999, 1)))
+        .progress(false)
+        .scan()
+        .extract_to_jsonl(&out)
+        .unwrap_err();
+
+    let planning = err.downcast_ref::<PlanningError>().expect("PlanningError");
+    match planning {
+        PlanningError::DateRangeNoFiles { requested_start, requested_end, available_start, available_end, .. } => {
+            assert_eq!(*requested_start, Some(YearMonth::new(1999, 1)));
+            assert_eq!(*requested_end, Some(YearMonth::new(1999, 1)));
+            assert_eq!(*available_start, YearMonth::new(2006, 1));
+            assert_eq!(*available_end, YearMonth::new(2006, 1));
+            assert!(planning.to_string().contains("1999-01..=1999-01"));
+            assert!(planning.to_string().contains("2006-01..=2006-01"));
+        }
+        other => panic!("unexpected planning error: {other:?}"),
+    }
+}
+
+#[test]
+fn invalid_date_range_surfaces_structured_build_error() {
+    let base = make_corpus_basic();
+    let out = base.join("out.jsonl");
+
+    let err = RedditETL::new()
+        .base_dir(&base)
+        .sources(Sources::Both)
+        .date_range(Some(YearMonth::new(2006, 2)), Some(YearMonth::new(2006, 1)))
+        .progress(false)
+        .scan()
+        .extract_to_jsonl(&out)
+        .unwrap_err();
+
+    let build = err.downcast_ref::<BuildError>().expect("BuildError");
+    assert_eq!(build, &BuildError::InvalidDateRange { start: YearMonth::new(2006, 2), end: YearMonth::new(2006, 1) });
+}
 
 #[test]
 fn export_partitioned_jsonl_unmatched_query_removes_output_files() {

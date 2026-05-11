@@ -1,5 +1,24 @@
 use crate::date::YearMonth;
+use std::error::Error;
+use std::fmt;
 use std::path::{Path, PathBuf};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BuildError {
+    InvalidDateRange { start: YearMonth, end: YearMonth },
+}
+
+impl fmt::Display for BuildError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BuildError::InvalidDateRange { start, end } => {
+                write!(f, "invalid date range: start {start} is after end {end}")
+            }
+        }
+    }
+}
+
+impl Error for BuildError {}
 
 /// Data source toggle (comments, submissions, both).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,10 +63,13 @@ pub struct ETLOptions {
     /// available_memory_fraction. Defaults to 256 MiB.
     pub inflight_bytes: usize,
 
-    /// Opt-in: when true, `extract_spool_monthly` reads/writes a
-    /// `<out_dir>/_progress.json` sidecar and skips months already
-    /// committed by a prior run. Default false to preserve current behavior.
+    /// Opt-in: when true, supported extract/export operations read/write a
+    /// `_progress.json`-style sidecar and skip months already committed by a
+    /// prior run. Default false to preserve current behavior.
     pub resume: bool,
+
+    #[doc(hidden)]
+    pub build_error: Option<BuildError>,
 }
 
 impl Default for ETLOptions {
@@ -83,6 +105,7 @@ impl Default for ETLOptions {
 
             inflight_bytes: 256 * 1024 * 1024,
             resume: false,
+            build_error: None,
         }
     }
 }
@@ -110,6 +133,10 @@ impl ETLOptions {
     pub fn with_date_range(mut self, start: Option<YearMonth>, end: Option<YearMonth>) -> Self {
         self.start = start;
         self.end = end;
+        self.build_error = match (start, end) {
+            (Some(s), Some(e)) if s > e => Some(BuildError::InvalidDateRange { start: s, end: e }),
+            _ => None,
+        };
         self
     }
     pub fn with_shard_count(mut self, shards: usize) -> Self {
@@ -182,7 +209,8 @@ impl ETLOptions {
         self
     }
 
-    /// Opt in to resumable spool runs (`extract_spool_monthly` only).
+    /// Opt in to resumable extract/export runs (`extract_to_jsonl`,
+    /// `extract_to_json`, `extract_spool_monthly`, and parents helpers).
     pub fn with_resume(mut self, yes: bool) -> Self {
         self.resume = yes;
         self

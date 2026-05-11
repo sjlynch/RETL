@@ -8,7 +8,6 @@
 //! is atomic on Windows and POSIX.
 
 use crate::atomic_write::write_jsonl_atomic;
-use crate::paths::FileJob;
 use anyhow::Result;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -26,7 +25,7 @@ where
 }
 
 pub fn stitch_tmp_parts(tmp_dir: &Path, out_path: &Path, write_buf: usize) -> Result<()> {
-    let mut paths: Vec<_> = fs::read_dir(tmp_dir)?.filter_map(|e| e.ok().map(|e| e.path())).collect();
+    let mut paths = jsonl_part_paths(tmp_dir)?;
     paths.sort();
     write_atomic(out_path, write_buf, |out| {
         for p in paths {
@@ -52,7 +51,7 @@ pub fn stitch_tmp_parts(tmp_dir: &Path, out_path: &Path, write_buf: usize) -> Re
 /// the previous `r.lines().flatten()` form silently swallowed them and
 /// produced a truncated array.
 pub fn stitch_tmp_parts_to_json_array(tmp_dir: &Path, out_path: &Path, pretty: bool, write_buf: usize) -> Result<()> {
-    let mut paths: Vec<_> = fs::read_dir(tmp_dir)?.filter_map(|e| e.ok().map(|e| e.path())).collect();
+    let mut paths = jsonl_part_paths(tmp_dir)?;
     paths.sort();
 
     write_atomic(out_path, write_buf, |out| {
@@ -94,6 +93,19 @@ pub fn stitch_tmp_parts_to_json_array(tmp_dir: &Path, out_path: &Path, pretty: b
     })
 }
 
+fn jsonl_part_paths(tmp_dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for entry in fs::read_dir(tmp_dir)? {
+        let path = entry?.path();
+        if !path.is_file() { continue; }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue; };
+        if name.ends_with(".jsonl.part") || (name.starts_with(".part_") && name.ends_with(".jsonl")) {
+            paths.push(path);
+        }
+    }
+    Ok(paths)
+}
+
 pub fn concat_tsvs(parts: &Vec<PathBuf>, out_path: &Path, write_buf: usize) -> Result<()> {
     let mut paths = parts.clone();
     paths.sort();
@@ -104,11 +116,6 @@ pub fn concat_tsvs(parts: &Vec<PathBuf>, out_path: &Path, write_buf: usize) -> R
         }
         Ok(())
     })
-}
-
-pub fn tmp_name_for_job(job: &FileJob) -> String {
-    let kind = match job.kind { crate::paths::FileKind::Comment => "RC", crate::paths::FileKind::Submission => "RS" };
-    format!("{kind}_{}.jsonl.part", job.ym)
 }
 
 #[cfg(test)]

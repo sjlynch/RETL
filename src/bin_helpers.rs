@@ -3,7 +3,7 @@
 //! couple of CLI-only path/I/O helpers.
 
 use anyhow::{Context, Result};
-use retl::{Aggregator, RedditETL, Sources, YearMonth};
+use retl::{Aggregator, BuildError, RedditETL, Sources, YearMonth};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
@@ -45,6 +45,9 @@ pub(crate) fn ensure_dirs(common: &CommonOpts) -> Result<PathBuf> {
 }
 
 pub(crate) fn build_etl(common: &CommonOpts) -> Result<RedditETL> {
+    if let (Some(start), Some(end)) = (common.start, common.end) {
+        if start > end { return Err(BuildError::InvalidDateRange { start, end }.into()); }
+    }
     let lib_tmp = ensure_dirs(common)?;
     let mut etl = RedditETL::new()
         .base_dir(&common.data_dir)

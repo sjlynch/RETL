@@ -231,9 +231,12 @@ impl RedditETL {
         inputs: Vec<PathBuf>,
         shards_dir: &Path,
         final_out: &Path,
-        _resume: bool,
+        resume: bool,
         pretty: bool,
     ) -> Result<(usize, usize)> {
+        if resume {
+            tracing::warn!("aggregate_jsonls_parallel does not support resume; rebuilding aggregate shards");
+        }
         fs::create_dir_all(shards_dir)?;
         let shard_errors = build_aggregate_shards::<A>(&inputs, shards_dir, self.opts.progress);
         let merged_shards = publish_aggregated_final::<A>(shards_dir, final_out, pretty, self.opts.progress)?;
