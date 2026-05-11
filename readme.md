@@ -23,6 +23,7 @@
 
 ## Table of Contents
 
+- [Try it in 60 seconds (no corpus needed)](#try-it-in-60-seconds-no-corpus-needed)
 - [Data Layout](#data-layout)
 - [Install](#install)
 - [Command-Line Interface](#command-line-interface)
@@ -45,9 +46,37 @@
 
 ---
 
+## Try it in 60 seconds (no corpus needed)
+
+You can verify a fresh checkout without downloading the multi-GB Reddit corpus.
+This builds the release CLI binary, then runs the `quickstart` example against
+the committed `benches/data/sample.jsonl` fixture. The example writes a tiny
+Reddit-style `.zst` corpus under `target/retl_quickstart_sample/data` and runs
+real RETL scans over it.
+
+~~~sh
+cargo build --release
+cargo run --release --example quickstart
+~~~
+
+Expected output:
+
+~~~text
+Prepared sample corpus from benches/data/sample.jsonl under target/retl_quickstart_sample/data
+Feature demo: subreddit=programming, source=RC+RS
+2019-12	2 records
+2020-01	3 records
+Found 4 unique authors: alice, cory, kate, quinn
+~~~
+
+If that works and you already have monthly Reddit dumps, continue with the
+full [Quick Start](#quick-start).
+
+---
+
 ## Data Layout
 
-RETL expects a base directory with two subfolders:
+For real corpus runs, RETL expects a base directory with two subfolders:
 
 ~~~text
 <base_dir>/
@@ -77,7 +106,7 @@ The monthly files become very large in later years. It’s normal for broader qu
 
 ### As a library (recommended)
 
-Add RETL to your Cargo.toml via Git (replace the URL with your repo if needed):
+Add RETL to your Cargo.toml via Git:
 
 ~~~toml
 [dependencies]
