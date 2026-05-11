@@ -185,12 +185,13 @@ retl integrity --mode full --source both --start 2006-01 --end 2006-04
 Bad files print one `path<TAB>error` line per failure on stdout and the
 process exits with status `2`.
 
-### `aggregate` — fold JSONL inputs into one JSON
+### `aggregate` — fold JSONL inputs into JSON or TSV rollups
 
-Aggregates one or more JSONL inputs into a single JSON file using a built-in
-record-count aggregator (each input is processed in parallel; per-input shard
-intermediates land under `--shards-dir`, which defaults to `agg_shards/`
-next to `--out`).
+Aggregates one or more JSONL inputs using the `retl::Aggregator` pipeline
+(each input is processed in parallel; per-input shard intermediates land under
+`--shards-dir`, which defaults to `agg_shards/` next to `--out`). With no
+`--by`, the CLI keeps the original built-in record-count fallback and writes a
+JSON aggregate state:
 
 ~~~sh
 retl aggregate \
@@ -198,9 +199,17 @@ retl aggregate \
   ./spool/part_RC_2006-01.jsonl ./spool/part_RS_2006-01.jsonl
 ~~~
 
-For more interesting aggregations, implement `retl::Aggregator` for your own
-type and call `RedditETL::aggregate_jsonls_parallel::<MyAgg>(...)` from a
-small driver — the CLI ships only the simple record-count case.
+Built-in grouped rollups write two-column TSV:
+
+~~~sh
+retl aggregate --by subreddit --out counts.tsv ./spool/*.jsonl
+retl aggregate --by month --out months.tsv ./spool/*.jsonl
+retl aggregate --by author --top 100 --out top_authors.tsv ./spool/*.jsonl
+retl aggregate --by 'json:/subreddit' --metric 'sum:/score' --out scores.tsv ./spool/*.jsonl
+~~~
+
+`--metric` defaults to `count` and also supports `avg:/pointer`,
+`min:/pointer`, and `max:/pointer` for numeric JSON-pointer values.
 
 ---
 

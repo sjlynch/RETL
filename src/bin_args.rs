@@ -30,7 +30,7 @@ pub(crate) enum Command {
     Count(CountArgs),
     /// Validate `.zst` monthly files (quick sample or full decode).
     Integrity(IntegrityArgs),
-    /// Aggregate JSONL inputs into a single JSON file (built-in record-count).
+    /// Aggregate JSONL inputs into JSON record counts or built-in TSV rollups.
     Aggregate(AggregateArgs),
     /// Resolve and attach parent comments/submissions onto a spool directory.
     Parents(ParentsArgs),
@@ -202,15 +202,25 @@ pub(crate) struct AggregateArgs {
     /// JSONL input files to aggregate.
     #[arg(required = true, num_args = 1..)]
     pub(crate) inputs: Vec<PathBuf>,
-    /// Output JSON file for the aggregated result.
+    /// Output path. Without `--by`, writes JSON record-count state; with `--by`, writes TSV.
     #[arg(long, short)]
     pub(crate) out: PathBuf,
     /// Directory used for per-input aggregate shards (default: alongside `--out`).
     #[arg(long)]
     pub(crate) shards_dir: Option<PathBuf>,
-    /// Pretty-print the final JSON.
+    /// Pretty-print the final JSON (only used when `--by` is omitted).
     #[arg(long)]
     pub(crate) pretty: bool,
+    /// Built-in group key: `subreddit`, `month`, `author`, or `json:/pointer`.
+    #[arg(long = "by")]
+    pub(crate) by: Option<String>,
+    /// Metric for grouped aggregation: `count` (default), `sum:/pointer`,
+    /// `avg:/pointer`, `min:/pointer`, or `max:/pointer`.
+    #[arg(long = "metric")]
+    pub(crate) metric: Option<String>,
+    /// Keep only the top N groups by metric value (ties sort by key).
+    #[arg(long)]
+    pub(crate) top: Option<usize>,
 }
 
 #[derive(Args, Debug)]

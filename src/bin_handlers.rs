@@ -2,7 +2,7 @@
 //! corresponds 1:1 to a `Command` variant and is invoked from `main.rs`.
 
 use anyhow::{Context, Result};
-use retl::{IntegrityMode, RedditETL, Sources, YearMonth};
+use retl::{replace_file_atomic_backoff, IntegrityMode, RedditETL, Sources, YearMonth};
 use std::fs;
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
@@ -12,7 +12,8 @@ use crate::bin_args::{
     IntegrityModeArg, ParentsArgs, ScanArgs,
 };
 use crate::bin_helpers::{
-    build_etl, discover_spool_parts, plan, stream_extract_to_stdout, RecCount,
+    build_etl, discover_spool_parts, plan, stream_extract_to_stdout, GroupBySpec, GroupMetricAgg,
+    MetricSpec, RecCount,
 };
 
 pub(crate) fn run_scan(args: ScanArgs) -> Result<()> {
@@ -64,7 +65,9 @@ pub(crate) fn run_export(args: ExportArgs) -> Result<()> {
         ExportFmt::Json => {
             let pretty = args.pretty;
             if to_stdout {
-                stream_extract_to_stdout(&work_dir, "stdout.json", |p| scan.extract_to_json(p, pretty))?;
+                stream_extract_to_stdout(&work_dir, "stdout.json", |p| {
+                    scan.extract_to_json(p, pretty)
+                })?;
             } else {
                 scan.extract_to_json(&args.out, pretty)?;
             }
@@ -150,17 +153,56 @@ pub(crate) fn run_aggregate(args: AggregateArgs) -> Result<()> {
     fs::create_dir_all(&shards_dir)
         .with_context(|| format!("creating shards_dir {}", shards_dir.display()))?;
 
-    let (built, errors) = etl.aggregate_jsonls_parallel::<RecCount>(
-        args.inputs,
-        &shards_dir,
-        &args.out,
-        true,
-        args.pretty,
-    )?;
-    eprintln!(
-        "Aggregated {} shard(s); {} input(s) failed during shard build",
-        built, errors
-    );
+    if let Some(by) = args.by {
+        let group_by = GroupBySpec::parse(&by)?;
+        let metric = MetricSpec::parse(args.metric.as_deref())?;
+        let top = args.top;
+        let (agg, built, errors) = etl
+            .aggregate_jsonls_parallel_collect_with::<GroupMetricAgg, _>(
+                args.inputs,
+                &shards_dir,
+                || GroupMetricAgg::new(group_by.clone(), metric.clone()),
+            )?;
+        write_grouped_tsv(&args.out, agg.rows(top))?;
+        eprintln!(
+            "Aggregated {} shard(s) to TSV; {} input(s) failed during shard build",
+            built, errors
+        );
+    } else {
+        if args.metric.is_some() {
+            anyhow::bail!("--metric requires --by");
+        }
+        if args.top.is_some() {
+            anyhow::bail!("--top requires --by");
+        }
+        let (built, errors) = etl.aggregate_jsonls_parallel::<RecCount>(
+            args.inputs,
+            &shards_dir,
+            &args.out,
+            true,
+            args.pretty,
+        )?;
+        eprintln!(
+            "Aggregated {} shard(s); {} input(s) failed during shard build",
+            built, errors
+        );
+    }
+    Ok(())
+}
+
+fn write_grouped_tsv(out: &Path, rows: Vec<(String, String)>) -> Result<()> {
+    let tmp = out.with_extension("tsv.inprogress");
+    {
+        let f = fs::File::create(&tmp)
+            .with_context(|| format!("creating output tempfile {}", tmp.display()))?;
+        let mut w = BufWriter::new(f);
+        for (key, value) in rows {
+            writeln!(w, "{key}\t{value}")?;
+        }
+        w.flush()?;
+    }
+    replace_file_atomic_backoff(&tmp, out)
+        .with_context(|| format!("publishing output file {}", out.display()))?;
     Ok(())
 }
 
@@ -219,8 +261,11 @@ pub(crate) fn run_parents(args: ParentsArgs) -> Result<()> {
     };
 
     let ids = build(None, None).collect_parent_ids_from_jsonls(spool_parts.clone())?;
-    let parents = build(Some(Sources::Both), Some((wstart, wend)))
-        .resolve_parent_maps(&ids, &args.cache, args.resume)?;
+    let parents = build(Some(Sources::Both), Some((wstart, wend))).resolve_parent_maps(
+        &ids,
+        &args.cache,
+        args.resume,
+    )?;
     let attached = build(None, None).attach_parents_jsonls_parallel(
         spool_parts,
         &args.out,
@@ -237,4 +282,3 @@ pub(crate) fn run_parents(args: ParentsArgs) -> Result<()> {
     );
     Ok(())
 }
-

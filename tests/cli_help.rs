@@ -81,7 +81,9 @@ fn export_help_advertises_format_and_out() {
 #[test]
 fn count_help_advertises_modes() {
     let assert = retl().args(["count", "--help"]).assert().success();
-    let pred = contains("--mode").and(contains("month")).and(contains("author"));
+    let pred = contains("--mode")
+        .and(contains("month"))
+        .and(contains("author"));
     assert.stdout(pred);
 }
 
@@ -98,7 +100,11 @@ fn integrity_help_advertises_modes_and_sample() {
 #[test]
 fn aggregate_help_requires_inputs_and_out() {
     let assert = retl().args(["aggregate", "--help"]).assert().success();
-    let pred = contains("INPUTS").and(contains("--out"));
+    let pred = contains("INPUTS")
+        .and(contains("--out"))
+        .and(contains("--by"))
+        .and(contains("--metric"))
+        .and(contains("--top"));
     assert.stdout(pred);
 }
 
