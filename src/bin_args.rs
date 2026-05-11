@@ -73,9 +73,14 @@ pub(crate) struct CommonOpts {
     #[arg(long)]
     pub(crate) no_progress: bool,
 
-    /// Whitelist of fields to keep on export. Comma-separated, repeatable.
+    /// Whitelist of top-level fields to keep on export. Comma-separated, repeatable.
+    /// Comments use `body`/`parent_id`/`link_id`; submissions use `title`/`selftext`/`domain`.
     #[arg(long, value_delimiter = ',')]
     pub(crate) whitelist: Vec<String>,
+
+    /// Error if `--whitelist` matches zero fields in the first sampled records.
+    #[arg(long)]
+    pub(crate) strict_whitelist: bool,
 
     /// Convert `created_utc` to RFC3339 strings on export.
     #[arg(long)]

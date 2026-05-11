@@ -60,6 +60,7 @@ fn scan_help_advertises_common_flags() {
         .and(contains("--file-concurrency"))
         .and(contains("--no-progress"))
         .and(contains("--whitelist"))
+        .and(contains("--strict-whitelist"))
         .and(contains("--human-timestamps"))
         .and(contains("--source"))
         .and(contains("--subreddit"));

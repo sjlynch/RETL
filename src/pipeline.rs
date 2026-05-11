@@ -27,6 +27,7 @@ impl RedditETL {
     pub fn sources(mut self, sources: Sources) -> Self { self.opts = self.opts.with_sources(sources); self }
     pub fn date_range(mut self, start: Option<YearMonth>, end: Option<YearMonth>) -> Self { self.opts = self.opts.with_date_range(start, end); self }
     pub fn whitelist_fields<I, S>(mut self, fields: I) -> Self where I: IntoIterator<Item = S>, S: Into<String> { self.opts = self.opts.with_whitelist_fields(fields); self }
+    pub fn strict_whitelist(mut self, yes: bool) -> Self { self.opts = self.opts.with_strict_whitelist(yes); self }
     pub fn parallelism(mut self, threads: usize) -> Self { self.opts = self.opts.with_parallelism(threads); self }
     pub fn work_dir(mut self, dir: impl AsRef<Path>) -> Self { self.opts = self.opts.with_work_dir(dir); self }
     pub fn shard_count(mut self, count: usize) -> Self { self.opts = self.opts.with_shard_count(count); self }
@@ -127,6 +128,7 @@ impl ScanPlan {
         // correct builder on RedditETL instance
         self.etl = self.etl.whitelist_fields(fields); self
     }
+    pub fn strict_whitelist(mut self, yes: bool) -> Self { self.etl = self.etl.strict_whitelist(yes); self }
 }
 
 #[inline]

@@ -10,7 +10,7 @@ use crate::zstd_jsonl::{
     for_each_line_cfg, for_each_line_cfg_with_skip, for_each_line_with_progress_cfg,
     for_each_line_with_progress_cfg_with_skip, parse_minimal,
 };
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use indicatif::ProgressBar;
 use serde_json::{Map, Value};
 use std::io::{self, Write};
@@ -24,6 +24,62 @@ const TIMESTAMP_KEY_PATTERNS: &[&[u8]] = &[
     b"\"retrieved_on\":",
     b"\"edited\":",
 ];
+
+/// Number of accepted records sampled before warning/erroring that a whitelist
+/// did not match any top-level keys. Large enough to avoid overreacting to a
+/// few schema variants, small enough to catch typos near the start of a run.
+pub(crate) const WHITELIST_ZERO_MATCH_SAMPLE: u64 = 100;
+
+const WHITELIST_ZERO_MATCH_HINT: &str = "check field names. Comments use `body`/`parent_id`/`link_id`; submissions use `title`/`selftext`/`domain`.";
+
+#[derive(Debug, Default)]
+struct WhitelistMatchState {
+    seen: u64,
+    matched_any: bool,
+    reported: bool,
+}
+
+/// Shared per-export whitelist sanity checker. It samples accepted records
+/// after filtering and reports once if every sampled record projected to `{}`.
+#[derive(Debug)]
+pub(crate) struct WhitelistMatchTracker {
+    strict: bool,
+    state: std::sync::Mutex<WhitelistMatchState>,
+}
+
+impl WhitelistMatchTracker {
+    pub(crate) fn new(strict: bool) -> Self {
+        Self { strict, state: std::sync::Mutex::new(WhitelistMatchState::default()) }
+    }
+
+    pub(crate) fn observe(&self, dropped_all_whitelisted_keys: bool) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("whitelist validation state lock poisoned"))?;
+
+        if state.seen < WHITELIST_ZERO_MATCH_SAMPLE {
+            state.seen += 1;
+            if !dropped_all_whitelisted_keys {
+                state.matched_any = true;
+            }
+        }
+
+        if state.seen == WHITELIST_ZERO_MATCH_SAMPLE && !state.matched_any && !state.reported {
+            state.reported = true;
+            let msg = format!(
+                "--whitelist matched zero fields on the first {} records; {}",
+                WHITELIST_ZERO_MATCH_SAMPLE, WHITELIST_ZERO_MATCH_HINT
+            );
+            if self.strict {
+                return Err(anyhow!(msg));
+            }
+            tracing::warn!("{}", msg);
+        }
+
+        Ok(())
+    }
+}
 
 /// Append `buf` followed by a newline to `writer` and bump the running record count.
 #[inline]
@@ -186,10 +242,12 @@ pub fn stream_job<W: Write + ?Sized>(
     bounds: Option<(crate::date::YearMonth, crate::date::YearMonth)>,
     read_buf_bytes: usize,
     human_timestamps: bool,
+    whitelist_tracker: Option<&WhitelistMatchTracker>,
 ) -> Result<u64> {
     let mut written: u64 = 0;
     let mut ts_buf = String::new();
     let mut tok_buf = String::new();
+    let mut whitelist_error: Option<anyhow::Error> = None;
 
     // Build the streaming tokenizer once per file so the small key-set is
     // hashed exactly once and the buffers above are reused across every line.
@@ -198,6 +256,9 @@ pub fn stream_job<W: Write + ?Sized>(
         .map(|fields| WhitelistTokenizer::new(fields.iter().map(|s| s.as_str())));
 
     let mut on_line = |line: &str| -> Result<()> {
+        if whitelist_error.is_some() {
+            return Ok(());
+        }
         if let Ok(min) = parse_minimal(line) {
             if !matches_minimal(&min, targets, query) { return Ok(()); }
             if !within_bounds(&min, bounds) { return Ok(()); }
@@ -233,6 +294,12 @@ pub fn stream_job<W: Write + ?Sized>(
                     tok.tokenize_into(line, &mut tok_buf)
                 };
                 if tok_result.is_ok() {
+                    if let Some(tracker) = whitelist_tracker {
+                        if let Err(e) = tracker.observe(tok_buf == "{}") {
+                            whitelist_error = Some(e);
+                            return Ok(());
+                        }
+                    }
                     write_and_count(writer, tok_buf.as_bytes(), &mut written)?;
                     return Ok(());
                 }
@@ -253,6 +320,14 @@ pub fn stream_job<W: Write + ?Sized>(
                 val
             };
 
+            if let Some(tracker) = whitelist_tracker {
+                let dropped_all = matches!(&out_val, Value::Object(obj) if obj.is_empty());
+                if let Err(e) = tracker.observe(dropped_all) {
+                    whitelist_error = Some(e);
+                    return Ok(());
+                }
+            }
+
             if human_timestamps {
                 apply_human_timestamps(&mut out_val);
             }
@@ -268,6 +343,10 @@ pub fn stream_job<W: Write + ?Sized>(
         for_each_line_with_progress_cfg(&job.path, read_buf_bytes, |delta| pb.inc(delta), |s| on_line(s))?;
     } else {
         for_each_line_cfg(&job.path, read_buf_bytes, |s| on_line(s))?;
+    }
+
+    if let Some(e) = whitelist_error {
+        return Err(e);
     }
 
     Ok(written)

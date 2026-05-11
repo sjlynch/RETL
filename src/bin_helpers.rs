@@ -60,7 +60,13 @@ pub(crate) fn build_etl(common: &CommonOpts) -> Result<RedditETL> {
         etl = etl.file_concurrency(fc);
     }
     if !common.whitelist.is_empty() {
+        if common.whitelist.iter().all(|field| field.trim().is_empty()) {
+            anyhow::bail!("--whitelist must include at least one non-empty field");
+        }
         etl = etl.whitelist_fields(common.whitelist.iter().cloned());
+    }
+    if common.strict_whitelist {
+        etl = etl.strict_whitelist(true);
     }
     if common.human_timestamps {
         etl = etl.timestamps_human_readable(true);

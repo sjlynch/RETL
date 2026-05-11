@@ -21,6 +21,7 @@ pub struct ETLOptions {
     pub end: Option<YearMonth>,       // inclusive
     pub shard_count: usize,           // number of on-disk dedup shards
     pub whitelist_fields: Option<Vec<String>>,
+    pub strict_whitelist: bool,       // fail instead of warn when whitelisted keys match nothing
     pub parallelism: Option<usize>,   // Some(N) to set rayon threads, None to use default
     pub work_dir: Option<PathBuf>,    // if None, create in base_dir/.reddit_etl_work/
     pub file_concurrency: usize,      // limit number of monthly files processed concurrently
@@ -68,6 +69,7 @@ impl Default for ETLOptions {
             end: None,
             shard_count: 256,
             whitelist_fields: None,
+            strict_whitelist: false,
             parallelism: None,
             work_dir: None,
             file_concurrency: 1, // safe default to prevent OOM on big .zst windows
@@ -121,7 +123,20 @@ impl ETLOptions {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        self.whitelist_fields = Some(fields.into_iter().map(Into::into).collect());
+        self.whitelist_fields = Some(
+            fields
+                .into_iter()
+                .filter_map(|field| {
+                    let field = field.into();
+                    let field = field.trim();
+                    if field.is_empty() { None } else { Some(field.to_string()) }
+                })
+                .collect(),
+        );
+        self
+    }
+    pub fn with_strict_whitelist(mut self, yes: bool) -> Self {
+        self.strict_whitelist = yes;
         self
     }
     pub fn with_parallelism(mut self, threads: usize) -> Self {

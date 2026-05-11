@@ -9,7 +9,7 @@ use crate::progress_manifest::{ManifestAccumulator, MonthEntry};
 use crate::query::QuerySpec;
 use crate::shard::{ShardedWriter, UsernameStream};
 use crate::stitch::{concat_tsvs, stitch_tmp_parts, stitch_tmp_parts_to_json_array, tmp_name_for_job};
-use crate::streaming::{process_file_for_usernames_with_skip, stream_job};
+use crate::streaming::{process_file_for_usernames_with_skip, stream_job, WhitelistMatchTracker};
 use crate::util::{create_with_backoff, with_thread_pool};
 use crate::zstd_jsonl::{for_each_line_cfg, for_each_line_with_progress_cfg, parse_minimal, MinimalRecord};
 use anyhow::{anyhow, Context, Result};
@@ -19,7 +19,7 @@ use std::fs;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// Export format for partitioned corpus-style outputs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -156,6 +156,7 @@ impl ScanPlan {
     ///
     /// Returns `(vector_of_paths, total_records_written)`.
     pub fn extract_spool_monthly(self, out_dir: &Path) -> Result<(Vec<PathBuf>, u64)> {
+        validate_export_whitelist(&self.etl)?;
         let parallelism = self.etl.opts.parallelism;
 
         with_thread_pool(parallelism, || {
@@ -210,6 +211,9 @@ impl ScanPlan {
             };
 
             let whitelist = self.etl.opts.whitelist_fields.clone();
+            let whitelist_tracker = whitelist
+                .as_ref()
+                .map(|_| Arc::new(WhitelistMatchTracker::new(self.etl.opts.strict_whitelist)));
             let targets_ref = targets.as_ref();
             let bounds = bounds_tuple(self.etl.opts.start, self.etl.opts.end);
             let read_buf = self.etl.opts.read_buffer_bytes;
@@ -229,6 +233,8 @@ impl ScanPlan {
                     read_buf,
                     write_buf,
                     human_ts,
+                    whitelist_tracker.as_deref(),
+                    self.etl.opts.strict_whitelist,
                     resume,
                     &completed_keys,
                 )?;
@@ -313,6 +319,7 @@ impl ScanPlan {
     /// atomically renamed onto its final path. Stale `*.inprogress` from a
     /// crashed prior run are swept on entry.
     pub fn export_partitioned(self, out_base_dir: &Path, format: ExportFormat) -> Result<()> {
+        validate_export_whitelist(&self.etl)?;
         let targets = resolve_target_subs_from(&self.etl.opts.subreddit, &self.query.subreddits);
         let parallelism = self.etl.opts.parallelism;
 
@@ -328,6 +335,9 @@ impl ScanPlan {
         sweep_stale_inprogress(out_base_dir, true)?;
 
         let whitelist = self.etl.opts.whitelist_fields.clone();
+        let whitelist_tracker = whitelist
+            .as_ref()
+            .map(|_| Arc::new(WhitelistMatchTracker::new(self.etl.opts.strict_whitelist)));
         let targets_ref = targets.as_ref();
         let bounds = bounds_tuple(self.etl.opts.start, self.etl.opts.end);
         let total_bytes = total_compressed_size(&files);
@@ -355,12 +365,12 @@ impl ScanPlan {
             let written = match format {
                 ExportFormat::Jsonl => {
                     write_jsonl_atomic(&staging_dir, &out_path, write_buf, |w| {
-                        stream_job(job, w, targets_ref, &self.query, &whitelist, pb.clone(), bounds, read_buf, human_ts)
+                        stream_job(job, w, targets_ref, &self.query, &whitelist, pb.clone(), bounds, read_buf, human_ts, whitelist_tracker.as_deref())
                     })?
                 }
                 ExportFormat::Zst => {
                     write_zst_atomic(&staging_dir, &out_path, zst_level, write_buf, |w| {
-                        stream_job(job, w, targets_ref, &self.query, &whitelist, pb.clone(), bounds, read_buf, human_ts)
+                        stream_job(job, w, targets_ref, &self.query, &whitelist, pb.clone(), bounds, read_buf, human_ts, whitelist_tracker.as_deref())
                     })?
                 }
             };
@@ -384,6 +394,13 @@ struct MonthResult {
     out_path: PathBuf,
     key: String,
     lines: u64,
+}
+
+fn validate_export_whitelist(etl: &RedditETL) -> Result<()> {
+    if matches!(&etl.opts.whitelist_fields, Some(fields) if fields.is_empty()) {
+        anyhow::bail!("--whitelist must include at least one non-empty field");
+    }
+    Ok(())
 }
 
 /// Load `_progress.json`, validate each entry against the on-disk file size,
@@ -428,6 +445,8 @@ fn process_month(
     read_buf: usize,
     write_buf: usize,
     human_ts: bool,
+    whitelist_tracker: Option<&WhitelistMatchTracker>,
+    strict_whitelist: bool,
     resume: bool,
     completed_keys: &HashSet<String>,
 ) -> Result<Option<MonthResult>> {
@@ -453,11 +472,16 @@ fn process_month(
     let n = match write_jsonl_atomic(staging_dir, &out_path, write_buf, |w| {
         stream_job(
             job, w, targets, query, whitelist,
-            pb.cloned(), bounds, read_buf, human_ts,
+            pb.cloned(), bounds, read_buf, human_ts, whitelist_tracker,
         )
     }) {
         Ok(n) => n,
         Err(e) => {
+            if strict_whitelist
+                && e.chain().any(|cause| cause.to_string().starts_with("--whitelist matched zero fields"))
+            {
+                return Err(e);
+            }
             tracing::warn!(path=%out_path.display(), error=%e, "Skipping month: failed to atomically write spool output");
             if let Some(pb) = pb {
                 let sz = fs::metadata(&job.path).map(|m| m.len()).unwrap_or(0);
@@ -493,6 +517,7 @@ fn extract_common(
     out_path: &Path,
     finalize: Finalize,
 ) -> Result<()> {
+    validate_export_whitelist(etl)?;
     let parallelism = etl.opts.parallelism;
     with_thread_pool(parallelism, || {
     let discovered = discover_all(&etl.opts.comments_dir, &etl.opts.submissions_dir);
@@ -519,6 +544,9 @@ fn extract_common(
     let tmp_dir = work_dir.join(tmp_dir_name);
     fs::create_dir_all(&tmp_dir)?;
     let whitelist = etl.opts.whitelist_fields.clone();
+    let whitelist_tracker = whitelist
+        .as_ref()
+        .map(|_| Arc::new(WhitelistMatchTracker::new(etl.opts.strict_whitelist)));
 
     let total_bytes = total_compressed_size(&files);
     let pb = if etl.opts.progress {
@@ -539,7 +567,7 @@ fn extract_common(
             .with_context(|| format!("create {}", tmp_file.display()))?;
         let mut writer = BufWriter::with_capacity(write_buf, file);
 
-        stream_job(job, &mut writer, targets_ref, query, &whitelist, pb.clone(), bounds, read_buf, human_ts)?;
+        stream_job(job, &mut writer, targets_ref, query, &whitelist, pb.clone(), bounds, read_buf, human_ts, whitelist_tracker.as_deref())?;
         writer.flush()?;
         Ok(())
     })?;
