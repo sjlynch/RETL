@@ -547,7 +547,7 @@ The merged exclusion list is applied by `.exclude_common_bots()` on a
 ## Fuzzing
 
 RETL ships [cargo-fuzz](https://rust-fuzz.github.io/book/cargo-fuzz.html) targets
-for the two functions that walk attacker-controlled bytes:
+for the byte-facing paths that walk attacker-controlled JSONL lines:
 
 - `retl::parse_minimal` (in `src/zstd_jsonl.rs`) — every JSONL line passes
   through this `serde_json::from_str` wrapper.
@@ -555,6 +555,9 @@ for the two functions that walk attacker-controlled bytes:
   hand-rolled byte scanner that rewrites `"created_utc"`, `"retrieved_on"`,
   and `"edited"` integer values to RFC3339 strings without going through
   `serde_json::Value`.
+- `retl::WhitelistTokenizer::tokenize_into` (in `src/json_whitelist.rs`) — a
+  hand-rolled top-level object scanner that projects common Reddit fields for
+  whitelist exports without a full `serde_json::Value` round-trip.
 
 Setup (one-time):
 
@@ -563,8 +566,8 @@ cargo install cargo-fuzz
 rustup toolchain install nightly
 ~~~
 
-The `fuzz/` crate is pre-scaffolded — no `cargo fuzz init` needed. Two
-targets live under `fuzz/fuzz_targets/`, each seeded with ~50 inputs at
+The `fuzz/` crate is pre-scaffolded — no `cargo fuzz init` needed. Targets
+live under `fuzz/fuzz_targets/`, each seeded with a target-specific corpus at
 `fuzz/corpus/<target>/`:
 
 ~~~sh
@@ -577,6 +580,12 @@ cargo +nightly fuzz run fuzz_parse_minimal -- -max_total_time=300
 # (c) on shallow top-level objects, the byte path matches the slow path
 #     (apply_human_timestamps applied to the parsed Value).
 cargo +nightly fuzz run fuzz_rewrite_timestamps -- -max_total_time=300
+
+# Walks &str → WhitelistTokenizer::tokenize_into with a fixed Reddit-field
+# whitelist, then validates no panic/abort, valid UTF-8 output, JSON
+# round-tripping for valid JSON inputs, and projection equivalence for valid
+# top-level objects.
+cargo +nightly fuzz run fuzz_whitelist_tokenizer -- -max_total_time=300
 ~~~
 
 The seed corpora include real Reddit-shaped JSONL lines plus adversarial
@@ -584,11 +593,12 @@ inputs: bodies that contain `\"created_utc\":` substrings (must be left
 unchanged), `"`-escaped quotes around the keys, leading zeros / leading
 `+` / lone `-`, very long integer strings, fractional and exponent forms,
 `null`/`true`/`false` values, whitespace before and after the `:`, `i64`
-extrema, and a deliberate `{...{"created_utc": ...}...}` nested-object case.
+extrema, empty/whitespace/non-object inputs, and a deliberate
+`{...{"created_utc": ...}...}` nested-object case.
 
 Triage:
 
-- Any panic, abort, or OOM in either target is a bug — file as a separate
+- Any panic, abort, or OOM in any fuzz target is a bug — file as a separate
   task with the failing input.
 - For the timestamp rewriter, a case where the byte path mutates a
   `"created_utc":` substring inside a JSON string-typed value (rather than
