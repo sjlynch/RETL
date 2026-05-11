@@ -14,8 +14,8 @@
 
 use proptest::prelude::*;
 use retl::{
-    build_runs_sorted, merge_runs_sorted, DedupeCfg, ExportFormat, KeyExtractor,
-    RedditETL, Sources, YearMonth,
+    build_runs_sorted, merge_runs_sorted, DedupeCfg, ExportFormat, KeyExtractor, RedditETL,
+    Sources, YearMonth,
 };
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashSet};
@@ -110,15 +110,21 @@ fn query_strategy() -> impl Strategy<Value = GenQuery> {
             Just(vec!["id".to_string(), "subreddit".to_string()]),
         ]),
     )
-        .prop_map(
-            |(subs, auths, min_s, max_s, wl)| GenQuery {
+        .prop_map(|(subs, auths, mut min_s, mut max_s, wl)| {
+            if let (Some(min), Some(max)) = (min_s, max_s) {
+                if min > max {
+                    min_s = Some(max);
+                    max_s = Some(min);
+                }
+            }
+            GenQuery {
                 subreddits: subs,
                 authors_in: auths,
                 min_score: min_s,
                 max_score: max_s,
                 whitelist: wl,
-            },
-        )
+            }
+        })
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -138,7 +144,7 @@ fn format_strategy() -> impl Strategy<Value = OutFormat> {
 
 /// Mirror of the predicate used by `matches_minimal` for the subset of fields
 /// that our generators populate (no pseudo users, no domain/keywords/regex).
-/// Filters use `allow_pseudo_users()` so the pseudo-user gate is off.
+/// Filters use `include_pseudo_users()` so the pseudo-user gate is off.
 fn record_matches(r: &TestRecord, q: &GenQuery) -> bool {
     if let Some(subs) = &q.subreddits {
         if !subs.iter().any(|s| s.eq_ignore_ascii_case(&r.subreddit)) {
@@ -228,17 +234,14 @@ fn run_export(records: &[TestRecord], q: &GenQuery, fmt: OutFormat) -> Vec<Value
     let mut etl = RedditETL::new()
         .base_dir(base)
         .sources(Sources::Comments)
-        .date_range(
-            Some(YearMonth::new(2006, 1)),
-            Some(YearMonth::new(2006, 1)),
-        )
+        .date_range(Some(YearMonth::new(2006, 1)), Some(YearMonth::new(2006, 1)))
         .progress(false);
 
     if let Some(wl) = &q.whitelist {
         etl = etl.whitelist_fields(wl.clone());
     }
 
-    let mut plan = etl.scan().allow_pseudo_users();
+    let mut plan = etl.scan().include_pseudo_users();
     if let Some(subs) = &q.subreddits {
         plan = plan.subreddits(subs.clone());
     }
@@ -273,7 +276,8 @@ fn run_export(records: &[TestRecord], q: &GenQuery, fmt: OutFormat) -> Vec<Value
         }
         OutFormat::PartitionedZst => {
             let out_dir = base.join("export");
-            plan.export_partitioned(&out_dir, ExportFormat::Zst).unwrap();
+            plan.export_partitioned(&out_dir, ExportFormat::Zst)
+                .unwrap();
             // export_partitioned removes empty zsts; fall back to "no records exported".
             let rc_out = out_dir.join("comments").join("RC_2006-01.zst");
             if !rc_out.exists() {
@@ -352,7 +356,11 @@ fn run_dedupe_pipeline(lines: &[String], dir: &Path, label: &str) -> Vec<String>
         // Tight buffers so even small inputs may produce >1 run, exercising
         // the k-way merge path. The actual default would coalesce everything
         // into a single run for tiny inputs.
-        mem: retl::AdaptiveMemCfg { soft_low_frac: 0.0, high_frac: 1.0, adapt_cooldown_ms: 1 },
+        mem: retl::AdaptiveMemCfg {
+            soft_low_frac: 0.0,
+            high_frac: 1.0,
+            adapt_cooldown_ms: 1,
+        },
         min_buf_mb: 0,
         max_buf_mb: 0,
         read_buf_bytes: 8 * 1024,

@@ -71,16 +71,22 @@ pub(crate) fn build_etl(common: &CommonOpts) -> Result<RedditETL> {
     Ok(etl)
 }
 
-/// Build a `ScanPlan` from `etl` with the (possibly empty) subreddit selection
-/// applied. Inlined as a macro because `ScanPlan` is not re-exported from the
-/// crate root and we want to avoid widening the public API just for the CLI.
+/// Build a `ScanPlan` from `etl` with common CLI scan selections applied.
+/// Inlined as a macro because `ScanPlan` is not re-exported from the crate root
+/// and we want to avoid widening the public API just for the CLI.
 macro_rules! plan {
-    ($etl:expr, $subs:expr) => {{
+    ($etl:expr, $common:expr) => {{
+        let common = &$common;
         let scan = $etl.scan();
-        if $subs.is_empty() {
+        let scan = if common.subreddits.is_empty() {
             scan
         } else {
-            scan.subreddits($subs.iter().map(String::as_str))
+            scan.subreddits(common.subreddits.iter().map(String::as_str))
+        };
+        if common.include_deleted {
+            scan.include_pseudo_users()
+        } else {
+            scan
         }
     }};
 }
@@ -129,8 +135,8 @@ pub(crate) fn stream_extract_to_stdout(
 /// Discover spool parts in `dir`, parsing `part_RC_YYYY-MM.jsonl` and
 /// `part_RS_YYYY-MM.jsonl` filenames. Returns `(sorted_paths, min, max)`.
 pub(crate) fn discover_spool_parts(dir: &Path) -> Result<(Vec<PathBuf>, YearMonth, YearMonth)> {
-    let entries = fs::read_dir(dir)
-        .with_context(|| format!("reading spool dir {}", dir.display()))?;
+    let entries =
+        fs::read_dir(dir).with_context(|| format!("reading spool dir {}", dir.display()))?;
     let mut parts: Vec<(YearMonth, PathBuf)> = Vec::new();
     for e in entries {
         let e = e?;

@@ -9,7 +9,11 @@ use serde_json::Value;
 use time::{Date, OffsetDateTime};
 
 pub fn matches_subreddit_basic(min: &MinimalRecord, sub: &str) -> bool {
-    if let Some(s) = &min.subreddit { s.eq_ignore_ascii_case(sub) } else { false }
+    if let Some(s) = &min.subreddit {
+        s.eq_ignore_ascii_case(sub)
+    } else {
+        false
+    }
 }
 
 /// Linear scan of a small (<10) list of pre-lowercased targets, comparing to
@@ -28,18 +32,24 @@ fn list_contains_ci(list: &[String], needle: &str) -> bool {
 /// Case-insensitive byte search for the literal "http" (https is a superset).
 #[inline]
 fn ascii_ci_contains_http(haystack: &[u8]) -> bool {
-    if haystack.len() < 4 { return false; }
-    haystack.windows(4).any(|w|
+    if haystack.len() < 4 {
+        return false;
+    }
+    haystack.windows(4).any(|w| {
         w[0].eq_ignore_ascii_case(&b'h')
             && w[1].eq_ignore_ascii_case(&b't')
             && w[2].eq_ignore_ascii_case(&b't')
             && w[3].eq_ignore_ascii_case(&b'p')
-    )
+    })
 }
 
 /// Decide using only fields in MinimalRecord (fast path).
 /// If `targets_opt` is None, accept any subreddit (still rejects missing subreddit).
-pub fn matches_minimal(min: &MinimalRecord, targets_opt: Option<&Vec<String>>, q: &QuerySpec) -> bool {
+pub fn matches_minimal(
+    min: &MinimalRecord,
+    targets_opt: Option<&Vec<String>>,
+    q: &QuerySpec,
+) -> bool {
     if let Some(targets) = targets_opt {
         match min.subreddit.as_deref() {
             Some(s) if list_contains_ci(targets, s) => {}
@@ -58,23 +68,35 @@ pub fn matches_minimal(min: &MinimalRecord, targets_opt: Option<&Vec<String>>, q
             return false;
         }
         if let Some(ref deny) = q.authors_out {
-            if list_contains_ci(deny, a) { return false; }
+            if list_contains_ci(deny, a) {
+                return false;
+            }
         }
         if let Some(ref allow) = q.authors_in {
-            if !list_contains_ci(allow, a) { return false; }
+            if !list_contains_ci(allow, a) {
+                return false;
+            }
         }
         if let Some(re) = &q.author_regex {
-            if !re.is_match(a) { return false; }
+            if !re.is_match(a) {
+                return false;
+            }
         }
     } else {
         return false;
     }
 
     if let Some(min_s) = q.min_score {
-        match min.score { Some(sc) if sc >= min_s => {}, _ => return false }
+        match min.score {
+            Some(sc) if sc >= min_s => {}
+            _ => return false,
+        }
     }
     if let Some(max_s) = q.max_score {
-        match min.score { Some(sc) if sc <= max_s => {}, _ => return false }
+        match min.score {
+            Some(sc) if sc <= max_s => {}
+            _ => return false,
+        }
     }
 
     // domains_in can be matched from MinimalRecord now (submissions only).
@@ -89,16 +111,38 @@ pub fn matches_minimal(min: &MinimalRecord, targets_opt: Option<&Vec<String>>, q
     // keywords_any: run the pre-built ASCII-case-insensitive automaton over each
     // text field's raw bytes — no per-record allocation or to_lowercase pass.
     if let Some(ac) = q.keywords_automaton() {
-        let matched = min.body.as_deref().map_or(false, |s| ac.is_match(s.as_bytes()))
-            || min.selftext.as_deref().map_or(false, |s| ac.is_match(s.as_bytes()))
-            || min.title.as_deref().map_or(false, |s| ac.is_match(s.as_bytes()));
-        if !matched { return false; }
+        let matched = min
+            .body
+            .as_deref()
+            .map_or(false, |s| ac.is_match(s.as_bytes()))
+            || min
+                .selftext
+                .as_deref()
+                .map_or(false, |s| ac.is_match(s.as_bytes()))
+            || min
+                .title
+                .as_deref()
+                .map_or(false, |s| ac.is_match(s.as_bytes()));
+        if !matched {
+            return false;
+        }
     }
     if q.contains_url == Some(true) {
-        let matched = min.body.as_deref().map_or(false, |s| ascii_ci_contains_http(s.as_bytes()))
-            || min.selftext.as_deref().map_or(false, |s| ascii_ci_contains_http(s.as_bytes()))
-            || min.title.as_deref().map_or(false, |s| ascii_ci_contains_http(s.as_bytes()));
-        if !matched { return false; }
+        let matched = min
+            .body
+            .as_deref()
+            .map_or(false, |s| ascii_ci_contains_http(s.as_bytes()))
+            || min
+                .selftext
+                .as_deref()
+                .map_or(false, |s| ascii_ci_contains_http(s.as_bytes()))
+            || min
+                .title
+                .as_deref()
+                .map_or(false, |s| ascii_ci_contains_http(s.as_bytes()));
+        if !matched {
+            return false;
+        }
     }
 
     true
@@ -120,26 +164,34 @@ pub fn matches_full(val: &Value, kind: FileKind, q: &QuerySpec) -> bool {
     true
 }
 
-/// Resolve target subreddits from either a Query override or ETL default.
-/// Returns None to indicate "all subreddits".
+/// Resolve target subreddits from both the deprecated ETL single-subreddit
+/// default and the query-level multi-subreddit selector. When both are set,
+/// the selections are merged rather than letting one silently override the
+/// other. Returns None to indicate "all subreddits".
 pub fn resolve_target_subs_from(
     etl_subreddit: &Option<String>,
     q_subreddits: &Option<Vec<String>>,
 ) -> Option<Vec<String>> {
-    let mut v = if let Some(ref subs) = q_subreddits {
-        subs.clone()
-    } else if let Some(ref single) = etl_subreddit {
-        vec![single.clone().to_lowercase()]
-    } else {
+    let mut v = Vec::new();
+    if let Some(ref single) = etl_subreddit {
+        v.push(single.clone().to_lowercase());
+    }
+    if let Some(ref subs) = q_subreddits {
+        v.extend(subs.iter().cloned());
+    }
+    if v.is_empty() {
         return None;
-    };
+    }
     v.sort();
     v.dedup();
     Some(v)
 }
 
 /// Bounds helpers (record-level YYYY-MM gate)
-pub fn bounds_tuple(start: Option<YearMonth>, end: Option<YearMonth>) -> Option<(YearMonth, YearMonth)> {
+pub fn bounds_tuple(
+    start: Option<YearMonth>,
+    end: Option<YearMonth>,
+) -> Option<(YearMonth, YearMonth)> {
     match (start, end) {
         (Some(s), Some(e)) => Some((s, e)),
         _ => None,

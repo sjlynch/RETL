@@ -116,10 +116,15 @@ The `retl` binary exposes five subcommands. All accept a shared set of flags
 | `--start <YYYY-MM>` / `--end <YYYY-MM>` | Inclusive month range. Omit either to leave that side unbounded. |
 | `--source rc\|rs\|both` | Comments only, submissions only, or both (default). |
 | `--subreddit <NAME>` (`-s`) | Subreddit selector. Repeatable; omit for "any subreddit". |
+| `--include-deleted` | Include pseudo-users (`[deleted]`, `[removed]`, and empty authors) that are filtered by default. |
 | `--whitelist a,b,c` | Restrict export to the listed JSON fields (comma-separated). |
 | `--human-timestamps` | Emit `created_utc` as RFC3339 strings. |
 | `--parallelism <N>` / `--file-concurrency <N>` | Rayon threads / concurrent monthly files. |
 | `--no-progress` | Disable progress bars. |
+
+### Pseudo-user filtering (default ON)
+
+By default, scans exclude records whose `author` is `[deleted]`, `[removed]`, or the empty string. This keeps normal username/export queries focused on real author names, but it matters for deletion-rate, ban-wave, or corpus-completeness analysis. Pass `--include-deleted` (alias: `--include-pseudo-users`) on the CLI, or call `.include_pseudo_users()` on a `ScanPlan`, to keep those records.
 
 ### `scan` — emit unique usernames
 
@@ -324,7 +329,7 @@ RedditETL::new()
     .progress(true)
     .scan()
     .subreddit("programming")
-    .allow_pseudo_users() // include "[deleted]"
+    .include_pseudo_users() // include "[deleted]"
     .export_partitioned(std::path::Path::new("out_corpus_zst"), ExportFormat::Zst)?;
 ~~~
 
@@ -420,7 +425,7 @@ let (spool_parts, _n) = RedditETL::new()
     .progress(true)
     .scan()
     .subreddit("programming")
-    .allow_pseudo_users()
+    .include_pseudo_users()
     .extract_spool_monthly(Path::new("spool"))?;
 
 // Step 2: Collect parent IDs

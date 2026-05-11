@@ -17,7 +17,7 @@ use crate::bin_helpers::{
 
 pub(crate) fn run_scan(args: ScanArgs) -> Result<()> {
     let etl = build_etl(&args.common)?;
-    let scan = plan!(etl, args.common.subreddits);
+    let scan = plan!(etl, args.common);
 
     match args.out {
         Some(path) => {
@@ -50,7 +50,7 @@ pub(crate) fn run_export(args: ExportArgs) -> Result<()> {
         etl = etl.resume(true);
     }
     let work_dir = args.common.work_dir.clone();
-    let scan = plan!(etl, args.common.subreddits);
+    let scan = plan!(etl, args.common);
     let to_stdout = args.out == Path::new("-");
 
     match args.format {
@@ -64,7 +64,9 @@ pub(crate) fn run_export(args: ExportArgs) -> Result<()> {
         ExportFmt::Json => {
             let pretty = args.pretty;
             if to_stdout {
-                stream_extract_to_stdout(&work_dir, "stdout.json", |p| scan.extract_to_json(p, pretty))?;
+                stream_extract_to_stdout(&work_dir, "stdout.json", |p| {
+                    scan.extract_to_json(p, pretty)
+                })?;
             } else {
                 scan.extract_to_json(&args.out, pretty)?;
             }
@@ -84,7 +86,7 @@ pub(crate) fn run_export(args: ExportArgs) -> Result<()> {
 
 pub(crate) fn run_count(args: CountArgs) -> Result<()> {
     let etl = build_etl(&args.common)?;
-    let scan = plan!(etl, args.common.subreddits);
+    let scan = plan!(etl, args.common);
 
     match args.mode {
         CountMode::Month => {
@@ -166,7 +168,7 @@ pub(crate) fn run_aggregate(args: AggregateArgs) -> Result<()> {
 
 pub(crate) fn run_first_seen(args: FirstSeenArgs) -> Result<()> {
     let etl = build_etl(&args.common)?;
-    let scan = plan!(etl, args.common.subreddits);
+    let scan = plan!(etl, args.common);
     scan.build_first_seen_index_to_tsv(&args.out)?;
     Ok(())
 }
@@ -219,8 +221,11 @@ pub(crate) fn run_parents(args: ParentsArgs) -> Result<()> {
     };
 
     let ids = build(None, None).collect_parent_ids_from_jsonls(spool_parts.clone())?;
-    let parents = build(Some(Sources::Both), Some((wstart, wend)))
-        .resolve_parent_maps(&ids, &args.cache, args.resume)?;
+    let parents = build(Some(Sources::Both), Some((wstart, wend))).resolve_parent_maps(
+        &ids,
+        &args.cache,
+        args.resume,
+    )?;
     let attached = build(None, None).attach_parents_jsonls_parallel(
         spool_parts,
         &args.out,
@@ -237,4 +242,3 @@ pub(crate) fn run_parents(args: ParentsArgs) -> Result<()> {
     );
     Ok(())
 }
-

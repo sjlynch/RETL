@@ -89,6 +89,10 @@ pub(crate) struct CommonOpts {
     #[arg(long = "subreddit", short = 's')]
     pub(crate) subreddits: Vec<String>,
 
+    /// Include pseudo-users that are excluded by default: [deleted], [removed], and empty authors.
+    #[arg(long = "include-deleted", alias = "include-pseudo-users")]
+    pub(crate) include_deleted: bool,
+
     /// Inflight bytes budget for bucketing/dedupe producer/consumer pairs.
     /// 0 disables the explicit cap and falls back to memory-fraction sampling.
     #[arg(long)]

@@ -62,7 +62,8 @@ fn scan_help_advertises_common_flags() {
         .and(contains("--whitelist"))
         .and(contains("--human-timestamps"))
         .and(contains("--source"))
-        .and(contains("--subreddit"));
+        .and(contains("--subreddit"))
+        .and(contains("--include-deleted"));
     assert.stdout(pred);
 }
 
@@ -81,7 +82,9 @@ fn export_help_advertises_format_and_out() {
 #[test]
 fn count_help_advertises_modes() {
     let assert = retl().args(["count", "--help"]).assert().success();
-    let pred = contains("--mode").and(contains("month")).and(contains("author"));
+    let pred = contains("--mode")
+        .and(contains("month"))
+        .and(contains("author"));
     assert.stdout(pred);
 }
 
