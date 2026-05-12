@@ -49,7 +49,8 @@
 //!      RFC3339 when enabled.
 //!    - [`ShardedWriter`] (per-month spool) and [`ShardedKVWriter`]
 //!      (per-author shards) handle on-disk fan-out.
-//!    - [`PartitionWriters`] writes RC/RS partitions as JSONL or ZST.
+//!    - `ScanPlan::export_partitioned` (called after `RedditETL::scan`)
+//!      writes RC/RS partitions as JSONL or ZST.
 //!    - [`NdjsonReader`] / [`NdjsonWriter`] are the line-buffered helpers
 //!      used by stitch and dedupe.
 //!
@@ -91,6 +92,9 @@
 //!   must not call it.
 //! - [`set_global_multiprogress`] / [`make_count_progress`] /
 //!   [`make_progress_bar_labeled`] / [`ProgressScope`] — indicatif glue.
+//! - [`PartitionWriters`] — standalone user-keyed NDJSON fan-out helper that
+//!   writes `<stem>_part_NNNN.ndjson`; it is not the RC/RS JSONL/ZST
+//!   partitioned export path.
 //! - [`available_memory_fraction`] / [`is_low_memory`] — adaptive throttling
 //!   knobs for binaries.
 //!

@@ -324,7 +324,17 @@ Place your corpus under `./data/`:
 ...
 ~~~
 
-Create a small driver:
+To use RETL as a library, create a separate binary crate that depends on this
+repository (do **not** replace this repo's `src/main.rs`; that file is the
+`retl` CLI):
+
+~~~toml
+[dependencies]
+anyhow = "1"
+retl = { git = "https://github.com/sjlynch/retl", branch = "main" }
+~~~
+
+Then put a small driver like this in that crate's `src/main.rs`:
 
 ~~~rust
 use anyhow::Result;
@@ -340,7 +350,7 @@ fn main() -> Result<()> {
         .subreddit("programming")
         .keywords_any(["rust"])
         .contains_url(true)
-        .count_by_month()?; // {"2006-01": N}
+        .count_by_month()?; // BTreeMap<YearMonth, u64>, e.g. 2006-01 => N
 
     for (ym, n) in counts {
         println!("{ym}\t{n}");
@@ -349,11 +359,13 @@ fn main() -> Result<()> {
 }
 ~~~
 
-Run:
+Run from that driver crate:
 
 ~~~sh
 cargo run --release
 ~~~
+
+For an in-repo executable example, see `examples/quickstart.rs`.
 
 ---
 
