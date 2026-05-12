@@ -99,54 +99,56 @@
 
 mod config;
 mod date;
-mod paths;
-mod zstd_jsonl;
-mod shard_common;
-mod shard;
-mod username_stream;
-mod query;
 mod kv_shard;
+mod paths;
+mod query;
+mod shard;
+mod shard_common;
+mod username_stream;
+mod zstd_jsonl;
 
-mod filters;
-mod progress;
-mod stitch;
-mod concurrency;
-mod streaming;
-mod util;
-mod mem;
 mod atomic_write;
-mod progress_manifest;
+mod concurrency;
+mod filters;
+mod mem;
 mod pipeline;
 mod pipeline_exec;
+mod progress;
+mod progress_manifest;
+mod stitch;
+mod streaming;
+mod util;
 
-mod parents;
-mod parents_ids;
 mod aggregate;
 mod integrity;
+mod parents;
+mod parents_ids;
 mod partition;
 
 mod bucketing;
+mod dedupe;
 mod json_utils;
 mod json_whitelist;
-mod ndjson;
 mod key_extractor;
-mod dedupe;
+mod ndjson;
 
-pub use crate::config::{ETLOptions, Sources};
+pub use crate::config::{BuildError, ETLOptions, Sources};
 pub use crate::date::YearMonth;
 pub use crate::pipeline::RedditETL;
 pub use crate::pipeline_exec::ExportFormat;
-pub use crate::shard::UsernameStream;
 pub use crate::query::QuerySpec;
+pub use crate::shard::UsernameStream;
 
-pub use crate::parents::{ParentIds, ParentMaps};
 pub use crate::aggregate::Aggregator;
+pub use crate::parents::{ParentAttachStats, ParentIds, ParentMaps};
 
 #[doc(hidden)]
 pub use crate::aggregate::{merge_aggregator_shards_parallel, merge_aggregator_shards_serial};
 
 // Expose multiprogress and progress helpers.
-pub use crate::progress::{set_global_multiprogress, make_count_progress, make_progress_bar_labeled, ProgressScope};
+pub use crate::progress::{
+    make_count_progress, make_progress_bar_labeled, set_global_multiprogress, ProgressScope,
+};
 
 // Expose memory helpers for adaptive throttling from the binary.
 pub use crate::mem::{available_memory_fraction, is_low_memory, maybe_throttle_low_memory};
@@ -166,14 +168,18 @@ pub use crate::zstd_jsonl::{quick_validate_zst, validate_zst_full};
 pub use crate::partition::PartitionWriters;
 
 //export robust file ops from util so binaries can import from crate root.
-pub use crate::util::{open_with_backoff, create_with_backoff, remove_with_backoff, replace_file_atomic_backoff};
+pub use crate::util::{
+    create_with_backoff, open_with_backoff, remove_with_backoff, replace_file_atomic_backoff,
+};
 
 // Scoped rayon pool + opt-in tracing init for binaries.
 pub use crate::util::{init_tracing_for_binary, with_thread_pool};
 
 //export bucketing & json utils to application code
-pub use crate::bucketing::{BucketingCfg, partition_stage1, bucketize_shards, process_bucket_streaming};
-pub use crate::json_utils::{author_lower, subreddit_lower, is_comment_record};
+pub use crate::bucketing::{
+    bucketize_shards, partition_stage1, process_bucket_streaming, BucketingCfg,
+};
+pub use crate::json_utils::{author_lower, is_comment_record, subreddit_lower};
 
 // export NDJSON helpers
 pub use crate::ndjson::{NdjsonReader, NdjsonWriter};
@@ -186,25 +192,25 @@ pub use crate::json_whitelist::{TokenizerError, WhitelistTokenizer};
 pub use crate::key_extractor::KeyExtractor;
 
 // export dedupe engine
-pub use crate::dedupe::{DedupeCfg, build_runs_sorted, merge_runs_sorted};
+pub use crate::dedupe::{build_runs_sorted, merge_runs_sorted, DedupeCfg};
 pub use crate::mem::AdaptiveMemCfg;
 
 // Test-only re-exports of internals so behavioral tests can drive them directly.
 // Behavior is unchanged; these are additive exports used by tests/*.rs.
 #[doc(hidden)]
-pub use crate::shard::ShardedWriter;
-#[doc(hidden)]
-pub use crate::kv_shard::ShardedKVWriter;
-#[doc(hidden)]
 pub use crate::concurrency::for_each_file_limited;
-#[doc(hidden)]
-pub use crate::paths::{plan_files, discover_all, FileKind, FileJob, Discovered};
 #[doc(hidden)]
 pub use crate::date::iter_year_months;
 #[doc(hidden)]
-pub use crate::filters::{bounds_tuple, within_bounds};
+pub use crate::filters::{bounds_tuple, resolve_target_subs_from, within_bounds};
 #[doc(hidden)]
-pub use crate::zstd_jsonl::{MinimalRecord, parse_minimal};
+pub use crate::kv_shard::ShardedKVWriter;
+#[doc(hidden)]
+pub use crate::paths::{plan_files, discover_all, FileKind, FileJob, Discovered, PlanningError, SourceStatus, plan_files_checked};
+#[doc(hidden)]
+pub use crate::shard::ShardedWriter;
+#[doc(hidden)]
+pub use crate::zstd_jsonl::{parse_minimal, MinimalRecord};
 
 // Bench-only re-exports of hot inner-loop functions. Used by `benches/inner_loops.rs`
 // (criterion harness) to defend ahash/byte-rewrite perf changes against regressions.

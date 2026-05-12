@@ -40,7 +40,7 @@ fn main() -> Result<()> {
         .progress(true)
         .scan()
         .subreddit(target_sub)
-        .allow_pseudo_users()
+        .include_pseudo_users()
         .extract_spool_monthly(Path::new("spool"))?;
 
     // Step 2: collect parent IDs referenced by the spooled records.
@@ -54,7 +54,10 @@ fn main() -> Result<()> {
     //         resolve.
     let parents: ParentMaps = RedditETL::new()
         .base_dir(base_dir)
-        .date_range(Some(YearMonth::new(2005, 12)), Some(YearMonth::new(2006, 4)))
+        .date_range(
+            Some(YearMonth::new(2005, 12)),
+            Some(YearMonth::new(2006, 4)),
+        )
         .progress(true)
         .resolve_parent_maps(&ids, Path::new("parents_cache"), /*resume=*/ true)?;
 

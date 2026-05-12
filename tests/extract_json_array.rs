@@ -6,7 +6,7 @@
 mod common;
 
 use common::*;
-use retl::{RedditETL, Sources, YearMonth};
+use retl::{PlanningError, RedditETL, Sources, YearMonth};
 use serde_json::Value;
 use std::fs;
 
@@ -22,7 +22,7 @@ fn extract_to_json_array_compact_parses_back_as_vec() {
         .progress(false)
         .scan()
         .subreddit("programming")
-        .allow_pseudo_users()
+        .include_pseudo_users()
         .extract_to_json(&out, false)
         .unwrap();
 
@@ -53,7 +53,7 @@ fn extract_to_json_array_pretty_parses_back_as_vec_and_has_indentation() {
         .progress(false)
         .scan()
         .subreddit("programming")
-        .allow_pseudo_users()
+        .include_pseudo_users()
         .extract_to_json(&out, true)
         .unwrap();
 
@@ -73,15 +73,14 @@ fn extract_to_json_array_pretty_parses_back_as_vec_and_has_indentation() {
 }
 
 #[test]
-fn extract_to_json_array_empty_when_no_files_writes_empty_array() {
-    // No corpus on disk for this date range -> should emit "[]" and parse cleanly.
+fn extract_to_json_array_errors_when_no_input_files_exist() {
     let dir = tempfile::tempdir().unwrap();
     let base = dir.path().to_path_buf();
     fs::create_dir_all(base.join("comments")).unwrap();
     fs::create_dir_all(base.join("submissions")).unwrap();
 
     let out = base.join("empty.json");
-    RedditETL::new()
+    let err = RedditETL::new()
         .base_dir(&base)
         .sources(Sources::Both)
         .date_range(Some(YearMonth::new(1999, 1)), Some(YearMonth::new(1999, 1)))
@@ -89,9 +88,8 @@ fn extract_to_json_array_empty_when_no_files_writes_empty_array() {
         .scan()
         .subreddit("programming")
         .extract_to_json(&out, false)
-        .unwrap();
+        .unwrap_err();
 
-    let s = fs::read_to_string(&out).unwrap();
-    let arr: Vec<Value> = serde_json::from_str(&s).expect("empty array still valid JSON");
-    assert!(arr.is_empty());
+    assert!(err.downcast_ref::<PlanningError>().is_some());
+    assert!(!out.exists(), "no empty JSON array should be published without candidate input files");
 }

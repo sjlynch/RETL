@@ -1,6 +1,25 @@
 use crate::date::YearMonth;
 use crate::mem::AdaptiveMemCfg;
+use std::error::Error;
+use std::fmt;
 use std::path::{Path, PathBuf};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BuildError {
+    InvalidDateRange { start: YearMonth, end: YearMonth },
+}
+
+impl fmt::Display for BuildError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BuildError::InvalidDateRange { start, end } => {
+                write!(f, "invalid date range: start {start} is after end {end}")
+            }
+        }
+    }
+}
+
+impl Error for BuildError {}
 
 /// Data source toggle (comments, submissions, both).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -16,12 +35,13 @@ pub struct ETLOptions {
     pub base_dir: PathBuf,
     pub comments_dir: PathBuf,
     pub submissions_dir: PathBuf,
-    pub subreddit: Option<String>,    // normalized lowercase, no "r/"
+    pub subreddit: Option<String>, // normalized lowercase, no "r/"; deprecated single-subreddit default
     pub sources: Sources,
-    pub start: Option<YearMonth>,     // inclusive
-    pub end: Option<YearMonth>,       // inclusive
-    pub shard_count: usize,           // number of on-disk dedup shards
+    pub start: Option<YearMonth>, // inclusive
+    pub end: Option<YearMonth>,   // inclusive
+    pub shard_count: usize,       // number of on-disk dedup shards
     pub whitelist_fields: Option<Vec<String>>,
+    pub strict_whitelist: bool,       // fail instead of warn when whitelisted keys match nothing
     pub parallelism: Option<usize>,   // Some(N) to set rayon threads, None to use default
     pub work_dir: Option<PathBuf>,    // if None, create in base_dir/.reddit_etl_work/
     pub file_concurrency: usize,      // limit number of monthly files processed concurrently
@@ -29,8 +49,8 @@ pub struct ETLOptions {
     pub progress_label: Option<String>, // optional label for progress bar
 
     // IO tuning
-    pub read_buffer_bytes: usize,     // BufReader capacity
-    pub write_buffer_bytes: usize,    // BufWriter capacity
+    pub read_buffer_bytes: usize,  // BufReader capacity
+    pub write_buffer_bytes: usize, // BufWriter capacity
 
     // output formatting
     pub human_readable_timestamps: bool, // convert unix timestamps to RFC3339 strings
@@ -50,10 +70,13 @@ pub struct ETLOptions {
     /// minimum cooldown between target recomputations.
     pub adaptive_mem: AdaptiveMemCfg,
 
-    /// Opt-in: when true, `extract_spool_monthly` reads/writes a
-    /// `<out_dir>/_progress.json` sidecar and skips months already
-    /// committed by a prior run. Default false to preserve current behavior.
+    /// Opt-in: when true, supported extract/export operations read/write a
+    /// `_progress.json`-style sidecar and skip months already committed by a
+    /// prior run. Default false to preserve current behavior.
     pub resume: bool,
+
+    #[doc(hidden)]
+    pub build_error: Option<BuildError>,
 }
 
 impl Default for ETLOptions {
@@ -74,6 +97,7 @@ impl Default for ETLOptions {
             end: None,
             shard_count: 256,
             whitelist_fields: None,
+            strict_whitelist: false,
             parallelism: None,
             work_dir: None,
             file_concurrency: 1, // safe default to prevent OOM on big .zst windows
@@ -90,6 +114,7 @@ impl Default for ETLOptions {
             inflight_bytes: 256 * 1024 * 1024,
             adaptive_mem: AdaptiveMemCfg::default(),
             resume: false,
+            build_error: None,
         }
     }
 }
@@ -102,6 +127,7 @@ impl ETLOptions {
         self.base_dir = base;
         self
     }
+    #[deprecated(note = "use RedditETL::scan().subreddits([...]) instead")]
     pub fn with_subreddit(mut self, sub: impl AsRef<str>) -> Self {
         let mut s = sub.as_ref().trim().to_lowercase();
         if let Some(rest) = s.strip_prefix("r/") {
@@ -117,6 +143,10 @@ impl ETLOptions {
     pub fn with_date_range(mut self, start: Option<YearMonth>, end: Option<YearMonth>) -> Self {
         self.start = start;
         self.end = end;
+        self.build_error = match (start, end) {
+            (Some(s), Some(e)) if s > e => Some(BuildError::InvalidDateRange { start: s, end: e }),
+            _ => None,
+        };
         self
     }
     pub fn with_shard_count(mut self, shards: usize) -> Self {
@@ -128,7 +158,20 @@ impl ETLOptions {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        self.whitelist_fields = Some(fields.into_iter().map(Into::into).collect());
+        self.whitelist_fields = Some(
+            fields
+                .into_iter()
+                .filter_map(|field| {
+                    let field = field.into();
+                    let field = field.trim();
+                    if field.is_empty() { None } else { Some(field.to_string()) }
+                })
+                .collect(),
+        );
+        self
+    }
+    pub fn with_strict_whitelist(mut self, yes: bool) -> Self {
+        self.strict_whitelist = yes;
         self
     }
     pub fn with_parallelism(mut self, threads: usize) -> Self {
@@ -197,7 +240,8 @@ impl ETLOptions {
         self
     }
 
-    /// Opt in to resumable spool runs (`extract_spool_monthly` only).
+    /// Opt in to resumable extract/export runs (`extract_to_jsonl`,
+    /// `extract_to_json`, `extract_spool_monthly`, and parents helpers).
     pub fn with_resume(mut self, yes: bool) -> Self {
         self.resume = yes;
         self
