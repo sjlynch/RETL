@@ -15,12 +15,13 @@ pub struct ETLOptions {
     pub base_dir: PathBuf,
     pub comments_dir: PathBuf,
     pub submissions_dir: PathBuf,
-    pub subreddit: Option<String>,    // normalized lowercase, no "r/"
+    pub subreddit: Option<String>, // normalized lowercase, no "r/"; deprecated single-subreddit default
     pub sources: Sources,
-    pub start: Option<YearMonth>,     // inclusive
-    pub end: Option<YearMonth>,       // inclusive
-    pub shard_count: usize,           // number of on-disk dedup shards
+    pub start: Option<YearMonth>, // inclusive
+    pub end: Option<YearMonth>,   // inclusive
+    pub shard_count: usize,       // number of on-disk dedup shards
     pub whitelist_fields: Option<Vec<String>>,
+    pub strict_whitelist: bool,       // fail instead of warn when whitelisted keys match nothing
     pub parallelism: Option<usize>,   // Some(N) to set rayon threads, None to use default
     pub work_dir: Option<PathBuf>,    // if None, create in base_dir/.reddit_etl_work/
     pub file_concurrency: usize,      // limit number of monthly files processed concurrently
@@ -28,8 +29,8 @@ pub struct ETLOptions {
     pub progress_label: Option<String>, // optional label for progress bar
 
     // IO tuning
-    pub read_buffer_bytes: usize,     // BufReader capacity
-    pub write_buffer_bytes: usize,    // BufWriter capacity
+    pub read_buffer_bytes: usize,  // BufReader capacity
+    pub write_buffer_bytes: usize, // BufWriter capacity
 
     // output formatting
     pub human_readable_timestamps: bool, // convert unix timestamps to RFC3339 strings
@@ -68,6 +69,7 @@ impl Default for ETLOptions {
             end: None,
             shard_count: 256,
             whitelist_fields: None,
+            strict_whitelist: false,
             parallelism: None,
             work_dir: None,
             file_concurrency: 1, // safe default to prevent OOM on big .zst windows
@@ -95,6 +97,7 @@ impl ETLOptions {
         self.base_dir = base;
         self
     }
+    #[deprecated(note = "use RedditETL::scan().subreddits([...]) instead")]
     pub fn with_subreddit(mut self, sub: impl AsRef<str>) -> Self {
         let mut s = sub.as_ref().trim().to_lowercase();
         if let Some(rest) = s.strip_prefix("r/") {
@@ -121,7 +124,20 @@ impl ETLOptions {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        self.whitelist_fields = Some(fields.into_iter().map(Into::into).collect());
+        self.whitelist_fields = Some(
+            fields
+                .into_iter()
+                .filter_map(|field| {
+                    let field = field.into();
+                    let field = field.trim();
+                    if field.is_empty() { None } else { Some(field.to_string()) }
+                })
+                .collect(),
+        );
+        self
+    }
+    pub fn with_strict_whitelist(mut self, yes: bool) -> Self {
+        self.strict_whitelist = yes;
         self
     }
     pub fn with_parallelism(mut self, threads: usize) -> Self {

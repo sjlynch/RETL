@@ -35,7 +35,10 @@ fn extract_with_whitelist_and_human_timestamps() {
     // If created_utc exists, it should now be a string (RFC3339).
     for v in lines {
         if let Some(cu) = v.get("created_utc") {
-            assert!(cu.is_string(), "created_utc should be RFC3339 string when present");
+            assert!(
+                cu.is_string(),
+                "created_utc should be RFC3339 string when present"
+            );
         }
     }
 }
@@ -70,8 +73,10 @@ fn extract_with_human_timestamps_only() {
         if let Some(cu) = v.get("created_utc") {
             saw_created = true;
             let s = cu.as_str().expect("created_utc should be RFC3339 string");
-            assert!(s.contains('T') && (s.ends_with('Z') || s.contains('+')),
-                    "created_utc not RFC3339-shaped: {s}");
+            assert!(
+                s.contains('T') && (s.ends_with('Z') || s.contains('+')),
+                "created_utc not RFC3339-shaped: {s}"
+            );
         }
         if let Some(ro) = v.get("retrieved_on") {
             saw_retrieved = true;
@@ -91,7 +96,10 @@ fn extract_with_human_timestamps_only() {
     }
     assert!(saw_created, "expected at least one row with created_utc");
     assert!(saw_retrieved, "expected at least one row with retrieved_on");
-    assert!(saw_edited_bool, "expected at least one row with edited:false bool");
+    assert!(
+        saw_edited_bool,
+        "expected at least one row with edited:false bool"
+    );
 }
 
 /// Partitioned export to ZST:
@@ -111,7 +119,7 @@ fn export_partitioned_zst() {
         .progress(false)
         .scan()
         .subreddit("programming")
-        .allow_pseudo_users() // include `[deleted]`
+        .include_pseudo_users() // include `[deleted]`
         .export_partitioned(&out_dir, ExportFormat::Zst)
         .unwrap();
 

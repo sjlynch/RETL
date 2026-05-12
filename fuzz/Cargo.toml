@@ -7,6 +7,10 @@ edition = "2021"
 [package.metadata]
 cargo-fuzz = true
 
+# Keep the cargo-fuzz crate independent from the repository workspace when
+# commands are run from `fuzz/` or with `--manifest-path fuzz/Cargo.toml`.
+[workspace]
+
 [dependencies]
 libfuzzer-sys = "0.4"
 serde_json = "1"
@@ -28,6 +32,13 @@ bench = false
 [[bin]]
 name = "fuzz_rewrite_timestamps"
 path = "fuzz_targets/fuzz_rewrite_timestamps.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_whitelist_tokenizer"
+path = "fuzz_targets/fuzz_whitelist_tokenizer.rs"
 test = false
 doc = false
 bench = false

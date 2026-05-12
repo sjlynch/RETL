@@ -10,7 +10,7 @@ use std::io::{BufRead, BufReader};
 /// End-to-end parents pipeline over a tiny synthetic corpus:
 /// 1) Build a small test corpus under a temp dir (RC/RS 2006-01 for r/programming).
 /// 2) Spool *both* submissions and comments for r/programming **without** restricting authors,
-///    but with `.allow_pseudo_users()` so `[deleted]` is included.
+///    but with `.include_pseudo_users()` so `[deleted]` is included.
 /// 3) Collect parent IDs from the spooled JSONL files.
 /// 4) Resolve the parent contents into a cache by scanning the tiny corpus over a ±1 month window.
 /// 5) Attach parent payloads back onto the spooled records.
@@ -48,7 +48,7 @@ fn spool_resolve_attach_parents_end_to_end() {
         .progress(false)
         .scan()
         .subreddit("programming")
-        .allow_pseudo_users() // crucial: include "[deleted]" in the spooled RC set
+        .include_pseudo_users() // crucial: include "[deleted]" in the spooled RC set
         .extract_spool_monthly(&spool_dir)
         .unwrap();
 
@@ -81,7 +81,7 @@ fn spool_resolve_attach_parents_end_to_end() {
         .file_concurrency(4)
         .progress(false)
         .date_range(Some(parent_start), Some(parent_end))
-        .resolve_parent_maps(&ids, &parents_cache_dir, /*resume=*/true)
+        .resolve_parent_maps(&ids, &parents_cache_dir, /*resume=*/ true)
         .unwrap();
 
     // ------------- Step 4: Attach parents to spooled JSONL -----------------
@@ -89,7 +89,12 @@ fn spool_resolve_attach_parents_end_to_end() {
         .base_dir(&base)
         .work_dir(&lib_tmp)
         .progress(false)
-        .attach_parents_jsonls_parallel(spool_parts.clone(), &spool_with_parents_dir, &parents, /*resume=*/false)
+        .attach_parents_jsonls_parallel(
+            spool_parts.clone(),
+            &spool_with_parents_dir,
+            &parents,
+            /*resume=*/ false,
+        )
         .unwrap();
 
     assert!(
@@ -103,7 +108,10 @@ fn spool_resolve_attach_parents_end_to_end() {
     //   RC_2006-01.jsonl -> 3 comments (including `[deleted]`)
     //   RS_2006-01.jsonl -> 2 submissions
     // Total = 5
-    assert_eq!(total_lines, 5, "expected 5 total lines after parent attachment");
+    assert_eq!(
+        total_lines, 5,
+        "expected 5 total lines after parent attachment"
+    );
 }
 
 #[test]

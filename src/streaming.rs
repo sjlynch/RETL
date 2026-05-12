@@ -10,7 +10,7 @@ use crate::zstd_jsonl::{
     for_each_line_cfg, for_each_line_cfg_with_skip, for_each_line_with_progress_cfg,
     for_each_line_with_progress_cfg_with_skip, parse_minimal,
 };
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use indicatif::ProgressBar;
 use serde_json::{Map, Value};
 use std::io::{self, Write};
@@ -19,11 +19,64 @@ use time::OffsetDateTime;
 
 /// The three JSON keys the byte-level rewriter targets, with their `":` suffix
 /// pre-baked so the search can flat-scan the line for an anchored byte sequence.
-const TIMESTAMP_KEY_PATTERNS: &[&[u8]] = &[
-    b"\"created_utc\":",
-    b"\"retrieved_on\":",
-    b"\"edited\":",
-];
+const TIMESTAMP_KEY_PATTERNS: &[&[u8]] =
+    &[b"\"created_utc\":", b"\"retrieved_on\":", b"\"edited\":"];
+
+/// Number of accepted records sampled before warning/erroring that a whitelist
+/// did not match any top-level keys. Large enough to avoid overreacting to a
+/// few schema variants, small enough to catch typos near the start of a run.
+pub(crate) const WHITELIST_ZERO_MATCH_SAMPLE: u64 = 100;
+
+const WHITELIST_ZERO_MATCH_HINT: &str = "check field names. Comments use `body`/`parent_id`/`link_id`; submissions use `title`/`selftext`/`domain`.";
+
+#[derive(Debug, Default)]
+struct WhitelistMatchState {
+    seen: u64,
+    matched_any: bool,
+    reported: bool,
+}
+
+/// Shared per-export whitelist sanity checker. It samples accepted records
+/// after filtering and reports once if every sampled record projected to `{}`.
+#[derive(Debug)]
+pub(crate) struct WhitelistMatchTracker {
+    strict: bool,
+    state: std::sync::Mutex<WhitelistMatchState>,
+}
+
+impl WhitelistMatchTracker {
+    pub(crate) fn new(strict: bool) -> Self {
+        Self { strict, state: std::sync::Mutex::new(WhitelistMatchState::default()) }
+    }
+
+    pub(crate) fn observe(&self, dropped_all_whitelisted_keys: bool) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("whitelist validation state lock poisoned"))?;
+
+        if state.seen < WHITELIST_ZERO_MATCH_SAMPLE {
+            state.seen += 1;
+            if !dropped_all_whitelisted_keys {
+                state.matched_any = true;
+            }
+        }
+
+        if state.seen == WHITELIST_ZERO_MATCH_SAMPLE && !state.matched_any && !state.reported {
+            state.reported = true;
+            let msg = format!(
+                "--whitelist matched zero fields on the first {} records; {}",
+                WHITELIST_ZERO_MATCH_SAMPLE, WHITELIST_ZERO_MATCH_HINT
+            );
+            if self.strict {
+                return Err(anyhow!(msg));
+            }
+            tracing::warn!("{}", msg);
+        }
+
+        Ok(())
+    }
+}
 
 /// Append `buf` followed by a newline to `writer` and bump the running record count.
 #[inline]
@@ -38,26 +91,20 @@ fn write_and_count<W: Write + ?Sized>(
     Ok(())
 }
 
-fn apply_human_timestamp_in_place(map: &mut Map<String, Value>, key: &str) {
-    if let Some(v) = map.get_mut(key) {
-        if let Some(n) = v.as_i64() {
-            if let Ok(dt) = OffsetDateTime::from_unix_timestamp(n) {
-                if let Ok(s) = dt.format(&Rfc3339) {
-                    *v = Value::String(s);
-                }
-            }
-        }
-    }
-}
-
 #[doc(hidden)]
 pub fn apply_human_timestamps(val: &mut Value) {
     if let Some(obj) = val.as_object_mut() {
-        // Convert common timestamp fields if they are numeric.
-        apply_human_timestamp_in_place(obj, "created_utc");
-        apply_human_timestamp_in_place(obj, "retrieved_on");
-        // "edited" can be bool or number. Only convert numeric forms.
-        apply_human_timestamp_in_place(obj, "edited");
+        // Convert common timestamp fields if they are numeric. "edited" can
+        // be bool or number, so only numeric forms are rewritten.
+        for key in ["created_utc", "retrieved_on", "edited"] {
+            let Some(v) = obj.get_mut(key) else { continue };
+            let Some(n) = v.as_i64() else { continue };
+            let Ok(dt) = OffsetDateTime::from_unix_timestamp(n) else {
+                continue;
+            };
+            let Ok(s) = dt.format(&Rfc3339) else { continue };
+            *v = Value::String(s);
+        }
     }
 }
 
@@ -109,8 +156,8 @@ fn find_timestamp_field(bytes: &[u8], start: usize) -> Option<(usize, usize)> {
 
         // No digits → not an integer (e.g. `false`, `null`).
         // Trailing `.`/`e`/`E` → float; `as_i64` would reject too.
-        let is_integer = j > digits_start
-            && !matches!(bytes.get(j), Some(b'.') | Some(b'e') | Some(b'E'));
+        let is_integer =
+            j > digits_start && !matches!(bytes.get(j), Some(b'.') | Some(b'e') | Some(b'E'));
         if !is_integer {
             i = value_start;
             continue;
@@ -176,6 +223,95 @@ pub fn rewrite_human_timestamps_bytes(line: &str, buf: &mut String) {
     }
 }
 
+fn write_raw_line<W: Write + ?Sized>(writer: &mut W, line: &str, written: &mut u64) -> Result<()> {
+    write_and_count(writer, line.as_bytes(), written)?;
+    Ok(())
+}
+
+fn write_with_timestamps<W: Write + ?Sized>(
+    writer: &mut W,
+    line: &str,
+    timestamp_buf: &mut String,
+    written: &mut u64,
+) -> Result<()> {
+    rewrite_human_timestamps_bytes(line, timestamp_buf);
+    write_and_count(writer, timestamp_buf.as_bytes(), written)?;
+    Ok(())
+}
+
+fn write_with_whitelist<W: Write + ?Sized>(
+    writer: &mut W,
+    line: &str,
+    fields: &[String],
+    tokenizer: &WhitelistTokenizer,
+    tokenizer_buf: &mut String,
+    human_timestamps: bool,
+    written: &mut u64,
+) -> Result<()> {
+    // Preferred path: the streaming tokenizer copies raw value bytes verbatim
+    // and never builds a `serde_json::Value`. If it rejects a structurally
+    // surprising line, fall back to the slow Value path so correctness on odd
+    // records is preserved.
+    let tok_result = if human_timestamps {
+        // Fused single-pass: project whitelisted keys AND rewrite the three
+        // timestamp keys' integer values to RFC3339 in one walk over the raw
+        // line bytes. Replaces the older tokenize_into →
+        // rewrite_human_timestamps_bytes chain.
+        tokenizer.tokenize_and_rewrite_timestamps_into(line, tokenizer_buf)
+    } else {
+        tokenizer.tokenize_into(line, tokenizer_buf)
+    };
+
+    if tok_result.is_ok() {
+        write_and_count(writer, tokenizer_buf.as_bytes(), written)?;
+        return Ok(());
+    }
+
+    write_via_value(writer, line, Some(fields), human_timestamps, written)
+}
+
+fn write_via_value<W: Write + ?Sized>(
+    writer: &mut W,
+    line: &str,
+    whitelist: Option<&[String]>,
+    human_timestamps: bool,
+    written: &mut u64,
+) -> Result<()> {
+    let val: Value = serde_json::from_str(line)?;
+    let mut out_val = if let Some(fields) = whitelist {
+        let mut obj = Map::new();
+        if let Some(map) = val.as_object() {
+            for k in fields {
+                if let Some(v) = map.get(k) {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        Value::Object(obj)
+    } else {
+        val
+    };
+
+    if human_timestamps {
+        apply_human_timestamps(&mut out_val);
+    }
+
+    serde_json::to_writer(&mut *writer, &out_val)?;
+    writer.write_all(b"\n")?;
+    *written += 1;
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum StreamWritePath<'a> {
+    Raw,
+    Timestamps,
+    Whitelist {
+        fields: &'a [String],
+        tokenizer: &'a WhitelistTokenizer,
+    },
+}
+
 pub fn stream_job<W: Write + ?Sized>(
     job: &FileJob,
     writer: &mut W,
@@ -186,10 +322,12 @@ pub fn stream_job<W: Write + ?Sized>(
     bounds: Option<(crate::date::YearMonth, crate::date::YearMonth)>,
     read_buf_bytes: usize,
     human_timestamps: bool,
+    whitelist_tracker: Option<&WhitelistMatchTracker>,
 ) -> Result<u64> {
     let mut written: u64 = 0;
     let mut ts_buf = String::new();
     let mut tok_buf = String::new();
+    let mut whitelist_error: Option<anyhow::Error> = None;
 
     // Build the streaming tokenizer once per file so the small key-set is
     // hashed exactly once and the buffers above are reused across every line.
@@ -197,77 +335,69 @@ pub fn stream_job<W: Write + ?Sized>(
         .as_ref()
         .map(|fields| WhitelistTokenizer::new(fields.iter().map(|s| s.as_str())));
 
+    let write_path = match whitelist.as_deref() {
+        None if human_timestamps => StreamWritePath::Timestamps,
+        None => StreamWritePath::Raw,
+        Some(fields) => StreamWritePath::Whitelist {
+            fields,
+            tokenizer: tokenizer
+                .as_ref()
+                .expect("whitelist tokenizer is built when fields are present"),
+        },
+    };
+
     let mut on_line = |line: &str| -> Result<()> {
-        if let Ok(min) = parse_minimal(line) {
-            if !matches_minimal(&min, targets, query) { return Ok(()); }
-            if !within_bounds(&min, bounds) { return Ok(()); }
+        if whitelist_error.is_some() {
+            return Ok(());
+        }
+        let Ok(min) = parse_minimal(line) else {
+            return Ok(());
+        };
+        if !matches_minimal(&min, targets, query) {
+            return Ok(());
+        }
+        if !within_bounds(&min, bounds) {
+            return Ok(());
+        }
 
-            // Fast-path: raw line when no transforms needed.
-            if whitelist.is_none() && !human_timestamps {
-                write_and_count(writer, line.as_bytes(), &mut written)?;
-                return Ok(());
+        match write_path {
+            StreamWritePath::Raw => write_raw_line(writer, line, &mut written),
+            StreamWritePath::Timestamps => {
+                write_with_timestamps(writer, line, &mut ts_buf, &mut written)
             }
-
-            // Byte-level fast-path: human timestamps only, no whitelist.
-            // Rewrites `"created_utc"|"retrieved_on"|"edited":<int>` in place without
-            // a `serde_json::Value` round-trip. This is the common export/spool config.
-            if whitelist.is_none() && human_timestamps {
-                rewrite_human_timestamps_bytes(line, &mut ts_buf);
-                write_and_count(writer, ts_buf.as_bytes(), &mut written)?;
-                return Ok(());
-            }
-
-            // Whitelist branch — preferred path is the streaming tokenizer
-            // which copies raw value bytes verbatim and never builds a
-            // `serde_json::Value`. If the tokenizer rejects the line as
-            // structurally surprising, fall back to the slow Value path so we
-            // never regress correctness on an odd record.
-            if let Some(tok) = &tokenizer {
-                let tok_result = if human_timestamps {
-                    // Fused single-pass: project whitelisted keys AND rewrite
-                    // the three timestamp keys' integer values to RFC3339 in
-                    // one walk over the raw line bytes. Replaces the older
-                    // tokenize_into → rewrite_human_timestamps_bytes chain.
-                    tok.tokenize_and_rewrite_timestamps_into(line, &mut tok_buf)
-                } else {
-                    tok.tokenize_into(line, &mut tok_buf)
-                };
-                if tok_result.is_ok() {
-                    write_and_count(writer, tok_buf.as_bytes(), &mut written)?;
-                    return Ok(());
-                }
-                // Fall through to slow path on tokenizer error.
-            }
-
-            // Slow path: parse Value for whitelisting (and timestamp conversion if both apply).
-            let val: Value = serde_json::from_str(line)?;
-            let mut out_val = if let Some(fields) = whitelist {
-                let mut obj = Map::new();
-                if let Some(map) = val.as_object() {
-                    for k in fields {
-                        if let Some(v) = map.get(k) { obj.insert(k.clone(), v.clone()); }
+            StreamWritePath::Whitelist { fields, tokenizer } => {
+                write_with_whitelist(
+                    writer,
+                    line,
+                    fields,
+                    tokenizer,
+                    &mut tok_buf,
+                    human_timestamps,
+                    &mut written,
+                )?;
+                if let Some(tracker) = whitelist_tracker {
+                    if let Err(e) = tracker.observe(tok_buf == "{}") {
+                        whitelist_error = Some(e);
                     }
                 }
-                Value::Object(obj)
-            } else {
-                val
-            };
-
-            if human_timestamps {
-                apply_human_timestamps(&mut out_val);
+                Ok(())
             }
-
-            serde_json::to_writer(&mut *writer, &out_val)?;
-            writer.write_all(b"\n")?;
-            written += 1;
         }
-        Ok(())
     };
 
     if let Some(pb) = pb {
-        for_each_line_with_progress_cfg(&job.path, read_buf_bytes, |delta| pb.inc(delta), |s| on_line(s))?;
+        for_each_line_with_progress_cfg(
+            &job.path,
+            read_buf_bytes,
+            |delta| pb.inc(delta),
+            |s| on_line(s),
+        )?;
     } else {
         for_each_line_cfg(&job.path, read_buf_bytes, |s| on_line(s))?;
+    }
+
+    if let Some(e) = whitelist_error {
+        return Err(e);
     }
 
     Ok(written)
@@ -289,11 +419,18 @@ pub fn process_file_for_usernames_with_skip(
     mut on_skip: impl FnMut(&std::path::Path, &anyhow::Error),
 ) -> Result<()> {
     let handle_line = |line: &str| -> Result<()> {
-        let min = match parse_minimal(line) { Ok(m) => m, Err(_) => return Ok(()) };
-        if !matches_subreddit_basic(&min, subreddit) { return Ok(()); }
+        let min = match parse_minimal(line) {
+            Ok(m) => m,
+            Err(_) => return Ok(()),
+        };
+        if !matches_subreddit_basic(&min, subreddit) {
+            return Ok(());
+        }
         if let Some(author) = min.author.as_deref() {
             let a = author.trim();
-            if a.is_empty() || a == "[deleted]" || a == "[removed]" { return Ok(()); }
+            if a.is_empty() || a == "[deleted]" || a == "[removed]" {
+                return Ok(());
+            }
             shard_writer.write(a)?;
         }
         Ok(())
