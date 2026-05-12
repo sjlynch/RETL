@@ -135,8 +135,8 @@ builder methods.
 
 ## Command-Line Interface
 
-The `retl` binary exposes five subcommands. All accept a shared set of flags
-(see `retl <subcommand> --help` for the full list):
+The `retl` binary exposes the main ETL subcommands. All accept a shared set of
+flags (see `retl <subcommand> --help` for the full list):
 
 | Common flag | Purpose |
 | --- | --- |
@@ -161,6 +161,30 @@ retl scan \
   --start 2006-01 --end 2006-04 \
   --subreddit programming --subreddit reddit.com \
   --out usernames.txt
+~~~
+
+### `dedupe` — emit unique keys
+
+Walks the corpus, applies the query selection, and writes one distinct key per
+line to `--out` (use `--out -` for stdout). `--key` reuses RETL's
+`KeyExtractor`: `author` and `subreddit` use the `MinimalRecord` fast path;
+`json:/pointer` parses full JSON only to extract the requested JSON Pointer.
+Aliases: `unique`, `distinct`.
+
+~~~sh
+# Unique authors who posted in r/rust in 2020-2023
+retl dedupe \
+  --data-dir ./data \
+  --start 2020-01 --end 2023-12 \
+  --subreddit rust \
+  --key author \
+  --out unique_authors.txt
+
+# Unique subreddits in the selected comments/submissions
+retl dedupe --key subreddit --start 2021-01 --end 2021-12 --out subreddits.txt
+
+# Unique parent IDs from comments using a JSON Pointer key
+retl dedupe --source rc --key 'json:/parent_id' --start 2020-01 --end 2020-12 --out parent_ids.txt
 ~~~
 
 ### `export` — extract filtered records
@@ -214,12 +238,13 @@ retl integrity --mode full --source both --start 2006-01 --end 2006-04
 Bad files print one `path<TAB>error` line per failure on stdout and the
 process exits with status `2`.
 
-### `aggregate` — fold JSONL inputs into one JSON
+### `aggregate` — fold JSONL inputs into JSON or TSV rollups
 
-Aggregates one or more JSONL inputs into a single JSON file using a built-in
-record-count aggregator (each input is processed in parallel; per-input shard
-intermediates land under `--shards-dir`, which defaults to `agg_shards/`
-next to `--out`).
+Aggregates one or more JSONL inputs using the `retl::Aggregator` pipeline
+(each input is processed in parallel; per-input shard intermediates land under
+`--shards-dir`, which defaults to `agg_shards/` next to `--out`). With no
+`--by`, the CLI keeps the original built-in record-count fallback and writes a
+JSON aggregate state:
 
 ~~~sh
 retl aggregate \
@@ -227,9 +252,17 @@ retl aggregate \
   ./spool/part_RC_2006-01.jsonl ./spool/part_RS_2006-01.jsonl
 ~~~
 
-For more interesting aggregations, implement `retl::Aggregator` for your own
-type and call `RedditETL::aggregate_jsonls_parallel::<MyAgg>(...)` from a
-small driver — the CLI ships only the simple record-count case.
+Built-in grouped rollups write two-column TSV:
+
+~~~sh
+retl aggregate --by subreddit --out counts.tsv ./spool/*.jsonl
+retl aggregate --by month --out months.tsv ./spool/*.jsonl
+retl aggregate --by author --top 100 --out top_authors.tsv ./spool/*.jsonl
+retl aggregate --by 'json:/subreddit' --metric 'sum:/score' --out scores.tsv ./spool/*.jsonl
+~~~
+
+`--metric` defaults to `count` and also supports `avg:/pointer`,
+`min:/pointer`, and `max:/pointer` for numeric JSON-pointer values.
 
 ---
 
@@ -576,7 +609,7 @@ The merged exclusion list is applied by `.exclude_common_bots()` on a
 ## Fuzzing
 
 RETL ships [cargo-fuzz](https://rust-fuzz.github.io/book/cargo-fuzz.html) targets
-for the two functions that walk attacker-controlled bytes:
+for the byte-facing paths that walk attacker-controlled JSONL lines:
 
 - `retl::parse_minimal` (in `src/zstd_jsonl.rs`) — every JSONL line passes
   through this `serde_json::from_str` wrapper.
@@ -584,6 +617,9 @@ for the two functions that walk attacker-controlled bytes:
   hand-rolled byte scanner that rewrites `"created_utc"`, `"retrieved_on"`,
   and `"edited"` integer values to RFC3339 strings without going through
   `serde_json::Value`.
+- `retl::WhitelistTokenizer::tokenize_into` (in `src/json_whitelist.rs`) — a
+  hand-rolled top-level object scanner that projects common Reddit fields for
+  whitelist exports without a full `serde_json::Value` round-trip.
 
 Setup (one-time):
 
@@ -592,8 +628,8 @@ cargo install cargo-fuzz
 rustup toolchain install nightly
 ~~~
 
-The `fuzz/` crate is pre-scaffolded — no `cargo fuzz init` needed. Two
-targets live under `fuzz/fuzz_targets/`, each seeded with ~50 inputs at
+The `fuzz/` crate is pre-scaffolded — no `cargo fuzz init` needed. Targets
+live under `fuzz/fuzz_targets/`, each seeded with a target-specific corpus at
 `fuzz/corpus/<target>/`:
 
 ~~~sh
@@ -606,6 +642,12 @@ cargo +nightly fuzz run fuzz_parse_minimal -- -max_total_time=300
 # (c) on shallow top-level objects, the byte path matches the slow path
 #     (apply_human_timestamps applied to the parsed Value).
 cargo +nightly fuzz run fuzz_rewrite_timestamps -- -max_total_time=300
+
+# Walks &str → WhitelistTokenizer::tokenize_into with a fixed Reddit-field
+# whitelist, then validates no panic/abort, valid UTF-8 output, JSON
+# round-tripping for valid JSON inputs, and projection equivalence for valid
+# top-level objects.
+cargo +nightly fuzz run fuzz_whitelist_tokenizer -- -max_total_time=300
 ~~~
 
 The seed corpora include real Reddit-shaped JSONL lines plus adversarial
@@ -613,11 +655,12 @@ inputs: bodies that contain `\"created_utc\":` substrings (must be left
 unchanged), `"`-escaped quotes around the keys, leading zeros / leading
 `+` / lone `-`, very long integer strings, fractional and exponent forms,
 `null`/`true`/`false` values, whitespace before and after the `:`, `i64`
-extrema, and a deliberate `{...{"created_utc": ...}...}` nested-object case.
+extrema, empty/whitespace/non-object inputs, and a deliberate
+`{...{"created_utc": ...}...}` nested-object case.
 
 Triage:
 
-- Any panic, abort, or OOM in either target is a bug — file as a separate
+- Any panic, abort, or OOM in any fuzz target is a bug — file as a separate
   task with the failing input.
 - For the timestamp rewriter, a case where the byte path mutates a
   `"created_utc":` substring inside a JSON string-typed value (rather than
