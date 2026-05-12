@@ -44,16 +44,24 @@ fn first_seen_help_advertises_out() {
 }
 
 #[test]
-fn export_help_advertises_zst_level_and_resume() {
+fn export_help_advertises_export_only_flags() {
     let assert = retl().args(["export", "--help"]).assert().success();
-    let pred = contains("--zst-level").and(contains("--resume"));
+    let pred = contains("--zst-level")
+        .and(contains("--resume"))
+        .and(contains("--whitelist"))
+        .and(contains("--strict-whitelist"))
+        .and(contains("--human-timestamps"))
+        .and(contains("--inflight-bytes"));
     assert.stdout(pred);
 }
 
 #[test]
-fn dedupe_help_advertises_key_and_out() {
+fn dedupe_help_advertises_key_out_and_inflight() {
     let assert = retl().args(["dedupe", "--help"]).assert().success();
-    let pred = contains("--key").and(contains("--out")).and(contains("json:/pointer"));
+    let pred = contains("--key")
+        .and(contains("--out"))
+        .and(contains("--inflight-bytes"))
+        .and(contains("json:/pointer"));
     assert.stdout(pred);
 }
 
@@ -67,12 +75,12 @@ fn scan_help_advertises_common_flags() {
         .and(contains("--parallelism"))
         .and(contains("--file-concurrency"))
         .and(contains("--no-progress"))
-        .and(contains("--whitelist"))
-        .and(contains("--strict-whitelist"))
-        .and(contains("--human-timestamps"))
         .and(contains("--source"))
         .and(contains("--subreddit"))
-        .and(contains("--include-deleted"));
+        .and(contains("--include-deleted"))
+        .and(contains("--whitelist").not())
+        .and(contains("--strict-whitelist").not())
+        .and(contains("--human-timestamps").not());
     assert.stdout(pred);
 }
 
@@ -83,6 +91,8 @@ fn export_help_advertises_format_and_out() {
         .and(contains("jsonl"))
         .and(contains("json"))
         .and(contains("spool"))
+        .and(contains("zst"))
+        .and(contains("partitioned-jsonl"))
         .and(contains("--out"))
         .and(contains("--pretty"));
     assert.stdout(pred);

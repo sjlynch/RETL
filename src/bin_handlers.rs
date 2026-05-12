@@ -2,7 +2,10 @@
 //! corresponds 1:1 to a `Command` variant and is invoked from `main.rs`.
 
 use anyhow::{Context, Result};
-use retl::{replace_file_atomic_backoff, IntegrityMode, KeyExtractor, RedditETL, Sources, YearMonth};
+use retl::{
+    replace_file_atomic_backoff, ExportFormat, IntegrityMode, KeyExtractor, RedditETL, Sources,
+    YearMonth,
+};
 use std::fs;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -12,8 +15,8 @@ use crate::bin_args::{
     IntegrityArgs, IntegrityModeArg, ParentsArgs, ScanArgs,
 };
 use crate::bin_helpers::{
-    build_etl, discover_spool_parts, plan, stream_extract_to_stdout, GroupBySpec, GroupMetricAgg,
-    MetricSpec, RecCount,
+    build_etl, discover_spool_parts, plan, stream_extract_to_stdout, stream_path_output_to_stdout,
+    GroupBySpec, GroupMetricAgg, MetricSpec, RecCount,
 };
 
 pub(crate) fn run_scan(args: ScanArgs) -> Result<()> {
@@ -44,7 +47,10 @@ pub(crate) fn run_scan(args: ScanArgs) -> Result<()> {
 
 pub(crate) fn run_dedupe(args: DedupeArgs) -> Result<()> {
     let key = parse_dedupe_key(&args.key)?;
-    let etl = build_etl(&args.common)?;
+    let mut etl = build_etl(&args.common)?;
+    if let Some(b) = args.inflight_bytes {
+        etl = etl.inflight_bytes(b);
+    }
     let work_dir = args.common.work_dir.clone();
     let scan = plan!(etl, args.common);
 
@@ -80,7 +86,9 @@ fn parse_dedupe_key(spec: &str) -> Result<KeyExtractor> {
         "subreddit" => Ok(KeyExtractor::subreddit_lowercase_fast()),
         _ => {
             let ptr = trimmed.strip_prefix("json:").ok_or_else(|| {
-                anyhow::anyhow!("unsupported --key {trimmed:?}; expected author, subreddit, or json:/pointer")
+                anyhow::anyhow!(
+                    "unsupported --key {trimmed:?}; expected author, subreddit, or json:/pointer"
+                )
             })?;
             if !ptr.starts_with('/') {
                 anyhow::bail!("JSON pointer keys must start with '/': use --key json:/field");
@@ -96,8 +104,33 @@ fn stdout_dedupe_path(work_dir: &Path) -> PathBuf {
         .join(format!("retl_dedupe_stdout_{}.txt", std::process::id()))
 }
 
+fn export_format_name(fmt: ExportFmt) -> &'static str {
+    match fmt {
+        ExportFmt::Jsonl => "jsonl",
+        ExportFmt::Json => "json",
+        ExportFmt::Spool => "spool",
+        ExportFmt::Zst => "zst",
+        ExportFmt::PartitionedJsonl => "partitioned-jsonl",
+    }
+}
+
 pub(crate) fn run_export(args: ExportArgs) -> Result<()> {
     let mut etl = build_etl(&args.common)?;
+    if !args.whitelist.is_empty() {
+        if args.whitelist.iter().all(|field| field.trim().is_empty()) {
+            anyhow::bail!("--whitelist must include at least one non-empty field");
+        }
+        etl = etl.whitelist_fields(args.whitelist.iter().cloned());
+    }
+    if args.strict_whitelist {
+        etl = etl.strict_whitelist(true);
+    }
+    if args.human_timestamps {
+        etl = etl.timestamps_human_readable(true);
+    }
+    if let Some(b) = args.inflight_bytes {
+        etl = etl.inflight_bytes(b);
+    }
     if let Some(level) = args.zst_level {
         etl = etl.zst_level(level);
     }
@@ -135,6 +168,26 @@ pub(crate) fn run_export(args: ExportArgs) -> Result<()> {
             let (parts, n) = scan.extract_spool_monthly(&args.out)?;
             eprintln!("Spooled {} records across {} part files", n, parts.len());
         }
+        ExportFmt::Zst | ExportFmt::PartitionedJsonl => {
+            if to_stdout {
+                anyhow::bail!(
+                    "--out - is not valid for --format {} (it expects a directory)",
+                    export_format_name(args.format)
+                );
+            }
+            if args.resume {
+                anyhow::bail!(
+                    "--resume is not supported with --format {}; use jsonl/json/spool for resumable exports",
+                    export_format_name(args.format)
+                );
+            }
+            let partition_format = match args.format {
+                ExportFmt::Zst => ExportFormat::Zst,
+                ExportFmt::PartitionedJsonl => ExportFormat::Jsonl,
+                _ => unreachable!(),
+            };
+            scan.export_partitioned(&args.out, partition_format)?;
+        }
     }
     Ok(())
 }
@@ -169,7 +222,14 @@ pub(crate) fn run_count(args: CountArgs) -> Result<()> {
             let out = args.out.ok_or_else(|| {
                 anyhow::anyhow!("--out is required for `count --mode author` (TSV destination)")
             })?;
-            scan.author_counts_to_tsv(&out)?;
+            if out == Path::new("-") {
+                let work_dir = args.common.work_dir.clone();
+                stream_path_output_to_stdout(&work_dir, "count", "author_counts.tsv", |p| {
+                    scan.author_counts_to_tsv(p)
+                })?;
+            } else {
+                scan.author_counts_to_tsv(&out)?;
+            }
         }
     }
     Ok(())

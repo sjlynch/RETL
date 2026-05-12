@@ -12,7 +12,7 @@
 - 🧠 **Intuitive query builder (DSL)**: subreddits, authors (allow/deny), regex, keywords, URL presence, domains, score thresholds
 - 🧰 **Exports**:
   - JSONL / JSON array (stitched)
-  - Partitioned per source (RC/RS) as JSONL or ZST
+  - Partitioned per source/month in corpus layout as JSONL or ZST (CLI: `retl export --format partitioned-jsonl` / `--format zst`)
 - 📈 **Analytics helpers**: `count_by_month()`, per‑author counts, “first seen” index
 - 👪 **Parent pipeline**: collect parent IDs → resolve content → attach parent payloads back to records
 - 🧪 **Integrity checks** for corrupted monthly files (quick or full)
@@ -135,8 +135,8 @@ builder methods.
 
 ## Command-Line Interface
 
-The `retl` binary exposes the main ETL subcommands. All accept a shared set of
-flags (see `retl <subcommand> --help` for the full list):
+The `retl` binary exposes the main ETL subcommands. Most accept a shared set of
+selection/runtime flags (see `retl <subcommand> --help` for the full list):
 
 | Common flag | Purpose |
 | --- | --- |
@@ -146,9 +146,6 @@ flags (see `retl <subcommand> --help` for the full list):
 | `--source rc\|rs\|both` | Comments only, submissions only, or both (default). |
 | `--subreddit <NAME>` (`-s`) | Subreddit selector. Repeatable; omit for "any subreddit". |
 | `--include-deleted` | Include pseudo-users (`[deleted]`, `[removed]`, and empty authors) that are filtered by default. |
-| `--whitelist a,b,c` | Restrict export to the listed JSON fields (comma-separated). |
-| `--human-timestamps` | Emit `created_utc` as RFC3339 strings. |
-| `--resume` (export) | Reuse completed per-month export parts only when the stored query/config fingerprint matches the current filters, sources, date range, whitelist, and timestamp settings. |
 | `--parallelism <N>` / `--file-concurrency <N>` | Rayon threads / concurrent monthly files. |
 | `--no-progress` | Disable progress bars. |
 
@@ -195,13 +192,15 @@ retl dedupe --source rc --key 'json:/parent_id' --start 2020-01 --end 2020-12 --
 
 ### `export` — extract filtered records
 
-Three formats:
+Formats:
 
 * `--format jsonl` → single stitched `.jsonl` file (default).
 * `--format json`  → single `.json` file containing a JSON array (`--pretty` for pretty-print).
 * `--format spool` → per-source per-month files (`part_RC_YYYY-MM.jsonl`, `part_RS_YYYY-MM.jsonl`) under the directory passed to `--out`. Use this for the parents-pipeline workflow.
+* `--format zst` → corpus-style partitioned `.zst` output under `<out>/comments/RC_YYYY-MM.zst` and `<out>/submissions/RS_YYYY-MM.zst`.
+* `--format partitioned-jsonl` → the same corpus-style directory layout, but as uncompressed `.jsonl` files.
 
-With `--resume`, `jsonl`/`json` exports checkpoint per-month `.part_*.jsonl` files under `--work-dir`, while `spool` checkpoints `part_RC_*` / `part_RS_*` and `_progress.json` under `--out`. The checkpoint includes a fingerprint of the query and output-affecting config; changing filters, sources, date range, whitelist fields, or `--human-timestamps` discards stale parts instead of mixing results from different runs.
+Export-only modifiers include `--whitelist a,b,c`, `--strict-whitelist`, `--human-timestamps`, `--zst-level <N>`, and `--resume`. With `--resume`, `jsonl`/`json` exports checkpoint per-month `.part_*.jsonl` files under `--work-dir`, while `spool` checkpoints `part_RC_*` / `part_RS_*` and `_progress.json` under `--out`. The checkpoint includes a fingerprint of the query and output-affecting config; changing filters, sources, date range, whitelist fields, or `--human-timestamps` discards stale parts instead of mixing results from different runs. `--resume` is not currently supported for `zst` or `partitioned-jsonl`.
 
 ~~~sh
 # JSONL with a field whitelist and human timestamps
@@ -216,6 +215,15 @@ retl export \
 
 # Spool monthly parts (input for parents pipeline / aggregation)
 retl export --start 2006-01 --end 2006-01 -s programming --format spool --out ./spool
+
+# Re-emit a filtered mini-corpus in the original RC/RS .zst layout
+retl export \
+  --data-dir ./data \
+  --start 2020-01 --end 2020-12 \
+  --subreddit rust \
+  --format zst \
+  --zst-level 10 \
+  --out ./rust_2020_corpus
 ~~~
 
 ### `count` — record counts
