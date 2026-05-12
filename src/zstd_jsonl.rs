@@ -51,9 +51,9 @@ pub struct MinimalRecord {
     pub title: Option<String>,    // submissions
 
     #[allow(dead_code)]
-    pub parent_id: Option<String>,// comments
+    pub parent_id: Option<String>, // comments
 
-    pub domain: Option<String>,   // submissions (used by domains_in)
+    pub domain: Option<String>, // submissions (used by domains_in)
 }
 
 // ----------------------------- Helpers for full-error logging ------------------------------------
@@ -127,13 +127,13 @@ impl<'a> Default for LineStreamOpts<'a> {
 /// "Frame requires too much memory" on very large frames. If decoding
 /// still fails (e.g., checksum/corruption), we log a single warning,
 /// invoke `opts.on_skip` (if set), advance progress to the file's size
-/// (if a progress callback is set), and return `Ok(())` — corruption
-/// never aborts the run.
-pub fn for_each_line_with_opts(
+/// (if a progress callback is set), and report the skipped/partial read to
+/// callers that need resume correctness.
+pub fn for_each_line_with_opts_status(
     path: &Path,
     opts: LineStreamOpts<'_>,
     mut on_line: impl FnMut(&str) -> Result<()>,
-) -> Result<()> {
+) -> Result<bool> {
     let LineStreamOpts {
         read_buf_bytes,
         mut progress,
@@ -148,7 +148,7 @@ pub fn for_each_line_with_opts(
         &mut on_line,
     );
     match result {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(true),
         Err(e) => {
             warn_decode_skip(path, &e);
             if let Some(cb) = on_skip.as_deref_mut() {
@@ -160,9 +160,19 @@ pub fn for_each_line_with_opts(
                     cb(meta.len());
                 }
             }
-            Ok(())
+            Ok(false)
         }
     }
+}
+
+/// Back-compat wrapper for callers that tolerate corrupt zstd inputs by
+/// warning and continuing.
+pub fn for_each_line_with_opts(
+    path: &Path,
+    opts: LineStreamOpts<'_>,
+    on_line: impl FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    for_each_line_with_opts_status(path, opts, on_line).map(|_| ())
 }
 
 /// Tunable line-stream entry point used throughout the library.
@@ -175,6 +185,23 @@ pub fn for_each_line_cfg(
     on_line: impl FnMut(&str) -> Result<()>,
 ) -> Result<()> {
     for_each_line_with_opts(
+        path,
+        LineStreamOpts {
+            read_buf_bytes: Some(read_buf_bytes),
+            ..Default::default()
+        },
+        on_line,
+    )
+}
+
+/// Like [`for_each_line_cfg`] but returns `Ok(false)` when a zstd decode error
+/// was tolerated after zero or more lines had already been delivered.
+pub fn for_each_line_cfg_status(
+    path: &Path,
+    read_buf_bytes: usize,
+    on_line: impl FnMut(&str) -> Result<()>,
+) -> Result<bool> {
+    for_each_line_with_opts_status(
         path,
         LineStreamOpts {
             read_buf_bytes: Some(read_buf_bytes),
@@ -214,6 +241,25 @@ pub fn for_each_line_with_progress_cfg(
     on_line: impl FnMut(&str) -> Result<()>,
 ) -> Result<()> {
     for_each_line_with_opts(
+        path,
+        LineStreamOpts {
+            read_buf_bytes: Some(read_buf_bytes),
+            progress: Some(&mut on_progress),
+            ..Default::default()
+        },
+        on_line,
+    )
+}
+
+/// Like [`for_each_line_with_progress_cfg`] but returns `Ok(false)` when a
+/// zstd decode error was tolerated.
+pub fn for_each_line_with_progress_cfg_status(
+    path: &Path,
+    read_buf_bytes: usize,
+    mut on_progress: impl FnMut(u64),
+    on_line: impl FnMut(&str) -> Result<()>,
+) -> Result<bool> {
+    for_each_line_with_opts_status(
         path,
         LineStreamOpts {
             read_buf_bytes: Some(read_buf_bytes),
@@ -299,7 +345,10 @@ fn for_each_line_attempt<'borrow, 'cb: 'borrow>(
 ) -> Result<()> {
     let file = open_with_backoff(path, 16, 50)?;
     let counter = Arc::new(AtomicU64::new(0));
-    let cnt = CountingReader { inner: file, counter: counter.clone() };
+    let cnt = CountingReader {
+        inner: file,
+        counter: counter.clone(),
+    };
 
     let mut decoder = Decoder::new(cnt)?;
     decoder.window_log_max(ZSTD_WINDOW_LOG_MAX)?;
@@ -330,7 +379,9 @@ fn for_each_line_attempt<'borrow, 'cb: 'borrow>(
         }
         if buf.ends_with('\n') {
             let _ = buf.pop();
-            if buf.ends_with('\r') { let _ = buf.pop(); }
+            if buf.ends_with('\r') {
+                let _ = buf.pop();
+            }
         }
         // Per-line progress delta (preserves prior cadence: drained before
         // the user's `on_line` callback runs so "bytes read" never lags
@@ -450,8 +501,14 @@ mod tests {
             skip_calls
         );
         let (skipped_path, err_msg) = &skip_calls[0];
-        assert_eq!(skipped_path, &path, "on_skip must receive the original path");
-        assert!(!err_msg.is_empty(), "on_skip must receive a non-empty error description");
+        assert_eq!(
+            skipped_path, &path,
+            "on_skip must receive the original path"
+        );
+        assert!(
+            !err_msg.is_empty(),
+            "on_skip must receive a non-empty error description"
+        );
     }
 
     /// On a healthy file, the *_with_skip variant must NOT invoke `on_skip`
@@ -481,6 +538,9 @@ mod tests {
         );
         assert!(res.is_ok(), "healthy file must scan without error");
         assert_eq!(skip_count, 0, "on_skip must not fire on healthy files");
-        assert_eq!(lines_seen, 50, "all lines must be delivered on healthy files");
+        assert_eq!(
+            lines_seen, 50,
+            "all lines must be delivered on healthy files"
+        );
     }
 }

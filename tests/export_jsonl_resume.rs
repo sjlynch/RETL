@@ -3,7 +3,66 @@ mod common;
 
 use common::*;
 use retl::{RedditETL, Sources, YearMonth};
+use serde_json::json;
 use std::fs;
+
+#[test]
+fn jsonl_resume_fingerprint_change_rebuilds_tmp_parts() {
+    let base = tempfile::tempdir().unwrap().keep();
+    let work_dir = base.join("work_fp");
+    let rc_path = base.join("comments").join("RC_2006-01.zst");
+    let lines = vec![
+        json!({
+            "id":"p1", "author":"alice", "subreddit":"programming",
+            "created_utc":1136073600_i64, "score":1, "body":"programming"
+        })
+        .to_string(),
+        json!({
+            "id":"r1", "author":"ferris", "subreddit":"rust",
+            "created_utc":1136073601_i64, "score":1, "body":"rust"
+        })
+        .to_string(),
+    ];
+    write_zst_lines(&rc_path, &lines);
+    fs::create_dir_all(base.join("submissions")).unwrap();
+
+    let out1 = base.join("programming.jsonl");
+    RedditETL::new()
+        .base_dir(&base)
+        .work_dir(&work_dir)
+        .sources(Sources::Comments)
+        .date_range(Some(YearMonth::new(2006, 1)), Some(YearMonth::new(2006, 1)))
+        .progress(false)
+        .resume(true)
+        .scan()
+        .subreddit("programming")
+        .extract_to_jsonl(&out1)
+        .unwrap();
+    assert!(fs::read_to_string(&out1).unwrap().contains("programming"));
+
+    let out2 = base.join("rust.jsonl");
+    RedditETL::new()
+        .base_dir(&base)
+        .work_dir(&work_dir)
+        .sources(Sources::Comments)
+        .date_range(Some(YearMonth::new(2006, 1)), Some(YearMonth::new(2006, 1)))
+        .progress(false)
+        .resume(true)
+        .scan()
+        .subreddit("rust")
+        .extract_to_jsonl(&out2)
+        .unwrap();
+
+    let second = fs::read_to_string(&out2).unwrap();
+    assert!(
+        second.contains("rust"),
+        "changed query must rebuild tmp part, got {second}"
+    );
+    assert!(
+        !second.contains("programming"),
+        "stale programming part was stitched"
+    );
+}
 
 #[test]
 fn jsonl_resume_reuses_valid_month_parts_without_reading_sources() {

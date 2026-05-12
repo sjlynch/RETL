@@ -8,7 +8,9 @@
 //! Entries store the on-disk size of the published file. On re-entry we
 //! cross-check by stat'ing the final destination and comparing sizes — if the
 //! file is missing, smaller, or larger than recorded, the entry is dropped and
-//! that month is re-run. The optional `sha256` field is reserved for v2.
+//! that month is re-run. The manifest also records a fingerprint of the query
+//! and output-affecting options; a mismatch invalidates the checkpoint set.
+//! The optional `sha256` field is reserved for v2.
 
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
@@ -16,8 +18,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::atomic_write::write_jsonl_atomic;
 use crate::atomic_write::ensure_staging_dir;
+use crate::atomic_write::write_jsonl_atomic;
 
 pub const MANIFEST_FILE_NAME: &str = "_progress.json";
 const MANIFEST_VERSION: u32 = 1;
@@ -33,12 +35,18 @@ pub struct MonthEntry {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProgressManifest {
     pub version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
     pub months: HashMap<String, MonthEntry>,
 }
 
 impl Default for ProgressManifest {
     fn default() -> Self {
-        Self { version: MANIFEST_VERSION, months: HashMap::new() }
+        Self {
+            version: MANIFEST_VERSION,
+            fingerprint: None,
+            months: HashMap::new(),
+        }
     }
 }
 
@@ -81,12 +89,19 @@ pub fn load(out_dir: &Path) -> ProgressManifest {
 /// Atomically rewrite the manifest from the current accumulator snapshot.
 /// Uses the same staging dir as the spool outputs so a crash never publishes
 /// a half-written manifest.
-pub fn save(out_dir: &Path, months: &HashMap<String, MonthEntry>) -> Result<()> {
+pub fn save(
+    out_dir: &Path,
+    months: &HashMap<String, MonthEntry>,
+    fingerprint: Option<&str>,
+) -> Result<()> {
     let staging_dir = ensure_staging_dir(out_dir)?;
     let dest = manifest_path(out_dir);
-    let manifest = ProgressManifest { version: MANIFEST_VERSION, months: months.clone() };
-    let bytes = serde_json::to_vec_pretty(&manifest)
-        .context("serialize progress manifest")?;
+    let manifest = ProgressManifest {
+        version: MANIFEST_VERSION,
+        fingerprint: fingerprint.map(str::to_owned),
+        months: months.clone(),
+    };
+    let bytes = serde_json::to_vec_pretty(&manifest).context("serialize progress manifest")?;
     write_jsonl_atomic(&staging_dir, &dest, 64 * 1024, |w| {
         w.write_all(&bytes)?;
         Ok(())
@@ -99,25 +114,32 @@ pub fn save(out_dir: &Path, months: &HashMap<String, MonthEntry>) -> Result<()> 
 /// each successful per-month commit.
 pub struct ManifestAccumulator {
     out_dir: PathBuf,
+    fingerprint: Option<String>,
     months: Mutex<HashMap<String, MonthEntry>>,
 }
 
 impl ManifestAccumulator {
-    pub fn new(out_dir: &Path, initial: HashMap<String, MonthEntry>) -> Self {
+    pub fn new(
+        out_dir: &Path,
+        initial: HashMap<String, MonthEntry>,
+        fingerprint: Option<String>,
+    ) -> Self {
         Self {
             out_dir: out_dir.to_path_buf(),
+            fingerprint,
             months: Mutex::new(initial),
         }
     }
 
     /// Insert or update an entry for `key`, then atomically rewrite the manifest.
+    ///
+    /// The in-memory insert, snapshot construction, staged write, and atomic
+    /// rename all happen under the same mutex. That serializes concurrent
+    /// workers with `file_concurrency > 1`, preventing lost updates and staged
+    /// `_progress.json.inprogress` collisions.
     pub fn commit(&self, key: String, entry: MonthEntry) -> Result<()> {
-        let snapshot = {
-            let mut guard = self.months.lock();
-            guard.insert(key, entry);
-            guard.clone()
-        };
-        save(&self.out_dir, &snapshot)
+        let mut guard = self.months.lock();
+        guard.insert(key, entry);
+        save(&self.out_dir, &*guard, self.fingerprint.as_deref())
     }
-
 }

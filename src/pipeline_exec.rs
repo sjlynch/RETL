@@ -16,14 +16,17 @@ use crate::progress_manifest::{ManifestAccumulator, MonthEntry};
 use crate::query::QuerySpec;
 use crate::shard::{ShardedWriter, UsernameStream};
 use crate::stitch::{concat_tsvs, stitch_tmp_parts, stitch_tmp_parts_to_json_array};
-use crate::streaming::{process_file_for_usernames_with_skip, stream_job, WhitelistMatchTracker};
-use crate::util::{create_with_backoff, with_thread_pool};
+use crate::streaming::{
+    process_file_for_usernames_with_skip, stream_job, StreamJobResult, WhitelistMatchTracker,
+};
+use crate::util::{create_with_backoff, remove_with_backoff, with_thread_pool};
 use crate::zstd_jsonl::{
     for_each_line_cfg, for_each_line_with_progress_cfg, parse_minimal, MinimalRecord,
 };
 use anyhow::{anyhow, Context, Result};
 use indicatif::ProgressBar;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt;
 use std::fs;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -45,6 +48,42 @@ enum Finalize {
 
 const FILE_PREFIX_RC: &str = "part_RC";
 const FILE_PREFIX_RS: &str = "part_RS";
+
+#[derive(Debug)]
+struct PartialScanError {
+    path: PathBuf,
+    written: u64,
+}
+
+impl fmt::Display for PartialScanError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "zstd decode error while streaming {}; {} record(s) were decoded before the file was skipped",
+            self.path.display(),
+            self.written
+        )
+    }
+}
+
+impl std::error::Error for PartialScanError {}
+
+fn complete_stream_job(job: &FileJob, result: StreamJobResult) -> Result<u64> {
+    if result.complete {
+        Ok(result.written)
+    } else {
+        Err(PartialScanError {
+            path: job.path.clone(),
+            written: result.written,
+        }
+        .into())
+    }
+}
+
+fn is_partial_scan_error(e: &anyhow::Error) -> bool {
+    e.chain()
+        .any(|cause| cause.downcast_ref::<PartialScanError>().is_some())
+}
 
 // -------- Original operations (back-compat) --------
 
@@ -198,14 +237,24 @@ impl ScanPlan {
                 let input = tmp_dir.join("matched.ndjson");
                 let f = create_with_backoff(&input, 16, 50)
                     .with_context(|| format!("create {}", input.display()))?;
-                let writer = Mutex::new(BufWriter::with_capacity(self.etl.opts.write_buffer_bytes, f));
+                let writer = Mutex::new(BufWriter::with_capacity(
+                    self.etl.opts.write_buffer_bytes,
+                    f,
+                ));
 
-                scan_records(&self.etl, &self.query, /*show_progress=*/true, |_min, _kind, line| {
-                    let mut w = writer.lock().map_err(|_| anyhow!("dedupe writer lock poisoned"))?;
-                    w.write_all(line.as_bytes())?;
-                    w.write_all(b"\n")?;
-                    Ok(())
-                })?;
+                scan_records(
+                    &self.etl,
+                    &self.query,
+                    /*show_progress=*/ true,
+                    |_min, _kind, line| {
+                        let mut w = writer
+                            .lock()
+                            .map_err(|_| anyhow!("dedupe writer lock poisoned"))?;
+                        w.write_all(line.as_bytes())?;
+                        w.write_all(b"\n")?;
+                        Ok(())
+                    },
+                )?;
                 writer
                     .into_inner()
                     .map_err(|_| anyhow!("dedupe writer lock poisoned"))?
@@ -276,15 +325,17 @@ impl ScanPlan {
             let staging_dir = ensure_staging_dir(out_dir)?;
             sweep_stale_inprogress(out_dir, true)?;
 
-            let targets = resolve_target_subs_from(&plan.etl.opts.subreddit, &plan.query.subreddits);
+            let targets =
+                resolve_target_subs_from(&plan.etl.opts.subreddit, &plan.query.subreddits);
             let files = plan_pipeline_files(&plan.etl)?;
 
             let resume = plan.etl.opts.resume;
+            let resume_fingerprint = build_resume_fingerprint(&plan.etl, &plan.query, "spool")?;
             // Resume manifest: load on entry, validate each entry against the
-            // file actually on disk, and snapshot the surviving keys before any
-            // worker mutates the accumulator.
+            // current query/config fingerprint and the file actually on disk,
+            // then snapshot surviving keys before any worker mutates the accumulator.
             let (initial_months, completed_keys) = if resume {
-                load_and_validate_manifest(out_dir)?
+                load_and_validate_manifest(out_dir, &resume_fingerprint)?
             } else {
                 (HashMap::new(), HashSet::new())
             };
@@ -314,8 +365,16 @@ impl ScanPlan {
             // Persist the (pruned) manifest before any work, so a crash mid-
             // prune cannot resurrect entries we already know are stale.
             let accumulator = if resume {
-                crate::progress_manifest::save(out_dir, &initial_months)?;
-                Some(ManifestAccumulator::new(out_dir, initial_months))
+                crate::progress_manifest::save(
+                    out_dir,
+                    &initial_months,
+                    Some(&resume_fingerprint),
+                )?;
+                Some(ManifestAccumulator::new(
+                    out_dir,
+                    initial_months,
+                    Some(resume_fingerprint.clone()),
+                ))
             } else {
                 None
             };
@@ -511,10 +570,10 @@ impl ScanPlan {
                     };
                     let out_path = out_dir.join(file_name);
 
-                    let written = match format {
+                    let written_result = match format {
                         ExportFormat::Jsonl => {
                             write_jsonl_atomic(&staging_dir, &out_path, write_buf, |w| {
-                                stream_job(
+                                let result = stream_job(
                                     job,
                                     w,
                                     targets_ref,
@@ -525,12 +584,13 @@ impl ScanPlan {
                                     read_buf,
                                     human_ts,
                                     whitelist_tracker.as_deref(),
-                                )
-                            })?
+                                )?;
+                                complete_stream_job(job, result)
+                            })
                         }
                         ExportFormat::Zst => {
                             write_zst_atomic(&staging_dir, &out_path, zst_level, write_buf, |w| {
-                                stream_job(
+                                let result = stream_job(
                                     job,
                                     w,
                                     targets_ref,
@@ -541,9 +601,19 @@ impl ScanPlan {
                                     read_buf,
                                     human_ts,
                                     whitelist_tracker.as_deref(),
-                                )
-                            })?
+                                )?;
+                                complete_stream_job(job, result)
+                            })
                         }
+                    };
+
+                    let written = match written_result {
+                        Ok(n) => n,
+                        Err(e) if is_partial_scan_error(&e) => {
+                            tracing::warn!(path=%job.path.display(), error=%e, "Skipping partitioned export month after zstd decode error; staged output was discarded");
+                            return Ok(());
+                        }
+                        Err(e) => return Err(e),
                     };
 
                     if written == 0 {
@@ -602,6 +672,86 @@ fn validate_export_whitelist(etl: &RedditETL) -> Result<()> {
     Ok(())
 }
 
+fn opt_ym_string(ym: Option<YearMonth>) -> Option<String> {
+    ym.map(|ym| ym.to_string())
+}
+
+fn stable_fnv1a_hex(bytes: &[u8]) -> String {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x00000100000001B3;
+    let mut hash = FNV_OFFSET;
+    for b in bytes {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    format!("fnv1a64:{hash:016x}")
+}
+
+/// Fingerprint every query/config knob that can change the bytes written by a
+/// resumable extract/spool operation. If it changes between `--resume` runs,
+/// stale month parts are discarded instead of being stitched into the new run.
+fn build_resume_fingerprint(etl: &RedditETL, query: &QuerySpec, operation: &str) -> Result<String> {
+    let input = serde_json::json!({
+        "operation": operation,
+        "sources": format!("{:?}", etl.opts.sources),
+        "start": opt_ym_string(etl.opts.start),
+        "end": opt_ym_string(etl.opts.end),
+        "legacy_subreddit": etl.opts.subreddit.as_ref(),
+        "whitelist_fields": etl.opts.whitelist_fields.as_ref(),
+        "strict_whitelist": etl.opts.strict_whitelist,
+        "human_readable_timestamps": etl.opts.human_readable_timestamps,
+        "query": {
+            "subreddits": query.subreddits.as_ref(),
+            "authors_in": query.authors_in.as_ref(),
+            "authors_out": query.authors_out.as_ref(),
+            "author_regex": query.author_regex.as_ref().map(|re| re.as_str()),
+            "author_regex_pattern": query.author_regex_pattern.as_ref(),
+            "min_score": query.min_score,
+            "max_score": query.max_score,
+            "keywords_any": query.keywords_any.as_ref(),
+            "domains_in": query.domains_in.as_ref(),
+            "contains_url": query.contains_url,
+            "filter_pseudo_users": query.filter_pseudo_users,
+        }
+    });
+    let bytes = serde_json::to_vec(&input).context("serialize resume fingerprint input")?;
+    Ok(stable_fnv1a_hex(&bytes))
+}
+
+fn remove_matching_files(dir: &Path, mut should_remove: impl FnMut(&str) -> bool) -> Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if should_remove(name) {
+            if let Err(e) = remove_with_backoff(&path, 8, 50) {
+                tracing::warn!(path=%path.display(), error=%e, "failed to remove stale resume part");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn clear_spool_resume_parts(out_dir: &Path) -> Result<()> {
+    remove_matching_files(out_dir, |name| {
+        (name.starts_with("part_RC_") || name.starts_with("part_RS_")) && name.ends_with(".jsonl")
+    })
+}
+
+fn clear_extract_resume_parts(tmp_dir: &Path) -> Result<()> {
+    remove_matching_files(tmp_dir, |name| {
+        name.starts_with(".part_") && name.ends_with(".jsonl")
+    })
+}
+
 struct MonthJobCtx<'a> {
     out_dir: &'a Path,
     staging_dir: &'a Path,
@@ -619,13 +769,24 @@ struct MonthJobCtx<'a> {
     completed_keys: &'a HashSet<String>,
 }
 
-/// Load `_progress.json`, validate each entry against the on-disk file size,
-/// drop mismatches with a `tracing::info` warning, and return the surviving
-/// entries plus a snapshot of completed keys for fast skip-lookup.
+/// Load `_progress.json`, validate it against the current fingerprint and each
+/// entry against the on-disk file size, drop mismatches with a warning, and
+/// return the surviving entries plus a snapshot of completed keys.
 fn load_and_validate_manifest(
     out_dir: &Path,
+    fingerprint: &str,
 ) -> Result<(HashMap<String, MonthEntry>, HashSet<String>)> {
     let manifest = crate::progress_manifest::load(out_dir);
+    if manifest.fingerprint.as_deref() != Some(fingerprint) && !manifest.months.is_empty() {
+        tracing::warn!(
+            path=%crate::progress_manifest::manifest_path(out_dir).display(),
+            stored=?manifest.fingerprint,
+            current=%fingerprint,
+            "resume manifest fingerprint does not match current query/config; discarding spool parts"
+        );
+        clear_spool_resume_parts(out_dir)?;
+        return Ok((HashMap::new(), HashSet::new()));
+    }
     let mut keep: HashMap<String, MonthEntry> = HashMap::new();
     for (k, v) in manifest.months {
         let final_name = format!("part_{}.jsonl", k);
@@ -653,7 +814,9 @@ fn process_month(job: &FileJob, ctx: &MonthJobCtx<'_>) -> Result<Option<MonthRes
         FileKind::Comment => (FILE_PREFIX_RC, "RC"),
         FileKind::Submission => (FILE_PREFIX_RS, "RS"),
     };
-    let out_path = ctx.out_dir.join(format!("{}_{}.jsonl", file_prefix, job.ym));
+    let out_path = ctx
+        .out_dir
+        .join(format!("{}_{}.jsonl", file_prefix, job.ym));
     let key = crate::progress_manifest::month_key(key_prefix, job.ym);
 
     // Resume fast-path: skip the month entirely if it's already in the
@@ -669,7 +832,7 @@ fn process_month(job: &FileJob, ctx: &MonthJobCtx<'_>) -> Result<Option<MonthRes
     }
 
     let n = match write_jsonl_atomic(ctx.staging_dir, &out_path, ctx.write_buf, |w| {
-        stream_job(
+        let result = stream_job(
             job,
             w,
             ctx.targets,
@@ -680,12 +843,21 @@ fn process_month(job: &FileJob, ctx: &MonthJobCtx<'_>) -> Result<Option<MonthRes
             ctx.read_buf,
             ctx.human_ts,
             ctx.whitelist_tracker,
-        )
+        )?;
+        complete_stream_job(job, result)
     }) {
         Ok(n) => n,
+        Err(e) if is_partial_scan_error(&e) => {
+            tracing::warn!(path=%job.path.display(), output=%out_path.display(), error=%e, "Skipping month after zstd decode error; staged spool output was discarded and resume will retry it");
+            return Ok(None);
+        }
         Err(e) => {
             if ctx.strict_whitelist
-                && e.chain().any(|cause| cause.to_string().starts_with("--whitelist matched zero fields"))
+                && e.chain().any(|cause| {
+                    cause
+                        .to_string()
+                        .starts_with("--whitelist matched zero fields")
+                })
             {
                 return Err(e);
             }
@@ -732,14 +904,31 @@ fn export_part_path(tmp_dir: &Path, key: &str) -> PathBuf {
     tmp_dir.join(format!(".part_{}.jsonl", key))
 }
 
-fn load_and_validate_export_manifest(tmp_dir: &Path) -> Result<(HashMap<String, MonthEntry>, HashSet<String>)> {
+fn load_and_validate_export_manifest(
+    tmp_dir: &Path,
+    fingerprint: &str,
+) -> Result<(HashMap<String, MonthEntry>, HashSet<String>)> {
     let manifest = crate::progress_manifest::load(tmp_dir);
+    if manifest.fingerprint.as_deref() != Some(fingerprint) {
+        tracing::warn!(
+            path=%crate::progress_manifest::manifest_path(tmp_dir).display(),
+            stored=?manifest.fingerprint,
+            current=%fingerprint,
+            "extract resume manifest fingerprint does not match current query/config; discarding cached parts"
+        );
+        clear_extract_resume_parts(tmp_dir)?;
+        return Ok((HashMap::new(), HashSet::new()));
+    }
     let mut keep: HashMap<String, MonthEntry> = HashMap::new();
     for (k, v) in manifest.months {
         let part_path = export_part_path(tmp_dir, &k);
         match validate_jsonl_part(&part_path) {
-            Ok(entry) if entry.size == v.size => { keep.insert(k, entry); }
-            _ => tracing::info!(key=%k, "dropping stale extract progress entry; month will be re-run"),
+            Ok(entry) if entry.size == v.size => {
+                keep.insert(k, entry);
+            }
+            _ => {
+                tracing::info!(key=%k, "dropping stale extract progress entry; month will be re-run")
+            }
         }
     }
     let completed_keys: HashSet<String> = keep.keys().cloned().collect();
@@ -747,22 +936,31 @@ fn load_and_validate_export_manifest(tmp_dir: &Path) -> Result<(HashMap<String, 
 }
 
 fn validate_jsonl_part(path: &Path) -> Result<MonthEntry> {
-    let file = fs::File::open(path).with_context(|| format!("opening extract resume part {}", path.display()))?;
+    let file = fs::File::open(path)
+        .with_context(|| format!("opening extract resume part {}", path.display()))?;
     let mut reader = BufReader::new(file);
     let mut buf = String::new();
     let mut lines = 0_u64;
     loop {
         buf.clear();
         let n = reader.read_line(&mut buf)?;
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         let line = buf.trim_end_matches(['\r', '\n']);
-        if line.is_empty() { continue; }
+        if line.is_empty() {
+            continue;
+        }
         let _: serde_json::Value = serde_json::from_str(line)
             .with_context(|| format!("validating JSONL part {}", path.display()))?;
         lines += 1;
     }
     let size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    Ok(MonthEntry { size, lines, sha256: None })
+    Ok(MonthEntry {
+        size,
+        lines,
+        sha256: None,
+    })
 }
 
 /// Shared extraction logic used by:
@@ -785,21 +983,27 @@ fn extract_common(
         let work_dir = etl.ensure_work_dir()?;
         let tmp_dir = work_dir.join(tmp_dir_name);
         if !etl.opts.resume && tmp_dir.exists() {
-            fs::remove_dir_all(&tmp_dir).with_context(|| format!("clearing extract work dir {}", tmp_dir.display()))?;
+            fs::remove_dir_all(&tmp_dir)
+                .with_context(|| format!("clearing extract work dir {}", tmp_dir.display()))?;
         }
         fs::create_dir_all(&tmp_dir)?;
         let staging_dir = ensure_staging_dir(&tmp_dir)?;
         sweep_stale_inprogress(&tmp_dir, true)?;
 
         let resume = etl.opts.resume;
+        let resume_fingerprint = build_resume_fingerprint(etl, query, "extract")?;
         let (initial_months, completed_keys) = if resume {
-            load_and_validate_export_manifest(&tmp_dir)?
+            load_and_validate_export_manifest(&tmp_dir, &resume_fingerprint)?
         } else {
             (HashMap::new(), HashSet::new())
         };
         let accumulator = if resume {
-            crate::progress_manifest::save(&tmp_dir, &initial_months)?;
-            Some(ManifestAccumulator::new(&tmp_dir, initial_months))
+            crate::progress_manifest::save(&tmp_dir, &initial_months, Some(&resume_fingerprint))?;
+            Some(ManifestAccumulator::new(
+                &tmp_dir,
+                initial_months,
+                Some(resume_fingerprint.clone()),
+            ))
         } else {
             None
         };
@@ -861,13 +1065,36 @@ fn extract_common(
                     }
                 }
 
-                let lines = write_jsonl_atomic(&staging_dir, &tmp_file, write_buf, |w| {
-                    stream_job(job, w, targets_ref, query, &whitelist, pb.clone(), bounds, read_buf, human_ts, whitelist_tracker.as_deref())
-                })?;
+                let lines = match write_jsonl_atomic(&staging_dir, &tmp_file, write_buf, |w| {
+                    let result = stream_job(
+                        job,
+                        w,
+                        targets_ref,
+                        query,
+                        &whitelist,
+                        pb.clone(),
+                        bounds,
+                        read_buf,
+                        human_ts,
+                        whitelist_tracker.as_deref(),
+                    )?;
+                    complete_stream_job(job, result)
+                }) {
+                    Ok(lines) => lines,
+                    Err(e) if is_partial_scan_error(&e) => {
+                        tracing::warn!(path=%job.path.display(), part=%tmp_file.display(), error=%e, "Skipping extract month after zstd decode error; staged part was discarded and resume will retry it");
+                        return Ok(());
+                    }
+                    Err(e) => return Err(e),
+                };
 
                 if let Some(acc) = &accumulator {
                     let size = fs::metadata(&tmp_file).map(|m| m.len()).unwrap_or(0);
-                    let entry = MonthEntry { size, lines, sha256: None };
+                    let entry = MonthEntry {
+                        size,
+                        lines,
+                        sha256: None,
+                    };
                     if let Err(e) = acc.commit(key, entry) {
                         tracing::warn!(error=%e, "failed to update extract progress manifest; continuing");
                     }

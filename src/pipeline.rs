@@ -116,10 +116,11 @@ impl RedditETL {
         self.opts = self.opts.with_adaptive_mem(cfg);
         self
     }
-    /// Opt in to resumable spool runs: when enabled, `extract_spool_monthly`
-    /// reads and writes a `<out_dir>/_progress.json` sidecar so a re-run skips
-    /// months already published by a previous (possibly crashed) invocation.
-    /// Default false to preserve existing behavior.
+    /// Opt in to resumable extract/spool runs: when enabled, supported export
+    /// paths read/write a `_progress.json` sidecar keyed by month and by a
+    /// fingerprint of the current query/config, so changing filters invalidates
+    /// stale parts instead of reusing them. Default false to preserve existing
+    /// behavior.
     pub fn resume(mut self, yes: bool) -> Self {
         self.opts = self.opts.with_resume(yes);
         self

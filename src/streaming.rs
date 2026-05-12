@@ -7,7 +7,7 @@ use crate::paths::FileJob;
 use crate::query::QuerySpec;
 use crate::shard::ShardedWriter;
 use crate::zstd_jsonl::{
-    for_each_line_cfg, for_each_line_cfg_with_skip, for_each_line_with_progress_cfg,
+    for_each_line_cfg_status, for_each_line_cfg_with_skip, for_each_line_with_progress_cfg_status,
     for_each_line_with_progress_cfg_with_skip, parse_minimal,
 };
 use anyhow::{anyhow, Result};
@@ -46,7 +46,10 @@ pub(crate) struct WhitelistMatchTracker {
 
 impl WhitelistMatchTracker {
     pub(crate) fn new(strict: bool) -> Self {
-        Self { strict, state: std::sync::Mutex::new(WhitelistMatchState::default()) }
+        Self {
+            strict,
+            state: std::sync::Mutex::new(WhitelistMatchState::default()),
+        }
     }
 
     pub(crate) fn observe(&self, dropped_all_whitelisted_keys: bool) -> Result<()> {
@@ -247,7 +250,7 @@ fn write_with_whitelist<W: Write + ?Sized>(
     tokenizer_buf: &mut String,
     human_timestamps: bool,
     written: &mut u64,
-) -> Result<()> {
+) -> Result<bool> {
     // Preferred path: the streaming tokenizer copies raw value bytes verbatim
     // and never builds a `serde_json::Value`. If it rejects a structurally
     // surprising line, fall back to the slow Value path so correctness on odd
@@ -263,8 +266,9 @@ fn write_with_whitelist<W: Write + ?Sized>(
     };
 
     if tok_result.is_ok() {
+        let emitted_empty_projection = tokenizer_buf == "{}";
         write_and_count(writer, tokenizer_buf.as_bytes(), written)?;
-        return Ok(());
+        return Ok(emitted_empty_projection);
     }
 
     write_via_value(writer, line, Some(fields), human_timestamps, written)
@@ -276,9 +280,9 @@ fn write_via_value<W: Write + ?Sized>(
     whitelist: Option<&[String]>,
     human_timestamps: bool,
     written: &mut u64,
-) -> Result<()> {
+) -> Result<bool> {
     let val: Value = serde_json::from_str(line)?;
-    let mut out_val = if let Some(fields) = whitelist {
+    let (mut out_val, emitted_empty_projection) = if let Some(fields) = whitelist {
         let mut obj = Map::new();
         if let Some(map) = val.as_object() {
             for k in fields {
@@ -287,9 +291,10 @@ fn write_via_value<W: Write + ?Sized>(
                 }
             }
         }
-        Value::Object(obj)
+        let is_empty = obj.is_empty();
+        (Value::Object(obj), is_empty)
     } else {
-        val
+        (val, false)
     };
 
     if human_timestamps {
@@ -299,7 +304,7 @@ fn write_via_value<W: Write + ?Sized>(
     serde_json::to_writer(&mut *writer, &out_val)?;
     writer.write_all(b"\n")?;
     *written += 1;
-    Ok(())
+    Ok(emitted_empty_projection)
 }
 
 #[derive(Clone, Copy)]
@@ -310,6 +315,15 @@ enum StreamWritePath<'a> {
         fields: &'a [String],
         tokenizer: &'a WhitelistTokenizer,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamJobResult {
+    pub written: u64,
+    /// False when the zstd decoder reported corruption after delivering zero
+    /// or more lines. Callers that publish resumable outputs must not commit
+    /// such files as complete.
+    pub complete: bool,
 }
 
 pub fn stream_job<W: Write + ?Sized>(
@@ -323,7 +337,7 @@ pub fn stream_job<W: Write + ?Sized>(
     read_buf_bytes: usize,
     human_timestamps: bool,
     whitelist_tracker: Option<&WhitelistMatchTracker>,
-) -> Result<u64> {
+) -> Result<StreamJobResult> {
     let mut written: u64 = 0;
     let mut ts_buf = String::new();
     let mut tok_buf = String::new();
@@ -366,7 +380,7 @@ pub fn stream_job<W: Write + ?Sized>(
                 write_with_timestamps(writer, line, &mut ts_buf, &mut written)
             }
             StreamWritePath::Whitelist { fields, tokenizer } => {
-                write_with_whitelist(
+                let emitted_empty_projection = write_with_whitelist(
                     writer,
                     line,
                     fields,
@@ -376,7 +390,7 @@ pub fn stream_job<W: Write + ?Sized>(
                     &mut written,
                 )?;
                 if let Some(tracker) = whitelist_tracker {
-                    if let Err(e) = tracker.observe(tok_buf == "{}") {
+                    if let Err(e) = tracker.observe(emitted_empty_projection) {
                         whitelist_error = Some(e);
                     }
                 }
@@ -385,22 +399,22 @@ pub fn stream_job<W: Write + ?Sized>(
         }
     };
 
-    if let Some(pb) = pb {
-        for_each_line_with_progress_cfg(
+    let complete = if let Some(pb) = pb {
+        for_each_line_with_progress_cfg_status(
             &job.path,
             read_buf_bytes,
             |delta| pb.inc(delta),
             |s| on_line(s),
-        )?;
+        )?
     } else {
-        for_each_line_cfg(&job.path, read_buf_bytes, |s| on_line(s))?;
-    }
+        for_each_line_cfg_status(&job.path, read_buf_bytes, |s| on_line(s))?
+    };
 
     if let Some(e) = whitelist_error {
         return Err(e);
     }
 
-    Ok(written)
+    Ok(StreamJobResult { written, complete })
 }
 
 /// Process a single monthly file and shard usernames matching `subreddit`.
@@ -453,4 +467,92 @@ pub fn process_file_for_usernames_with_skip(
         )?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn whitelist_slow_path_reports_empty_projection_independent_of_tokenizer_buffer() {
+        let fields = vec!["id".to_string()];
+        let tokenizer = WhitelistTokenizer::new(fields.iter().map(|s| s.as_str()));
+        let mut tokenizer_buf = String::new();
+        let mut out = Vec::new();
+        let mut written = 0_u64;
+
+        let non_empty = write_with_whitelist(
+            &mut out,
+            r#"{"id":"kept","subreddit":"programming","author":"a"}"#,
+            &fields,
+            &tokenizer,
+            &mut tokenizer_buf,
+            false,
+            &mut written,
+        )
+        .unwrap();
+        assert!(!non_empty, "sanity: first projection contains id");
+        assert!(tokenizer_buf.contains("kept"));
+
+        // Top-level arrays are valid JSON so the slow Value path can project
+        // them, but the byte tokenizer rejects them. The emitted object is
+        // empty because there is no top-level object containing `id`; this
+        // must be computed from the slow path, not from tokenizer_buf.
+        let empty = write_with_whitelist(
+            &mut out,
+            r#"[{"id":"not-a-top-level-object"}]"#,
+            &fields,
+            &tokenizer,
+            &mut tokenizer_buf,
+            false,
+            &mut written,
+        )
+        .unwrap();
+        assert!(
+            empty,
+            "slow-path array projection should be reported as empty"
+        );
+        assert_eq!(written, 2);
+    }
+
+    #[test]
+    fn strict_whitelist_zero_match_counts_slow_path_empty_projections() {
+        let fields = vec!["not_present".to_string()];
+        let tokenizer = WhitelistTokenizer::new(fields.iter().map(|s| s.as_str()));
+        let tracker = WhitelistMatchTracker::new(true);
+        let mut tokenizer_buf = String::from("previous non-empty output");
+        let mut out = Vec::new();
+        let mut written = 0_u64;
+        let mut err = None;
+
+        for i in 0..WHITELIST_ZERO_MATCH_SAMPLE {
+            let line = if i % 2 == 0 {
+                r#"{"id":"fast","subreddit":"programming","author":"a"}"#
+            } else {
+                r#"[{"id":"slow"}]"#
+            };
+            let empty = write_with_whitelist(
+                &mut out,
+                line,
+                &fields,
+                &tokenizer,
+                &mut tokenizer_buf,
+                false,
+                &mut written,
+            )
+            .unwrap();
+            if let Err(e) = tracker.observe(empty) {
+                err = Some(e);
+                break;
+            }
+        }
+
+        let msg = err
+            .expect("strict tracker must error after 100 empty projections")
+            .to_string();
+        assert!(
+            msg.contains("--whitelist matched zero fields"),
+            "unexpected error: {msg}"
+        );
+    }
 }

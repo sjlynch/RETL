@@ -148,6 +148,7 @@ flags (see `retl <subcommand> --help` for the full list):
 | `--include-deleted` | Include pseudo-users (`[deleted]`, `[removed]`, and empty authors) that are filtered by default. |
 | `--whitelist a,b,c` | Restrict export to the listed JSON fields (comma-separated). |
 | `--human-timestamps` | Emit `created_utc` as RFC3339 strings. |
+| `--resume` (export) | Reuse completed per-month export parts only when the stored query/config fingerprint matches the current filters, sources, date range, whitelist, and timestamp settings. |
 | `--parallelism <N>` / `--file-concurrency <N>` | Rayon threads / concurrent monthly files. |
 | `--no-progress` | Disable progress bars. |
 
@@ -199,6 +200,8 @@ Three formats:
 * `--format jsonl` → single stitched `.jsonl` file (default).
 * `--format json`  → single `.json` file containing a JSON array (`--pretty` for pretty-print).
 * `--format spool` → per-source per-month files (`part_RC_YYYY-MM.jsonl`, `part_RS_YYYY-MM.jsonl`) under the directory passed to `--out`. Use this for the parents-pipeline workflow.
+
+With `--resume`, `jsonl`/`json` exports checkpoint per-month `.part_*.jsonl` files under `--work-dir`, while `spool` checkpoints `part_RC_*` / `part_RS_*` and `_progress.json` under `--out`. The checkpoint includes a fingerprint of the query and output-affecting config; changing filters, sources, date range, whitelist fields, or `--human-timestamps` discards stale parts instead of mixing results from different runs.
 
 ~~~sh
 # JSONL with a field whitelist and human timestamps
@@ -480,7 +483,7 @@ Collect parent IDs from your spooled JSONL, resolve parent contents by scanning 
 use retl::{ParentIds, ParentMaps, RedditETL, Sources, YearMonth};
 use std::path::Path;
 
-let resume = true; // reuse completed spool/progress entries, parent-cache shards, and attached outputs
+let resume = true; // reuse matching spool/progress entries, parent-cache shards, and attached outputs
 
 let (spool_parts, _n) = RedditETL::new()
     .base_dir("./data")
@@ -514,6 +517,8 @@ let _out_paths = RedditETL::new()
 ~~~
 
 Resolved comments receive a `"parent"` object containing either the parent comment’s body (`t1_...`) or the submission’s title/selftext (`t3_...`). If a referenced parent cannot be resolved from the cache/window, `retl` leaves the `"parent"` key absent rather than writing an empty object; the CLI reports resolved/unresolved totals and warns when more than 5% are unresolved.
+
+Note: extract/spool resume entries are fingerprinted by query/config. Parent-cache resume files are keyed by source/month and validated by parsing; regenerate the parent ID set when changing the upstream query.
 
 The `parents` CLI uses `--window-months 3` by default, scanning three extra months on each side of the spool range. Larger windows catch more old cross-month parents, but scan more corpus bytes and create/use more parent-cache shard files; smaller windows are faster and lighter but can leave more parents unresolved.
 
