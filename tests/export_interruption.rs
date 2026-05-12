@@ -46,9 +46,13 @@ fn interrupted_export_leaves_no_half_written_zst_at_destination() {
         .progress(false)
         .scan()
         .subreddit("programming")
-        .allow_pseudo_users()
+        .include_pseudo_users()
         .export_partitioned(&out_dir, ExportFormat::Zst);
-    assert!(res.is_ok(), "export_partitioned should not bubble decode errors: {:?}", res.err());
+    assert!(
+        res.is_ok(),
+        "export_partitioned should not bubble decode errors: {:?}",
+        res.err()
+    );
 
     // ---- The load-bearing assertion ---------------------------------------
     // No `.zst` at the FINAL destination directory tree.
