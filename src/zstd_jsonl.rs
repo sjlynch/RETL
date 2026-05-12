@@ -33,8 +33,9 @@ const DEFAULT_READ_BUF_BYTES: usize = 16 * 1024;
 /// Minimal line-level schema for fast filtering.
 /// Extra fields are ignored by serde.
 /// NOTE: includes `score` to enable fast numeric filters.
-/// Includes `selftext`, `body`, `title`, `parent_id` so keyword/URL filtering works
-/// without a full parse. Includes `domain` (submissions) and `id` (both kinds).
+/// Includes `selftext`, `body`, `title`, `url`, and `parent_id` so keyword/URL
+/// filtering works without a full parse. Includes `domain` (submissions) and
+/// `id` (both kinds).
 #[derive(Debug, Deserialize)]
 pub struct MinimalRecord {
     pub subreddit: Option<String>,
@@ -49,6 +50,7 @@ pub struct MinimalRecord {
     pub selftext: Option<String>, // submissions
     pub body: Option<String>,     // comments
     pub title: Option<String>,    // submissions
+    pub url: Option<String>,      // submissions (outbound URL on link posts)
 
     #[allow(dead_code)]
     pub parent_id: Option<String>, // comments

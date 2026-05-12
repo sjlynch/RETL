@@ -29,18 +29,22 @@ fn list_contains_ci(list: &[String], needle: &str) -> bool {
     }
 }
 
+#[inline]
+fn ascii_ci_is_http_prefix(bytes: &[u8]) -> bool {
+    bytes.len() >= 4
+        && bytes[0].eq_ignore_ascii_case(&b'h')
+        && bytes[1].eq_ignore_ascii_case(&b't')
+        && bytes[2].eq_ignore_ascii_case(&b't')
+        && bytes[3].eq_ignore_ascii_case(&b'p')
+}
+
 /// Case-insensitive byte search for the literal "http" (https is a superset).
 #[inline]
 fn ascii_ci_contains_http(haystack: &[u8]) -> bool {
     if haystack.len() < 4 {
         return false;
     }
-    haystack.windows(4).any(|w| {
-        w[0].eq_ignore_ascii_case(&b'h')
-            && w[1].eq_ignore_ascii_case(&b't')
-            && w[2].eq_ignore_ascii_case(&b't')
-            && w[3].eq_ignore_ascii_case(&b'p')
-    })
+    haystack.windows(4).any(ascii_ci_is_http_prefix)
 }
 
 /// Decide using only fields in MinimalRecord (fast path).
@@ -139,7 +143,11 @@ pub fn matches_minimal(
             || min
                 .title
                 .as_deref()
-                .map_or(false, |s| ascii_ci_contains_http(s.as_bytes()));
+                .map_or(false, |s| ascii_ci_contains_http(s.as_bytes()))
+            || min
+                .url
+                .as_deref()
+                .map_or(false, |s| ascii_ci_is_http_prefix(s.as_bytes()));
         if !matched {
             return false;
         }
