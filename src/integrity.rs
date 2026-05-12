@@ -1,4 +1,4 @@
-use crate::paths::{discover_all, plan_files};
+use crate::paths::{discover_all, plan_files_checked};
 use crate::progress::make_count_progress;
 use crate::util::{open_with_backoff, with_thread_pool};
 use crate::RedditETL;
@@ -65,7 +65,14 @@ impl RedditETL {
     /// `par_iter()` and let Rayon schedule them across the pool.
     pub fn check_corpus_integrity(self, mode: IntegrityMode) -> Result<Vec<(PathBuf, String)>> {
         let discovered = discover_all(&self.opts.comments_dir, &self.opts.submissions_dir);
-        let files = plan_files(&discovered, self.opts.sources, self.opts.start, self.opts.end);
+        let files = plan_files_checked(
+            &discovered,
+            &self.opts.comments_dir,
+            &self.opts.submissions_dir,
+            self.opts.sources,
+            self.opts.start,
+            self.opts.end,
+        )?;
 
         let label = match mode {
             IntegrityMode::Quick { .. } => "Integrity (quick)",
@@ -81,11 +88,16 @@ impl RedditETL {
 
         let validate = |job: &crate::paths::FileJob| {
             let res = match mode {
-                IntegrityMode::Quick { sample_bytes } => quick_validate_zst(&job.path, sample_bytes),
+                IntegrityMode::Quick { sample_bytes } => {
+                    quick_validate_zst(&job.path, sample_bytes)
+                }
                 IntegrityMode::Full => validate_zst_full(&job.path),
             };
             if let Err(e) = res {
-                errors.lock().unwrap().push((job.path.clone(), e.to_string()));
+                errors
+                    .lock()
+                    .unwrap()
+                    .push((job.path.clone(), e.to_string()));
             }
             if let Some(pb) = &pb {
                 pb.inc(1);

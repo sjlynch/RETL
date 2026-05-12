@@ -150,7 +150,48 @@ fn unresolved_parent_is_absent_and_counted() {
     );
     let line = fs::read_to_string(&attached_paths[0]).unwrap();
     let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
-    assert!(v.get("parent").is_none(), "unresolved parent must be absent");
+    assert!(
+        v.get("parent").is_none(),
+        "unresolved parent must be absent"
+    );
+}
+
+#[test]
+fn attach_parents_resume_rebuilds_corrupt_published_output() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input = tmp.path().join("part_RC_2006-01.jsonl");
+    fs::write(
+        &input,
+        "{\"id\":\"c1\",\"body\":\"child\",\"parent_id\":\"t1_p1\",\"created_utc\":1136073600}\n",
+    )
+    .unwrap();
+
+    let out_dir = tmp.path().join("attached");
+    fs::create_dir_all(&out_dir).unwrap();
+    fs::write(out_dir.join("part_RC_2006-01.jsonl"), "{\"id\":").unwrap();
+
+    let mut comments = HashMap::new();
+    comments.insert("p1".to_string(), "parent body".to_string());
+    let parents = ParentMaps {
+        comments,
+        submissions: HashMap::new(),
+        comment_shards: Some(HashMap::new()),
+        submission_shards: Some(HashMap::new()),
+    };
+
+    let (attached_paths, stats) = RedditETL::new()
+        .progress(false)
+        .attach_parents_jsonls_parallel_with_stats(vec![input], &out_dir, &parents, true)
+        .unwrap();
+
+    assert_eq!(stats.resolved, 1);
+    assert_eq!(stats.unresolved, 0);
+    let line = fs::read_to_string(&attached_paths[0]).unwrap();
+    let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+    assert_eq!(
+        v.pointer("/parent/body").and_then(|v| v.as_str()),
+        Some("parent body")
+    );
 }
 
 fn count_jsonl_lines(paths: &[std::path::PathBuf]) -> usize {

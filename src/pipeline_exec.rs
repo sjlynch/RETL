@@ -85,6 +85,34 @@ fn is_partial_scan_error(e: &anyhow::Error) -> bool {
         .any(|cause| cause.downcast_ref::<PartialScanError>().is_some())
 }
 
+fn warn_dedupe_zero_keys(key: &KeyExtractor, input_records: u64) {
+    match key {
+        KeyExtractor::JsonPointer(ptr) => {
+            let key_spec = format!("json:{ptr}");
+            tracing::warn!(
+                key = %key_spec,
+                input_records,
+                "--key {key_spec} matched nothing; check the pointer; the value may not be a scalar"
+            );
+        }
+        KeyExtractor::AuthorLowerFast => tracing::warn!(
+            key = "author",
+            input_records,
+            "--key author extracted zero keys from matching input records"
+        ),
+        KeyExtractor::SubredditLowerFast => tracing::warn!(
+            key = "subreddit",
+            input_records,
+            "--key subreddit extracted zero keys from matching input records"
+        ),
+        KeyExtractor::ByValue(_) => tracing::warn!(
+            key = "<custom>",
+            input_records,
+            "custom dedupe key extractor extracted zero keys from matching input records"
+        ),
+    }
+}
+
 // -------- Original operations (back-compat) --------
 
 impl RedditETL {
@@ -241,12 +269,14 @@ impl ScanPlan {
                     self.etl.opts.write_buffer_bytes,
                     f,
                 ));
+                let matched_records = AtomicU64::new(0);
 
                 scan_records(
                     &self.etl,
                     &self.query,
                     /*show_progress=*/ true,
                     |_min, _kind, line| {
+                        matched_records.fetch_add(1, Ordering::Relaxed);
                         let mut w = writer
                             .lock()
                             .map_err(|_| anyhow!("dedupe writer lock poisoned"))?;
@@ -281,6 +311,12 @@ impl ScanPlan {
                     unique_count += 1;
                     Ok(())
                 })?;
+
+                let matched_records = matched_records.load(Ordering::Relaxed);
+                if matched_records > 0 && unique_count == 0 {
+                    warn_dedupe_zero_keys(key, matched_records);
+                }
+
                 Ok(unique_count)
             })();
 
@@ -438,20 +474,23 @@ impl ScanPlan {
     pub fn count_by_month(self) -> Result<BTreeMap<YearMonth, u64>> {
         let plan = self.build()?;
         log_pseudo_user_filter(&plan.query);
-        let total = Mutex::new(BTreeMap::<YearMonth, u64>::new());
-        scan_records(
-            &plan.etl,
-            &plan.query,
-            /*show_progress=*/ false,
-            |min, _kind, _line| {
-                if let Some(ts) = min.created_utc {
-                    let ym = ym_from_epoch(ts);
-                    *total.lock().unwrap().entry(ym).or_insert(0) += 1;
-                }
-                Ok(())
-            },
-        )?;
-        Ok(total.into_inner().unwrap())
+        let parallelism = plan.etl.opts.parallelism;
+        with_thread_pool(parallelism, || {
+            let total = Mutex::new(BTreeMap::<YearMonth, u64>::new());
+            scan_records(
+                &plan.etl,
+                &plan.query,
+                /*show_progress=*/ false,
+                |min, _kind, _line| {
+                    if let Some(ts) = min.created_utc {
+                        let ym = ym_from_epoch(ts);
+                        *total.lock().unwrap().entry(ym).or_insert(0) += 1;
+                    }
+                    Ok(())
+                },
+            )?;
+            Ok(total.into_inner().unwrap())
+        })
     }
 
     pub fn author_counts_to_tsv(self, out_path: &Path) -> Result<()> {
@@ -488,28 +527,31 @@ impl ScanPlan {
     pub fn build_first_seen_index_to_tsv(self, out_path: &Path) -> Result<()> {
         let plan = self.build()?;
         log_pseudo_user_filter(&plan.query);
-        let work_dir = plan.etl.ensure_work_dir()?;
-        let kv = ShardedKVWriter::create(&work_dir, "first_seen", plan.etl.opts.shard_count)?;
+        let parallelism = plan.etl.opts.parallelism;
+        with_thread_pool(parallelism, || {
+            let work_dir = plan.etl.ensure_work_dir()?;
+            let kv = ShardedKVWriter::create(&work_dir, "first_seen", plan.etl.opts.shard_count)?;
 
-        scan_records(
-            &plan.etl,
-            &plan.query,
-            /*show_progress=*/ false,
-            |min, _kind, _line| {
-                if let (Some(a), Some(ts)) = (min.author.as_deref(), min.created_utc) {
-                    let a = a.trim();
-                    if a.is_empty() {
-                        return Ok(());
+            scan_records(
+                &plan.etl,
+                &plan.query,
+                /*show_progress=*/ false,
+                |min, _kind, _line| {
+                    if let (Some(a), Some(ts)) = (min.author.as_deref(), min.created_utc) {
+                        let a = a.trim();
+                        if a.is_empty() {
+                            return Ok(());
+                        }
+                        kv.write_kv(a, ts)?;
                     }
-                    kv.write_kv(a, ts)?;
-                }
-                Ok(())
-            },
-        )?;
+                    Ok(())
+                },
+            )?;
 
-        let shards = kv.reduce_min("first_seen")?;
-        concat_tsvs(&shards, out_path, plan.etl.opts.write_buffer_bytes)?;
-        Ok(())
+            let shards = kv.reduce_min("first_seen")?;
+            concat_tsvs(&shards, out_path, plan.etl.opts.write_buffer_bytes)?;
+            Ok(())
+        })
     }
 
     /// Export corpus back to partitioned JSONL or ZST by month/kinds with query filters.

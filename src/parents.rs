@@ -1,3 +1,6 @@
+use crate::atomic_write::{
+    ensure_staging_dir, sweep_stale_inprogress, write_jsonl_atomic, INPROGRESS_EXT,
+};
 use crate::date::YearMonth;
 use crate::filters::ym_from_epoch;
 use crate::mem::{available_memory_fraction, is_low_memory};
@@ -5,10 +8,9 @@ use crate::parents_ids::{IdShards, SharedIdsetCache, WorkerShardCache};
 use crate::paths::{discover_all, plan_files, FileJob, FileKind};
 use crate::pipeline::RedditETL;
 use crate::progress::{make_count_progress, make_progress_bar_labeled, total_compressed_size};
-use crate::util::replace_file_atomic_backoff;
+use crate::util::{replace_file_atomic_backoff, with_thread_pool};
 use crate::zstd_jsonl::{for_each_line_with_progress_cfg_no_throttle, parse_minimal};
 use anyhow::{Context, Result};
-use rayon::prelude::*;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
@@ -337,6 +339,34 @@ fn build_id_shard_index(
     Ok((comment_shards.into_inner(), submission_shards.into_inner()))
 }
 
+fn attach_inprogress_path(staging_dir: &Path, final_dest: &Path) -> Result<PathBuf> {
+    let file_name = final_dest
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("final_dest has no file name: {}", final_dest.display()))?;
+    let mut staged = staging_dir.join(file_name);
+    staged.as_mut_os_string().push(INPROGRESS_EXT);
+    Ok(staged)
+}
+
+fn validate_jsonl_file(path: &Path) -> bool {
+    let Ok(f) = File::open(path) else {
+        return false;
+    };
+    let r = BufReader::new(f);
+    for line in r.lines() {
+        let Ok(line) = line else {
+            return false;
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        if serde_json::from_str::<Value>(&line).is_err() {
+            return false;
+        }
+    }
+    true
+}
+
 fn load_shard_value<V>(
     eager_values: &HashMap<String, V>,
     shards: Option<&HashMap<YearMonth, PathBuf>>,
@@ -379,104 +409,112 @@ impl RedditETL {
         cache_dir: &Path,
         resume: bool,
     ) -> Result<ParentMaps> {
-        let comments_out = cache_dir.join("comments");
-        let submissions_out = cache_dir.join("submissions");
-        fs::create_dir_all(&comments_out)?;
-        fs::create_dir_all(&submissions_out)?;
+        with_thread_pool(self.opts.parallelism, || {
+            let comments_out = cache_dir.join("comments");
+            let submissions_out = cache_dir.join("submissions");
+            fs::create_dir_all(&comments_out)?;
+            fs::create_dir_all(&submissions_out)?;
 
-        let discovered = discover_all(&self.opts.comments_dir, &self.opts.submissions_dir);
-        let files = plan_files(
-            &discovered,
-            crate::config::Sources::Both,
-            self.opts.start,
-            self.opts.end,
-        );
-        if files.is_empty() {
-            // Correct return type for this function is ParentMaps.
-            return Ok(ParentMaps {
-                comments: HashMap::new(),
-                submissions: HashMap::new(),
-                comment_shards: Some(HashMap::new()),
-                submission_shards: Some(HashMap::new()),
-            });
-        }
+            let discovered = discover_all(&self.opts.comments_dir, &self.opts.submissions_dir);
+            let files = plan_files(
+                &discovered,
+                crate::config::Sources::Both,
+                self.opts.start,
+                self.opts.end,
+            );
+            if files.is_empty() {
+                tracing::warn!(
+                    comments_dir = %self.opts.comments_dir.display(),
+                    submissions_dir = %self.opts.submissions_dir.display(),
+                    start = ?self.opts.start,
+                    end = ?self.opts.end,
+                    "resolve_parent_maps planned zero corpus files; returning empty parent maps"
+                );
+                return Ok(ParentMaps {
+                    comments: HashMap::new(),
+                    submissions: HashMap::new(),
+                    comment_shards: Some(HashMap::new()),
+                    submission_shards: Some(HashMap::new()),
+                });
+            }
 
-        let total_bytes = total_compressed_size(&files);
-        let pb = if self.opts.progress {
-            Some(make_progress_bar_labeled(
-                total_bytes,
-                self.opts.progress_label.as_deref(),
-            ))
-        } else {
-            None
-        };
-
-        let (comment_shards, submission_shards) = build_id_shard_index(
-            &files,
-            ids,
-            &comments_out,
-            &submissions_out,
-            resume,
-            self.opts.read_buffer_bytes,
-            self.opts.file_concurrency,
-            pb.as_ref(),
-        )?;
-
-        if let Some(pb) = pb {
-            let final_msg = if let Some(l) = self.opts.progress_label.as_deref() {
-                format!("{l} done")
+            let total_bytes = total_compressed_size(&files);
+            let pb = if self.opts.progress {
+                Some(make_progress_bar_labeled(
+                    total_bytes,
+                    self.opts.progress_label.as_deref(),
+                ))
             } else {
-                "done".to_string()
-            };
-            pb.finish_with_message(final_msg);
-        }
-
-        // Much stricter: only eager-load when plenty of RAM is free.
-        let eager_ok = available_memory_fraction() > 0.50;
-
-        let mut comments_map: HashMap<String, String> = HashMap::new();
-        let mut submissions_map: HashMap<String, (String, String)> = HashMap::new();
-
-        if eager_ok {
-            let load = |dir: &Path| -> Vec<PathBuf> {
-                let mut v: Vec<PathBuf> = fs::read_dir(dir)
-                    .ok()
-                    .into_iter()
-                    .flat_map(|it| it.filter_map(|e| e.ok().map(|e| e.path())))
-                    .collect();
-                v.sort();
-                v
+                None
             };
 
-            for p in load(&comments_out) {
-                let f = File::open(&p)?;
-                let r = BufReader::new(f);
-                let m: HashMap<String, String> = serde_json::from_reader(r)?;
-                for (k, v) in m {
-                    comments_map.insert(k, v);
-                }
-                if is_low_memory(0.10) {
-                    break;
-                }
-            }
-            for p in load(&submissions_out) {
-                let f = File::open(&p)?;
-                let r = BufReader::new(f);
-                let m: HashMap<String, (String, String)> = serde_json::from_reader(r)?;
-                for (k, v) in m {
-                    submissions_map.insert(k, v);
-                }
-                if is_low_memory(0.10) {
-                    break;
-                }
-            }
-        }
+            let (comment_shards, submission_shards) = build_id_shard_index(
+                &files,
+                ids,
+                &comments_out,
+                &submissions_out,
+                resume,
+                self.opts.read_buffer_bytes,
+                self.opts.file_concurrency,
+                pb.as_ref(),
+            )?;
 
-        Ok(ParentMaps {
-            comments: comments_map,
-            submissions: submissions_map,
-            comment_shards: Some(comment_shards),
-            submission_shards: Some(submission_shards),
+            if let Some(pb) = pb {
+                let final_msg = if let Some(l) = self.opts.progress_label.as_deref() {
+                    format!("{l} done")
+                } else {
+                    "done".to_string()
+                };
+                pb.finish_with_message(final_msg);
+            }
+
+            // Much stricter: only eager-load when plenty of RAM is free.
+            let eager_ok = available_memory_fraction() > 0.50;
+
+            let mut comments_map: HashMap<String, String> = HashMap::new();
+            let mut submissions_map: HashMap<String, (String, String)> = HashMap::new();
+
+            if eager_ok {
+                let load = |dir: &Path| -> Vec<PathBuf> {
+                    let mut v: Vec<PathBuf> = fs::read_dir(dir)
+                        .ok()
+                        .into_iter()
+                        .flat_map(|it| it.filter_map(|e| e.ok().map(|e| e.path())))
+                        .collect();
+                    v.sort();
+                    v
+                };
+
+                for p in load(&comments_out) {
+                    let f = File::open(&p)?;
+                    let r = BufReader::new(f);
+                    let m: HashMap<String, String> = serde_json::from_reader(r)?;
+                    for (k, v) in m {
+                        comments_map.insert(k, v);
+                    }
+                    if is_low_memory(0.10) {
+                        break;
+                    }
+                }
+                for p in load(&submissions_out) {
+                    let f = File::open(&p)?;
+                    let r = BufReader::new(f);
+                    let m: HashMap<String, (String, String)> = serde_json::from_reader(r)?;
+                    for (k, v) in m {
+                        submissions_map.insert(k, v);
+                    }
+                    if is_low_memory(0.10) {
+                        break;
+                    }
+                }
+            }
+
+            Ok(ParentMaps {
+                comments: comments_map,
+                submissions: submissions_map,
+                comment_shards: Some(comment_shards),
+                submission_shards: Some(submission_shards),
+            })
         })
     }
 
@@ -499,141 +537,187 @@ impl RedditETL {
         parents: &ParentMaps,
         resume: bool,
     ) -> Result<(Vec<PathBuf>, ParentAttachStats)> {
-        fs::create_dir_all(out_dir)?;
+        with_thread_pool(self.opts.parallelism, || {
+            fs::create_dir_all(out_dir)?;
+            let staging_dir = ensure_staging_dir(out_dir)?;
+            sweep_stale_inprogress(out_dir, true)?;
 
-        let label = self
-            .opts
-            .progress_label
-            .as_deref()
-            .unwrap_or("Attaching parents");
-        let pb = if self.opts.progress {
-            Some(make_count_progress(inputs.len() as u64, label))
-        } else {
-            None
-        };
+            let label = self
+                .opts
+                .progress_label
+                .as_deref()
+                .unwrap_or("Attaching parents");
+            let pb = if self.opts.progress {
+                Some(make_count_progress(inputs.len() as u64, label))
+            } else {
+                None
+            };
 
-        let parents_c_eager = &parents.comments;
-        let parents_s_eager = &parents.submissions;
+            let parents_c_eager = &parents.comments;
+            let parents_s_eager = &parents.submissions;
 
-        let comment_shards = parents.comment_shards.as_ref();
-        let submission_shards = parents.submission_shards.as_ref();
+            let comment_shards = parents.comment_shards.as_ref();
+            let submission_shards = parents.submission_shards.as_ref();
 
-        let attached: Vec<(PathBuf, ParentAttachStats)> = inputs
-            .par_iter()
-            .map(|in_path| -> Result<(PathBuf, ParentAttachStats)> {
-                let name = in_path.file_name().unwrap().to_string_lossy().to_string();
-                let out_path = out_dir.join(name);
+            let indexed_inputs: Vec<(usize, PathBuf)> = inputs.into_iter().enumerate().collect();
+            let attached = std::sync::Mutex::new(vec![None; indexed_inputs.len()]);
 
-                if resume && out_path.exists() {
+            crate::concurrency::for_each_file_limited(
+                &indexed_inputs,
+                self.opts.file_concurrency,
+                |(idx, in_path)| -> Result<()> {
+                    let name = in_path.file_name().unwrap().to_string_lossy().to_string();
+                    let out_path = out_dir.join(name);
+                    let inprogress_path = attach_inprogress_path(&staging_dir, &out_path)?;
+
+                    if resume && out_path.exists() && !inprogress_path.exists() {
+                        if validate_jsonl_file(&out_path) {
+                            if let Some(pb) = &pb {
+                                pb.inc(1);
+                            }
+                            attached.lock().unwrap()[*idx] =
+                                Some((out_path, ParentAttachStats::default()));
+                            return Ok(());
+                        }
+                        tracing::warn!(path=%out_path.display(), "resume: existing attached JSONL is unreadable/corrupt, rebuilding");
+                    }
+
+                    // Per-worker FIFO caches of parsed shard JSON. See
+                    // `WorkerShardCache` for why eviction is plain FIFO with no
+                    // bump-on-hit.
+                    let mut c_cache = WorkerShardCache::<String>::new(COMMENT_SHARD_CACHE_CAP);
+                    let mut s_cache =
+                        WorkerShardCache::<(String, String)>::new(SUBMISSION_SHARD_CACHE_CAP);
+
+                    let file_stats = write_jsonl_atomic(
+                        &staging_dir,
+                        &out_path,
+                        self.opts.write_buffer_bytes,
+                        |w| -> Result<ParentAttachStats> {
+                            let mut file_stats = ParentAttachStats::default();
+                            let f = File::open(in_path)?;
+                            let r = BufReader::new(f);
+
+                            for line in r.lines() {
+                                let line = line?;
+                                if line.is_empty() {
+                                    continue;
+                                }
+                                let mut v: Value = match serde_json::from_str(&line) {
+                                    Ok(x) => x,
+                                    Err(_) => continue,
+                                };
+                                let is_comment =
+                                    v.get("body").is_some() && v.get("parent_id").is_some();
+
+                                if is_comment {
+                                    // Own-month is derived from the consuming record's
+                                    // created_utc; used to pick the most-likely parent
+                                    // shard before falling back to other months.
+                                    let own_ym = v
+                                        .get("created_utc")
+                                        .and_then(|x| x.as_i64())
+                                        .map(ym_from_epoch);
+
+                                    if let Some(parent_id) =
+                                        v.get("parent_id").and_then(|x| x.as_str())
+                                    {
+                                        let mut parent_obj = serde_json::Map::new();
+                                        let mut payload_fields = 0usize;
+
+                                        if let Some(rest) = parent_id.strip_prefix("t1_") {
+                                            if let Some(text) = load_shard_value(
+                                                parents_c_eager,
+                                                comment_shards,
+                                                &mut c_cache,
+                                                rest,
+                                                own_ym,
+                                            )? {
+                                                parent_obj.insert(
+                                                    "kind".into(),
+                                                    Value::String("comment".into()),
+                                                );
+                                                parent_obj.insert(
+                                                    "id".into(),
+                                                    Value::String(rest.to_string()),
+                                                );
+                                                parent_obj
+                                                    .insert("body".into(), Value::String(text));
+                                                payload_fields += 1;
+                                            }
+                                        } else if let Some(rest) = parent_id.strip_prefix("t3_") {
+                                            if let Some((title, selftext)) = load_shard_value(
+                                                parents_s_eager,
+                                                submission_shards,
+                                                &mut s_cache,
+                                                rest,
+                                                own_ym,
+                                            )? {
+                                                parent_obj.insert(
+                                                    "kind".into(),
+                                                    Value::String("submission".into()),
+                                                );
+                                                parent_obj.insert(
+                                                    "id".into(),
+                                                    Value::String(rest.to_string()),
+                                                );
+                                                parent_obj
+                                                    .insert("title".into(), Value::String(title));
+                                                parent_obj.insert(
+                                                    "selftext".into(),
+                                                    Value::String(selftext),
+                                                );
+                                                payload_fields += 2;
+                                            }
+                                        }
+
+                                        if payload_fields > 0 {
+                                            if let Some(map) = v.as_object_mut() {
+                                                map.insert(
+                                                    "parent".into(),
+                                                    Value::Object(parent_obj),
+                                                );
+                                            }
+                                            file_stats.resolved += 1;
+                                        } else {
+                                            file_stats.unresolved += 1;
+                                        }
+                                    }
+                                }
+
+                                serde_json::to_writer(&mut *w, &v)?;
+                                w.write_all(b"\n")?;
+                            }
+
+                            Ok(file_stats)
+                        },
+                    )?;
+
                     if let Some(pb) = &pb {
                         pb.inc(1);
                     }
-                    return Ok((out_path, ParentAttachStats::default()));
-                }
+                    attached.lock().unwrap()[*idx] = Some((out_path, file_stats));
+                    Ok(())
+                },
+            )?;
 
-                // Per-worker FIFO caches of parsed shard JSON. See
-                // `WorkerShardCache` for why eviction is plain FIFO with no
-                // bump-on-hit.
-                let mut c_cache = WorkerShardCache::<String>::new(COMMENT_SHARD_CACHE_CAP);
-                let mut s_cache =
-                    WorkerShardCache::<(String, String)>::new(SUBMISSION_SHARD_CACHE_CAP);
-                let mut file_stats = ParentAttachStats::default();
+            if let Some(pb) = pb {
+                let final_msg = format!("{label} done");
+                pb.finish_with_message(final_msg);
+            }
 
-                let f = File::open(in_path)?;
-                let r = BufReader::new(f);
-                let out = File::create(&out_path)?;
-                let mut w = BufWriter::new(out);
-
-                for line in r.lines() {
-                    let line = line?;
-                    if line.is_empty() {
-                        continue;
-                    }
-                    let mut v: Value = match serde_json::from_str(&line) {
-                        Ok(x) => x,
-                        Err(_) => continue,
-                    };
-                    let is_comment = v.get("body").is_some() && v.get("parent_id").is_some();
-
-                    if is_comment {
-                        // Own-month is derived from the consuming record's
-                        // created_utc; used to pick the most-likely parent
-                        // shard before falling back to other months.
-                        let own_ym = v
-                            .get("created_utc")
-                            .and_then(|x| x.as_i64())
-                            .map(ym_from_epoch);
-
-                        if let Some(parent_id) = v.get("parent_id").and_then(|x| x.as_str()) {
-                            let mut parent_obj = serde_json::Map::new();
-                            let mut payload_fields = 0usize;
-
-                            if let Some(rest) = parent_id.strip_prefix("t1_") {
-                                if let Some(text) = load_shard_value(
-                                    parents_c_eager,
-                                    comment_shards,
-                                    &mut c_cache,
-                                    rest,
-                                    own_ym,
-                                )? {
-                                    parent_obj
-                                        .insert("kind".into(), Value::String("comment".into()));
-                                    parent_obj.insert("id".into(), Value::String(rest.to_string()));
-                                    parent_obj.insert("body".into(), Value::String(text));
-                                    payload_fields += 1;
-                                }
-                            } else if let Some(rest) = parent_id.strip_prefix("t3_") {
-                                if let Some((title, selftext)) = load_shard_value(
-                                    parents_s_eager,
-                                    submission_shards,
-                                    &mut s_cache,
-                                    rest,
-                                    own_ym,
-                                )? {
-                                    parent_obj
-                                        .insert("kind".into(), Value::String("submission".into()));
-                                    parent_obj.insert("id".into(), Value::String(rest.to_string()));
-                                    parent_obj.insert("title".into(), Value::String(title));
-                                    parent_obj.insert("selftext".into(), Value::String(selftext));
-                                    payload_fields += 2;
-                                }
-                            }
-
-                            if payload_fields > 0 {
-                                if let Some(map) = v.as_object_mut() {
-                                    map.insert("parent".into(), Value::Object(parent_obj));
-                                }
-                                file_stats.resolved += 1;
-                            } else {
-                                file_stats.unresolved += 1;
-                            }
-                        }
-                    }
-
-                    serde_json::to_writer(&mut w, &v)?;
-                    w.write_all(b"\n")?;
-                }
-                w.flush()?;
-                if let Some(pb) = &pb {
-                    pb.inc(1);
-                }
-                Ok((out_path, file_stats))
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        if let Some(pb) = pb {
-            let final_msg = format!("{label} done");
-            pb.finish_with_message(final_msg);
-        }
-
-        let mut stats = ParentAttachStats::default();
-        let out_paths = attached
-            .into_iter()
-            .map(|(path, file_stats)| {
-                stats.add(file_stats);
-                path
-            })
-            .collect();
-        Ok((out_paths, stats))
+            let mut stats = ParentAttachStats::default();
+            let out_paths = attached
+                .into_inner()
+                .unwrap()
+                .into_iter()
+                .map(|entry| {
+                    let (path, file_stats) = entry.expect("attach result missing after success");
+                    stats.add(file_stats);
+                    path
+                })
+                .collect();
+            Ok((out_paths, stats))
+        })
     }
 }

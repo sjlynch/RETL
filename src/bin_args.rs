@@ -142,6 +142,7 @@ pub(crate) struct DedupeArgs {
     #[command(flatten)]
     pub(crate) common: CommonOpts,
     /// Key to deduplicate: `author`, `subreddit`, or `json:/pointer`.
+    /// JSON pointers should reference a scalar; strings, numbers, and bools are emitted as text.
     #[arg(long, value_name = "KEY")]
     pub(crate) key: String,
     /// Output text file, one unique key per line. Use `-` for stdout.

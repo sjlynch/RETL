@@ -2,6 +2,7 @@ use crate::parents::ParentIds;
 use crate::pipeline::RedditETL;
 use crate::progress::make_progress_bar_labeled;
 use crate::shard_common;
+use crate::util::with_thread_pool;
 use ahash::{AHashSet, RandomState};
 use anyhow::{Context, Result};
 use rayon::prelude::*;
@@ -216,91 +217,93 @@ impl RedditETL {
             return Ok(ParentIds::new());
         }
 
-        let work_dir = self.ensure_work_dir()?;
-        let ids_root = work_dir.join("parent_ids");
-        fs::create_dir_all(&ids_root)?;
+        with_thread_pool(self.opts.parallelism, || {
+            let work_dir = self.ensure_work_dir()?;
+            let ids_root = work_dir.join("parent_ids");
+            fs::create_dir_all(&ids_root)?;
 
-        // Fewer shards reduces disk thrash later; we keep a wider FIFO in memory.
-        let shard_count = 256usize;
-        let t1_writer = IdShardWriter::create(&ids_root, "t1", shard_count)?;
-        let t3_writer = IdShardWriter::create(&ids_root, "t3", shard_count)?;
+            // Fewer shards reduces disk thrash later; we keep a wider FIFO in memory.
+            let shard_count = 256usize;
+            let t1_writer = IdShardWriter::create(&ids_root, "t1", shard_count)?;
+            let t3_writer = IdShardWriter::create(&ids_root, "t3", shard_count)?;
 
-        let total_bytes: u64 = paths.iter().map(|p| fs::metadata(p).map(|m| m.len()).unwrap_or(0)).sum();
-        let pb = if self.opts.progress {
-            Some(make_progress_bar_labeled(total_bytes, self.opts.progress_label.as_deref()))
-        } else { None };
+            let total_bytes: u64 = paths.iter().map(|p| fs::metadata(p).map(|m| m.len()).unwrap_or(0)).sum();
+            let pb = if self.opts.progress {
+                Some(make_progress_bar_labeled(total_bytes, self.opts.progress_label.as_deref()))
+            } else { None };
 
-        let read_buf = self.opts.read_buffer_bytes;
+            let read_buf = self.opts.read_buffer_bytes;
 
-        // Surface I/O / parse errors instead of silently dropping them. Each
-        // worker writes a tracing::warn! on failure and bumps the shared
-        // counter; the total is reported back via tracing at the end.
-        let err_count = AtomicUsize::new(0);
+            // Surface I/O / parse errors instead of silently dropping them. Each
+            // worker writes a tracing::warn! on failure and bumps the shared
+            // counter; the total is reported back via tracing at the end.
+            let err_count = AtomicUsize::new(0);
 
-        paths.par_iter().for_each(|p| {
-            let res = (|| -> Result<()> {
-                let f = File::open(p).with_context(|| format!("open {}", p.display()))?;
-                let mut r = BufReader::with_capacity(read_buf, f);
-                let mut buf = String::with_capacity(64 * 1024);
-                loop {
-                    buf.clear();
-                    let n = r.read_line(&mut buf)
-                        .with_context(|| format!("read {}", p.display()))?;
-                    if n == 0 { break; }
-                    if buf.ends_with('\n') { buf.pop(); if buf.ends_with('\r') { buf.pop(); } }
-                    if buf.is_empty() { continue; }
+            paths.par_iter().for_each(|p| {
+                let res = (|| -> Result<()> {
+                    let f = File::open(p).with_context(|| format!("open {}", p.display()))?;
+                    let mut r = BufReader::with_capacity(read_buf, f);
+                    let mut buf = String::with_capacity(64 * 1024);
+                    loop {
+                        buf.clear();
+                        let n = r.read_line(&mut buf)
+                            .with_context(|| format!("read {}", p.display()))?;
+                        if n == 0 { break; }
+                        if buf.ends_with('\n') { buf.pop(); if buf.ends_with('\r') { buf.pop(); } }
+                        if buf.is_empty() { continue; }
 
-                    let v: Value = match serde_json::from_str(&buf) {
-                        Ok(x) => x,
-                        Err(_) => {
-                            // Single malformed line should not abort the file;
-                            // count it but do not bail.
-                            err_count.fetch_add(1, Ordering::Relaxed);
-                            if let Some(pb) = &pb { pb.inc(n as u64); }
-                            continue;
+                        let v: Value = match serde_json::from_str(&buf) {
+                            Ok(x) => x,
+                            Err(_) => {
+                                // Single malformed line should not abort the file;
+                                // count it but do not bail.
+                                err_count.fetch_add(1, Ordering::Relaxed);
+                                if let Some(pb) = &pb { pb.inc(n as u64); }
+                                continue;
+                            }
+                        };
+                        if let Some(parent_id) = v.get("parent_id").and_then(|x| x.as_str()) {
+                            if let Some(rest) = parent_id.strip_prefix("t1_") {
+                                t1_writer.write(rest)?;
+                            } else if let Some(rest) = parent_id.strip_prefix("t3_") {
+                                t3_writer.write(rest)?;
+                            }
                         }
-                    };
-                    if let Some(parent_id) = v.get("parent_id").and_then(|x| x.as_str()) {
-                        if let Some(rest) = parent_id.strip_prefix("t1_") {
-                            t1_writer.write(rest)?;
-                        } else if let Some(rest) = parent_id.strip_prefix("t3_") {
-                            t3_writer.write(rest)?;
+                        if let Some(link_id) = v.get("link_id").and_then(|x| x.as_str()) {
+                            if let Some(rest) = link_id.strip_prefix("t3_") {
+                                t3_writer.write(rest)?;
+                            }
                         }
+
+                        if let Some(pb) = &pb { pb.inc(n as u64); }
                     }
-                    if let Some(link_id) = v.get("link_id").and_then(|x| x.as_str()) {
-                        if let Some(rest) = link_id.strip_prefix("t3_") {
-                            t3_writer.write(rest)?;
-                        }
-                    }
+                    Ok(())
+                })();
 
-                    if let Some(pb) = &pb { pb.inc(n as u64); }
+                if let Err(e) = res {
+                    err_count.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(path=%p.display(), error=%e, "collect_parent_ids: skipped file due to error");
                 }
-                Ok(())
-            })();
+            });
 
-            if let Err(e) = res {
-                err_count.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(path=%p.display(), error=%e, "collect_parent_ids: skipped file due to error");
+            let t1_shards = t1_writer.dedup()?;
+            let t3_shards = t3_writer.dedup()?;
+
+            if let Some(pb) = pb {
+                let final_msg = if let Some(l) = self.opts.progress_label.as_deref() {
+                    format!("{l} done")
+                } else {
+                    "done".to_string()
+                };
+                pb.finish_with_message(final_msg);
             }
-        });
 
-        let t1_shards = t1_writer.dedup()?;
-        let t3_shards = t3_writer.dedup()?;
+            let errors = err_count.load(Ordering::Relaxed);
+            if errors > 0 {
+                tracing::warn!(error_count = errors, "collect_parent_ids_from_jsonls completed with errors");
+            }
 
-        if let Some(pb) = pb {
-            let final_msg = if let Some(l) = self.opts.progress_label.as_deref() {
-                format!("{l} done")
-            } else {
-                "done".to_string()
-            };
-            pb.finish_with_message(final_msg);
-        }
-
-        let errors = err_count.load(Ordering::Relaxed);
-        if errors > 0 {
-            tracing::warn!(error_count = errors, "collect_parent_ids_from_jsonls completed with errors");
-        }
-
-        Ok(ParentIds::from_shards(t1_shards, t3_shards))
+            Ok(ParentIds::from_shards(t1_shards, t3_shards))
+        })
     }
 }

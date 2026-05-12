@@ -9,7 +9,7 @@
 //!   4. Re-stream the spool, attaching a `"parent": {...}` payload to every
 //!      comment that has one (`attach_parents_jsonls_parallel`).
 //!
-//! The `src/examples.rs` ancestor of this file did all of step 3 by hand,
+//! An earlier hand-rolled version of this pipeline did all of step 3 by hand,
 //! re-implementing zstd line streaming and parent-id collection. Prefer the
 //! library APIs — they share the atomic-write / backpressure / Windows-retry
 //! invariants that the rest of the pipeline depends on.
