@@ -6,8 +6,8 @@ use retl::{RedditETL, Sources, YearMonth};
 
 /// Demonstrates `count_by_month()` with combined filters:
 ///   - keywords_any("rust") (matches 2 rows in the tiny corpus)
-///   - contains_url(true) (narrows to the comment which has http://)
-/// Outcome: Only one comment remains in Jan 2006, so count == 1.
+///   - contains_url(true) (keeps the comment body URL and the link-post `url`)
+/// Outcome: The comment and the link-post submission remain in Jan 2006, so count == 2.
 #[test]
 fn count_by_month_keywords_and_url() {
     let base = make_corpus_basic();
@@ -24,7 +24,7 @@ fn count_by_month_keywords_and_url() {
         .unwrap();
 
     assert_eq!(counts.len(), 1);
-    assert_eq!(counts.get(&YearMonth::new(2006, 1)).copied(), Some(1));
+    assert_eq!(counts.get(&YearMonth::new(2006, 1)).copied(), Some(2));
 }
 
 /// Demonstrates the TSV reducers:

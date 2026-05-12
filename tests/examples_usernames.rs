@@ -7,9 +7,9 @@ use retl::{RedditETL, Sources, YearMonth};
 
 /// Demonstrates advanced `scan().usernames()` with keyword, score and URL filters:
 ///   - keywords_any("rust") matches title "Rust news" (submission) and a comment body
-///   - contains_url(true) keeps only records that include http(s) in title/body/selftext
+///   - contains_url(true) keeps records with http(s) in title/body/selftext or link-post `url`
 ///   - min_score(2) ensures low-score noise is removed
-/// Outcome: authors should include "alice" (comment with URL) but not "bob" (title lacks URL)
+/// Outcome: authors should include "alice" (comment with URL) and "bob" (link-post URL)
 #[test]
 fn usernames_with_filters_keywords_url_score() {
     let base = make_corpus_basic();
@@ -32,7 +32,7 @@ fn usernames_with_filters_keywords_url_score() {
     }
     got.sort();
     got.dedup();
-    assert_eq!(got, vec!["alice"]);
+    assert_eq!(got, vec!["alice", "bob"]);
 }
 
 /// Demonstrates domain filtering (`domains_in`) which applies to submissions only.
