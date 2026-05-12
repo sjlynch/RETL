@@ -13,6 +13,8 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
+const STITCH_BUF_BYTES: usize = 16 * 1024;
+
 /// Stage `<dest>.inprogress` in the destination's parent directory, run `body`,
 /// then atomically replace `out_path`. Thin wrapper around `write_jsonl_atomic`
 /// for the stitch call sites that don't carry an explicit staging dir.
@@ -24,12 +26,15 @@ where
     write_jsonl_atomic(parent, out_path, write_buf, body)
 }
 
+fn list_tmp_parts(dir: &Path) -> Result<Vec<PathBuf>> {
+    jsonl_part_paths(dir)
+}
+
 pub fn stitch_tmp_parts(tmp_dir: &Path, out_path: &Path, write_buf: usize) -> Result<()> {
-    let mut paths = jsonl_part_paths(tmp_dir)?;
-    paths.sort();
+    let parts = list_tmp_parts(tmp_dir)?;
     write_atomic(out_path, write_buf, |out| {
-        for p in paths {
-            let mut r = BufReader::new(std::fs::File::open(&p)?);
+        for path in &parts {
+            let mut r = BufReader::new(std::fs::File::open(path)?);
             std::io::copy(&mut r, out)?;
         }
         Ok(())
@@ -50,45 +55,93 @@ pub fn stitch_tmp_parts(tmp_dir: &Path, out_path: &Path, write_buf: usize) -> Re
 /// IO errors from corrupt or truncated temp parts are surfaced via `?`;
 /// the previous `r.lines().flatten()` form silently swallowed them and
 /// produced a truncated array.
-pub fn stitch_tmp_parts_to_json_array(tmp_dir: &Path, out_path: &Path, pretty: bool, write_buf: usize) -> Result<()> {
-    let mut paths = jsonl_part_paths(tmp_dir)?;
-    paths.sort();
+pub fn stitch_tmp_parts_to_json_array(
+    tmp_dir: &Path,
+    out_path: &Path,
+    pretty: bool,
+    write_buf: usize,
+) -> Result<()> {
+    if pretty {
+        return stitch_tmp_parts_to_json_array_pretty(tmp_dir, out_path, write_buf);
+    }
 
+    let parts = list_tmp_parts(tmp_dir)?;
     write_atomic(out_path, write_buf, |out| {
         let mut first = true;
 
-        if pretty {
-            out.write_all(b"[\n")?;
-        } else {
-            out.write_all(b"[")?;
-        }
+        out.write_all(b"[")?;
 
-        let mut buf = String::with_capacity(16 * 1024);
-        for p in paths {
-            let mut r = BufReader::new(std::fs::File::open(&p)?);
+        let mut buf = String::with_capacity(STITCH_BUF_BYTES);
+        for path in &parts {
+            let mut r = BufReader::new(std::fs::File::open(path)?);
             loop {
                 buf.clear();
                 let n = r.read_line(&mut buf)?;
-                if n == 0 { break; }
+                if n == 0 {
+                    break;
+                }
                 // strip trailing \n and optional \r
                 if buf.ends_with('\n') {
                     let _ = buf.pop();
-                    if buf.ends_with('\r') { let _ = buf.pop(); }
+                    if buf.ends_with('\r') {
+                        let _ = buf.pop();
+                    }
                 }
-                if buf.is_empty() { continue; }
+                if buf.is_empty() {
+                    continue;
+                }
                 if !first {
-                    out.write_all(if pretty { b",\n" } else { b"," })?;
+                    out.write_all(b",")?;
                 }
                 first = false;
                 out.write_all(buf.as_bytes())?;
             }
         }
 
-        if pretty {
-            out.write_all(b"\n]")?;
-        } else {
-            out.write_all(b"]")?;
+        out.write_all(b"]")?;
+        Ok(())
+    })
+}
+
+fn stitch_tmp_parts_to_json_array_pretty(
+    tmp_dir: &Path,
+    out_path: &Path,
+    write_buf: usize,
+) -> Result<()> {
+    let parts = list_tmp_parts(tmp_dir)?;
+    write_atomic(out_path, write_buf, |out| {
+        let mut first = true;
+
+        out.write_all(b"[\n")?;
+
+        let mut buf = String::with_capacity(STITCH_BUF_BYTES);
+        for path in &parts {
+            let mut r = BufReader::new(std::fs::File::open(path)?);
+            loop {
+                buf.clear();
+                let n = r.read_line(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                // strip trailing \n and optional \r
+                if buf.ends_with('\n') {
+                    let _ = buf.pop();
+                    if buf.ends_with('\r') {
+                        let _ = buf.pop();
+                    }
+                }
+                if buf.is_empty() {
+                    continue;
+                }
+                if !first {
+                    out.write_all(b",\n")?;
+                }
+                first = false;
+                out.write_all(buf.as_bytes())?;
+            }
         }
+
+        out.write_all(b"\n]")?;
         Ok(())
     })
 }

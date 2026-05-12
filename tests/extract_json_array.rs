@@ -22,7 +22,7 @@ fn extract_to_json_array_compact_parses_back_as_vec() {
         .progress(false)
         .scan()
         .subreddit("programming")
-        .allow_pseudo_users()
+        .include_pseudo_users()
         .extract_to_json(&out, false)
         .unwrap();
 
@@ -53,7 +53,7 @@ fn extract_to_json_array_pretty_parses_back_as_vec_and_has_indentation() {
         .progress(false)
         .scan()
         .subreddit("programming")
-        .allow_pseudo_users()
+        .include_pseudo_users()
         .extract_to_json(&out, true)
         .unwrap();
 

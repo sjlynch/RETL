@@ -2,14 +2,15 @@
 mod common;
 
 use common::*;
-use retl::{ParentIds, ParentMaps, RedditETL, Sources, YearMonth};
+use retl::{ParentAttachStats, ParentIds, ParentMaps, RedditETL, Sources, YearMonth};
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 
 /// End-to-end parents pipeline over a tiny synthetic corpus:
 /// 1) Build a small test corpus under a temp dir (RC/RS 2006-01 for r/programming).
 /// 2) Spool *both* submissions and comments for r/programming **without** restricting authors,
-///    but with `.allow_pseudo_users()` so `[deleted]` is included.
+///    but with `.include_pseudo_users()` so `[deleted]` is included.
 /// 3) Collect parent IDs from the spooled JSONL files.
 /// 4) Resolve the parent contents into a cache by scanning the tiny corpus over a ±1 month window.
 /// 5) Attach parent payloads back onto the spooled records.
@@ -47,7 +48,7 @@ fn spool_resolve_attach_parents_end_to_end() {
         .progress(false)
         .scan()
         .subreddit("programming")
-        .allow_pseudo_users() // crucial: include "[deleted]" in the spooled RC set
+        .include_pseudo_users() // crucial: include "[deleted]" in the spooled RC set
         .extract_spool_monthly(&spool_dir)
         .unwrap();
 
@@ -80,7 +81,7 @@ fn spool_resolve_attach_parents_end_to_end() {
         .file_concurrency(4)
         .progress(false)
         .date_range(Some(parent_start), Some(parent_end))
-        .resolve_parent_maps(&ids, &parents_cache_dir, /*resume=*/true)
+        .resolve_parent_maps(&ids, &parents_cache_dir, /*resume=*/ true)
         .unwrap();
 
     // ------------- Step 4: Attach parents to spooled JSONL -----------------
@@ -88,7 +89,12 @@ fn spool_resolve_attach_parents_end_to_end() {
         .base_dir(&base)
         .work_dir(&lib_tmp)
         .progress(false)
-        .attach_parents_jsonls_parallel(spool_parts.clone(), &spool_with_parents_dir, &parents, /*resume=*/false)
+        .attach_parents_jsonls_parallel(
+            spool_parts.clone(),
+            &spool_with_parents_dir,
+            &parents,
+            /*resume=*/ false,
+        )
         .unwrap();
 
     assert!(
@@ -102,7 +108,49 @@ fn spool_resolve_attach_parents_end_to_end() {
     //   RC_2006-01.jsonl -> 3 comments (including `[deleted]`)
     //   RS_2006-01.jsonl -> 2 submissions
     // Total = 5
-    assert_eq!(total_lines, 5, "expected 5 total lines after parent attachment");
+    assert_eq!(
+        total_lines, 5,
+        "expected 5 total lines after parent attachment"
+    );
+}
+
+#[test]
+fn unresolved_parent_is_absent_and_counted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input = tmp.path().join("part_RC_2006-01.jsonl");
+    fs::write(
+        &input,
+        r#"{"id":"c_missing","body":"child","parent_id":"t1_missing","created_utc":1136073600}"#,
+    )
+    .unwrap();
+
+    let parents = ParentMaps {
+        comments: HashMap::new(),
+        submissions: HashMap::new(),
+        comment_shards: Some(HashMap::new()),
+        submission_shards: Some(HashMap::new()),
+    };
+
+    let (attached_paths, stats) = RedditETL::new()
+        .progress(false)
+        .attach_parents_jsonls_parallel_with_stats(
+            vec![input],
+            &tmp.path().join("attached"),
+            &parents,
+            false,
+        )
+        .unwrap();
+
+    assert_eq!(
+        stats,
+        ParentAttachStats {
+            resolved: 0,
+            unresolved: 1,
+        }
+    );
+    let line = fs::read_to_string(&attached_paths[0]).unwrap();
+    let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+    assert!(v.get("parent").is_none(), "unresolved parent must be absent");
 }
 
 fn count_jsonl_lines(paths: &[std::path::PathBuf]) -> usize {
