@@ -12,7 +12,7 @@
 - 🧠 **Intuitive query builder (DSL)**: subreddits, authors (allow/deny), regex, keywords, URL presence, domains, score thresholds
 - 🧰 **Exports**:
   - JSONL / JSON array (stitched)
-  - Partitioned per source (RC/RS) as JSONL or ZST
+  - Partitioned per source/month in corpus layout as JSONL or ZST (CLI: `retl export --format partitioned-jsonl` / `--format zst`)
 - 📈 **Analytics helpers**: `count_by_month()`, per‑author counts, “first seen” index
 - 👪 **Parent pipeline**: collect parent IDs → resolve content → attach parent payloads back to records
 - 🧪 **Integrity checks** for corrupted monthly files (quick or full)
@@ -135,8 +135,9 @@ builder methods.
 
 ## Command-Line Interface
 
-The `retl` binary exposes the main ETL subcommands. All accept a shared set of
-flags (see `retl <subcommand> --help` for the full list):
+The `retl` binary exposes the main ETL subcommands. Most data-processing
+commands accept a shared set of selection/runtime flags (see
+`retl <subcommand> --help` for the full list):
 
 | Common flag | Purpose |
 | --- | --- |
@@ -146,15 +147,29 @@ flags (see `retl <subcommand> --help` for the full list):
 | `--source rc\|rs\|both` | Comments only, submissions only, or both (default). |
 | `--subreddit <NAME>` (`-s`) | Subreddit selector. Repeatable; omit for "any subreddit". |
 | `--include-deleted` | Include pseudo-users (`[deleted]`, `[removed]`, and empty authors) that are filtered by default. |
-| `--whitelist a,b,c` | Restrict export to the listed JSON fields (comma-separated). |
-| `--human-timestamps` | Emit `created_utc` as RFC3339 strings. |
-| `--resume` (export) | Reuse completed per-month export parts only when the stored query/config fingerprint matches the current filters, sources, date range, whitelist, and timestamp settings. |
 | `--parallelism <N>` / `--file-concurrency <N>` | Rayon threads / concurrent monthly files. |
 | `--no-progress` | Disable progress bars. |
 
 ### Pseudo-user filtering (default ON)
 
 By default, scans exclude records whose `author` is `[deleted]`, `[removed]`, or the empty string. This keeps normal username/export queries focused on real author names, but it matters for deletion-rate, ban-wave, or corpus-completeness analysis. Pass `--include-deleted` (alias: `--include-pseudo-users`) on the CLI, or call `.include_pseudo_users()` on a `ScanPlan`, to keep those records.
+
+### `describe` — inspect the discovered corpus
+
+Lists the monthly `.zst` files RETL sees under `--data-dir` without decoding
+anything. Use it before a long scan/export to verify the `comments/` +
+`submissions/` layout, available month ranges, selected file count, and total
+compressed bytes:
+
+~~~sh
+retl describe --data-dir ./data --source both --start 2016-01 --end 2016-12
+# source  available              files_in_range  compressed_bytes
+# rc      2005-12..=2024-12      12              123456789012
+# rs      2005-06..=2024-12      12              23456789012
+# total                          24              146913578024
+~~~
+
+Aliases: `retl ls`, `retl plan`.
 
 ### `scan` — emit unique usernames
 
@@ -195,13 +210,15 @@ retl dedupe --source rc --key 'json:/parent_id' --start 2020-01 --end 2020-12 --
 
 ### `export` — extract filtered records
 
-Three formats:
+Formats:
 
 * `--format jsonl` → single stitched `.jsonl` file (default).
 * `--format json`  → single `.json` file containing a JSON array (`--pretty` for pretty-print).
 * `--format spool` → per-source per-month files (`part_RC_YYYY-MM.jsonl`, `part_RS_YYYY-MM.jsonl`) under the directory passed to `--out`. Use this for the parents-pipeline workflow.
+* `--format zst` → corpus-style partitioned `.zst` output under `<out>/comments/RC_YYYY-MM.zst` and `<out>/submissions/RS_YYYY-MM.zst`.
+* `--format partitioned-jsonl` → the same corpus-style directory layout, but as uncompressed `.jsonl` files.
 
-With `--resume`, `jsonl`/`json` exports checkpoint per-month `.part_*.jsonl` files under `--work-dir`, while `spool` checkpoints `part_RC_*` / `part_RS_*` and `_progress.json` under `--out`. The checkpoint includes a fingerprint of the query and output-affecting config; changing filters, sources, date range, whitelist fields, or `--human-timestamps` discards stale parts instead of mixing results from different runs.
+Export-only modifiers include `--whitelist a,b,c`, `--strict-whitelist`, `--human-timestamps`, `--zst-level <N>`, and `--resume`. With `--resume`, `jsonl`/`json` exports checkpoint per-month `.part_*.jsonl` files under `--work-dir`, while `spool` checkpoints `part_RC_*` / `part_RS_*` and `_progress.json` under `--out`. The checkpoint includes a fingerprint of the query and output-affecting config; changing filters, sources, date range, whitelist fields, or `--human-timestamps` discards stale parts instead of mixing results from different runs. `--resume` is not currently supported for `zst` or `partitioned-jsonl`.
 
 ~~~sh
 # JSONL with a field whitelist and human timestamps
@@ -216,6 +233,15 @@ retl export \
 
 # Spool monthly parts (input for parents pipeline / aggregation)
 retl export --start 2006-01 --end 2006-01 -s programming --format spool --out ./spool
+
+# Re-emit a filtered mini-corpus in the original RC/RS .zst layout
+retl export \
+  --data-dir ./data \
+  --start 2020-01 --end 2020-12 \
+  --subreddit rust \
+  --format zst \
+  --zst-level 10 \
+  --out ./rust_2020_corpus
 ~~~
 
 ### `count` — record counts
@@ -373,6 +399,16 @@ For an in-repo executable example, see `examples/quickstart.rs`.
 
 All examples below operate on the same API you saw in the Quick Start.
 
+### Query DSL filter notes
+
+- `.contains_url(true)` keeps records with `http`/`https` in comment bodies,
+  submission `selftext`/`title`, or a link-post submission whose top-level
+  `url` starts with `http`/`https`.
+- `.domains_in([...])` matches the submission-only top-level `domain` field.
+  Reddit comments do not have `domain`; when used with `Sources::Both` or
+  `Sources::Comments`, comments are dropped and RETL emits a warning. Use
+  `Sources::Submissions` when you intend a domain-only scan.
+
 ### Extract to JSONL
 
 ~~~rust
@@ -490,6 +526,8 @@ RedditETL::new()
 ### Parents Pipeline (Attach Parent Content)
 
 Collect parent IDs from your spooled JSONL, resolve parent contents by scanning the corpus, then attach parents back onto your records:
+
+**Important:** if the spool is produced with `--whitelist` / `.whitelist_fields(...)`, the fields `body`, `parent_id`, and `link_id` **MUST** be preserved for any spool destined for the parents pipeline. For example, include at least `body,parent_id,link_id` alongside your analysis fields. If those fields are dropped, `retl parents` cannot identify/resolve comment parents and will warn that it found zero comment-shaped records.
 
 ~~~rust
 use retl::{ParentIds, ParentMaps, RedditETL, Sources, YearMonth};

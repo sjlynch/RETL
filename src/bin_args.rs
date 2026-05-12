@@ -12,7 +12,7 @@ use std::path::PathBuf;
 #[command(
     name = "retl",
     version,
-    about = "Reddit ETL toolkit — scan, export, count, validate, and aggregate Reddit RC/RS .zst dumps.",
+    about = "Reddit ETL toolkit — inspect, scan, export, count, validate, and aggregate Reddit RC/RS .zst dumps.",
     long_about = None,
 )]
 pub(crate) struct Cli {
@@ -22,12 +22,15 @@ pub(crate) struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum Command {
+    /// Inspect discovered corpus months, file counts, and compressed bytes without decoding.
+    #[command(alias = "ls", alias = "plan")]
+    Describe(DescribeArgs),
     /// Scan and emit unique usernames matching the query selection.
     Scan(ScanArgs),
     /// Emit distinct keys (author, subreddit, or JSON pointer) matching the query selection.
     #[command(alias = "unique", alias = "distinct")]
     Dedupe(DedupeArgs),
-    /// Export filtered records as JSONL, a JSON array, or per-month spool files.
+    /// Export filtered records as JSONL, JSON, spool files, or partitioned corpus files.
     Export(ExportArgs),
     /// Count records by month, or write per-author counts to TSV.
     Count(CountArgs),
@@ -43,7 +46,7 @@ pub(crate) enum Command {
 }
 
 // -----------------------------------------------------------------------------
-// Common flags shared by all subcommands.
+// Common flags shared by corpus-scanning subcommands.
 // -----------------------------------------------------------------------------
 
 #[derive(Args, Debug, Clone)]
@@ -76,19 +79,6 @@ pub(crate) struct CommonOpts {
     #[arg(long)]
     pub(crate) no_progress: bool,
 
-    /// Whitelist of top-level fields to keep on export. Comma-separated, repeatable.
-    /// Comments use `body`/`parent_id`/`link_id`; submissions use `title`/`selftext`/`domain`.
-    #[arg(long, value_delimiter = ',')]
-    pub(crate) whitelist: Vec<String>,
-
-    /// Error if `--whitelist` matches zero fields in the first sampled records.
-    #[arg(long)]
-    pub(crate) strict_whitelist: bool,
-
-    /// Convert `created_utc` to RFC3339 strings on export.
-    #[arg(long)]
-    pub(crate) human_timestamps: bool,
-
     /// Source selection: rc (comments), rs (submissions), or both.
     #[arg(long, value_enum, default_value_t = SourceArg::Both)]
     pub(crate) source: SourceArg,
@@ -100,11 +90,6 @@ pub(crate) struct CommonOpts {
     /// Include pseudo-users that are excluded by default: [deleted], [removed], and empty authors.
     #[arg(long = "include-deleted", alias = "include-pseudo-users")]
     pub(crate) include_deleted: bool,
-
-    /// Inflight bytes budget for bucketing/dedupe producer/consumer pairs.
-    /// 0 disables the explicit cap and falls back to memory-fraction sampling.
-    #[arg(long)]
-    pub(crate) inflight_bytes: Option<usize>,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug)]
@@ -129,6 +114,25 @@ impl From<SourceArg> for Sources {
 // -----------------------------------------------------------------------------
 
 #[derive(Args, Debug)]
+pub(crate) struct DescribeArgs {
+    /// Path to corpus base dir (containing `comments/` and `submissions/`).
+    #[arg(long, default_value = "./data")]
+    pub(crate) data_dir: PathBuf,
+
+    /// Inclusive start month (YYYY-MM).
+    #[arg(long, value_name = "YYYY-MM")]
+    pub(crate) start: Option<YearMonth>,
+
+    /// Inclusive end month (YYYY-MM).
+    #[arg(long, value_name = "YYYY-MM")]
+    pub(crate) end: Option<YearMonth>,
+
+    /// Source selection: rc (comments), rs (submissions), or both.
+    #[arg(long, value_enum, default_value_t = SourceArg::Both)]
+    pub(crate) source: SourceArg,
+}
+
+#[derive(Args, Debug)]
 pub(crate) struct ScanArgs {
     #[command(flatten)]
     pub(crate) common: CommonOpts,
@@ -148,6 +152,10 @@ pub(crate) struct DedupeArgs {
     /// Output text file, one unique key per line. Use `-` for stdout.
     #[arg(long, short)]
     pub(crate) out: PathBuf,
+    /// Inflight bytes budget for bucketing/dedupe producer/consumer pairs.
+    /// 0 disables the explicit cap and falls back to memory-fraction sampling.
+    #[arg(long)]
+    pub(crate) inflight_bytes: Option<usize>,
 }
 
 #[derive(Args, Debug)]
@@ -158,7 +166,7 @@ pub(crate) struct ExportArgs {
     #[arg(long, value_enum, default_value_t = ExportFmt::Jsonl)]
     pub(crate) format: ExportFmt,
     /// Output destination — file for `jsonl`/`json` (use `-` for stdout),
-    /// directory for `spool`.
+    /// directory for `spool`/`zst`/`partitioned-jsonl`.
     #[arg(long, short)]
     pub(crate) out: PathBuf,
     /// Pretty-print the JSON array (only with `--format json`).
@@ -167,11 +175,27 @@ pub(crate) struct ExportArgs {
     /// zstd compression level for `.zst` outputs. Clamped to 1..=22 by the library.
     #[arg(long)]
     pub(crate) zst_level: Option<i32>,
-    /// Resume a prior export with the same query/config. `jsonl`/`json` reuse
-    /// per-month `.part_*.jsonl` files and `_progress.json` in `--work-dir`;
-    /// `spool` reuses part files and `_progress.json` in `--out`. Changing
-    /// filters, sources, date range, whitelist, or timestamp formatting
-    /// invalidates the checkpoint and rebuilds the parts.
+    /// Whitelist of top-level fields to keep on export. Comma-separated, repeatable.
+    /// Comments use `body`/`parent_id`/`link_id`; submissions use `title`/`selftext`/`domain`.
+    #[arg(long, value_delimiter = ',')]
+    pub(crate) whitelist: Vec<String>,
+    /// Error if `--whitelist` matches zero fields in the first sampled records.
+    #[arg(long)]
+    pub(crate) strict_whitelist: bool,
+    /// Convert `created_utc` to RFC3339 strings on export.
+    #[arg(long)]
+    pub(crate) human_timestamps: bool,
+    /// Inflight bytes budget for bucketing/dedupe producer/consumer pairs.
+    /// 0 disables the explicit cap and falls back to memory-fraction sampling.
+    #[arg(long)]
+    pub(crate) inflight_bytes: Option<usize>,
+    /// Resume a prior export with the same query/config/corpus. `jsonl`/`json`
+    /// reuse per-month `.part_*.jsonl` files and `_progress.json` in a namespaced
+    /// scratch dir under `--work-dir`; `spool` reuses part files and
+    /// `_progress.json` in `--out`. Changing filters, corpus paths, sources,
+    /// date range, whitelist, or timestamp formatting invalidates the checkpoint
+    /// and rebuilds the parts. `zst` and `partitioned-jsonl` exports are not
+    /// currently resumable.
     #[arg(long)]
     pub(crate) resume: bool,
 }
@@ -184,6 +208,10 @@ pub(crate) enum ExportFmt {
     Json,
     /// Per-source per-month `part_RC_YYYY-MM.jsonl` / `part_RS_YYYY-MM.jsonl`.
     Spool,
+    /// Corpus-style partitioned `.zst` files under `comments/` and `submissions/`.
+    Zst,
+    /// Corpus-style partitioned `.jsonl` files under `comments/` and `submissions/`.
+    PartitionedJsonl,
 }
 
 #[derive(Args, Debug)]
@@ -194,7 +222,7 @@ pub(crate) struct CountArgs {
     #[arg(long, value_enum, default_value_t = CountMode::Month)]
     pub(crate) mode: CountMode,
     /// Output file (default stdout for `month`, required for `author`).
-    /// Pass `-` to stream to stdout when `--mode month`.
+    /// Pass `-` to stream either mode to stdout.
     #[arg(long, short)]
     pub(crate) out: Option<PathBuf>,
 }

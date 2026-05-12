@@ -339,21 +339,6 @@ pub(crate) fn build_etl(common: &CommonOpts) -> Result<RedditETL> {
     if let Some(fc) = common.file_concurrency {
         etl = etl.file_concurrency(fc);
     }
-    if !common.whitelist.is_empty() {
-        if common.whitelist.iter().all(|field| field.trim().is_empty()) {
-            anyhow::bail!("--whitelist must include at least one non-empty field");
-        }
-        etl = etl.whitelist_fields(common.whitelist.iter().cloned());
-    }
-    if common.strict_whitelist {
-        etl = etl.strict_whitelist(true);
-    }
-    if common.human_timestamps {
-        etl = etl.timestamps_human_readable(true);
-    }
-    if let Some(b) = common.inflight_bytes {
-        etl = etl.inflight_bytes(b);
-    }
     Ok(etl)
 }
 
@@ -382,22 +367,27 @@ pub(crate) use plan;
 // CLI-only path / I/O helpers.
 // -----------------------------------------------------------------------------
 
-/// Run an extraction that writes to a file path, then stream the resulting
-/// file to stdout and remove it. Used to honor `--out -` for
-/// `extract_to_jsonl` / `extract_to_json`, which only know how to write to a
-/// `Path`.
-pub(crate) fn stream_extract_to_stdout(
+/// Run an operation that writes to a file path, then stream the resulting
+/// file to stdout and remove it. Used to honor `--out -` for APIs that only
+/// know how to write to a `Path`.
+pub(crate) fn stream_path_output_to_stdout(
     work_dir: &Path,
+    temp_prefix: &str,
     file_stem: &str,
-    extract: impl FnOnce(&Path) -> Result<()>,
+    write_output: impl FnOnce(&Path) -> Result<()>,
 ) -> Result<()> {
     let lib_tmp = work_dir.join("lib_tmp");
     fs::create_dir_all(&lib_tmp)
         .with_context(|| format!("creating work_dir {}", lib_tmp.display()))?;
-    let tmp_path = lib_tmp.join(format!("retl_export_{}_{}", std::process::id(), file_stem));
+    let tmp_path = lib_tmp.join(format!(
+        "retl_{}_{}_{}",
+        temp_prefix,
+        std::process::id(),
+        file_stem
+    ));
     let _ = fs::remove_file(&tmp_path);
 
-    let result = extract(&tmp_path);
+    let result = write_output(&tmp_path);
 
     if let Err(e) = result {
         let _ = fs::remove_file(&tmp_path);
@@ -406,16 +396,27 @@ pub(crate) fn stream_extract_to_stdout(
 
     let copy_result = (|| -> Result<()> {
         let mut f = fs::File::open(&tmp_path)
-            .with_context(|| format!("opening export tempfile {}", tmp_path.display()))?;
+            .with_context(|| format!("opening {temp_prefix} tempfile {}", tmp_path.display()))?;
         let stdout = io::stdout();
         let mut w = stdout.lock();
-        io::copy(&mut f, &mut w).context("streaming export to stdout")?;
+        io::copy(&mut f, &mut w)
+            .with_context(|| format!("streaming {temp_prefix} output to stdout"))?;
         w.flush()?;
         Ok(())
     })();
 
     let _ = fs::remove_file(&tmp_path);
     copy_result
+}
+
+/// Run an extraction that writes to a file path, then stream the resulting
+/// file to stdout and remove it.
+pub(crate) fn stream_extract_to_stdout(
+    work_dir: &Path,
+    file_stem: &str,
+    extract: impl FnOnce(&Path) -> Result<()>,
+) -> Result<()> {
+    stream_path_output_to_stdout(work_dir, "export", file_stem, extract)
 }
 
 /// Discover spool parts in `dir`, parsing `part_RC_YYYY-MM.jsonl` and

@@ -3,6 +3,7 @@ use crate::atomic_write::{
 };
 use crate::date::YearMonth;
 use crate::filters::ym_from_epoch;
+use crate::json_utils::is_comment_record;
 use crate::mem::{available_memory_fraction, is_low_memory};
 use crate::parents_ids::{IdShards, SharedIdsetCache, WorkerShardCache};
 use crate::paths::{discover_all, plan_files, FileJob, FileKind};
@@ -56,6 +57,31 @@ impl ParentAttachStats {
     fn add(&mut self, other: Self) {
         self.resolved += other.resolved;
         self.unresolved += other.unresolved;
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ParentAttachDiagnostics {
+    files_scanned: u64,
+    resume_skipped_files: u64,
+    parsed_records: u64,
+    rc_records: u64,
+    records_with_body: u64,
+    records_with_parent_id: u64,
+    records_with_link_id: u64,
+    comment_shaped_records: u64,
+}
+
+impl ParentAttachDiagnostics {
+    fn add(&mut self, other: Self) {
+        self.files_scanned += other.files_scanned;
+        self.resume_skipped_files += other.resume_skipped_files;
+        self.parsed_records += other.parsed_records;
+        self.rc_records += other.rc_records;
+        self.records_with_body += other.records_with_body;
+        self.records_with_parent_id += other.records_with_parent_id;
+        self.records_with_link_id += other.records_with_link_id;
+        self.comment_shaped_records += other.comment_shaped_records;
     }
 }
 
@@ -367,6 +393,33 @@ fn validate_jsonl_file(path: &Path) -> bool {
     true
 }
 
+fn looks_like_rc_spool_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.starts_with("part_RC_") || name.starts_with("RC_"))
+        .unwrap_or(false)
+}
+
+fn warn_if_no_comment_shaped_records(diagnostics: ParentAttachDiagnostics) {
+    if diagnostics.files_scanned == 0
+        || diagnostics.parsed_records == 0
+        || diagnostics.comment_shaped_records > 0
+    {
+        return;
+    }
+
+    tracing::warn!(
+        scanned_files = diagnostics.files_scanned,
+        resume_skipped_files = diagnostics.resume_skipped_files,
+        records = diagnostics.parsed_records,
+        rc_records = diagnostics.rc_records,
+        records_with_body = diagnostics.records_with_body,
+        records_with_parent_id = diagnostics.records_with_parent_id,
+        records_with_link_id = diagnostics.records_with_link_id,
+        "parents attach found zero comment-shaped records in the spool; comment records must include `body` and `parent_id`, and parent resolution also requires `link_id`; if the spool was produced with --whitelist/.whitelist_fields, include body,parent_id,link_id or the output will be a no-op copy"
+    );
+}
+
 fn load_shard_value<V>(
     eager_values: &HashMap<String, V>,
     shards: Option<&HashMap<YearMonth, PathBuf>>,
@@ -575,8 +628,12 @@ impl RedditETL {
                             if let Some(pb) = &pb {
                                 pb.inc(1);
                             }
+                            let diagnostics = ParentAttachDiagnostics {
+                                resume_skipped_files: 1,
+                                ..Default::default()
+                            };
                             attached.lock().unwrap()[*idx] =
-                                Some((out_path, ParentAttachStats::default()));
+                                Some((out_path, ParentAttachStats::default(), diagnostics));
                             return Ok(());
                         }
                         tracing::warn!(path=%out_path.display(), "resume: existing attached JSONL is unreadable/corrupt, rebuilding");
@@ -589,12 +646,17 @@ impl RedditETL {
                     let mut s_cache =
                         WorkerShardCache::<(String, String)>::new(SUBMISSION_SHARD_CACHE_CAP);
 
-                    let file_stats = write_jsonl_atomic(
+                    let is_rc_spool_part = looks_like_rc_spool_path(in_path);
+                    let (file_stats, diagnostics) = write_jsonl_atomic(
                         &staging_dir,
                         &out_path,
                         self.opts.write_buffer_bytes,
-                        |w| -> Result<ParentAttachStats> {
+                        |w| -> Result<(ParentAttachStats, ParentAttachDiagnostics)> {
                             let mut file_stats = ParentAttachStats::default();
+                            let mut diagnostics = ParentAttachDiagnostics {
+                                files_scanned: 1,
+                                ..Default::default()
+                            };
                             let f = File::open(in_path)?;
                             let r = BufReader::new(f);
 
@@ -607,10 +669,27 @@ impl RedditETL {
                                     Ok(x) => x,
                                     Err(_) => continue,
                                 };
-                                let is_comment =
-                                    v.get("body").is_some() && v.get("parent_id").is_some();
 
+                                let has_body = v.get("body").is_some();
+                                let has_parent_id = v.get("parent_id").is_some();
+                                let has_link_id = v.get("link_id").is_some();
+                                diagnostics.parsed_records += 1;
+                                if is_rc_spool_part {
+                                    diagnostics.rc_records += 1;
+                                }
+                                if has_body {
+                                    diagnostics.records_with_body += 1;
+                                }
+                                if has_parent_id {
+                                    diagnostics.records_with_parent_id += 1;
+                                }
+                                if has_link_id {
+                                    diagnostics.records_with_link_id += 1;
+                                }
+
+                                let is_comment = is_comment_record(&v);
                                 if is_comment {
+                                    diagnostics.comment_shaped_records += 1;
                                     // Own-month is derived from the consuming record's
                                     // created_utc; used to pick the most-likely parent
                                     // shard before falling back to other months.
@@ -689,14 +768,14 @@ impl RedditETL {
                                 w.write_all(b"\n")?;
                             }
 
-                            Ok(file_stats)
+                            Ok((file_stats, diagnostics))
                         },
                     )?;
 
                     if let Some(pb) = &pb {
                         pb.inc(1);
                     }
-                    attached.lock().unwrap()[*idx] = Some((out_path, file_stats));
+                    attached.lock().unwrap()[*idx] = Some((out_path, file_stats, diagnostics));
                     Ok(())
                 },
             )?;
@@ -707,16 +786,20 @@ impl RedditETL {
             }
 
             let mut stats = ParentAttachStats::default();
+            let mut diagnostics = ParentAttachDiagnostics::default();
             let out_paths = attached
                 .into_inner()
                 .unwrap()
                 .into_iter()
                 .map(|entry| {
-                    let (path, file_stats) = entry.expect("attach result missing after success");
+                    let (path, file_stats, file_diagnostics) =
+                        entry.expect("attach result missing after success");
                     stats.add(file_stats);
+                    diagnostics.add(file_diagnostics);
                     path
                 })
                 .collect();
+            warn_if_no_comment_shaped_records(diagnostics);
             Ok((out_paths, stats))
         })
     }
