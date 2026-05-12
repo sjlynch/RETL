@@ -361,6 +361,16 @@ cargo run --release
 
 All examples below operate on the same API you saw in the Quick Start.
 
+### Query DSL filter notes
+
+- `.contains_url(true)` keeps records with `http`/`https` in comment bodies,
+  submission `selftext`/`title`, or a link-post submission whose top-level
+  `url` starts with `http`/`https`.
+- `.domains_in([...])` matches the submission-only top-level `domain` field.
+  Reddit comments do not have `domain`; when used with `Sources::Both` or
+  `Sources::Comments`, comments are dropped and RETL emits a warning. Use
+  `Sources::Submissions` when you intend a domain-only scan.
+
 ### Extract to JSONL
 
 ~~~rust

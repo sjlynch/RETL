@@ -194,6 +194,14 @@ impl IntoAuthorRegex for &String {
     }
 }
 
+pub(crate) fn log_domain_filter_comment_drop(query: &QuerySpec, sources: Sources) {
+    if query.domains_in.is_some() && matches!(sources, Sources::Comments | Sources::Both) {
+        tracing::warn!(
+            "domains_in filters Reddit's submission-only `domain` field; comment records have no domain and will be dropped. Use sources(Sources::Submissions) to scan only link/submission records."
+        );
+    }
+}
+
 impl ScanPlan {
     /// Common implementation for setters that map an iterator of strings into
     /// an `Option<Vec<String>>` field on the [`QuerySpec`], then renormalize.
@@ -296,6 +304,12 @@ impl ScanPlan {
     {
         self.set_string_list(|q, v| q.keywords_any = Some(v), iter, lowercase_str)
     }
+    /// Restrict to submissions whose top-level `domain` field matches one of
+    /// the provided domains (case-insensitive).
+    ///
+    /// Reddit comments do not carry a `domain` field. When this filter is used
+    /// with [`Sources::Comments`] or [`Sources::Both`], comments are rejected
+    /// by the filter and a warning is emitted when the plan is built.
     pub fn domains_in<I, S>(self, iter: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -319,6 +333,7 @@ impl ScanPlan {
         self.query = self.query.normalize();
         self.query.validate()?;
         self.query = self.query.compile_author_regex()?;
+        log_domain_filter_comment_drop(&self.query, self.etl.opts.sources);
         Ok(self)
     }
     pub fn whitelist_fields<I, S>(mut self, fields: I) -> Self
