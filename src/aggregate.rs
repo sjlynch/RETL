@@ -1,9 +1,9 @@
 //! Generic parallel aggregation support over JSONL inputs with progress.
 //! Implement `Aggregator` for your aggregation state and call `aggregate_jsonls_parallel`.
 
-use crate::progress::make_count_progress;
-use crate::pipeline::RedditETL;
 use crate::ndjson::for_each_jsonl_line_cfg;
+use crate::pipeline::RedditETL;
+use crate::progress::make_count_progress;
 use crate::util::replace_file_atomic_backoff;
 use anyhow::Result;
 use indicatif::ProgressBar;
@@ -67,7 +67,9 @@ pub fn merge_aggregator_shards_parallel<A: Aggregator>(
         .try_fold(A::default, |mut acc, shard| -> Result<A> {
             let part: A = load_shard(shard)?;
             acc.merge(part);
-            if let Some(pb) = pb { pb.inc(1); }
+            if let Some(pb) = pb {
+                pb.inc(1);
+            }
             Ok(acc)
         })
         .try_reduce(A::default, |mut left, right| {
@@ -87,7 +89,9 @@ pub fn merge_aggregator_shards_serial<A: Aggregator>(
     for shard in shards {
         let part: A = load_shard(shard)?;
         total.merge(part);
-        if let Some(pb) = pb { pb.inc(1); }
+        if let Some(pb) = pb {
+            pb.inc(1);
+        }
     }
     Ok(total)
 }
@@ -102,13 +106,21 @@ pub fn merge_aggregator_shards_serial<A: Aggregator>(
 /// Returns the count of inputs that hit a fatal shard-build error or a
 /// tolerated mid-file read error (built and will merge, but from a partial
 /// read of the input).
-fn build_aggregate_shards<A: Aggregator>(
+fn build_aggregate_shards_with<A, F>(
     inputs: &[PathBuf],
     shards_dir: &Path,
     progress: bool,
-) -> usize {
+    make_agg: &F,
+) -> usize
+where
+    A: Aggregator,
+    F: Fn() -> A + Send + Sync,
+{
     let pb_build = if progress {
-        Some(make_count_progress(inputs.len() as u64, "Aggregate: build shards"))
+        Some(make_count_progress(
+            inputs.len() as u64,
+            "Aggregate: build shards",
+        ))
     } else {
         None
     };
@@ -119,7 +131,7 @@ fn build_aggregate_shards<A: Aggregator>(
         let tmp_shard = out_shard.with_extension("json.inprogress");
 
         let result = (|| -> Result<bool> {
-            let mut agg = A::default();
+            let mut agg = make_agg();
             let had_read_error = for_each_jsonl_line_cfg(input, AGGREGATE_INGEST_BUF_BYTES, |line| {
                 if !line.is_empty() {
                     if let Ok(v) = serde_json::from_str::<Value>(line) {
@@ -156,64 +168,11 @@ fn build_aggregate_shards<A: Aggregator>(
         if let Some(pb) = &pb_build { pb.inc(1); }
     });
 
-    if let Some(pb) = pb_build { pb.finish_with_message("Aggregate: shard build done"); }
+    if let Some(pb) = pb_build {
+        pb.finish_with_message("Aggregate: shard build done");
+    }
 
     shard_errors.into_inner()
-}
-
-/// Phases 2 + 3: discover shards in `shards_dir`, tree-merge them, and
-/// atomically publish the merged result to `final_out`.
-///
-/// Only `*.json` shards are considered — leftover `*.inprogress` temps from
-/// prior failures are skipped. The final output goes through the same
-/// staging + `replace_file_atomic_backoff` dance as the shards so an
-/// interrupted run never leaves a half-written `final_out` in place.
-///
-/// Returns the number of shards successfully folded into the final output.
-fn publish_aggregated_final<A: Aggregator>(
-    shards_dir: &Path,
-    final_out: &Path,
-    pretty: bool,
-    progress: bool,
-) -> Result<usize> {
-    // Merge shards. Only consider successfully-written shard files
-    // (skip any leftover `.inprogress` temps from prior failures).
-    let mut shards: Vec<PathBuf> = fs::read_dir(shards_dir)?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
-        .collect();
-    shards.sort();
-
-    let pb_merge = if progress {
-        Some(make_count_progress(shards.len() as u64, "Aggregate: merge shards"))
-    } else {
-        None
-    };
-
-    // Tree-merge shards in parallel. `Aggregator::merge` is required to
-    // be associative (see trait docs); rayon's reduction preserves the
-    // left-to-right ordering of adjacent shards but nests combines
-    // arbitrarily.
-    let total: A = merge_aggregator_shards_parallel(&shards, pb_merge.as_ref())?;
-    let merged_shards = shards.len();
-
-    // Atomically publish the final output via tmp + rename so an
-    // interrupted run never leaves a half-written `final_out` in place.
-    let tmp_final = final_out.with_extension("json.inprogress");
-    {
-        let out = File::create(&tmp_final)?;
-        let mut w = BufWriter::new(out);
-        if pretty {
-            serde_json::to_writer_pretty(&mut w, &total)?;
-        } else {
-            serde_json::to_writer(&mut w, &total)?;
-        }
-        w.flush()?;
-    }
-    replace_file_atomic_backoff(&tmp_final, final_out)?;
-
-    if let Some(pb) = pb_merge { pb.finish_with_message("Aggregate: final written"); }
-    Ok(merged_shards)
 }
 
 impl RedditETL {
@@ -234,9 +193,73 @@ impl RedditETL {
         _resume: bool,
         pretty: bool,
     ) -> Result<(usize, usize)> {
-        fs::create_dir_all(shards_dir)?;
-        let shard_errors = build_aggregate_shards::<A>(&inputs, shards_dir, self.opts.progress);
-        let merged_shards = publish_aggregated_final::<A>(shards_dir, final_out, pretty, self.opts.progress)?;
+        let (total, merged_shards, shard_errors) =
+            self.aggregate_jsonls_parallel_collect::<A>(inputs, shards_dir)?;
+
+        // Atomically publish the final output via tmp + rename so an
+        // interrupted run never leaves a half-written `final_out` in place.
+        let tmp_final = final_out.with_extension("json.inprogress");
+        {
+            let out = File::create(&tmp_final)?;
+            let mut w = BufWriter::new(out);
+            if pretty {
+                serde_json::to_writer_pretty(&mut w, &total)?;
+            } else {
+                serde_json::to_writer(&mut w, &total)?;
+            }
+            w.flush()?;
+        }
+        replace_file_atomic_backoff(&tmp_final, final_out)?;
+
         Ok((merged_shards, shard_errors))
+    }
+
+    /// Build per-file aggregation shards in parallel, merge them, and return
+    /// the merged aggregate state to the caller instead of publishing JSON.
+    pub fn aggregate_jsonls_parallel_collect<A: Aggregator>(
+        &self,
+        inputs: Vec<PathBuf>,
+        shards_dir: &Path,
+    ) -> Result<(A, usize, usize)> {
+        self.aggregate_jsonls_parallel_collect_with::<A, _>(inputs, shards_dir, A::default)
+    }
+
+    /// Like [`Self::aggregate_jsonls_parallel_collect`], but uses `make_agg` to
+    /// construct per-input shard states. This lets callers provide runtime
+    /// configuration while still using the [`Aggregator`] merge contract.
+    pub fn aggregate_jsonls_parallel_collect_with<A, F>(
+        &self,
+        inputs: Vec<PathBuf>,
+        shards_dir: &Path,
+        make_agg: F,
+    ) -> Result<(A, usize, usize)>
+    where
+        A: Aggregator,
+        F: Fn() -> A + Send + Sync,
+    {
+        fs::create_dir_all(shards_dir)?;
+        let shard_errors =
+            build_aggregate_shards_with::<A, F>(&inputs, shards_dir, self.opts.progress, &make_agg);
+
+        let mut shards: Vec<PathBuf> = fs::read_dir(shards_dir)?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
+            .collect();
+        shards.sort();
+
+        let pb_merge = if self.opts.progress {
+            Some(make_count_progress(
+                shards.len() as u64,
+                "Aggregate: merge shards",
+            ))
+        } else {
+            None
+        };
+        let total: A = merge_aggregator_shards_parallel(&shards, pb_merge.as_ref())?;
+        if let Some(pb) = pb_merge {
+            pb.finish_with_message("Aggregate: merge done");
+        }
+
+        Ok((total, shards.len(), shard_errors))
     }
 }

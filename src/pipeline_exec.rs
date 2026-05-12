@@ -2,10 +2,12 @@ use crate::atomic_write::{
     ensure_staging_dir, sweep_stale_inprogress, write_jsonl_atomic, write_zst_atomic,
 };
 use crate::date::YearMonth;
+use crate::dedupe::{build_runs_sorted, merge_runs_sorted, DedupeCfg};
 use crate::filters::{
     bounds_tuple, matches_full, matches_minimal, resolve_target_subs_from, within_bounds,
     ym_from_epoch,
 };
+use crate::key_extractor::KeyExtractor;
 use crate::kv_shard::ShardedKVWriter;
 use crate::paths::{discover_all, plan_files, FileJob, FileKind};
 use crate::pipeline::{RedditETL, ScanPlan};
@@ -180,6 +182,72 @@ impl ScanPlan {
             out_path,
             Finalize::Jsonl,
         )
+    }
+
+    /// Write the distinct keys from matching records as one key per line.
+    ///
+    /// The scan/filter pass first spools matching raw JSONL records into the
+    /// configured work directory, then reuses the public sorted-run dedupe
+    /// engine (`build_runs_sorted` + `merge_runs_sorted`) with the supplied
+    /// [`KeyExtractor`]. Built-in `author` and `subreddit` extractors keep the
+    /// `MinimalRecord` fast path; `json:/pointer` extractors parse full JSON
+    /// only for key extraction.
+    pub fn dedupe_keys_to_lines(self, key: &KeyExtractor, out_path: &Path) -> Result<u64> {
+        let parallelism = self.etl.opts.parallelism;
+        with_thread_pool(parallelism, || {
+            let work_dir = self.etl.ensure_work_dir()?;
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let tmp_dir = work_dir.join(format!("dedupe_{}_{}", std::process::id(), unique));
+            fs::create_dir_all(&tmp_dir)
+                .with_context(|| format!("creating dedupe work dir {}", tmp_dir.display()))?;
+
+            let result = (|| -> Result<u64> {
+                let input = tmp_dir.join("matched.ndjson");
+                let f = create_with_backoff(&input, 16, 50)
+                    .with_context(|| format!("create {}", input.display()))?;
+                let writer = Mutex::new(BufWriter::with_capacity(self.etl.opts.write_buffer_bytes, f));
+
+                scan_records(&self.etl, &self.query, /*show_progress=*/true, |_min, _kind, line| {
+                    let mut w = writer.lock().map_err(|_| anyhow!("dedupe writer lock poisoned"))?;
+                    w.write_all(line.as_bytes())?;
+                    w.write_all(b"\n")?;
+                    Ok(())
+                })?;
+                writer
+                    .into_inner()
+                    .map_err(|_| anyhow!("dedupe writer lock poisoned"))?
+                    .flush()?;
+
+                let mut cfg = DedupeCfg {
+                    read_buf_bytes: self.etl.opts.read_buffer_bytes,
+                    write_buf_bytes: self.etl.opts.write_buffer_bytes,
+                    inflight_bytes: self.etl.opts.inflight_bytes,
+                    ..DedupeCfg::default()
+                };
+                if cfg.inflight_bytes > 0 {
+                    let per_flush_mb = (cfg.inflight_bytes / 2 / (1024 * 1024)).max(1);
+                    cfg.min_buf_mb = cfg.min_buf_mb.min(per_flush_mb);
+                    cfg.max_buf_mb = cfg.max_buf_mb.min(per_flush_mb.max(cfg.min_buf_mb));
+                }
+
+                let runs_dir = tmp_dir.join("runs");
+                let runs = build_runs_sorted(&input, &runs_dir, key, &cfg)?;
+                let mut unique_count = 0_u64;
+                merge_runs_sorted(&runs, out_path, key, &cfg, |current_key, _group, w| {
+                    w.write_all(current_key.as_bytes())?;
+                    w.write_all(b"\n")?;
+                    unique_count += 1;
+                    Ok(())
+                })?;
+                Ok(unique_count)
+            })();
+
+            let _ = fs::remove_dir_all(&tmp_dir);
+            result
+        })
     }
 
     pub fn extract_to_json(self, out_path: &Path, pretty: bool) -> Result<()> {
