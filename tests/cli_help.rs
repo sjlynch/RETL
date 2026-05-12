@@ -15,7 +15,8 @@ fn retl() -> Command {
 #[test]
 fn root_help_lists_all_subcommands() {
     let assert = retl().arg("--help").assert().success();
-    let pred = contains("scan")
+    let pred = contains("describe")
+        .and(contains("scan"))
         .and(contains("dedupe"))
         .and(contains("export"))
         .and(contains("count"))
@@ -23,6 +24,16 @@ fn root_help_lists_all_subcommands() {
         .and(contains("aggregate"))
         .and(contains("parents"))
         .and(contains("first-seen"));
+    assert.stdout(pred);
+}
+
+#[test]
+fn describe_help_advertises_discovery_flags() {
+    let assert = retl().args(["describe", "--help"]).assert().success();
+    let pred = contains("--data-dir")
+        .and(contains("--source"))
+        .and(contains("--start"))
+        .and(contains("--end"));
     assert.stdout(pred);
 }
 

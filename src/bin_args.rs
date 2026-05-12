@@ -12,7 +12,7 @@ use std::path::PathBuf;
 #[command(
     name = "retl",
     version,
-    about = "Reddit ETL toolkit — scan, export, count, validate, and aggregate Reddit RC/RS .zst dumps.",
+    about = "Reddit ETL toolkit — inspect, scan, export, count, validate, and aggregate Reddit RC/RS .zst dumps.",
     long_about = None,
 )]
 pub(crate) struct Cli {
@@ -22,6 +22,9 @@ pub(crate) struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum Command {
+    /// Inspect discovered corpus months, file counts, and compressed bytes without decoding.
+    #[command(alias = "ls", alias = "plan")]
+    Describe(DescribeArgs),
     /// Scan and emit unique usernames matching the query selection.
     Scan(ScanArgs),
     /// Emit distinct keys (author, subreddit, or JSON pointer) matching the query selection.
@@ -43,7 +46,7 @@ pub(crate) enum Command {
 }
 
 // -----------------------------------------------------------------------------
-// Common flags shared by all subcommands.
+// Common flags shared by corpus-scanning subcommands.
 // -----------------------------------------------------------------------------
 
 #[derive(Args, Debug, Clone)]
@@ -111,6 +114,25 @@ impl From<SourceArg> for Sources {
 // -----------------------------------------------------------------------------
 
 #[derive(Args, Debug)]
+pub(crate) struct DescribeArgs {
+    /// Path to corpus base dir (containing `comments/` and `submissions/`).
+    #[arg(long, default_value = "./data")]
+    pub(crate) data_dir: PathBuf,
+
+    /// Inclusive start month (YYYY-MM).
+    #[arg(long, value_name = "YYYY-MM")]
+    pub(crate) start: Option<YearMonth>,
+
+    /// Inclusive end month (YYYY-MM).
+    #[arg(long, value_name = "YYYY-MM")]
+    pub(crate) end: Option<YearMonth>,
+
+    /// Source selection: rc (comments), rs (submissions), or both.
+    #[arg(long, value_enum, default_value_t = SourceArg::Both)]
+    pub(crate) source: SourceArg,
+}
+
+#[derive(Args, Debug)]
 pub(crate) struct ScanArgs {
     #[command(flatten)]
     pub(crate) common: CommonOpts,
@@ -167,12 +189,13 @@ pub(crate) struct ExportArgs {
     /// 0 disables the explicit cap and falls back to memory-fraction sampling.
     #[arg(long)]
     pub(crate) inflight_bytes: Option<usize>,
-    /// Resume a prior export with the same query/config. `jsonl`/`json` reuse
-    /// per-month `.part_*.jsonl` files and `_progress.json` in `--work-dir`;
-    /// `spool` reuses part files and `_progress.json` in `--out`. Changing
-    /// filters, sources, date range, whitelist, or timestamp formatting
-    /// invalidates the checkpoint and rebuilds the parts. `zst` and
-    /// `partitioned-jsonl` exports are not currently resumable.
+    /// Resume a prior export with the same query/config/corpus. `jsonl`/`json`
+    /// reuse per-month `.part_*.jsonl` files and `_progress.json` in a namespaced
+    /// scratch dir under `--work-dir`; `spool` reuses part files and
+    /// `_progress.json` in `--out`. Changing filters, corpus paths, sources,
+    /// date range, whitelist, or timestamp formatting invalidates the checkpoint
+    /// and rebuilds the parts. `zst` and `partitioned-jsonl` exports are not
+    /// currently resumable.
     #[arg(long)]
     pub(crate) resume: bool,
 }

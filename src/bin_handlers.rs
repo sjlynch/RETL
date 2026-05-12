@@ -3,21 +3,88 @@
 
 use anyhow::{Context, Result};
 use retl::{
-    replace_file_atomic_backoff, ExportFormat, IntegrityMode, KeyExtractor, RedditETL, Sources,
+    create_with_backoff, discover_all, plan_files, replace_file_atomic_backoff,
+    total_compressed_size, ExportFormat, FileKind, IntegrityMode, KeyExtractor, RedditETL, Sources,
     YearMonth,
 };
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use crate::bin_args::{
-    AggregateArgs, CountArgs, CountMode, DedupeArgs, ExportArgs, ExportFmt, FirstSeenArgs,
-    IntegrityArgs, IntegrityModeArg, ParentsArgs, ScanArgs,
+    AggregateArgs, CountArgs, CountMode, DedupeArgs, DescribeArgs, ExportArgs, ExportFmt,
+    FirstSeenArgs, IntegrityArgs, IntegrityModeArg, ParentsArgs, ScanArgs, SourceArg,
 };
 use crate::bin_helpers::{
     build_etl, discover_spool_parts, plan, stream_extract_to_stdout, stream_path_output_to_stdout,
     GroupBySpec, GroupMetricAgg, MetricSpec, RecCount,
 };
+
+pub(crate) fn run_describe(args: DescribeArgs) -> Result<()> {
+    if let (Some(start), Some(end)) = (args.start, args.end) {
+        if start > end {
+            anyhow::bail!("invalid date range: start {start} is after end {end}");
+        }
+    }
+
+    let comments_dir = args.data_dir.join("comments");
+    let submissions_dir = args.data_dir.join("submissions");
+    let discovered = discover_all(&comments_dir, &submissions_dir);
+
+    let mut rows = Vec::new();
+    for kind in describe_kinds(args.source) {
+        let map = match kind {
+            FileKind::Comment => &discovered.comments,
+            FileKind::Submission => &discovered.submissions,
+        };
+        let jobs = plan_files(&discovered, source_for_kind(kind), args.start, args.end);
+        let bytes = total_compressed_size(&jobs);
+        rows.push((source_label(kind), available_range(map), jobs.len(), bytes));
+    }
+
+    let total_files: usize = rows.iter().map(|(_, _, files, _)| *files).sum();
+    let total_bytes: u64 = rows.iter().map(|(_, _, _, bytes)| *bytes).sum();
+
+    let stdout = io::stdout();
+    let mut w = BufWriter::new(stdout.lock());
+    writeln!(w, "source\tavailable\tfiles_in_range\tcompressed_bytes")?;
+    for (label, available, files, bytes) in rows {
+        writeln!(w, "{label}\t{available}\t{files}\t{bytes}")?;
+    }
+    writeln!(w, "total\t\t{total_files}\t{total_bytes}")?;
+    w.flush()?;
+    Ok(())
+}
+
+fn describe_kinds(source: SourceArg) -> Vec<FileKind> {
+    match source {
+        SourceArg::Rc => vec![FileKind::Comment],
+        SourceArg::Rs => vec![FileKind::Submission],
+        SourceArg::Both => vec![FileKind::Comment, FileKind::Submission],
+    }
+}
+
+fn source_for_kind(kind: FileKind) -> Sources {
+    match kind {
+        FileKind::Comment => Sources::Comments,
+        FileKind::Submission => Sources::Submissions,
+    }
+}
+
+fn source_label(kind: FileKind) -> &'static str {
+    match kind {
+        FileKind::Comment => "rc",
+        FileKind::Submission => "rs",
+    }
+}
+
+fn available_range(map: &BTreeMap<YearMonth, PathBuf>) -> String {
+    match (map.keys().next(), map.keys().next_back()) {
+        (Some(first), Some(last)) => format!("{first}..={last}"),
+        _ => "<none>".to_string(),
+    }
+}
 
 pub(crate) fn run_scan(args: ScanArgs) -> Result<()> {
     let etl = build_etl(&args.common)?;
@@ -267,6 +334,7 @@ pub(crate) fn run_aggregate(args: AggregateArgs) -> Result<()> {
     fs::create_dir_all(&shards_dir)
         .with_context(|| format!("creating shards_dir {}", shards_dir.display()))?;
 
+    let input_count = args.inputs.len();
     if let Some(by) = args.by {
         let group_by = GroupBySpec::parse(&by)?;
         let metric = MetricSpec::parse(args.metric.as_deref())?;
@@ -277,6 +345,7 @@ pub(crate) fn run_aggregate(args: AggregateArgs) -> Result<()> {
                 &shards_dir,
                 || GroupMetricAgg::new(group_by.clone(), metric.clone()),
             )?;
+        ensure_aggregate_inputs_succeeded(input_count, built, errors)?;
         write_grouped_tsv(&args.out, agg.rows(top))?;
         eprintln!(
             "Aggregated {} shard(s) to TSV; {} input(s) failed during shard build",
@@ -289,13 +358,10 @@ pub(crate) fn run_aggregate(args: AggregateArgs) -> Result<()> {
         if args.top.is_some() {
             anyhow::bail!("--top requires --by");
         }
-        let (built, errors) = etl.aggregate_jsonls_parallel::<RecCount>(
-            args.inputs,
-            &shards_dir,
-            &args.out,
-            true,
-            args.pretty,
-        )?;
+        let (agg, built, errors) =
+            etl.aggregate_jsonls_parallel_collect::<RecCount>(args.inputs, &shards_dir)?;
+        ensure_aggregate_inputs_succeeded(input_count, built, errors)?;
+        write_rec_count_json(&args.out, &agg, args.pretty)?;
         eprintln!(
             "Aggregated {} shard(s); {} input(s) failed during shard build",
             built, errors
@@ -304,10 +370,41 @@ pub(crate) fn run_aggregate(args: AggregateArgs) -> Result<()> {
     Ok(())
 }
 
+fn ensure_aggregate_inputs_succeeded(
+    input_count: usize,
+    built: usize,
+    errors: usize,
+) -> Result<()> {
+    if input_count > 0 && (errors == input_count || built == 0) {
+        anyhow::bail!(
+            "aggregate failed: {errors} of {input_count} input(s) failed during shard build; {built} shard(s) merged"
+        );
+    }
+    Ok(())
+}
+
+fn write_rec_count_json(out: &Path, agg: &RecCount, pretty: bool) -> Result<()> {
+    let tmp = out.with_extension("json.inprogress");
+    {
+        let f = create_with_backoff(&tmp, 16, 50)
+            .with_context(|| format!("creating output tempfile {}", tmp.display()))?;
+        let mut w = BufWriter::new(f);
+        if pretty {
+            serde_json::to_writer_pretty(&mut w, agg)?;
+        } else {
+            serde_json::to_writer(&mut w, agg)?;
+        }
+        w.flush()?;
+    }
+    replace_file_atomic_backoff(&tmp, out)
+        .with_context(|| format!("publishing output file {}", out.display()))?;
+    Ok(())
+}
+
 fn write_grouped_tsv(out: &Path, rows: Vec<(String, String)>) -> Result<()> {
     let tmp = out.with_extension("tsv.inprogress");
     {
-        let f = fs::File::create(&tmp)
+        let f = create_with_backoff(&tmp, 16, 50)
             .with_context(|| format!("creating output tempfile {}", tmp.display()))?;
         let mut w = BufWriter::new(f);
         for (key, value) in rows {
