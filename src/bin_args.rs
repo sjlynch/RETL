@@ -167,11 +167,12 @@ pub(crate) struct ExportArgs {
     /// zstd compression level for `.zst` outputs. Clamped to 1..=22 by the library.
     #[arg(long)]
     pub(crate) zst_level: Option<i32>,
-    /// Resume a prior export with the same query/config. `jsonl`/`json` reuse
-    /// per-month `.part_*.jsonl` files and `_progress.json` in `--work-dir`;
-    /// `spool` reuses part files and `_progress.json` in `--out`. Changing
-    /// filters, sources, date range, whitelist, or timestamp formatting
-    /// invalidates the checkpoint and rebuilds the parts.
+    /// Resume a prior export with the same query/config/corpus. `jsonl`/`json`
+    /// reuse per-month `.part_*.jsonl` files and `_progress.json` in a namespaced
+    /// scratch dir under `--work-dir`; `spool` reuses part files and
+    /// `_progress.json` in `--out`. Changing filters, corpus paths, sources,
+    /// date range, whitelist, or timestamp formatting invalidates the checkpoint
+    /// and rebuilds the parts.
     #[arg(long)]
     pub(crate) resume: bool,
 }

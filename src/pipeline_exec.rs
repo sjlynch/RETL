@@ -48,6 +48,7 @@ enum Finalize {
 
 const FILE_PREFIX_RC: &str = "part_RC";
 const FILE_PREFIX_RS: &str = "part_RS";
+static EXTRACT_SCRATCH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
 struct PartialScanError {
@@ -729,12 +730,80 @@ fn stable_fnv1a_hex(bytes: &[u8]) -> String {
     format!("fnv1a64:{hash:016x}")
 }
 
+fn absolutize_for_fingerprint(path: &Path) -> Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()
+            .context("resolve current directory for path fingerprint")?
+            .join(path))
+    }
+}
+
+fn canonicalize_or_absolutize(path: &Path) -> Result<PathBuf> {
+    match fs::canonicalize(path) {
+        Ok(path) => Ok(path),
+        Err(_) => absolutize_for_fingerprint(path),
+    }
+}
+
+fn path_for_fingerprint(path: &Path) -> Result<String> {
+    let path = if path.is_dir() {
+        canonicalize_or_absolutize(path)?
+    } else if let Some(file_name) = path.file_name() {
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        canonicalize_or_absolutize(parent)?.join(file_name)
+    } else {
+        canonicalize_or_absolutize(path)?
+    };
+    Ok(path.to_string_lossy().into_owned())
+}
+
+fn stable_hash_component(bytes: &[u8]) -> String {
+    stable_fnv1a_hex(bytes).replace(':', "_")
+}
+
+fn extract_scratch_dir(
+    work_dir: &Path,
+    tmp_dir_name: &str,
+    out_path: &Path,
+    resume: bool,
+    resume_fingerprint: Option<&str>,
+) -> Result<PathBuf> {
+    let name = if resume {
+        let fingerprint = resume_fingerprint
+            .ok_or_else(|| anyhow!("missing resume fingerprint for extract scratch directory"))?;
+        let input = serde_json::json!({
+            "resume_fingerprint": fingerprint,
+            "out_path": path_for_fingerprint(out_path)?,
+        });
+        let bytes = serde_json::to_vec(&input).context("serialize extract scratch fingerprint")?;
+        format!("{tmp_dir_name}_{}", stable_hash_component(&bytes))
+    } else {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let seq = EXTRACT_SCRATCH_COUNTER.fetch_add(1, Ordering::Relaxed);
+        format!("{tmp_dir_name}_{}_{}_{}", std::process::id(), unique, seq)
+    };
+    Ok(work_dir.join(name))
+}
+
 /// Fingerprint every query/config knob that can change the bytes written by a
 /// resumable extract/spool operation. If it changes between `--resume` runs,
 /// stale month parts are discarded instead of being stitched into the new run.
 fn build_resume_fingerprint(etl: &RedditETL, query: &QuerySpec, operation: &str) -> Result<String> {
     let input = serde_json::json!({
         "operation": operation,
+        "corpus_paths": {
+            "base_dir": path_for_fingerprint(&etl.opts.base_dir)?,
+            "comments_dir": path_for_fingerprint(&etl.opts.comments_dir)?,
+            "submissions_dir": path_for_fingerprint(&etl.opts.submissions_dir)?,
+        },
         "sources": format!("{:?}", etl.opts.sources),
         "start": opt_ym_string(etl.opts.start),
         "end": opt_ym_string(etl.opts.end),
@@ -1023,28 +1092,35 @@ fn extract_common(
         let files = plan_pipeline_files(etl)?;
 
         let work_dir = etl.ensure_work_dir()?;
-        let tmp_dir = work_dir.join(tmp_dir_name);
-        if !etl.opts.resume && tmp_dir.exists() {
-            fs::remove_dir_all(&tmp_dir)
-                .with_context(|| format!("clearing extract work dir {}", tmp_dir.display()))?;
-        }
+        let resume = etl.opts.resume;
+        let resume_fingerprint = if resume {
+            Some(build_resume_fingerprint(etl, query, "extract")?)
+        } else {
+            None
+        };
+        let tmp_dir = extract_scratch_dir(
+            &work_dir,
+            tmp_dir_name,
+            out_path,
+            resume,
+            resume_fingerprint.as_deref(),
+        )?;
         fs::create_dir_all(&tmp_dir)?;
         let staging_dir = ensure_staging_dir(&tmp_dir)?;
         sweep_stale_inprogress(&tmp_dir, true)?;
 
-        let resume = etl.opts.resume;
-        let resume_fingerprint = build_resume_fingerprint(etl, query, "extract")?;
-        let (initial_months, completed_keys) = if resume {
-            load_and_validate_export_manifest(&tmp_dir, &resume_fingerprint)?
-        } else {
-            (HashMap::new(), HashSet::new())
-        };
-        let accumulator = if resume {
-            crate::progress_manifest::save(&tmp_dir, &initial_months, Some(&resume_fingerprint))?;
+        let (initial_months, completed_keys) =
+            if let Some(fingerprint) = resume_fingerprint.as_deref() {
+                load_and_validate_export_manifest(&tmp_dir, fingerprint)?
+            } else {
+                (HashMap::new(), HashSet::new())
+            };
+        let accumulator = if let Some(fingerprint) = resume_fingerprint.as_ref() {
+            crate::progress_manifest::save(&tmp_dir, &initial_months, Some(fingerprint))?;
             Some(ManifestAccumulator::new(
                 &tmp_dir,
                 initial_months,
-                Some(resume_fingerprint.clone()),
+                Some(fingerprint.clone()),
             ))
         } else {
             None
@@ -1153,6 +1229,11 @@ fn extract_common(
             Finalize::Jsonl => stitch_tmp_parts(&tmp_dir, out_path, write_buf)?,
             Finalize::JsonArray { pretty } => {
                 stitch_tmp_parts_to_json_array(&tmp_dir, out_path, pretty, write_buf)?
+            }
+        }
+        if !resume {
+            if let Err(e) = fs::remove_dir_all(&tmp_dir) {
+                tracing::warn!(path=%tmp_dir.display(), error=%e, "failed to remove extract scratch dir");
             }
         }
         Ok(())
