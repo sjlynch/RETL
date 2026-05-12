@@ -44,9 +44,13 @@ pub struct QuerySpec {
     pub min_score: Option<i64>,
     pub max_score: Option<i64>,
     pub keywords_any: Option<Vec<String>>, // substring in body/selftext/title (case-insensitive)
-    pub domains_in: Option<Vec<String>>,   // submissions only (domain field)
-    pub contains_url: Option<bool>,        // if true, keep only records with http(s)
-    pub filter_pseudo_users: bool,         // exclude [deleted]/[removed]/empty author; default true
+    /// Submissions only: matches the top-level `domain` field. Comments do not
+    /// have this field and are rejected when the filter is active.
+    pub domains_in: Option<Vec<String>>,
+    /// If true, keep only records with http(s) in text or a submission `url`
+    /// whose value starts with http(s).
+    pub contains_url: Option<bool>,
+    pub filter_pseudo_users: bool, // exclude [deleted]/[removed]/empty author; default true
 
     // Lazily-built case-insensitive automaton over `keywords_any`.
     // Built once per QuerySpec on first call to `keywords_automaton()`.

@@ -10,7 +10,7 @@ use crate::filters::{
 use crate::key_extractor::KeyExtractor;
 use crate::kv_shard::ShardedKVWriter;
 use crate::paths::{discover_all, plan_files_checked, FileJob, FileKind};
-use crate::pipeline::{RedditETL, ScanPlan};
+use crate::pipeline::{log_domain_filter_comment_drop, RedditETL, ScanPlan};
 use crate::progress::{make_progress_bar_labeled, total_compressed_size};
 use crate::progress_manifest::{ManifestAccumulator, MonthEntry};
 use crate::query::QuerySpec;
@@ -251,6 +251,7 @@ impl ScanPlan {
     /// `MinimalRecord` fast path; `json:/pointer` extractors parse full JSON
     /// only for key extraction.
     pub fn dedupe_keys_to_lines(self, key: &KeyExtractor, out_path: &Path) -> Result<u64> {
+        log_domain_filter_comment_drop(&self.query, self.etl.opts.sources);
         let parallelism = self.etl.opts.parallelism;
         with_thread_pool(parallelism, || {
             let work_dir = self.etl.ensure_work_dir()?;

@@ -238,6 +238,7 @@ impl RedditETL {
             // worker writes a tracing::warn! on failure and bumps the shared
             // counter; the total is reported back via tracing at the end.
             let err_count = AtomicUsize::new(0);
+            let parent_ref_count = AtomicUsize::new(0);
 
             paths.par_iter().for_each(|p| {
                 let res = (|| -> Result<()> {
@@ -263,6 +264,7 @@ impl RedditETL {
                             }
                         };
                         if let Some(parent_id) = v.get("parent_id").and_then(|x| x.as_str()) {
+                            parent_ref_count.fetch_add(1, Ordering::Relaxed);
                             if let Some(rest) = parent_id.strip_prefix("t1_") {
                                 t1_writer.write(rest)?;
                             } else if let Some(rest) = parent_id.strip_prefix("t3_") {
@@ -270,6 +272,7 @@ impl RedditETL {
                             }
                         }
                         if let Some(link_id) = v.get("link_id").and_then(|x| x.as_str()) {
+                            parent_ref_count.fetch_add(1, Ordering::Relaxed);
                             if let Some(rest) = link_id.strip_prefix("t3_") {
                                 t3_writer.write(rest)?;
                             }
@@ -301,6 +304,13 @@ impl RedditETL {
             let errors = err_count.load(Ordering::Relaxed);
             if errors > 0 {
                 tracing::warn!(error_count = errors, "collect_parent_ids_from_jsonls completed with errors");
+            }
+            let parent_refs = parent_ref_count.load(Ordering::Relaxed);
+            if parent_refs == 0 {
+                tracing::warn!(
+                    input_files = paths.len(),
+                    "collect_parent_ids_from_jsonls found zero parent_id/link_id fields across the spool; parents pipeline requires parent_id and link_id to survive any --whitelist/.whitelist_fields"
+                );
             }
 
             Ok(ParentIds::from_shards(t1_shards, t3_shards))

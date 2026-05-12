@@ -361,6 +361,16 @@ cargo run --release
 
 All examples below operate on the same API you saw in the Quick Start.
 
+### Query DSL filter notes
+
+- `.contains_url(true)` keeps records with `http`/`https` in comment bodies,
+  submission `selftext`/`title`, or a link-post submission whose top-level
+  `url` starts with `http`/`https`.
+- `.domains_in([...])` matches the submission-only top-level `domain` field.
+  Reddit comments do not have `domain`; when used with `Sources::Both` or
+  `Sources::Comments`, comments are dropped and RETL emits a warning. Use
+  `Sources::Submissions` when you intend a domain-only scan.
+
 ### Extract to JSONL
 
 ~~~rust
@@ -478,6 +488,8 @@ RedditETL::new()
 ### Parents Pipeline (Attach Parent Content)
 
 Collect parent IDs from your spooled JSONL, resolve parent contents by scanning the corpus, then attach parents back onto your records:
+
+**Important:** if the spool is produced with `--whitelist` / `.whitelist_fields(...)`, the fields `body`, `parent_id`, and `link_id` **MUST** be preserved for any spool destined for the parents pipeline. For example, include at least `body,parent_id,link_id` alongside your analysis fields. If those fields are dropped, `retl parents` cannot identify/resolve comment parents and will warn that it found zero comment-shaped records.
 
 ~~~rust
 use retl::{ParentIds, ParentMaps, RedditETL, Sources, YearMonth};

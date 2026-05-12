@@ -4,7 +4,7 @@
 use crate::ndjson::for_each_jsonl_line_cfg;
 use crate::pipeline::RedditETL;
 use crate::progress::make_count_progress;
-use crate::util::{replace_file_atomic_backoff, with_thread_pool};
+use crate::util::{remove_with_backoff, replace_file_atomic_backoff, with_thread_pool};
 use anyhow::Result;
 use indicatif::ProgressBar;
 use rayon::prelude::*;
@@ -42,6 +42,34 @@ fn shard_name_for_input(shards_dir: &Path, input: &Path) -> PathBuf {
     // Common case: part_YYYY-MM
     let stem = stem.strip_prefix("part_").unwrap_or(stem);
     shards_dir.join(format!("agg_{}.json", stem))
+}
+
+fn aggregate_artifact_name(path: &Path) -> Option<&str> {
+    path.file_name().and_then(|s| s.to_str()).filter(|name| {
+        name.starts_with("agg_") && (name.ends_with(".json") || name.ends_with(".json.inprogress"))
+    })
+}
+
+fn is_aggregate_shard(path: &Path) -> bool {
+    aggregate_artifact_name(path).is_some_and(|name| name.ends_with(".json"))
+}
+
+fn clear_aggregate_artifacts(shards_dir: &Path) -> Result<()> {
+    if !shards_dir.exists() {
+        return Ok(());
+    }
+
+    for entry in fs::read_dir(shards_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if aggregate_artifact_name(&path).is_some() {
+            remove_with_backoff(&path, 16, 50)?;
+        }
+    }
+    Ok(())
 }
 
 fn load_shard<A: Aggregator>(shard: &Path) -> Result<A> {
@@ -242,9 +270,7 @@ impl RedditETL {
         A: Aggregator,
         F: Fn() -> A + Send + Sync,
     {
-        if shards_dir.exists() {
-            fs::remove_dir_all(shards_dir)?;
-        }
+        clear_aggregate_artifacts(shards_dir)?;
         fs::create_dir_all(shards_dir)?;
 
         with_thread_pool(self.opts.parallelism, || {
@@ -255,10 +281,17 @@ impl RedditETL {
                 &make_agg,
             );
 
-            let mut shards: Vec<PathBuf> = fs::read_dir(shards_dir)?
-                .filter_map(|e| e.ok().map(|e| e.path()))
-                .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
-                .collect();
+            let mut shards = Vec::new();
+            for entry in fs::read_dir(shards_dir)? {
+                let entry = entry?;
+                if !entry.file_type()?.is_file() {
+                    continue;
+                }
+                let path = entry.path();
+                if is_aggregate_shard(&path) {
+                    shards.push(path);
+                }
+            }
             shards.sort();
 
             let pb_merge = if self.opts.progress {
