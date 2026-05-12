@@ -379,20 +379,23 @@ impl ScanPlan {
     pub fn count_by_month(self) -> Result<BTreeMap<YearMonth, u64>> {
         let plan = self.build()?;
         log_pseudo_user_filter(&plan.query);
-        let total = Mutex::new(BTreeMap::<YearMonth, u64>::new());
-        scan_records(
-            &plan.etl,
-            &plan.query,
-            /*show_progress=*/ false,
-            |min, _kind, _line| {
-                if let Some(ts) = min.created_utc {
-                    let ym = ym_from_epoch(ts);
-                    *total.lock().unwrap().entry(ym).or_insert(0) += 1;
-                }
-                Ok(())
-            },
-        )?;
-        Ok(total.into_inner().unwrap())
+        let parallelism = plan.etl.opts.parallelism;
+        with_thread_pool(parallelism, || {
+            let total = Mutex::new(BTreeMap::<YearMonth, u64>::new());
+            scan_records(
+                &plan.etl,
+                &plan.query,
+                /*show_progress=*/ false,
+                |min, _kind, _line| {
+                    if let Some(ts) = min.created_utc {
+                        let ym = ym_from_epoch(ts);
+                        *total.lock().unwrap().entry(ym).or_insert(0) += 1;
+                    }
+                    Ok(())
+                },
+            )?;
+            Ok(total.into_inner().unwrap())
+        })
     }
 
     pub fn author_counts_to_tsv(self, out_path: &Path) -> Result<()> {
@@ -429,28 +432,31 @@ impl ScanPlan {
     pub fn build_first_seen_index_to_tsv(self, out_path: &Path) -> Result<()> {
         let plan = self.build()?;
         log_pseudo_user_filter(&plan.query);
-        let work_dir = plan.etl.ensure_work_dir()?;
-        let kv = ShardedKVWriter::create(&work_dir, "first_seen", plan.etl.opts.shard_count)?;
+        let parallelism = plan.etl.opts.parallelism;
+        with_thread_pool(parallelism, || {
+            let work_dir = plan.etl.ensure_work_dir()?;
+            let kv = ShardedKVWriter::create(&work_dir, "first_seen", plan.etl.opts.shard_count)?;
 
-        scan_records(
-            &plan.etl,
-            &plan.query,
-            /*show_progress=*/ false,
-            |min, _kind, _line| {
-                if let (Some(a), Some(ts)) = (min.author.as_deref(), min.created_utc) {
-                    let a = a.trim();
-                    if a.is_empty() {
-                        return Ok(());
+            scan_records(
+                &plan.etl,
+                &plan.query,
+                /*show_progress=*/ false,
+                |min, _kind, _line| {
+                    if let (Some(a), Some(ts)) = (min.author.as_deref(), min.created_utc) {
+                        let a = a.trim();
+                        if a.is_empty() {
+                            return Ok(());
+                        }
+                        kv.write_kv(a, ts)?;
                     }
-                    kv.write_kv(a, ts)?;
-                }
-                Ok(())
-            },
-        )?;
+                    Ok(())
+                },
+            )?;
 
-        let shards = kv.reduce_min("first_seen")?;
-        concat_tsvs(&shards, out_path, plan.etl.opts.write_buffer_bytes)?;
-        Ok(())
+            let shards = kv.reduce_min("first_seen")?;
+            concat_tsvs(&shards, out_path, plan.etl.opts.write_buffer_bytes)?;
+            Ok(())
+        })
     }
 
     /// Export corpus back to partitioned JSONL or ZST by month/kinds with query filters.

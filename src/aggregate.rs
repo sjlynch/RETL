@@ -4,7 +4,7 @@
 use crate::ndjson::for_each_jsonl_line_cfg;
 use crate::pipeline::RedditETL;
 use crate::progress::make_count_progress;
-use crate::util::replace_file_atomic_backoff;
+use crate::util::{replace_file_atomic_backoff, with_thread_pool};
 use anyhow::Result;
 use indicatif::ProgressBar;
 use rayon::prelude::*;
@@ -194,7 +194,9 @@ impl RedditETL {
         pretty: bool,
     ) -> Result<(usize, usize)> {
         if resume {
-            tracing::warn!("aggregate_jsonls_parallel does not support resume; rebuilding aggregate shards");
+            tracing::warn!(
+                "aggregate_jsonls_parallel does not support resume; rebuilding aggregate shards"
+            );
         }
         let (total, merged_shards, shard_errors) =
             self.aggregate_jsonls_parallel_collect::<A>(inputs, shards_dir)?;
@@ -240,29 +242,39 @@ impl RedditETL {
         A: Aggregator,
         F: Fn() -> A + Send + Sync,
     {
-        fs::create_dir_all(shards_dir)?;
-        let shard_errors =
-            build_aggregate_shards_with::<A, F>(&inputs, shards_dir, self.opts.progress, &make_agg);
-
-        let mut shards: Vec<PathBuf> = fs::read_dir(shards_dir)?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
-            .collect();
-        shards.sort();
-
-        let pb_merge = if self.opts.progress {
-            Some(make_count_progress(
-                shards.len() as u64,
-                "Aggregate: merge shards",
-            ))
-        } else {
-            None
-        };
-        let total: A = merge_aggregator_shards_parallel(&shards, pb_merge.as_ref())?;
-        if let Some(pb) = pb_merge {
-            pb.finish_with_message("Aggregate: merge done");
+        if shards_dir.exists() {
+            fs::remove_dir_all(shards_dir)?;
         }
+        fs::create_dir_all(shards_dir)?;
 
-        Ok((total, shards.len(), shard_errors))
+        with_thread_pool(self.opts.parallelism, || {
+            let shard_errors = build_aggregate_shards_with::<A, F>(
+                &inputs,
+                shards_dir,
+                self.opts.progress,
+                &make_agg,
+            );
+
+            let mut shards: Vec<PathBuf> = fs::read_dir(shards_dir)?
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
+                .collect();
+            shards.sort();
+
+            let pb_merge = if self.opts.progress {
+                Some(make_count_progress(
+                    shards.len() as u64,
+                    "Aggregate: merge shards",
+                ))
+            } else {
+                None
+            };
+            let total: A = merge_aggregator_shards_parallel(&shards, pb_merge.as_ref())?;
+            if let Some(pb) = pb_merge {
+                pb.finish_with_message("Aggregate: merge done");
+            }
+
+            Ok((total, shards.len(), shard_errors))
+        })
     }
 }

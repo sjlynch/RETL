@@ -1,6 +1,5 @@
 //! Concurrency helper: limit the number of monthly files processed in parallel.
 
-use crate::paths::FileJob;
 use anyhow::Result;
 use parking_lot::{Condvar, Mutex};
 use rayon::prelude::*;
@@ -55,9 +54,10 @@ impl Drop for Permit<'_> {
 /// pick up the next file as soon as a slot frees. The previous chunk-then-
 /// par_iter version had workers idle at every chunk boundary waiting for the
 /// slowest in-chunk member to finish; this version keeps the pipeline full.
-pub fn for_each_file_limited<F>(files: &[FileJob], limit: usize, f: F) -> Result<()>
+pub fn for_each_file_limited<T, F>(files: &[T], limit: usize, f: F) -> Result<()>
 where
-    F: Sync + Fn(&FileJob) -> Result<()>,
+    T: Sync,
+    F: Sync + Fn(&T) -> Result<()>,
 {
     if limit <= 1 {
         for job in files {

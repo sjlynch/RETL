@@ -222,9 +222,18 @@ impl Aggregator for GroupMetricAgg {
     }
 
     fn merge(&mut self, other: Self) {
-        if self.group_by.is_none() {
+        if let (Some(left_by), Some(right_by)) = (&self.group_by, &other.group_by) {
+            if left_by != right_by || self.metric != other.metric {
+                panic!(
+                    "refusing to merge incompatible grouped aggregate shards: left by={:?} metric={:?}, right by={:?} metric={:?}",
+                    left_by, self.metric, right_by, other.metric
+                );
+            }
+        } else if self.group_by.is_none() {
             self.group_by = other.group_by.clone();
             self.metric = other.metric.clone();
+        } else if !other.groups.is_empty() {
+            panic!("refusing to merge grouped aggregate shard with missing group_by metadata");
         }
         for (key, state) in other.groups {
             self.groups.entry(key).or_default().merge(state);
@@ -257,6 +266,19 @@ fn value_to_f64(v: &Value) -> Option<f64> {
         _ => return None,
     };
     n.is_finite().then_some(n)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[should_panic(expected = "refusing to merge incompatible grouped aggregate shards")]
+    fn group_metric_merge_rejects_incompatible_metadata() {
+        let mut left = GroupMetricAgg::new(GroupBySpec::Subreddit, MetricSpec::default());
+        let right = GroupMetricAgg::new(GroupBySpec::Author, MetricSpec::default());
+        left.merge(right);
+    }
 }
 
 fn value_to_month(v: &Value) -> Option<String> {
@@ -299,7 +321,9 @@ pub(crate) fn ensure_dirs(common: &CommonOpts) -> Result<PathBuf> {
 
 pub(crate) fn build_etl(common: &CommonOpts) -> Result<RedditETL> {
     if let (Some(start), Some(end)) = (common.start, common.end) {
-        if start > end { return Err(BuildError::InvalidDateRange { start, end }.into()); }
+        if start > end {
+            return Err(BuildError::InvalidDateRange { start, end }.into());
+        }
     }
     let lib_tmp = ensure_dirs(common)?;
     let mut etl = RedditETL::new()
