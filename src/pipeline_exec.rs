@@ -116,6 +116,7 @@ fn warn_dedupe_zero_keys(key: &KeyExtractor, input_records: u64) {
 // -------- Original operations (back-compat) --------
 
 impl RedditETL {
+    #[deprecated(note = "use RedditETL::scan().usernames()")]
     pub fn usernames(self) -> Result<UsernameStream> {
         let subreddit = self
             .opts
