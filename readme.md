@@ -106,8 +106,8 @@ builder methods.
 
 ## Command-Line Interface
 
-The `retl` binary exposes five subcommands. All accept a shared set of flags
-(see `retl <subcommand> --help` for the full list):
+The `retl` binary exposes the main ETL subcommands. All accept a shared set of
+flags (see `retl <subcommand> --help` for the full list):
 
 | Common flag | Purpose |
 | --- | --- |
@@ -132,6 +132,30 @@ retl scan \
   --start 2006-01 --end 2006-04 \
   --subreddit programming --subreddit reddit.com \
   --out usernames.txt
+~~~
+
+### `dedupe` — emit unique keys
+
+Walks the corpus, applies the query selection, and writes one distinct key per
+line to `--out` (use `--out -` for stdout). `--key` reuses RETL's
+`KeyExtractor`: `author` and `subreddit` use the `MinimalRecord` fast path;
+`json:/pointer` parses full JSON only to extract the requested JSON Pointer.
+Aliases: `unique`, `distinct`.
+
+~~~sh
+# Unique authors who posted in r/rust in 2020-2023
+retl dedupe \
+  --data-dir ./data \
+  --start 2020-01 --end 2023-12 \
+  --subreddit rust \
+  --key author \
+  --out unique_authors.txt
+
+# Unique subreddits in the selected comments/submissions
+retl dedupe --key subreddit --start 2021-01 --end 2021-12 --out subreddits.txt
+
+# Unique parent IDs from comments using a JSON Pointer key
+retl dedupe --source rc --key 'json:/parent_id' --start 2020-01 --end 2020-12 --out parent_ids.txt
 ~~~
 
 ### `export` — extract filtered records
@@ -185,12 +209,13 @@ retl integrity --mode full --source both --start 2006-01 --end 2006-04
 Bad files print one `path<TAB>error` line per failure on stdout and the
 process exits with status `2`.
 
-### `aggregate` — fold JSONL inputs into one JSON
+### `aggregate` — fold JSONL inputs into JSON or TSV rollups
 
-Aggregates one or more JSONL inputs into a single JSON file using a built-in
-record-count aggregator (each input is processed in parallel; per-input shard
-intermediates land under `--shards-dir`, which defaults to `agg_shards/`
-next to `--out`).
+Aggregates one or more JSONL inputs using the `retl::Aggregator` pipeline
+(each input is processed in parallel; per-input shard intermediates land under
+`--shards-dir`, which defaults to `agg_shards/` next to `--out`). With no
+`--by`, the CLI keeps the original built-in record-count fallback and writes a
+JSON aggregate state:
 
 ~~~sh
 retl aggregate \
@@ -198,9 +223,17 @@ retl aggregate \
   ./spool/part_RC_2006-01.jsonl ./spool/part_RS_2006-01.jsonl
 ~~~
 
-For more interesting aggregations, implement `retl::Aggregator` for your own
-type and call `RedditETL::aggregate_jsonls_parallel::<MyAgg>(...)` from a
-small driver — the CLI ships only the simple record-count case.
+Built-in grouped rollups write two-column TSV:
+
+~~~sh
+retl aggregate --by subreddit --out counts.tsv ./spool/*.jsonl
+retl aggregate --by month --out months.tsv ./spool/*.jsonl
+retl aggregate --by author --top 100 --out top_authors.tsv ./spool/*.jsonl
+retl aggregate --by 'json:/subreddit' --metric 'sum:/score' --out scores.tsv ./spool/*.jsonl
+~~~
+
+`--metric` defaults to `count` and also supports `avg:/pointer`,
+`min:/pointer`, and `max:/pointer` for numeric JSON-pointer values.
 
 ---
 
