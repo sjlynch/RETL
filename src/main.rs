@@ -24,6 +24,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Scan(a) => bin_handlers::run_scan(a),
+        Command::Dedupe(a) => bin_handlers::run_dedupe(a),
         Command::Export(a) => bin_handlers::run_export(a),
         Command::Count(a) => bin_handlers::run_count(a),
         Command::Integrity(a) => bin_handlers::run_integrity(a),

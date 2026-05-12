@@ -16,6 +16,7 @@ fn retl() -> Command {
 fn root_help_lists_all_subcommands() {
     let assert = retl().arg("--help").assert().success();
     let pred = contains("scan")
+        .and(contains("dedupe"))
         .and(contains("export"))
         .and(contains("count"))
         .and(contains("integrity"))
@@ -50,6 +51,13 @@ fn export_help_advertises_zst_level_and_resume() {
 }
 
 #[test]
+fn dedupe_help_advertises_key_and_out() {
+    let assert = retl().args(["dedupe", "--help"]).assert().success();
+    let pred = contains("--key").and(contains("--out")).and(contains("json:/pointer"));
+    assert.stdout(pred);
+}
+
+#[test]
 fn scan_help_advertises_common_flags() {
     let assert = retl().args(["scan", "--help"]).assert().success();
     let pred = contains("--data-dir")
@@ -63,7 +71,8 @@ fn scan_help_advertises_common_flags() {
         .and(contains("--strict-whitelist"))
         .and(contains("--human-timestamps"))
         .and(contains("--source"))
-        .and(contains("--subreddit"));
+        .and(contains("--subreddit"))
+        .and(contains("--include-deleted"));
     assert.stdout(pred);
 }
 
@@ -82,7 +91,9 @@ fn export_help_advertises_format_and_out() {
 #[test]
 fn count_help_advertises_modes() {
     let assert = retl().args(["count", "--help"]).assert().success();
-    let pred = contains("--mode").and(contains("month")).and(contains("author"));
+    let pred = contains("--mode")
+        .and(contains("month"))
+        .and(contains("author"));
     assert.stdout(pred);
 }
 
@@ -99,7 +110,11 @@ fn integrity_help_advertises_modes_and_sample() {
 #[test]
 fn aggregate_help_requires_inputs_and_out() {
     let assert = retl().args(["aggregate", "--help"]).assert().success();
-    let pred = contains("INPUTS").and(contains("--out"));
+    let pred = contains("INPUTS")
+        .and(contains("--out"))
+        .and(contains("--by"))
+        .and(contains("--metric"))
+        .and(contains("--top"));
     assert.stdout(pred);
 }
 

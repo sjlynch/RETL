@@ -6,9 +6,11 @@ use anyhow::{Context, Result};
 use retl::{Aggregator, RedditETL, Sources, YearMonth};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use time::OffsetDateTime;
 
 use crate::bin_args::CommonOpts;
 
@@ -29,6 +31,257 @@ impl Aggregator for RecCount {
     fn merge(&mut self, other: Self) {
         self.count += other.count;
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum GroupBySpec {
+    Subreddit,
+    Author,
+    Month,
+    JsonPointer(String),
+}
+
+impl GroupBySpec {
+    pub(crate) fn parse(raw: &str) -> Result<Self> {
+        match raw {
+            "subreddit" => Ok(Self::Subreddit),
+            "author" => Ok(Self::Author),
+            "month" => Ok(Self::Month),
+            s if s.starts_with("json:") => {
+                let pointer = s.trim_start_matches("json:");
+                validate_json_pointer(pointer)?;
+                Ok(Self::JsonPointer(pointer.to_string()))
+            }
+            _ => anyhow::bail!(
+                "unsupported --by {raw:?}; expected subreddit, author, month, or json:/pointer"
+            ),
+        }
+    }
+
+    fn key_for(&self, record: &Value) -> Option<String> {
+        match self {
+            Self::Subreddit => record.get("subreddit").and_then(value_to_key),
+            Self::Author => record.get("author").and_then(value_to_key),
+            Self::Month => record.get("created_utc").and_then(value_to_month),
+            Self::JsonPointer(pointer) => record.pointer(pointer).and_then(value_to_key),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum MetricKind {
+    #[default]
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct MetricSpec {
+    kind: MetricKind,
+    pointer: Option<String>,
+}
+
+impl MetricSpec {
+    pub(crate) fn parse(raw: Option<&str>) -> Result<Self> {
+        let Some(raw) = raw else {
+            return Ok(Self::default());
+        };
+        if raw == "count" {
+            return Ok(Self::default());
+        }
+        let (kind_raw, pointer) = raw.split_once(':').ok_or_else(|| {
+            anyhow::anyhow!(
+                "unsupported --metric {raw:?}; expected count, sum:/pointer, avg:/pointer, min:/pointer, or max:/pointer"
+            )
+        })?;
+        validate_json_pointer(pointer)?;
+        let kind = match kind_raw {
+            "sum" => MetricKind::Sum,
+            "avg" => MetricKind::Avg,
+            "min" => MetricKind::Min,
+            "max" => MetricKind::Max,
+            _ => anyhow::bail!(
+                "unsupported --metric {raw:?}; expected count, sum:/pointer, avg:/pointer, min:/pointer, or max:/pointer"
+            ),
+        };
+        Ok(Self {
+            kind,
+            pointer: Some(pointer.to_string()),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct MetricState {
+    count: u64,
+    sum: f64,
+    min: Option<f64>,
+    max: Option<f64>,
+}
+
+impl MetricState {
+    fn ingest_number(&mut self, n: f64) {
+        self.count += 1;
+        self.sum += n;
+        self.min = Some(self.min.map_or(n, |old| old.min(n)));
+        self.max = Some(self.max.map_or(n, |old| old.max(n)));
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.count += other.count;
+        self.sum += other.sum;
+        if let Some(n) = other.min {
+            self.min = Some(self.min.map_or(n, |old| old.min(n)));
+        }
+        if let Some(n) = other.max {
+            self.max = Some(self.max.map_or(n, |old| old.max(n)));
+        }
+    }
+}
+
+/// Built-in grouped aggregator used by `retl aggregate --by ...`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub(crate) struct GroupMetricAgg {
+    group_by: Option<GroupBySpec>,
+    metric: MetricSpec,
+    groups: BTreeMap<String, MetricState>,
+}
+
+impl GroupMetricAgg {
+    pub(crate) fn new(group_by: GroupBySpec, metric: MetricSpec) -> Self {
+        Self {
+            group_by: Some(group_by),
+            metric,
+            groups: BTreeMap::new(),
+        }
+    }
+
+    pub(crate) fn rows(&self, top: Option<usize>) -> Vec<(String, String)> {
+        let mut rows: Vec<(String, String, f64)> = self
+            .groups
+            .iter()
+            .filter_map(|(key, state)| {
+                let (display, sort_value) = match self.metric.kind {
+                    MetricKind::Count => (state.count.to_string(), state.count as f64),
+                    MetricKind::Sum => (format_number(state.sum), state.sum),
+                    MetricKind::Avg => {
+                        if state.count == 0 {
+                            return None;
+                        }
+                        let avg = state.sum / state.count as f64;
+                        (format_number(avg), avg)
+                    }
+                    MetricKind::Min => {
+                        let n = state.min?;
+                        (format_number(n), n)
+                    }
+                    MetricKind::Max => {
+                        let n = state.max?;
+                        (format_number(n), n)
+                    }
+                };
+                Some((key.clone(), display, sort_value))
+            })
+            .collect();
+
+        if let Some(limit) = top {
+            rows.sort_by(|a, b| b.2.total_cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+            rows.truncate(limit);
+        }
+
+        rows.into_iter()
+            .map(|(key, value, _)| (key, value))
+            .collect()
+    }
+}
+
+impl Aggregator for GroupMetricAgg {
+    fn ingest(&mut self, record: &Value) {
+        let Some(group_by) = &self.group_by else {
+            return;
+        };
+        let Some(key) = group_by.key_for(record) else {
+            return;
+        };
+
+        if self.metric.kind == MetricKind::Count {
+            self.groups.entry(key).or_default().count += 1;
+            return;
+        }
+
+        let Some(pointer) = &self.metric.pointer else {
+            return;
+        };
+        let Some(n) = record.pointer(pointer).and_then(value_to_f64) else {
+            return;
+        };
+        self.groups.entry(key).or_default().ingest_number(n);
+    }
+
+    fn merge(&mut self, other: Self) {
+        if self.group_by.is_none() {
+            self.group_by = other.group_by.clone();
+            self.metric = other.metric.clone();
+        }
+        for (key, state) in other.groups {
+            self.groups.entry(key).or_default().merge(state);
+        }
+    }
+}
+
+fn validate_json_pointer(pointer: &str) -> Result<()> {
+    if pointer.is_empty() || pointer.starts_with('/') {
+        Ok(())
+    } else {
+        anyhow::bail!("JSON pointers must be empty or start with '/': {pointer:?}")
+    }
+}
+
+fn value_to_key(v: &Value) -> Option<String> {
+    match v {
+        Value::Null => None,
+        Value::String(s) => Some(s.clone()),
+        Value::Bool(b) => Some(b.to_string()),
+        Value::Number(n) => Some(n.to_string()),
+        Value::Array(_) | Value::Object(_) => serde_json::to_string(v).ok(),
+    }
+}
+
+fn value_to_f64(v: &Value) -> Option<f64> {
+    let n = match v {
+        Value::Number(n) => n.as_f64()?,
+        Value::String(s) => s.parse::<f64>().ok()?,
+        _ => return None,
+    };
+    n.is_finite().then_some(n)
+}
+
+fn value_to_month(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) if looks_like_year_month_prefix(s) => Some(s[..7].to_string()),
+        Value::String(s) => s.parse::<i64>().ok().and_then(unix_seconds_to_month),
+        Value::Number(n) => n.as_i64().and_then(unix_seconds_to_month),
+        _ => None,
+    }
+}
+
+fn looks_like_year_month_prefix(s: &str) -> bool {
+    s.len() >= 7
+        && s.as_bytes()[4] == b'-'
+        && s.as_bytes()[0..4].iter().all(u8::is_ascii_digit)
+        && s.as_bytes()[5..7].iter().all(u8::is_ascii_digit)
+}
+
+fn unix_seconds_to_month(secs: i64) -> Option<String> {
+    let dt = OffsetDateTime::from_unix_timestamp(secs).ok()?;
+    Some(format!("{:04}-{:02}", dt.year(), u8::from(dt.month())))
+}
+
+fn format_number(n: f64) -> String {
+    n.to_string()
 }
 
 // -----------------------------------------------------------------------------
@@ -77,16 +330,22 @@ pub(crate) fn build_etl(common: &CommonOpts) -> Result<RedditETL> {
     Ok(etl)
 }
 
-/// Build a `ScanPlan` from `etl` with the (possibly empty) subreddit selection
-/// applied. Inlined as a macro because `ScanPlan` is not re-exported from the
-/// crate root and we want to avoid widening the public API just for the CLI.
+/// Build a `ScanPlan` from `etl` with common CLI scan selections applied.
+/// Inlined as a macro because `ScanPlan` is not re-exported from the crate root
+/// and we want to avoid widening the public API just for the CLI.
 macro_rules! plan {
-    ($etl:expr, $subs:expr) => {{
+    ($etl:expr, $common:expr) => {{
+        let common = &$common;
         let scan = $etl.scan();
-        if $subs.is_empty() {
+        let scan = if common.subreddits.is_empty() {
             scan
         } else {
-            scan.subreddits($subs.iter().map(String::as_str))
+            scan.subreddits(common.subreddits.iter().map(String::as_str))
+        };
+        if common.include_deleted {
+            scan.include_pseudo_users()
+        } else {
+            scan
         }
     }};
 }
@@ -135,8 +394,8 @@ pub(crate) fn stream_extract_to_stdout(
 /// Discover spool parts in `dir`, parsing `part_RC_YYYY-MM.jsonl` and
 /// `part_RS_YYYY-MM.jsonl` filenames. Returns `(sorted_paths, min, max)`.
 pub(crate) fn discover_spool_parts(dir: &Path) -> Result<(Vec<PathBuf>, YearMonth, YearMonth)> {
-    let entries = fs::read_dir(dir)
-        .with_context(|| format!("reading spool dir {}", dir.display()))?;
+    let entries =
+        fs::read_dir(dir).with_context(|| format!("reading spool dir {}", dir.display()))?;
     let mut parts: Vec<(YearMonth, PathBuf)> = Vec::new();
     for e in entries {
         let e = e?;

@@ -15,11 +15,11 @@ pub struct ETLOptions {
     pub base_dir: PathBuf,
     pub comments_dir: PathBuf,
     pub submissions_dir: PathBuf,
-    pub subreddit: Option<String>,    // normalized lowercase, no "r/"
+    pub subreddit: Option<String>, // normalized lowercase, no "r/"; deprecated single-subreddit default
     pub sources: Sources,
-    pub start: Option<YearMonth>,     // inclusive
-    pub end: Option<YearMonth>,       // inclusive
-    pub shard_count: usize,           // number of on-disk dedup shards
+    pub start: Option<YearMonth>, // inclusive
+    pub end: Option<YearMonth>,   // inclusive
+    pub shard_count: usize,       // number of on-disk dedup shards
     pub whitelist_fields: Option<Vec<String>>,
     pub strict_whitelist: bool,       // fail instead of warn when whitelisted keys match nothing
     pub parallelism: Option<usize>,   // Some(N) to set rayon threads, None to use default
@@ -29,8 +29,8 @@ pub struct ETLOptions {
     pub progress_label: Option<String>, // optional label for progress bar
 
     // IO tuning
-    pub read_buffer_bytes: usize,     // BufReader capacity
-    pub write_buffer_bytes: usize,    // BufWriter capacity
+    pub read_buffer_bytes: usize,  // BufReader capacity
+    pub write_buffer_bytes: usize, // BufWriter capacity
 
     // output formatting
     pub human_readable_timestamps: bool, // convert unix timestamps to RFC3339 strings
@@ -97,6 +97,7 @@ impl ETLOptions {
         self.base_dir = base;
         self
     }
+    #[deprecated(note = "use RedditETL::scan().subreddits([...]) instead")]
     pub fn with_subreddit(mut self, sub: impl AsRef<str>) -> Self {
         let mut s = sub.as_ref().trim().to_lowercase();
         if let Some(rest) = s.strip_prefix("r/") {

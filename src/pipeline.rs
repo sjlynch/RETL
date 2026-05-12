@@ -1,6 +1,6 @@
 use crate::config::{ETLOptions, Sources};
 use crate::date::YearMonth;
-use crate::query::{normalize_str, QuerySpec};
+use crate::query::{normalize_str, BuildError, QuerySpec};
 use crate::util::{default_bot_authors, merge_extra_exclusions};
 use anyhow::Result;
 use regex::Regex;
@@ -13,49 +13,132 @@ pub struct RedditETL {
 }
 
 impl Default for RedditETL {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl RedditETL {
     pub fn new() -> Self {
-        Self { opts: ETLOptions::default() }
+        Self {
+            opts: ETLOptions::default(),
+        }
     }
 
     // -------- Builder methods --------
-    pub fn base_dir(mut self, base: impl AsRef<std::path::Path>) -> Self { self.opts = self.opts.with_base_dir(base); self }
-    pub fn subreddit(mut self, sub: impl AsRef<str>) -> Self { self.opts = self.opts.with_subreddit(sub); self }
-    pub fn sources(mut self, sources: Sources) -> Self { self.opts = self.opts.with_sources(sources); self }
-    pub fn date_range(mut self, start: Option<YearMonth>, end: Option<YearMonth>) -> Self { self.opts = self.opts.with_date_range(start, end); self }
-    pub fn whitelist_fields<I, S>(mut self, fields: I) -> Self where I: IntoIterator<Item = S>, S: Into<String> { self.opts = self.opts.with_whitelist_fields(fields); self }
-    pub fn strict_whitelist(mut self, yes: bool) -> Self { self.opts = self.opts.with_strict_whitelist(yes); self }
-    pub fn parallelism(mut self, threads: usize) -> Self { self.opts = self.opts.with_parallelism(threads); self }
-    pub fn work_dir(mut self, dir: impl AsRef<Path>) -> Self { self.opts = self.opts.with_work_dir(dir); self }
-    pub fn shard_count(mut self, count: usize) -> Self { self.opts = self.opts.with_shard_count(count); self }
-    pub fn file_concurrency(mut self, n: usize) -> Self { self.opts = self.opts.with_file_concurrency(n); self }
-    pub fn progress(mut self, yes: bool) -> Self { self.opts = self.opts.with_progress(yes); self }
-    pub fn progress_label(mut self, label: impl Into<String>) -> Self { self.opts = self.opts.with_progress_label(label); self }
-    pub fn io_read_buffer(mut self, bytes: usize) -> Self { self.opts = self.opts.with_io_read_buffer(bytes); self }
-    pub fn io_write_buffer(mut self, bytes: usize) -> Self { self.opts = self.opts.with_io_write_buffer(bytes); self }
-    pub fn io_buffers(mut self, read_bytes: usize, write_bytes: usize) -> Self { self.opts = self.opts.with_io_buffers(read_bytes, write_bytes); self }
-    pub fn timestamps_human_readable(mut self, yes: bool) -> Self { self.opts = self.opts.with_human_timestamps(yes); self }
-    pub fn zst_level(mut self, level: i32) -> Self { self.opts = self.opts.with_zst_level(level); self }
+    pub fn base_dir(mut self, base: impl AsRef<std::path::Path>) -> Self {
+        self.opts = self.opts.with_base_dir(base);
+        self
+    }
+    #[deprecated(
+        note = "use RedditETL::scan().subreddits([...]) instead; ETLOptions::subreddit is a single-value default"
+    )]
+    pub fn subreddit(mut self, sub: impl AsRef<str>) -> Self {
+        #[allow(deprecated)]
+        {
+            self.opts = self.opts.with_subreddit(sub);
+        }
+        self
+    }
+    pub fn sources(mut self, sources: Sources) -> Self {
+        self.opts = self.opts.with_sources(sources);
+        self
+    }
+    pub fn date_range(mut self, start: Option<YearMonth>, end: Option<YearMonth>) -> Self {
+        self.opts = self.opts.with_date_range(start, end);
+        self
+    }
+    pub fn whitelist_fields<I, S>(mut self, fields: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.opts = self.opts.with_whitelist_fields(fields);
+        self
+    }
+    pub fn strict_whitelist(mut self, yes: bool) -> Self {
+        self.opts = self.opts.with_strict_whitelist(yes);
+        self
+    }
+    pub fn parallelism(mut self, threads: usize) -> Self {
+        self.opts = self.opts.with_parallelism(threads);
+        self
+    }
+    pub fn work_dir(mut self, dir: impl AsRef<Path>) -> Self {
+        self.opts = self.opts.with_work_dir(dir);
+        self
+    }
+    pub fn shard_count(mut self, count: usize) -> Self {
+        self.opts = self.opts.with_shard_count(count);
+        self
+    }
+    pub fn file_concurrency(mut self, n: usize) -> Self {
+        self.opts = self.opts.with_file_concurrency(n);
+        self
+    }
+    pub fn progress(mut self, yes: bool) -> Self {
+        self.opts = self.opts.with_progress(yes);
+        self
+    }
+    pub fn progress_label(mut self, label: impl Into<String>) -> Self {
+        self.opts = self.opts.with_progress_label(label);
+        self
+    }
+    pub fn io_read_buffer(mut self, bytes: usize) -> Self {
+        self.opts = self.opts.with_io_read_buffer(bytes);
+        self
+    }
+    pub fn io_write_buffer(mut self, bytes: usize) -> Self {
+        self.opts = self.opts.with_io_write_buffer(bytes);
+        self
+    }
+    pub fn io_buffers(mut self, read_bytes: usize, write_bytes: usize) -> Self {
+        self.opts = self.opts.with_io_buffers(read_bytes, write_bytes);
+        self
+    }
+    pub fn timestamps_human_readable(mut self, yes: bool) -> Self {
+        self.opts = self.opts.with_human_timestamps(yes);
+        self
+    }
+    pub fn zst_level(mut self, level: i32) -> Self {
+        self.opts = self.opts.with_zst_level(level);
+        self
+    }
     /// Override the inflight-bytes backpressure budget used by bucketing/dedupe
     /// producer/consumer pairs. See `ETLOptions::inflight_bytes`.
-    pub fn inflight_bytes(mut self, bytes: usize) -> Self { self.opts = self.opts.with_inflight_bytes(bytes); self }
+    pub fn inflight_bytes(mut self, bytes: usize) -> Self {
+        self.opts = self.opts.with_inflight_bytes(bytes);
+        self
+    }
     /// Opt in to resumable spool runs: when enabled, `extract_spool_monthly`
     /// reads and writes a `<out_dir>/_progress.json` sidecar so a re-run skips
     /// months already published by a previous (possibly crashed) invocation.
     /// Default false to preserve existing behavior.
-    pub fn resume(mut self, yes: bool) -> Self { self.opts = self.opts.with_resume(yes); self }
+    pub fn resume(mut self, yes: bool) -> Self {
+        self.opts = self.opts.with_resume(yes);
+        self
+    }
 
     // -------- Advanced: enter query mode --------
     pub fn scan(self) -> ScanPlan {
-        ScanPlan { etl: self, query: QuerySpec { filter_pseudo_users: true, ..Default::default() }.normalize() }
+        ScanPlan {
+            etl: self,
+            query: QuerySpec {
+                filter_pseudo_users: true,
+                ..Default::default()
+            }
+            .normalize(),
+        }
     }
 
     pub(crate) fn ensure_work_dir(&self) -> Result<PathBuf> {
-        let dir = self.opts.work_dir.clone().unwrap_or_else(|| self.opts.base_dir.join(".reddit_etl_work"));
-        fs::create_dir_all(&dir)?; Ok(dir)
+        let dir = self
+            .opts
+            .work_dir
+            .clone()
+            .unwrap_or_else(|| self.opts.base_dir.join(".reddit_etl_work"));
+        fs::create_dir_all(&dir)?;
+        Ok(dir)
     }
 }
 
@@ -64,6 +147,44 @@ impl RedditETL {
 pub struct ScanPlan {
     pub(crate) etl: RedditETL,
     pub(crate) query: QuerySpec,
+}
+
+/// Input accepted by [`ScanPlan::author_regex`]. Passing a raw pattern defers
+/// compilation until [`ScanPlan::build`], so malformed regexes return a
+/// structured [`BuildError`] instead of panicking during builder construction.
+#[doc(hidden)]
+pub enum AuthorRegexInput {
+    Compiled(Regex),
+    Pattern(String),
+}
+
+#[doc(hidden)]
+pub trait IntoAuthorRegex {
+    fn into_author_regex(self) -> AuthorRegexInput;
+}
+
+impl IntoAuthorRegex for Regex {
+    fn into_author_regex(self) -> AuthorRegexInput {
+        AuthorRegexInput::Compiled(self)
+    }
+}
+
+impl IntoAuthorRegex for &str {
+    fn into_author_regex(self) -> AuthorRegexInput {
+        AuthorRegexInput::Pattern(self.to_string())
+    }
+}
+
+impl IntoAuthorRegex for String {
+    fn into_author_regex(self) -> AuthorRegexInput {
+        AuthorRegexInput::Pattern(self)
+    }
+}
+
+impl IntoAuthorRegex for &String {
+    fn into_author_regex(self) -> AuthorRegexInput {
+        AuthorRegexInput::Pattern(self.clone())
+    }
 }
 
 impl ScanPlan {
@@ -87,22 +208,49 @@ impl ScanPlan {
         self
     }
 
-    pub fn subreddit(mut self, s: impl AsRef<str>) -> Self { self.query.subreddits = Some(vec![normalize_str(s.as_ref())]); self }
-    pub fn subreddits<I, S>(self, iter: I) -> Self where I: IntoIterator<Item = S>, S: AsRef<str> {
+    pub fn subreddit(mut self, s: impl AsRef<str>) -> Self {
+        self.query.subreddits = Some(vec![normalize_str(s.as_ref())]);
+        self
+    }
+    pub fn subreddits<I, S>(self, iter: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
         self.set_string_list(|q, v| q.subreddits = Some(v), iter, normalize_str)
     }
-    pub fn author(mut self, author: impl AsRef<str>) -> Self { self.query.authors_in = Some(vec![normalize_str(author.as_ref())]); self.query = self.query.normalize(); self }
-    pub fn authors<I, S>(self, iter: I) -> Self where I: IntoIterator<Item = S>, S: AsRef<str> {
+    pub fn author(mut self, author: impl AsRef<str>) -> Self {
+        self.query.authors_in = Some(vec![normalize_str(author.as_ref())]);
+        self.query = self.query.normalize();
+        self
+    }
+    pub fn authors<I, S>(self, iter: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
         self.set_string_list(|q, v| q.authors_in = Some(v), iter, normalize_str)
     }
-    pub fn authors_in<I, S>(self, iter: I) -> Self where I: IntoIterator<Item = S>, S: AsRef<str> {
+    pub fn authors_in<I, S>(self, iter: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
         self.set_string_list(|q, v| q.authors_in = Some(v), iter, normalize_str)
     }
-    pub fn authors_out<I, S>(self, iter: I) -> Self where I: IntoIterator<Item = S>, S: AsRef<str> {
+    pub fn authors_out<I, S>(self, iter: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
         self.set_string_list(|q, v| q.authors_out = Some(v), iter, normalize_str)
     }
     /// Alias for authors_out: exclude the provided authors (normalized).
-    pub fn exclude_authors<I, S>(self, iter: I) -> Self where I: IntoIterator<Item = S>, S: AsRef<str> {
+    pub fn exclude_authors<I, S>(self, iter: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
         self.authors_out(iter)
     }
     /// Convenience: exclude a default set of bot/service accounts, plus any env/file augments.
@@ -113,22 +261,72 @@ impl ScanPlan {
         self.query = self.query.normalize();
         self
     }
-    pub fn author_regex(mut self, re: Regex) -> Self { self.query.author_regex = Some(re); self }
-    pub fn min_score(mut self, v: i64) -> Self { self.query.min_score = Some(v); self }
-    pub fn max_score(mut self, v: i64) -> Self { self.query.max_score = Some(v); self }
-    pub fn keywords_any<I, S>(self, iter: I) -> Self where I: IntoIterator<Item = S>, S: AsRef<str> {
+    pub fn author_regex<R: IntoAuthorRegex>(mut self, re: R) -> Self {
+        match re.into_author_regex() {
+            AuthorRegexInput::Compiled(re) => {
+                self.query.author_regex_pattern = Some(re.as_str().to_string());
+                self.query.author_regex = Some(re);
+            }
+            AuthorRegexInput::Pattern(pattern) => {
+                self.query.author_regex_pattern = Some(pattern);
+                self.query.author_regex = None;
+            }
+        }
+        self
+    }
+    pub fn min_score(mut self, v: i64) -> Self {
+        self.query.min_score = Some(v);
+        self
+    }
+    pub fn max_score(mut self, v: i64) -> Self {
+        self.query.max_score = Some(v);
+        self
+    }
+    pub fn keywords_any<I, S>(self, iter: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
         self.set_string_list(|q, v| q.keywords_any = Some(v), iter, lowercase_str)
     }
-    pub fn domains_in<I, S>(self, iter: I) -> Self where I: IntoIterator<Item = S>, S: AsRef<str> {
+    pub fn domains_in<I, S>(self, iter: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
         self.set_string_list(|q, v| q.domains_in = Some(v), iter, lowercase_str)
     }
-    pub fn contains_url(mut self, yes: bool) -> Self { self.query.contains_url = Some(yes); self }
-    pub fn allow_pseudo_users(mut self) -> Self { self.query.filter_pseudo_users = false; self }
-    pub fn whitelist_fields<I, S>(mut self, fields: I) -> Self where I: IntoIterator<Item = S>, S: Into<String> {
-        // correct builder on RedditETL instance
-        self.etl = self.etl.whitelist_fields(fields); self
+    pub fn contains_url(mut self, yes: bool) -> Self {
+        self.query.contains_url = Some(yes);
+        self
     }
-    pub fn strict_whitelist(mut self, yes: bool) -> Self { self.etl = self.etl.strict_whitelist(yes); self }
+    pub fn include_pseudo_users(mut self) -> Self {
+        self.query.filter_pseudo_users = false;
+        self
+    }
+    #[deprecated(note = "use include_pseudo_users()")]
+    pub fn allow_pseudo_users(self) -> Self {
+        self.include_pseudo_users()
+    }
+    pub fn build(mut self) -> std::result::Result<Self, BuildError> {
+        self.query = self.query.normalize();
+        self.query.validate()?;
+        self.query = self.query.compile_author_regex()?;
+        Ok(self)
+    }
+    pub fn whitelist_fields<I, S>(mut self, fields: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        // correct builder on RedditETL instance
+        self.etl = self.etl.whitelist_fields(fields);
+        self
+    }
+    pub fn strict_whitelist(mut self, yes: bool) -> Self {
+        self.etl = self.etl.strict_whitelist(yes);
+        self
+    }
 }
 
 #[inline]

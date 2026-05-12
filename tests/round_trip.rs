@@ -62,7 +62,7 @@ fn round_trip_zst_preserves_counts_and_ids() {
         .progress(false)
         .scan()
         .subreddit("programming")
-        .allow_pseudo_users()
+        .include_pseudo_users()
         .export_partitioned(&out_dir, ExportFormat::Zst)
         .unwrap();
 
@@ -79,7 +79,7 @@ fn round_trip_zst_preserves_counts_and_ids() {
         .progress(false)
         .scan()
         .subreddit("programming")
-        .allow_pseudo_users()
+        .include_pseudo_users()
         .count_by_month()
         .unwrap();
 
@@ -126,7 +126,7 @@ fn round_trip_jsonl_preserves_counts_and_ids() {
         .progress(false)
         .scan()
         .subreddit("programming")
-        .allow_pseudo_users()
+        .include_pseudo_users()
         .export_partitioned(&out_dir, ExportFormat::Jsonl)
         .unwrap();
 
@@ -189,7 +189,7 @@ fn round_trip_zst_with_whitelist_is_structural_subset() {
         .progress(false)
         .scan()
         .subreddit("programming")
-        .allow_pseudo_users()
+        .include_pseudo_users()
         .whitelist_fields(whitelist)
         .export_partitioned(&out_dir, ExportFormat::Zst)
         .unwrap();

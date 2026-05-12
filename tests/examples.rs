@@ -46,7 +46,7 @@ fn extract_jsonl_scan_builder() {
         .progress(false)
         .scan()
         .subreddit("programming")
-        .allow_pseudo_users() // include `[deleted]`
+        .include_pseudo_users() // include `[deleted]`
         .extract_to_jsonl(&out)
         .unwrap();
 
@@ -72,7 +72,7 @@ fn export_partitioned_jsonl() {
         .progress(false)
         .scan()
         .subreddit("programming")
-        .allow_pseudo_users() // include `[deleted]`
+        .include_pseudo_users() // include `[deleted]`
         .export_partitioned(&out_dir, ExportFormat::Jsonl)
         .unwrap();
 
