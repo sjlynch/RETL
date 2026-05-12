@@ -364,7 +364,7 @@ fn dedupe_build_and_merge_groups_by_key_in_sorted_order() {
 }
 
 #[test]
-fn dedupe_single_run_promotes_directly_to_output() {
+fn dedupe_single_run_still_applies_merge_callback() {
     let dir = tempfile::tempdir().unwrap();
     let in_path = dir.path().join("small.ndjson");
     let mut lines = Vec::with_capacity(20);
@@ -376,7 +376,8 @@ fn dedupe_single_run_promotes_directly_to_output() {
     }
     write_ndjson(&in_path, &lines);
 
-    // Generous buffer -> exactly one run; merge_runs_sorted promotes it directly.
+    // Generous buffer -> exactly one run; merge_runs_sorted must still apply
+    // the caller's merge callback so single-run inputs are deduped too.
     let cfg = DedupeCfg {
         mem: retl::AdaptiveMemCfg { soft_low_frac: 0.0, high_frac: 1.0, adapt_cooldown_ms: 10_000 },
         min_buf_mb: 64,
@@ -391,8 +392,14 @@ fn dedupe_single_run_promotes_directly_to_output() {
     assert_eq!(runs.len(), 1);
 
     let out = dir.path().join("merged.ndjson");
-    merge_runs_sorted(&runs, &out, &key, &cfg, |_k, _g, _w| Ok(())).unwrap();
-    assert!(out.exists());
+    merge_runs_sorted(&runs, &out, &key, &cfg, |k, group, w| {
+        assert_eq!(group.len(), 4, "20 rows over 5 authors -> 4 per key");
+        writeln!(w, "{k}")?;
+        Ok(())
+    }).unwrap();
+
+    let merged = common::read_lines(&out);
+    assert_eq!(merged, vec!["u00", "u01", "u02", "u03", "u04"]);
 }
 
 // ---------- kv_shard ----------

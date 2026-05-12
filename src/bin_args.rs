@@ -24,6 +24,9 @@ pub(crate) struct Cli {
 pub(crate) enum Command {
     /// Scan and emit unique usernames matching the query selection.
     Scan(ScanArgs),
+    /// Emit distinct keys (author, subreddit, or JSON pointer) matching the query selection.
+    #[command(alias = "unique", alias = "distinct")]
+    Dedupe(DedupeArgs),
     /// Export filtered records as JSONL, a JSON array, or per-month spool files.
     Export(ExportArgs),
     /// Count records by month, or write per-author counts to TSV.
@@ -123,6 +126,18 @@ pub(crate) struct ScanArgs {
     /// Output file for usernames (default: stdout).
     #[arg(long, short)]
     pub(crate) out: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct DedupeArgs {
+    #[command(flatten)]
+    pub(crate) common: CommonOpts,
+    /// Key to deduplicate: `author`, `subreddit`, or `json:/pointer`.
+    #[arg(long, value_name = "KEY")]
+    pub(crate) key: String,
+    /// Output text file, one unique key per line. Use `-` for stdout.
+    #[arg(long, short)]
+    pub(crate) out: PathBuf,
 }
 
 #[derive(Args, Debug)]

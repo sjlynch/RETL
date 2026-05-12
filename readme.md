@@ -106,8 +106,8 @@ builder methods.
 
 ## Command-Line Interface
 
-The `retl` binary exposes five subcommands. All accept a shared set of flags
-(see `retl <subcommand> --help` for the full list):
+The `retl` binary exposes the main ETL subcommands. All accept a shared set of
+flags (see `retl <subcommand> --help` for the full list):
 
 | Common flag | Purpose |
 | --- | --- |
@@ -132,6 +132,30 @@ retl scan \
   --start 2006-01 --end 2006-04 \
   --subreddit programming --subreddit reddit.com \
   --out usernames.txt
+~~~
+
+### `dedupe` — emit unique keys
+
+Walks the corpus, applies the query selection, and writes one distinct key per
+line to `--out` (use `--out -` for stdout). `--key` reuses RETL's
+`KeyExtractor`: `author` and `subreddit` use the `MinimalRecord` fast path;
+`json:/pointer` parses full JSON only to extract the requested JSON Pointer.
+Aliases: `unique`, `distinct`.
+
+~~~sh
+# Unique authors who posted in r/rust in 2020-2023
+retl dedupe \
+  --data-dir ./data \
+  --start 2020-01 --end 2023-12 \
+  --subreddit rust \
+  --key author \
+  --out unique_authors.txt
+
+# Unique subreddits in the selected comments/submissions
+retl dedupe --key subreddit --start 2021-01 --end 2021-12 --out subreddits.txt
+
+# Unique parent IDs from comments using a JSON Pointer key
+retl dedupe --source rc --key 'json:/parent_id' --start 2020-01 --end 2020-12 --out parent_ids.txt
 ~~~
 
 ### `export` — extract filtered records
