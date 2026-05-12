@@ -3,8 +3,8 @@
 
 use anyhow::{Context, Result};
 use retl::{
-    discover_all, plan_files, replace_file_atomic_backoff, total_compressed_size, FileKind,
-    IntegrityMode, KeyExtractor, RedditETL, Sources, YearMonth,
+    create_with_backoff, discover_all, plan_files, replace_file_atomic_backoff,
+    total_compressed_size, FileKind, IntegrityMode, KeyExtractor, RedditETL, Sources, YearMonth,
 };
 use std::collections::BTreeMap;
 use std::fs;
@@ -276,6 +276,7 @@ pub(crate) fn run_aggregate(args: AggregateArgs) -> Result<()> {
     fs::create_dir_all(&shards_dir)
         .with_context(|| format!("creating shards_dir {}", shards_dir.display()))?;
 
+    let input_count = args.inputs.len();
     if let Some(by) = args.by {
         let group_by = GroupBySpec::parse(&by)?;
         let metric = MetricSpec::parse(args.metric.as_deref())?;
@@ -286,6 +287,7 @@ pub(crate) fn run_aggregate(args: AggregateArgs) -> Result<()> {
                 &shards_dir,
                 || GroupMetricAgg::new(group_by.clone(), metric.clone()),
             )?;
+        ensure_aggregate_inputs_succeeded(input_count, built, errors)?;
         write_grouped_tsv(&args.out, agg.rows(top))?;
         eprintln!(
             "Aggregated {} shard(s) to TSV; {} input(s) failed during shard build",
@@ -298,13 +300,10 @@ pub(crate) fn run_aggregate(args: AggregateArgs) -> Result<()> {
         if args.top.is_some() {
             anyhow::bail!("--top requires --by");
         }
-        let (built, errors) = etl.aggregate_jsonls_parallel::<RecCount>(
-            args.inputs,
-            &shards_dir,
-            &args.out,
-            true,
-            args.pretty,
-        )?;
+        let (agg, built, errors) =
+            etl.aggregate_jsonls_parallel_collect::<RecCount>(args.inputs, &shards_dir)?;
+        ensure_aggregate_inputs_succeeded(input_count, built, errors)?;
+        write_rec_count_json(&args.out, &agg, args.pretty)?;
         eprintln!(
             "Aggregated {} shard(s); {} input(s) failed during shard build",
             built, errors
@@ -313,10 +312,41 @@ pub(crate) fn run_aggregate(args: AggregateArgs) -> Result<()> {
     Ok(())
 }
 
+fn ensure_aggregate_inputs_succeeded(
+    input_count: usize,
+    built: usize,
+    errors: usize,
+) -> Result<()> {
+    if input_count > 0 && (errors == input_count || built == 0) {
+        anyhow::bail!(
+            "aggregate failed: {errors} of {input_count} input(s) failed during shard build; {built} shard(s) merged"
+        );
+    }
+    Ok(())
+}
+
+fn write_rec_count_json(out: &Path, agg: &RecCount, pretty: bool) -> Result<()> {
+    let tmp = out.with_extension("json.inprogress");
+    {
+        let f = create_with_backoff(&tmp, 16, 50)
+            .with_context(|| format!("creating output tempfile {}", tmp.display()))?;
+        let mut w = BufWriter::new(f);
+        if pretty {
+            serde_json::to_writer_pretty(&mut w, agg)?;
+        } else {
+            serde_json::to_writer(&mut w, agg)?;
+        }
+        w.flush()?;
+    }
+    replace_file_atomic_backoff(&tmp, out)
+        .with_context(|| format!("publishing output file {}", out.display()))?;
+    Ok(())
+}
+
 fn write_grouped_tsv(out: &Path, rows: Vec<(String, String)>) -> Result<()> {
     let tmp = out.with_extension("tsv.inprogress");
     {
-        let f = fs::File::create(&tmp)
+        let f = create_with_backoff(&tmp, 16, 50)
             .with_context(|| format!("creating output tempfile {}", tmp.display()))?;
         let mut w = BufWriter::new(f);
         for (key, value) in rows {
