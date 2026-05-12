@@ -97,18 +97,17 @@ fn normal_scan_warns_and_skips_truncated_month_without_crashing() {
         .progress(false)
         .scan()
         .subreddit("programming")
-        .allow_pseudo_users()
+        .include_pseudo_users()
         .count_by_month()
-        .expect("scan over a truncated month must not error out — \
-                 the streaming reader is supposed to warn and skip");
+        .expect(
+            "scan over a truncated month must not error out — \
+                 the streaming reader is supposed to warn and skip",
+        );
 
     // The map may be empty (file failed before any record was decoded) or
     // contain a partial count for 2006-03; either is acceptable. The
     // load-bearing assertion is that we got here without panicking.
-    let partial = counts
-        .get(&YearMonth::new(2006, 3))
-        .copied()
-        .unwrap_or(0);
+    let partial = counts.get(&YearMonth::new(2006, 3)).copied().unwrap_or(0);
     assert!(
         partial < FIXTURE_RECORDS as u64,
         "expected a partial count from the truncated month, got {} (full count would be {})",
