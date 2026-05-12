@@ -147,7 +147,8 @@ pub use crate::aggregate::{merge_aggregator_shards_parallel, merge_aggregator_sh
 
 // Expose multiprogress and progress helpers.
 pub use crate::progress::{
-    make_count_progress, make_progress_bar_labeled, set_global_multiprogress, ProgressScope,
+    make_count_progress, make_progress_bar_labeled, set_global_multiprogress,
+    total_compressed_size, ProgressScope,
 };
 
 // Expose memory helpers for adaptive throttling from the binary.

@@ -135,8 +135,8 @@ builder methods.
 
 ## Command-Line Interface
 
-The `retl` binary exposes the main ETL subcommands. All accept a shared set of
-flags (see `retl <subcommand> --help` for the full list):
+The `retl` binary exposes the main ETL subcommands. Data-processing commands
+accept a shared set of flags (see `retl <subcommand> --help` for the full list):
 
 | Common flag | Purpose |
 | --- | --- |
@@ -155,6 +155,23 @@ flags (see `retl <subcommand> --help` for the full list):
 ### Pseudo-user filtering (default ON)
 
 By default, scans exclude records whose `author` is `[deleted]`, `[removed]`, or the empty string. This keeps normal username/export queries focused on real author names, but it matters for deletion-rate, ban-wave, or corpus-completeness analysis. Pass `--include-deleted` (alias: `--include-pseudo-users`) on the CLI, or call `.include_pseudo_users()` on a `ScanPlan`, to keep those records.
+
+### `describe` — inspect the discovered corpus
+
+Lists the monthly `.zst` files RETL sees under `--data-dir` without decoding
+anything. Use it before a long scan/export to verify the `comments/` +
+`submissions/` layout, available month ranges, selected file count, and total
+compressed bytes:
+
+~~~sh
+retl describe --data-dir ./data --source both --start 2016-01 --end 2016-12
+# source  available              files_in_range  compressed_bytes
+# rc      2005-12..=2024-12      12              123456789012
+# rs      2005-06..=2024-12      12              23456789012
+# total                          24              146913578024
+~~~
+
+Aliases: `retl ls`, `retl plan`.
 
 ### `scan` — emit unique usernames
 

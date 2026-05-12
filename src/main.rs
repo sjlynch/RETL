@@ -23,6 +23,7 @@ fn main() -> Result<()> {
     retl::init_tracing_for_binary();
     let cli = Cli::parse();
     match cli.command {
+        Command::Describe(a) => bin_handlers::run_describe(a),
         Command::Scan(a) => bin_handlers::run_scan(a),
         Command::Dedupe(a) => bin_handlers::run_dedupe(a),
         Command::Export(a) => bin_handlers::run_export(a),
