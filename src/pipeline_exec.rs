@@ -46,6 +46,34 @@ enum Finalize {
 const FILE_PREFIX_RC: &str = "part_RC";
 const FILE_PREFIX_RS: &str = "part_RS";
 
+fn warn_dedupe_zero_keys(key: &KeyExtractor, input_records: u64) {
+    match key {
+        KeyExtractor::JsonPointer(ptr) => {
+            let key_spec = format!("json:{ptr}");
+            tracing::warn!(
+                key = %key_spec,
+                input_records,
+                "--key {key_spec} matched nothing; check the pointer; the value may not be a scalar"
+            );
+        }
+        KeyExtractor::AuthorLowerFast => tracing::warn!(
+            key = "author",
+            input_records,
+            "--key author extracted zero keys from matching input records"
+        ),
+        KeyExtractor::SubredditLowerFast => tracing::warn!(
+            key = "subreddit",
+            input_records,
+            "--key subreddit extracted zero keys from matching input records"
+        ),
+        KeyExtractor::ByValue(_) => tracing::warn!(
+            key = "<custom>",
+            input_records,
+            "custom dedupe key extractor extracted zero keys from matching input records"
+        ),
+    }
+}
+
 // -------- Original operations (back-compat) --------
 
 impl RedditETL {
@@ -198,14 +226,26 @@ impl ScanPlan {
                 let input = tmp_dir.join("matched.ndjson");
                 let f = create_with_backoff(&input, 16, 50)
                     .with_context(|| format!("create {}", input.display()))?;
-                let writer = Mutex::new(BufWriter::with_capacity(self.etl.opts.write_buffer_bytes, f));
+                let writer = Mutex::new(BufWriter::with_capacity(
+                    self.etl.opts.write_buffer_bytes,
+                    f,
+                ));
+                let matched_records = AtomicU64::new(0);
 
-                scan_records(&self.etl, &self.query, /*show_progress=*/true, |_min, _kind, line| {
-                    let mut w = writer.lock().map_err(|_| anyhow!("dedupe writer lock poisoned"))?;
-                    w.write_all(line.as_bytes())?;
-                    w.write_all(b"\n")?;
-                    Ok(())
-                })?;
+                scan_records(
+                    &self.etl,
+                    &self.query,
+                    /*show_progress=*/ true,
+                    |_min, _kind, line| {
+                        matched_records.fetch_add(1, Ordering::Relaxed);
+                        let mut w = writer
+                            .lock()
+                            .map_err(|_| anyhow!("dedupe writer lock poisoned"))?;
+                        w.write_all(line.as_bytes())?;
+                        w.write_all(b"\n")?;
+                        Ok(())
+                    },
+                )?;
                 writer
                     .into_inner()
                     .map_err(|_| anyhow!("dedupe writer lock poisoned"))?
@@ -232,6 +272,12 @@ impl ScanPlan {
                     unique_count += 1;
                     Ok(())
                 })?;
+
+                let matched_records = matched_records.load(Ordering::Relaxed);
+                if matched_records > 0 && unique_count == 0 {
+                    warn_dedupe_zero_keys(key, matched_records);
+                }
+
                 Ok(unique_count)
             })();
 
