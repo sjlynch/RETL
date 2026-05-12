@@ -2,8 +2,8 @@
 mod common;
 
 use common::*;
-use retl::{RedditETL, Sources, YearMonth};
 use regex::Regex;
+use retl::{RedditETL, Sources, YearMonth};
 
 /// Demonstrates advanced `scan().usernames()` with keyword, score and URL filters:
 ///   - keywords_any("rust") matches title "Rust news" (submission) and a comment body
@@ -27,7 +27,9 @@ fn usernames_with_filters_keywords_url_score() {
         .unwrap();
 
     let mut got = Vec::<String>::new();
-    while let Some(u) = it.next() { got.push(u.to_lowercase()); }
+    while let Some(u) = it.next() {
+        got.push(u.to_lowercase());
+    }
     got.sort();
     got.dedup();
     assert_eq!(got, vec!["alice"]);
@@ -51,7 +53,9 @@ fn usernames_with_domain_filter_submissions_only() {
         .unwrap();
 
     let mut got: Vec<String> = it.collect();
-    for s in got.iter_mut() { *s = s.to_lowercase(); }
+    for s in got.iter_mut() {
+        *s = s.to_lowercase();
+    }
     got.sort();
     got.dedup();
     assert_eq!(got, vec!["automoderator"]);
@@ -59,7 +63,7 @@ fn usernames_with_domain_filter_submissions_only() {
 
 /// Demonstrates author allow/deny lists and regex:
 ///   - authors_in(["alice","charlie"]) whitelists those two
-///   - authors_out(["charlie"]) removes charlie again
+///   - authors_out(["automoderator"]) applies an additional deny list
 ///   - author_regex(^a.*) keeps only authors starting with 'a' (alice)
 #[test]
 fn usernames_authors_in_out_and_regex() {
@@ -73,7 +77,7 @@ fn usernames_authors_in_out_and_regex() {
         .scan()
         .subreddit("programming")
         .authors_in(["alice", "charlie"])
-        .authors_out(["charlie"])
+        .authors_out(["automoderator"])
         .author_regex(re)
         .usernames()
         .unwrap();
