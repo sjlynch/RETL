@@ -102,6 +102,10 @@ pub(crate) struct QueryOpts {
     #[arg(long = "exclude-author", value_name = "NAME")]
     pub(crate) exclude_authors: Vec<String>,
 
+    /// Exclude RETL's default bot/service-account list, plus ETL_EXCLUDE_AUTHORS* augments.
+    #[arg(long = "exclude-common-bots")]
+    pub(crate) exclude_common_bots: bool,
+
     /// Regex matched against author names.
     #[arg(long = "author-regex", value_name = "REGEX")]
     pub(crate) author_regex: Option<String>,

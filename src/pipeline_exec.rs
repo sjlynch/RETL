@@ -868,6 +868,7 @@ fn build_resume_fingerprint(etl: &RedditETL, query: &QuerySpec, operation: &str)
             "subreddits": query.subreddits.as_ref(),
             "authors_in": query.authors_in.as_ref(),
             "authors_out": query.authors_out.as_ref(),
+            "exclude_common_bots": query.exclude_common_bots,
             "author_regex": query.author_regex.as_ref().map(|re| re.as_str()),
             "author_regex_pattern": query.author_regex_pattern.as_ref(),
             "min_score": query.min_score,

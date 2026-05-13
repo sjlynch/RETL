@@ -90,6 +90,7 @@ fn scan_help_advertises_common_flags() {
         .and(contains("--subreddit"))
         .and(contains("--author"))
         .and(contains("--exclude-author"))
+        .and(contains("--exclude-common-bots"))
         .and(contains("--author-regex"))
         .and(contains("--keyword"))
         .and(contains("--min-score"))
@@ -154,6 +155,7 @@ fn aggregate_help_requires_inputs_out_and_runtime_flags_only() {
         .and(contains("--source").not())
         .and(contains("--subreddit").not())
         .and(contains("--include-deleted").not())
+        .and(contains("--exclude-common-bots").not())
         .and(contains("--file-concurrency").not());
     assert.stdout(pred);
 }

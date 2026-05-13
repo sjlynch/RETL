@@ -135,10 +135,11 @@ builder methods.
 
 ## Command-Line Interface
 
-The `retl` binary exposes the main ETL subcommands. Corpus-scanning commands
-(`scan`, `dedupe`, `export`, `count`, `integrity`, and `first-seen`) accept a
+The `retl` binary exposes the main ETL subcommands. Querying commands that scan
+the corpus (`scan`, `dedupe`, `export`, `count`, and `first-seen`) accept a
 shared set of selection/runtime flags (see `retl <subcommand> --help` for the
-full list):
+full list). `integrity` scans the corpus too, but only accepts corpus selection
+and validation flags because it does not filter records by query:
 
 | Common flag | Purpose |
 | --- | --- |
@@ -149,6 +150,7 @@ full list):
 | `--subreddit <NAME>` (`-s`) | Subreddit selector. Repeatable; omit for "any subreddit". |
 | `--author <NAME>` / `--author-in <NAME>` | Author allow-list selector. Repeatable. |
 | `--exclude-author <NAME>` | Author deny-list selector. Repeatable. |
+| `--exclude-common-bots` | Exclude RETL's built-in bot/service-account list plus `ETL_EXCLUDE_AUTHORS*` augments; composes with `--exclude-author`. |
 | `--author-regex <REGEX>` | Keep authors matching a regex. |
 | `--keyword <TEXT>` | Keep records containing a keyword in body/title/selftext. Repeatable. |
 | `--min-score <N>` / `--max-score <N>` | Inclusive score thresholds. |
@@ -160,7 +162,7 @@ full list):
 
 ### Pseudo-user filtering (default ON)
 
-By default, scans exclude records whose `author` is `[deleted]`, `[removed]`, or the empty string. This keeps normal username/export queries focused on real author names, but it matters for deletion-rate, ban-wave, or corpus-completeness analysis. Pass `--include-deleted` (alias: `--include-pseudo-users`) on the CLI, or call `.include_pseudo_users()` on a `ScanPlan`, to keep those records.
+By default, scans exclude records whose `author` is `[deleted]`, `[removed]`, or the empty string. This keeps normal username/export queries focused on real author names, but it matters for deletion-rate, ban-wave, or corpus-completeness analysis. Pass `--include-deleted` (alias: `--include-pseudo-users`) on the CLI, or call `.include_pseudo_users()` on a `ScanPlan`, to keep those records. Bot/service-account exclusions are separate: use `--exclude-common-bots` or `.exclude_common_bots()` to drop accounts such as AutoModerator without changing pseudo-user handling.
 
 ### `describe` — inspect the discovered corpus
 
@@ -423,7 +425,10 @@ Run from that driver crate:
 cargo run --release
 ~~~
 
-For an in-repo executable example, see `examples/quickstart.rs`.
+For an in-repo executable example, see `examples/quickstart.rs`. The central
+query builder type and its validation error are public, so downstream code can
+name `retl::ScanPlan` and `retl::QueryBuildError` when wrapping or storing
+plans.
 
 ---
 
@@ -440,6 +445,10 @@ All examples below operate on the same API you saw in the Quick Start.
   Reddit comments do not have `domain`; when used with `Sources::Both` or
   `Sources::Comments`, comments are dropped and RETL emits a warning. Use
   `Sources::Submissions` when you intend a domain-only scan.
+- `.exclude_common_bots()` merges RETL's default bot/service-account deny-list
+  with any `.authors_out(...)` entries and `ETL_EXCLUDE_AUTHORS*` augments,
+  regardless of builder call order. It does not affect pseudo-users; use
+  `.include_pseudo_users()` / `--include-deleted` for those.
 
 ### Extract to JSONL
 
@@ -733,13 +742,16 @@ The three benchmark groups:
 ## Environment variables
 
 - `RUST_LOG` — standard `tracing` filter (e.g. `RUST_LOG=info`).
-- `ETL_EXCLUDE_AUTHORS` — comma-separated authors to add to the default
-  bot/service exclusion list.
+- `ETL_EXCLUDE_AUTHORS` — comma/semicolon/whitespace-separated authors to add
+  to the default bot/service exclusion list.
 - `ETL_EXCLUDE_AUTHORS_FILE` — path to a newline-separated file of additional
   authors to exclude.
 
 The merged exclusion list is applied by `.exclude_common_bots()` on a
-`ScanPlan`.
+`ScanPlan`, or by passing `--exclude-common-bots` to scan-capable CLI commands
+such as `scan`, `export`, `count`, `dedupe`, and `first-seen`. Explicit
+`--exclude-author` / `.authors_out(...)` entries are merged with these defaults
+instead of being overwritten.
 
 ---
 

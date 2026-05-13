@@ -8,11 +8,11 @@ use std::sync::{Arc, OnceLock};
 /// Structured error returned when a scan/query builder contains contradictory
 /// or invalid filter settings.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BuildError {
+pub struct QueryBuildError {
     message: String,
 }
 
-impl BuildError {
+impl QueryBuildError {
     pub(crate) fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
@@ -20,13 +20,13 @@ impl BuildError {
     }
 }
 
-impl fmt::Display for BuildError {
+impl fmt::Display for QueryBuildError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.message)
     }
 }
 
-impl std::error::Error for BuildError {}
+impl std::error::Error for QueryBuildError {}
 
 /// High-level query/filter spec for advanced scans.
 /// All string lists are matched case-insensitively (we store normalized lowercase).
@@ -35,9 +35,14 @@ pub struct QuerySpec {
     pub subreddits: Option<Vec<String>>,
     pub authors_in: Option<Vec<String>>,
     pub authors_out: Option<Vec<String>>,
+    /// When true, [`ScanPlan::build`](crate::ScanPlan::build) merges RETL's
+    /// default bot/service deny-list and `ETL_EXCLUDE_AUTHORS*` augments into
+    /// `authors_out`. Keeping this as intent until build time avoids
+    /// order-dependent builder calls.
+    pub exclude_common_bots: bool,
     /// Compiled author regex used by the hot-path filter. Builders that accept
     /// raw patterns also keep `author_regex_pattern` so invalid regexes can be
-    /// surfaced as [`BuildError`] from `ScanPlan::build()` instead of panicking
+    /// surfaced as [`QueryBuildError`] from `ScanPlan::build()` instead of panicking
     /// during builder construction.
     pub author_regex: Option<Regex>,
     pub(crate) author_regex_pattern: Option<String>,
@@ -67,6 +72,7 @@ impl Clone for QuerySpec {
             subreddits: self.subreddits.clone(),
             authors_in: self.authors_in.clone(),
             authors_out: self.authors_out.clone(),
+            exclude_common_bots: self.exclude_common_bots,
             author_regex: self.author_regex.clone(),
             author_regex_pattern: self.author_regex_pattern.clone(),
             min_score: self.min_score,
@@ -122,10 +128,10 @@ impl QuerySpec {
     /// Validate contradictory or malformed query filters before a scan starts.
     /// Error messages name the offending field(s) so callers can surface them
     /// directly to users.
-    pub fn validate(&self) -> Result<(), BuildError> {
+    pub fn validate(&self) -> Result<(), QueryBuildError> {
         if let (Some(min), Some(max)) = (self.min_score, self.max_score) {
             if min > max {
-                return Err(BuildError::new(format!(
+                return Err(QueryBuildError::new(format!(
                     "min_score ({min}) cannot be greater than max_score ({max})"
                 )));
             }
@@ -133,7 +139,7 @@ impl QuerySpec {
 
         if let Some(subreddits) = &self.subreddits {
             if subreddits.is_empty() {
-                return Err(BuildError::new(
+                return Err(QueryBuildError::new(
                     "subreddits cannot be an empty list; omit subreddits to match all",
                 ));
             }
@@ -141,7 +147,7 @@ impl QuerySpec {
 
         if let (Some(allow), Some(deny)) = (&self.authors_in, &self.authors_out) {
             if let Some(author) = allow.iter().find(|a| deny.iter().any(|d| d == *a)) {
-                return Err(BuildError::new(format!(
+                return Err(QueryBuildError::new(format!(
                     "authors_in and authors_out both contain '{author}'"
                 )));
             }
@@ -149,17 +155,17 @@ impl QuerySpec {
 
         if let Some(pattern) = &self.author_regex_pattern {
             Regex::new(pattern).map_err(|e| {
-                BuildError::new(format!("author_regex is invalid: {e}; pattern={pattern:?}"))
+                QueryBuildError::new(format!("author_regex is invalid: {e}; pattern={pattern:?}"))
             })?;
         }
 
         Ok(())
     }
 
-    pub(crate) fn compile_author_regex(mut self) -> Result<Self, BuildError> {
+    pub(crate) fn compile_author_regex(mut self) -> Result<Self, QueryBuildError> {
         if let Some(pattern) = &self.author_regex_pattern {
             let re = Regex::new(pattern).map_err(|e| {
-                BuildError::new(format!("author_regex is invalid: {e}; pattern={pattern:?}"))
+                QueryBuildError::new(format!("author_regex is invalid: {e}; pattern={pattern:?}"))
             })?;
             self.author_regex = Some(re);
         }

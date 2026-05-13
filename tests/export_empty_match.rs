@@ -14,7 +14,7 @@
 mod common;
 
 use common::*;
-use retl::{BuildError, ExportFormat, PlanningError, RedditETL, Sources, YearMonth};
+use retl::{ConfigBuildError, ExportFormat, PlanningError, RedditETL, Sources, YearMonth};
 use std::fs;
 
 #[test]
@@ -116,8 +116,8 @@ fn invalid_date_range_surfaces_structured_build_error() {
         .extract_to_jsonl(&out)
         .unwrap_err();
 
-    let build = err.downcast_ref::<BuildError>().expect("BuildError");
-    assert_eq!(build, &BuildError::InvalidDateRange { start: YearMonth::new(2006, 2), end: YearMonth::new(2006, 1) });
+    let build = err.downcast_ref::<ConfigBuildError>().expect("ConfigBuildError");
+    assert_eq!(build, &ConfigBuildError::InvalidDateRange { start: YearMonth::new(2006, 2), end: YearMonth::new(2006, 1) });
 }
 
 #[test]

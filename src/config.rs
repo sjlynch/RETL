@@ -4,22 +4,23 @@ use std::error::Error;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+/// Structured error returned when ETL option builders contain invalid settings.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum BuildError {
+pub enum ConfigBuildError {
     InvalidDateRange { start: YearMonth, end: YearMonth },
 }
 
-impl fmt::Display for BuildError {
+impl fmt::Display for ConfigBuildError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            BuildError::InvalidDateRange { start, end } => {
+            ConfigBuildError::InvalidDateRange { start, end } => {
                 write!(f, "invalid date range: start {start} is after end {end}")
             }
         }
     }
 }
 
-impl Error for BuildError {}
+impl Error for ConfigBuildError {}
 
 /// Data source toggle (comments, submissions, both).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,7 +79,7 @@ pub struct ETLOptions {
     pub resume: bool,
 
     #[doc(hidden)]
-    pub build_error: Option<BuildError>,
+    pub build_error: Option<ConfigBuildError>,
 }
 
 impl Default for ETLOptions {
@@ -146,7 +147,7 @@ impl ETLOptions {
         self.start = start;
         self.end = end;
         self.build_error = match (start, end) {
-            (Some(s), Some(e)) if s > e => Some(BuildError::InvalidDateRange { start: s, end: e }),
+            (Some(s), Some(e)) if s > e => Some(ConfigBuildError::InvalidDateRange { start: s, end: e }),
             _ => None,
         };
         self

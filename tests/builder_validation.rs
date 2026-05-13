@@ -87,6 +87,47 @@ fn etl_subreddit_default_merges_with_scanplan_subreddits() {
 }
 
 #[test]
+fn exclude_common_bots_composes_with_authors_out_in_either_order() {
+    let base = common::make_corpus_basic();
+
+    let mut authors_out_then_bots: Vec<String> = RedditETL::new()
+        .base_dir(&base)
+        .sources(Sources::Both)
+        .date_range(Some(YearMonth::new(2006, 1)), Some(YearMonth::new(2006, 1)))
+        .progress(false)
+        .scan()
+        .subreddit("programming")
+        .authors_out(["alice"])
+        .exclude_common_bots()
+        .usernames()
+        .unwrap()
+        .collect();
+    authors_out_then_bots.sort();
+    assert_eq!(
+        authors_out_then_bots,
+        vec!["bob".to_string(), "charlie".to_string()]
+    );
+
+    let mut bots_then_authors_out: Vec<String> = RedditETL::new()
+        .base_dir(&base)
+        .sources(Sources::Both)
+        .date_range(Some(YearMonth::new(2006, 1)), Some(YearMonth::new(2006, 1)))
+        .progress(false)
+        .scan()
+        .subreddit("programming")
+        .exclude_common_bots()
+        .authors_out(["alice"])
+        .usernames()
+        .unwrap()
+        .collect();
+    bots_then_authors_out.sort();
+    assert_eq!(
+        bots_then_authors_out,
+        vec!["bob".to_string(), "charlie".to_string()]
+    );
+}
+
+#[test]
 fn include_pseudo_users_keeps_deleted_removed_and_empty_authors() {
     let dir = tempfile::tempdir().unwrap().keep();
     let rc = dir.join("comments").join("RC_2006-01.zst");

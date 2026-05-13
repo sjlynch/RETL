@@ -1,7 +1,7 @@
 use crate::config::{ETLOptions, Sources};
 use crate::date::YearMonth;
 use crate::mem::AdaptiveMemCfg;
-use crate::query::{normalize_str, BuildError, QuerySpec};
+use crate::query::{normalize_str, QueryBuildError, QuerySpec};
 use crate::util::{default_bot_authors, merge_extra_exclusions};
 use anyhow::Result;
 use regex::Regex;
@@ -158,7 +158,7 @@ pub struct ScanPlan {
 
 /// Input accepted by [`ScanPlan::author_regex`]. Passing a raw pattern defers
 /// compilation until [`ScanPlan::build`], so malformed regexes return a
-/// structured [`BuildError`] instead of panicking during builder construction.
+/// structured [`QueryBuildError`] instead of panicking during builder construction.
 #[doc(hidden)]
 pub enum AuthorRegexInput {
     Compiled(Regex),
@@ -269,11 +269,12 @@ impl ScanPlan {
         self.authors_out(iter)
     }
     /// Convenience: exclude a default set of bot/service accounts, plus any env/file augments.
+    ///
+    /// This composes with [`ScanPlan::authors_out`] / [`ScanPlan::exclude_authors`]
+    /// regardless of call order; the actual merge happens in [`ScanPlan::build`]
+    /// so explicit deny-list entries are never overwritten by the defaults.
     pub fn exclude_common_bots(mut self) -> Self {
-        let mut v = default_bot_authors();
-        merge_extra_exclusions(&mut v);
-        self.query.authors_out = Some(v);
-        self.query = self.query.normalize();
+        self.query.exclude_common_bots = true;
         self
     }
     pub fn author_regex<R: IntoAuthorRegex>(mut self, re: R) -> Self {
@@ -329,8 +330,15 @@ impl ScanPlan {
     pub fn allow_pseudo_users(self) -> Self {
         self.include_pseudo_users()
     }
-    pub fn build(mut self) -> std::result::Result<Self, BuildError> {
+    pub fn build(mut self) -> std::result::Result<Self, QueryBuildError> {
         self.query = self.query.normalize();
+        if self.query.exclude_common_bots {
+            let mut authors_out = self.query.authors_out.take().unwrap_or_default();
+            authors_out.extend(default_bot_authors());
+            merge_extra_exclusions(&mut authors_out);
+            self.query.authors_out = Some(authors_out);
+            self.query = self.query.normalize();
+        }
         self.query.validate()?;
         self.query = self.query.compile_author_regex()?;
         log_domain_filter_comment_drop(&self.query, self.etl.opts.sources);

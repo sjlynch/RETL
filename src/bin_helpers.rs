@@ -3,7 +3,7 @@
 //! couple of CLI-only path/I/O helpers.
 
 use anyhow::{Context, Result};
-use retl::{Aggregator, BuildError, RedditETL, Sources, YearMonth};
+use retl::{Aggregator, ConfigBuildError, RedditETL, Sources, YearMonth};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -322,7 +322,7 @@ pub(crate) fn ensure_dirs(common: &CommonOpts) -> Result<PathBuf> {
 pub(crate) fn build_etl(common: &CommonOpts) -> Result<RedditETL> {
     if let (Some(start), Some(end)) = (common.start, common.end) {
         if start > end {
-            return Err(BuildError::InvalidDateRange { start, end }.into());
+            return Err(ConfigBuildError::InvalidDateRange { start, end }.into());
         }
     }
     let lib_tmp = ensure_dirs(common)?;
@@ -343,8 +343,8 @@ pub(crate) fn build_etl(common: &CommonOpts) -> Result<RedditETL> {
 }
 
 /// Build a `ScanPlan` from `etl` with common CLI scan selections applied.
-/// Inlined as a macro because `ScanPlan` is not re-exported from the crate root
-/// and we want to avoid widening the public API just for the CLI.
+/// Kept as a macro so the binary call sites stay concise while sharing the
+/// same public builder surface external users get from `retl::ScanPlan`.
 macro_rules! plan {
     ($etl:expr, $common:expr, $query:expr) => {{
         let common = &$common;
@@ -358,6 +358,9 @@ macro_rules! plan {
         }
         if !query.exclude_authors.is_empty() {
             scan = scan.authors_out(query.exclude_authors.iter().map(String::as_str));
+        }
+        if query.exclude_common_bots {
+            scan = scan.exclude_common_bots();
         }
         if let Some(author_regex) = &query.author_regex {
             scan = scan.author_regex(author_regex.as_str());

@@ -21,9 +21,12 @@
 //!      backpressure), `adaptive_mem` thresholds, `resume`, IO buffer sizes,
 //!      `zst_level`.
 //!    - [`YearMonth`] / `iter_year_months` — inclusive month range cursors.
-//!    - [`QuerySpec`] — subreddit / author / regex / keyword / domain / score
-//!      filters; exposes `requires_full_parse()` to choose between the
-//!      [`MinimalRecord`] fast-path and a full `serde_json::Value` parse.
+//!    - [`ScanPlan`] / [`QuerySpec`] — the query builder returned by
+//!      [`RedditETL::scan`], plus subreddit / author / regex / keyword / domain
+//!      / score filters. `ScanPlan::build` returns [`QueryBuildError`] for
+//!      contradictory or malformed query settings. `QuerySpec` exposes
+//!      `requires_full_parse()` to choose between the [`MinimalRecord`] fast-path
+//!      and a full `serde_json::Value` parse.
 //!
 //! 2. **Discover & plan**
 //!    - `discover_all` / `plan_files` (doc(hidden)) walk the corpus and emit
@@ -136,11 +139,11 @@ mod json_whitelist;
 mod key_extractor;
 mod ndjson;
 
-pub use crate::config::{BuildError, ETLOptions, Sources};
+pub use crate::config::{ConfigBuildError, ETLOptions, Sources};
 pub use crate::date::YearMonth;
-pub use crate::pipeline::RedditETL;
+pub use crate::pipeline::{RedditETL, ScanPlan};
 pub use crate::pipeline_exec::ExportFormat;
-pub use crate::query::QuerySpec;
+pub use crate::query::{QueryBuildError, QuerySpec};
 pub use crate::shard::UsernameStream;
 
 pub use crate::aggregate::Aggregator;
