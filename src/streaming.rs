@@ -472,6 +472,75 @@ pub fn process_file_for_usernames_with_skip(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::date::YearMonth;
+    use crate::paths::FileKind;
+
+    fn write_zst(path: &std::path::Path, payload: &[u8]) {
+        let f = std::fs::File::create(path).unwrap();
+        let mut enc = zstd::stream::write::Encoder::new(f, 3).unwrap();
+        std::io::Write::write_all(&mut enc, payload).unwrap();
+        enc.finish().unwrap();
+    }
+
+    struct FailsAfterWriter {
+        remaining: usize,
+    }
+
+    impl std::io::Write for FailsAfterWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.remaining == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "writer boom",
+                ));
+            }
+            let n = self.remaining.min(buf.len());
+            self.remaining -= n;
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn stream_job_propagates_writer_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("RC_2020-01.zst");
+        write_zst(
+            &path,
+            b"{\"id\":\"c1\",\"author\":\"alice\",\"subreddit\":\"rust\",\"created_utc\":1577836800}\n",
+        );
+
+        let job = FileJob {
+            kind: FileKind::Comment,
+            ym: YearMonth::new(2020, 1),
+            path,
+        };
+        let query = QuerySpec::default();
+        let whitelist: Option<Vec<String>> = None;
+        let mut writer = FailsAfterWriter { remaining: 8 };
+
+        let res = stream_job(
+            &job,
+            &mut writer,
+            None,
+            &query,
+            &whitelist,
+            None,
+            None,
+            16 * 1024,
+            false,
+            None,
+        );
+
+        let err = res.expect_err("writer errors from stream_job must propagate");
+        assert!(
+            err.to_string().contains("writer boom"),
+            "unexpected error: {err}"
+        );
+    }
 
     #[test]
     fn whitelist_slow_path_reports_empty_projection_independent_of_tokenizer_buffer() {
