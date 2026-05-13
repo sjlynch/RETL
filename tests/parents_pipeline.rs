@@ -194,6 +194,122 @@ fn attach_parents_resume_rebuilds_corrupt_published_output() {
     );
 }
 
+#[test]
+fn attach_resume_rebuilds_when_resolution_window_expands() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("corpus");
+    let work_dir = tmp.path().join("work");
+    let spool_dir = work_dir.join("spool");
+    let attached_dir = work_dir.join("attached");
+    let cache_dir = work_dir.join("parents_cache");
+    let lib_tmp = work_dir.join("lib_tmp");
+
+    let parent_month = YearMonth::new(2005, 12);
+    let child_month = YearMonth::new(2006, 1);
+
+    write_zst_lines(
+        &base.join("submissions").join("RS_2005-12.zst"),
+        &[serde_json::json!({
+            "author": "parent_author",
+            "created_utc": 1133395200,
+            "domain": "example.com",
+            "id": "s_dec",
+            "score": 10,
+            "selftext": "parent selftext",
+            "title": "December parent",
+            "subreddit": "programming"
+        })
+        .to_string()],
+    );
+    write_zst_lines(
+        &base.join("comments").join("RC_2006-01.zst"),
+        &[serde_json::json!({
+            "author": "child_author",
+            "body": "child body",
+            "created_utc": 1136073600,
+            "id": "c_child",
+            "link_id": "t3_s_dec",
+            "parent_id": "t3_s_dec",
+            "score": 1,
+            "subreddit": "programming"
+        })
+        .to_string()],
+    );
+
+    let (spool_parts, total_written) = RedditETL::new()
+        .base_dir(&base)
+        .work_dir(&lib_tmp)
+        .sources(Sources::Comments)
+        .date_range(Some(child_month), Some(child_month))
+        .progress(false)
+        .scan()
+        .subreddit("programming")
+        .extract_spool_monthly(&spool_dir)
+        .unwrap();
+    assert_eq!(total_written, 1);
+
+    let ids = RedditETL::new()
+        .base_dir(&base)
+        .work_dir(&lib_tmp)
+        .progress(false)
+        .collect_parent_ids_from_jsonls(spool_parts.clone())
+        .unwrap();
+
+    let narrow_parents = RedditETL::new()
+        .base_dir(&base)
+        .work_dir(&lib_tmp)
+        .date_range(Some(child_month), Some(child_month))
+        .progress(false)
+        .resolve_parent_maps(&ids, &cache_dir, true)
+        .unwrap();
+
+    let (first_paths, first_stats) = RedditETL::new()
+        .base_dir(&base)
+        .work_dir(&lib_tmp)
+        .date_range(Some(child_month), Some(child_month))
+        .progress(false)
+        .attach_parents_jsonls_parallel_with_stats(
+            spool_parts.clone(),
+            &attached_dir,
+            &narrow_parents,
+            false,
+        )
+        .unwrap();
+    assert_eq!(first_stats.resolved, 0);
+    assert_eq!(first_stats.unresolved, 1);
+    let first_line = fs::read_to_string(&first_paths[0]).unwrap();
+    let first_value: serde_json::Value = serde_json::from_str(first_line.trim()).unwrap();
+    assert!(first_value.get("parent").is_none());
+
+    let wider_parents = RedditETL::new()
+        .base_dir(&base)
+        .work_dir(&lib_tmp)
+        .date_range(Some(parent_month), Some(child_month))
+        .progress(false)
+        .resolve_parent_maps(&ids, &cache_dir, true)
+        .unwrap();
+
+    let (second_paths, second_stats) = RedditETL::new()
+        .base_dir(&base)
+        .work_dir(&lib_tmp)
+        .date_range(Some(parent_month), Some(child_month))
+        .progress(false)
+        .attach_parents_jsonls_parallel_with_stats(spool_parts, &attached_dir, &wider_parents, true)
+        .unwrap();
+
+    assert_eq!(second_stats.resolved, 1);
+    assert_eq!(second_stats.unresolved, 0);
+    assert_eq!(second_paths[0], first_paths[0]);
+    let second_line = fs::read_to_string(&second_paths[0]).unwrap();
+    let second_value: serde_json::Value = serde_json::from_str(second_line.trim()).unwrap();
+    assert_eq!(
+        second_value
+            .pointer("/parent/title")
+            .and_then(|v| v.as_str()),
+        Some("December parent")
+    );
+}
+
 fn count_jsonl_lines(paths: &[std::path::PathBuf]) -> usize {
     let mut total = 0usize;
     for p in paths {
