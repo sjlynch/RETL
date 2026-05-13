@@ -140,11 +140,15 @@ fn dedup_single_shard(input: &Path, output: &Path) -> Result<()> {
             }
         }
         if !buf.is_empty() {
-            if seen.insert(buf.clone()) {
-                writer.write_all(buf.as_bytes())?;
-                writer.write_all(b"\n")?;
-            }
+            seen.insert(buf.clone());
         }
+    }
+
+    let mut keys: Vec<String> = seen.into_iter().collect();
+    keys.sort_unstable();
+    for key in keys {
+        writer.write_all(key.as_bytes())?;
+        writer.write_all(b"\n")?;
     }
     writer.flush()?;
     Ok(())
