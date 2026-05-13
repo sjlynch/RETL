@@ -1,7 +1,7 @@
 //! Streaming primitives: the one-pass record filter/writer (`stream_job`) with progress,
 //! and the usernames collector for a single monthly file.
 
-use crate::filters::{matches_minimal, matches_subreddit_basic, within_bounds};
+use crate::filters::{matches_minimal, matches_subreddit_basic, within_bounds, DateBounds};
 use crate::json_whitelist::WhitelistTokenizer;
 use crate::paths::FileJob;
 use crate::query::QuerySpec;
@@ -333,7 +333,7 @@ pub fn stream_job<W: Write + ?Sized>(
     query: &QuerySpec,
     whitelist: &Option<Vec<String>>,
     pb: Option<ProgressBar>,
-    bounds: Option<(crate::date::YearMonth, crate::date::YearMonth)>,
+    bounds: Option<DateBounds>,
     read_buf_bytes: usize,
     human_timestamps: bool,
     whitelist_tracker: Option<&WhitelistMatchTracker>,

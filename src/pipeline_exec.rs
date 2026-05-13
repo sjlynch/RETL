@@ -5,11 +5,13 @@ use crate::date::YearMonth;
 use crate::dedupe::{build_runs_sorted, merge_runs_sorted, DedupeCfg};
 use crate::filters::{
     bounds_tuple, matches_full, matches_minimal, resolve_target_subs_from, within_bounds,
-    ym_from_epoch,
+    ym_from_epoch, DateBounds,
 };
 use crate::key_extractor::KeyExtractor;
 use crate::kv_shard::ShardedKVWriter;
-use crate::paths::{discover_all, plan_files_checked, FileJob, FileKind};
+use crate::paths::{
+    discover_all, log_missing_month_warnings, plan_files_checked, FileJob, FileKind,
+};
 use crate::pipeline::{RedditETL, ScanPlan};
 use crate::progress::{make_progress_bar_labeled, total_compressed_size};
 use crate::progress_manifest::{ManifestAccumulator, MonthEntry};
@@ -751,14 +753,16 @@ fn plan_pipeline_files(etl: &RedditETL) -> Result<Vec<FileJob>> {
         return Err(err.into());
     }
     let discovered = discover_all(&etl.opts.comments_dir, &etl.opts.submissions_dir);
-    Ok(plan_files_checked(
+    let jobs = plan_files_checked(
         &discovered,
         &etl.opts.comments_dir,
         &etl.opts.submissions_dir,
         etl.opts.sources,
         etl.opts.start,
         etl.opts.end,
-    )?)
+    )?;
+    log_missing_month_warnings(&discovered, etl.opts.sources, etl.opts.start, etl.opts.end);
+    Ok(jobs)
 }
 
 fn validate_export_whitelist(etl: &RedditETL) -> Result<()> {
@@ -924,7 +928,7 @@ struct MonthJobCtx<'a> {
     query: &'a QuerySpec,
     whitelist: &'a Option<Vec<String>>,
     pb: Option<&'a ProgressBar>,
-    bounds: Option<(YearMonth, YearMonth)>,
+    bounds: Option<DateBounds>,
     read_buf: usize,
     write_buf: usize,
     human_ts: bool,

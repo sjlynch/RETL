@@ -1,4 +1,4 @@
-use crate::paths::{discover_all, plan_files_checked};
+use crate::paths::{discover_all, log_missing_month_warnings, plan_files_checked};
 use crate::progress::make_count_progress;
 use crate::util::{open_with_backoff, with_thread_pool};
 use crate::RedditETL;
@@ -73,6 +73,12 @@ impl RedditETL {
             self.opts.start,
             self.opts.end,
         )?;
+        log_missing_month_warnings(
+            &discovered,
+            self.opts.sources,
+            self.opts.start,
+            self.opts.end,
+        );
 
         let label = match mode {
             IntegrityMode::Quick { .. } => "Integrity (quick)",

@@ -1,5 +1,5 @@
 //! Multi-month / missing-month coverage:
-//! - `paths::plan_files` silently skips missing months (corpus has 2005-12 and 2006-02 but not 2006-01).
+//! - `paths::plan_files` skips missing months while planner diagnostics report requested holes (corpus has 2005-12 and 2006-02 but not 2006-01).
 //! - `date::iter_year_months` correctly crosses the year boundary.
 //! - `filters::bounds_tuple` + `within_bounds` filter records by record-level `created_utc`
 //!   (independent from the plan-level filename gate).
@@ -10,8 +10,9 @@ mod common;
 use common::*;
 
 use retl::{
-    bounds_tuple, discover_all, iter_year_months, parse_minimal, plan_files, within_bounds,
-    FileKind, Sources, YearMonth,
+    bounds_tuple, discover_all, format_year_month_ranges, iter_year_months,
+    missing_month_diagnostics, parse_minimal, plan_files, within_bounds, FileKind, Sources,
+    YearMonth,
 };
 
 #[test]
@@ -44,16 +45,13 @@ fn iter_year_months_inclusive_endpoints_and_inverted_range_is_empty() {
 }
 
 #[test]
-fn plan_files_silently_skips_missing_month() {
+fn plan_files_skips_missing_month_and_diagnostics_report_hole() {
     // Corpus has 2005-12 and 2006-02 but NOT 2006-01.
-    let base = make_corpus_multi_month(&[
-        YearMonth::new(2005, 12),
-        YearMonth::new(2006, 2),
-    ]);
+    let base = make_corpus_multi_month(&[YearMonth::new(2005, 12), YearMonth::new(2006, 2)]);
     let discovered = discover_all(&base.join("comments"), &base.join("submissions"));
 
     // Plan a range that *requires* 2005-12, 2006-01, 2006-02. The 2006-01 hole
-    // must be silently skipped — no error, no entry.
+    // is skipped in the executable plan, and reported separately as diagnostics.
     let jobs = plan_files(
         &discovered,
         Sources::Both,
@@ -62,7 +60,12 @@ fn plan_files_silently_skips_missing_month() {
     );
 
     // Expect exactly 4 jobs: 2 months × 2 sources (Comment + Submission).
-    assert_eq!(jobs.len(), 4, "got jobs: {:?}", jobs.iter().map(|j| j.path.clone()).collect::<Vec<_>>());
+    assert_eq!(
+        jobs.len(),
+        4,
+        "got jobs: {:?}",
+        jobs.iter().map(|j| j.path.clone()).collect::<Vec<_>>()
+    );
 
     // No job should refer to month 2006-01.
     let mut months: Vec<YearMonth> = jobs.iter().map(|j| j.ym).collect();
@@ -74,18 +77,33 @@ fn plan_files_silently_skips_missing_month() {
     );
 
     // Both kinds present.
-    let n_rc = jobs.iter().filter(|j| matches!(j.kind, FileKind::Comment)).count();
-    let n_rs = jobs.iter().filter(|j| matches!(j.kind, FileKind::Submission)).count();
+    let n_rc = jobs
+        .iter()
+        .filter(|j| matches!(j.kind, FileKind::Comment))
+        .count();
+    let n_rs = jobs
+        .iter()
+        .filter(|j| matches!(j.kind, FileKind::Submission))
+        .count();
     assert_eq!(n_rc, 2);
     assert_eq!(n_rs, 2);
+
+    let diagnostics = missing_month_diagnostics(
+        &discovered,
+        Sources::Both,
+        Some(YearMonth::new(2005, 12)),
+        Some(YearMonth::new(2006, 2)),
+    );
+    assert_eq!(diagnostics.len(), 2);
+    for diag in diagnostics {
+        assert_eq!(diag.months, vec![YearMonth::new(2006, 1)]);
+        assert_eq!(format_year_month_ranges(&diag.months), "2006-01");
+    }
 }
 
 #[test]
 fn plan_files_clamps_to_existing_when_start_unset() {
-    let base = make_corpus_multi_month(&[
-        YearMonth::new(2005, 12),
-        YearMonth::new(2006, 2),
-    ]);
+    let base = make_corpus_multi_month(&[YearMonth::new(2005, 12), YearMonth::new(2006, 2)]);
     let discovered = discover_all(&base.join("comments"), &base.join("submissions"));
 
     // Sources::Comments only, end=2006-02, start=None ⇒ clamp to existing min (2005-12).
@@ -103,11 +121,8 @@ fn plan_files_clamps_to_existing_when_start_unset() {
 
 #[test]
 fn within_bounds_uses_record_level_timestamp() {
-    let bounds = bounds_tuple(
-        Some(YearMonth::new(2006, 1)),
-        Some(YearMonth::new(2006, 1)),
-    );
-    assert!(bounds.is_some(), "both endpoints set => Some");
+    let bounds = bounds_tuple(Some(YearMonth::new(2006, 1)), Some(YearMonth::new(2006, 1)));
+    assert!(bounds.is_some(), "any endpoint set => Some");
 
     // Synthesize a MinimalRecord from a JSON line. created_utc is what within_bounds reads.
     fn rec(ts: i64) -> retl::MinimalRecord {
@@ -135,23 +150,46 @@ fn within_bounds_uses_record_level_timestamp() {
     let no_ts = parse_minimal(&no_ts_line).unwrap();
     assert!(!within_bounds(&no_ts, bounds));
 
-    // When no bounds are set (either endpoint missing), within_bounds is permissive.
-    let none_bounds = bounds_tuple(None, Some(YearMonth::new(2006, 1)));
-    assert!(none_bounds.is_none(), "missing endpoint => None (no record-level gate)");
-    assert!(within_bounds(&dec_2005, none_bounds));
-    assert!(within_bounds(&no_ts, none_bounds));
+    // One-sided lower bound: December is out, January/February are in.
+    let lower_only = bounds_tuple(Some(YearMonth::new(2006, 1)), None);
+    assert!(lower_only.is_some(), "one-sided lower bound is active");
+    assert!(!within_bounds(&dec_2005, lower_only));
+    assert!(within_bounds(&in_jan, lower_only));
+    assert!(within_bounds(&feb_2006, lower_only));
+    assert!(!within_bounds(&no_ts, lower_only));
+
+    // One-sided upper bound: February is out, December/January are in.
+    let upper_only = bounds_tuple(None, Some(YearMonth::new(2006, 1)));
+    assert!(upper_only.is_some(), "one-sided upper bound is active");
+    assert!(within_bounds(&dec_2005, upper_only));
+    assert!(within_bounds(&in_jan, upper_only));
+    assert!(!within_bounds(&feb_2006, upper_only));
+    assert!(!within_bounds(&no_ts, upper_only));
+
+    // With no date bounds at all, within_bounds is permissive.
+    let no_bounds = bounds_tuple(None, None);
+    assert!(no_bounds.is_none());
+    assert!(within_bounds(&dec_2005, no_bounds));
+    assert!(within_bounds(&no_ts, no_bounds));
 }
 
 #[test]
-fn bounds_tuple_returns_none_unless_both_endpoints_set() {
-    assert!(bounds_tuple(None, None).is_none());
-    assert!(bounds_tuple(Some(YearMonth::new(2006, 1)), None).is_none());
-    assert!(bounds_tuple(None, Some(YearMonth::new(2006, 1))).is_none());
+fn bounds_tuple_represents_independent_endpoints() {
+    assert_eq!(bounds_tuple(None, None), None);
     assert_eq!(
-        bounds_tuple(
-            Some(YearMonth::new(2006, 1)),
-            Some(YearMonth::new(2006, 3)),
-        ),
-        Some((YearMonth::new(2006, 1), YearMonth::new(2006, 3)))
+        bounds_tuple(Some(YearMonth::new(2006, 1)), None)
+            .unwrap()
+            .start,
+        Some(YearMonth::new(2006, 1))
     );
+    assert_eq!(
+        bounds_tuple(None, Some(YearMonth::new(2006, 1)))
+            .unwrap()
+            .end,
+        Some(YearMonth::new(2006, 1))
+    );
+    let bounded =
+        bounds_tuple(Some(YearMonth::new(2006, 1)), Some(YearMonth::new(2006, 3))).unwrap();
+    assert_eq!(bounded.start, Some(YearMonth::new(2006, 1)));
+    assert_eq!(bounded.end, Some(YearMonth::new(2006, 3)));
 }
