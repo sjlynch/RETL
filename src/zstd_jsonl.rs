@@ -151,7 +151,7 @@ pub fn for_each_line_with_opts_status(
     );
     match result {
         Ok(()) => Ok(true),
-        Err(e) => {
+        Err(LineStreamAttemptError::Decode(e)) => {
             warn_decode_skip(path, &e);
             if let Some(cb) = on_skip.as_deref_mut() {
                 cb(path, &e);
@@ -164,6 +164,7 @@ pub fn for_each_line_with_opts_status(
             }
             Ok(false)
         }
+        Err(LineStreamAttemptError::Callback(e)) => Err(e),
     }
 }
 
@@ -327,6 +328,11 @@ impl<R: Read> Read for CountingReader<R> {
     }
 }
 
+enum LineStreamAttemptError {
+    Decode(anyhow::Error),
+    Callback(anyhow::Error),
+}
+
 /// Single inner read loop. The two former `_attempt` paths only differed on
 /// whether the file was wrapped in `CountingReader` to drive a progress
 /// callback — we always wrap it now (the atomic add lands once per
@@ -344,16 +350,19 @@ fn for_each_line_attempt<'borrow, 'cb: 'borrow>(
     mut on_progress: Option<&'borrow mut (dyn FnMut(u64) + 'cb)>,
     throttle: bool,
     on_line: &mut impl FnMut(&str) -> Result<()>,
-) -> Result<()> {
-    let file = open_with_backoff(path, 16, 50)?;
+) -> std::result::Result<(), LineStreamAttemptError> {
+    let file =
+        open_with_backoff(path, 16, 50).map_err(|e| LineStreamAttemptError::Decode(e.into()))?;
     let counter = Arc::new(AtomicU64::new(0));
     let cnt = CountingReader {
         inner: file,
         counter: counter.clone(),
     };
 
-    let mut decoder = Decoder::new(cnt)?;
-    decoder.window_log_max(ZSTD_WINDOW_LOG_MAX)?;
+    let mut decoder = Decoder::new(cnt).map_err(|e| LineStreamAttemptError::Decode(e.into()))?;
+    decoder
+        .window_log_max(ZSTD_WINDOW_LOG_MAX)
+        .map_err(|e| LineStreamAttemptError::Decode(e.into()))?;
 
     let cap = read_buf_bytes.unwrap_or(DEFAULT_READ_BUF_BYTES);
     let mut reader = BufReader::with_capacity(cap, decoder);
@@ -368,7 +377,9 @@ fn for_each_line_attempt<'borrow, 'cb: 'borrow>(
     let mut tick: u32 = 0;
     loop {
         buf.clear();
-        let n = reader.read_line(&mut buf)?;
+        let n = reader
+            .read_line(&mut buf)
+            .map_err(|e| LineStreamAttemptError::Decode(e.into()))?;
         if n == 0 {
             // Final progress flush at EOF.
             if let Some(cb) = on_progress.as_deref_mut() {
@@ -395,7 +406,7 @@ fn for_each_line_attempt<'borrow, 'cb: 'borrow>(
                 last = cur;
             }
         }
-        on_line(&buf)?;
+        on_line(&buf).map_err(LineStreamAttemptError::Callback)?;
         if throttle {
             tick = tick.wrapping_add(1);
             if tick & THROTTLE_SAMPLE_MASK == 0 {
@@ -543,6 +554,39 @@ mod tests {
         assert_eq!(
             lines_seen, 50,
             "all lines must be delivered on healthy files"
+        );
+    }
+
+    #[test]
+    fn callback_error_propagates_without_skip_callback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("callback-error.zst");
+        write_zst_with_checksum(&path, b"{\"id\":\"r1\"}\n");
+
+        let err = for_each_line_cfg(&path, 16 * 1024, |_line| {
+            Err(anyhow::anyhow!("callback boom"))
+        })
+        .expect_err("callback errors must propagate from for_each_line_cfg");
+        assert!(
+            err.to_string().contains("callback boom"),
+            "unexpected error: {err}"
+        );
+
+        let mut skip_count = 0usize;
+        let err = for_each_line_cfg_with_skip(
+            &path,
+            16 * 1024,
+            |_, _| skip_count += 1,
+            |_line| Err(anyhow::anyhow!("callback boom")),
+        )
+        .expect_err("callback errors must propagate from skip variants");
+        assert!(
+            err.to_string().contains("callback boom"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            skip_count, 0,
+            "on_skip must not fire for caller callback errors"
         );
     }
 }
