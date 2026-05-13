@@ -155,8 +155,11 @@ fn reduce_shard(input: &Path, output: &Path, reducer: Reducer) -> Result<()> {
             }
         }
     }
+    let mut rows: Vec<(String, i64)> = acc.into_iter().collect();
+    rows.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+
     let mut w = BufWriter::new(File::create(output)?);
-    for (k, v) in acc {
+    for (k, v) in rows {
         w.write_all(k.as_bytes())?;
         w.write_all(b"\t")?;
         w.write_all(v.to_string().as_bytes())?;

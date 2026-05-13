@@ -12,7 +12,9 @@ use crate::progress::{make_count_progress, make_progress_bar_labeled, total_comp
 use crate::util::{
     create_with_backoff, remove_with_backoff, replace_file_atomic_backoff, with_thread_pool,
 };
-use crate::zstd_jsonl::{for_each_line_with_progress_cfg_no_throttle, parse_minimal};
+use crate::zstd_jsonl::{
+    for_each_line_with_progress_cfg_no_throttle_status, malformed_json_error, parse_minimal,
+};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -364,7 +366,8 @@ fn build_id_shard_index(
         let mut out_map_c: HashMap<String, String> = HashMap::new();
         let mut out_map_s: HashMap<String, (String, String)> = HashMap::new();
 
-        for_each_line_with_progress_cfg_no_throttle(
+        let mut line_number = 0u64;
+        let completed = for_each_line_with_progress_cfg_no_throttle_status(
             &job.path,
             read_buf,
             |d| {
@@ -373,10 +376,9 @@ fn build_id_shard_index(
                 }
             },
             |line| {
-                let min = match parse_minimal(line) {
-                    Ok(v) => v,
-                    Err(_) => return Ok(()),
-                };
+                line_number += 1;
+                let min = parse_minimal(line)
+                    .map_err(|e| malformed_json_error(&job.path, line_number, e))?;
                 if let Some(id) = min.id.as_deref() {
                     match job.kind {
                         FileKind::Comment => {
@@ -420,6 +422,12 @@ fn build_id_shard_index(
             },
         )
         .with_context(|| format!("scan {}", job.path.display()))?;
+        if !completed {
+            return Err(anyhow::anyhow!(
+                "incomplete zstd decode while resolving parent map from {}",
+                job.path.display()
+            ));
+        }
 
         // Atomic write: serialize to a sibling .tmp first, fsync the data
         // path via BufWriter::flush, then atomically replace the dest.
