@@ -1,3 +1,4 @@
+use crate::util::remove_dir_all_with_backoff;
 use anyhow::Result;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -20,6 +21,7 @@ enum ReadStep {
 /// A streaming merger that yields deduped usernames from deduped shards.
 pub struct UsernameStream {
     files: Vec<PathBuf>,
+    cleanup_roots: Vec<PathBuf>,
     current_idx: usize,
     reader: Option<BufReader<File>>,
     buf: String,
@@ -27,15 +29,32 @@ pub struct UsernameStream {
 }
 
 impl UsernameStream {
-    pub fn from_deduped_files(mut files: Vec<PathBuf>) -> Result<Self> {
+    pub fn from_deduped_files(files: Vec<PathBuf>) -> Result<Self> {
+        Self::from_deduped_files_with_cleanup(files, Vec::new())
+    }
+
+    pub(crate) fn from_deduped_files_with_cleanup(
+        mut files: Vec<PathBuf>,
+        cleanup_roots: Vec<PathBuf>,
+    ) -> Result<Self> {
         files.sort();
         Ok(Self {
             files,
+            cleanup_roots,
             current_idx: 0,
             reader: None,
             buf: String::with_capacity(8 * 1024),
             current_file_errors: 0,
         })
+    }
+
+    fn cleanup_scratch(&mut self) {
+        self.reader = None;
+        for root in std::mem::take(&mut self.cleanup_roots) {
+            if let Err(e) = remove_dir_all_with_backoff(&root, 8, 50) {
+                tracing::warn!(path=%root.display(), error=%e, "UsernameStream: failed to remove scratch dir");
+            }
+        }
     }
 
     /// Try to open the next file. Advances `current_idx` regardless of outcome,
@@ -53,10 +72,8 @@ impl UsernameStream {
                 self.current_file_errors = 0;
                 Some(Ok(()))
             }
-            Err(e) => Some(Err(anyhow::Error::from(e).context(format!(
-                "open shard for streaming: {}",
-                path.display()
-            )))),
+            Err(e) => Some(Err(anyhow::Error::from(e)
+                .context(format!("open shard for streaming: {}", path.display())))),
         }
     }
 
@@ -70,7 +87,10 @@ impl UsernameStream {
         loop {
             if self.reader.is_none() {
                 match self.open_next() {
-                    None => return None,
+                    None => {
+                        self.cleanup_scratch();
+                        return None;
+                    }
                     Some(Ok(())) => {}
                     Some(Err(e)) => return Some(Err(e)),
                 }
@@ -112,7 +132,9 @@ impl UsernameStream {
             Ok(_) => {
                 if buf.ends_with('\n') {
                     let _ = buf.pop();
-                    if buf.ends_with('\r') { let _ = buf.pop(); }
+                    if buf.ends_with('\r') {
+                        let _ = buf.pop();
+                    }
                 }
                 if buf.is_empty() {
                     ReadStep::Empty
@@ -129,6 +151,12 @@ impl UsernameStream {
                 }
             }
         }
+    }
+}
+
+impl Drop for UsernameStream {
+    fn drop(&mut self) {
+        self.cleanup_scratch();
     }
 }
 
@@ -169,7 +197,10 @@ mod tests {
     struct ErroringReader;
     impl Read for ErroringReader {
         fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
-            Err(io::Error::new(io::ErrorKind::Other, "synthetic read failure"))
+            Err(io::Error::new(
+                io::ErrorKind::Other,
+                "synthetic read failure",
+            ))
         }
     }
 

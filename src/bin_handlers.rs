@@ -3,14 +3,15 @@
 
 use anyhow::{Context, Result};
 use retl::{
-    create_with_backoff, discover_all, plan_files, replace_file_atomic_backoff,
-    total_compressed_size, ExportFormat, FileKind, IntegrityMode, KeyExtractor, RedditETL, Sources,
-    YearMonth,
+    create_with_backoff, discover_all, plan_files, remove_with_backoff,
+    replace_file_atomic_backoff, total_compressed_size, ExportFormat, FileKind, IntegrityMode,
+    KeyExtractor, RedditETL, Sources, YearMonth,
 };
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::bin_args::{
     AggregateArgs, CountArgs, CountMode, DedupeArgs, DescribeArgs, ExportArgs, ExportFmt,
@@ -20,6 +21,70 @@ use crate::bin_helpers::{
     build_etl, discover_spool_parts, plan, stream_extract_to_stdout, stream_path_output_to_stdout,
     GroupBySpec, GroupMetricAgg, MetricSpec, RecCount,
 };
+
+const CLI_TEXT_WRITE_BUF_BYTES: usize = 64 * 1024;
+static CLI_STAGE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn output_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+fn write_text_file_atomic<T, F>(final_path: &Path, body: F) -> Result<T>
+where
+    F: FnOnce(&mut dyn Write) -> Result<T>,
+{
+    let parent = output_parent(final_path);
+    let staging_dir = parent.join("_staging");
+    fs::create_dir_all(&staging_dir)
+        .with_context(|| format!("creating staging dir {}", staging_dir.display()))?;
+
+    let file_name = final_path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("output path has no file name: {}", final_path.display()))?;
+    let mut staged_name = file_name.to_os_string();
+    let counter = CLI_STAGE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    staged_name.push(format!(".{}.{}.inprogress", std::process::id(), counter));
+    let staged = staging_dir.join(staged_name);
+
+    let file = create_with_backoff(&staged, 16, 50)
+        .with_context(|| format!("creating staged output {}", staged.display()))?;
+    let mut w = BufWriter::with_capacity(CLI_TEXT_WRITE_BUF_BYTES, file);
+
+    let result = match body(&mut w) {
+        Ok(v) => v,
+        Err(e) => {
+            drop(w);
+            let _ = remove_with_backoff(&staged, 8, 50);
+            return Err(e).with_context(|| format!("writing staged output {}", staged.display()));
+        }
+    };
+
+    if let Err(e) = w.flush() {
+        drop(w);
+        let _ = remove_with_backoff(&staged, 8, 50);
+        return Err(e).with_context(|| format!("flushing staged output {}", staged.display()));
+    }
+    drop(w);
+
+    let parent = output_parent(final_path);
+    fs::create_dir_all(parent)
+        .with_context(|| format!("creating output parent {}", parent.display()))?;
+
+    if let Err(e) = replace_file_atomic_backoff(&staged, final_path) {
+        let _ = remove_with_backoff(&staged, 8, 50);
+        return Err(e).with_context(|| {
+            format!(
+                "publishing staged output {} -> {}",
+                staged.display(),
+                final_path.display()
+            )
+        });
+    }
+
+    Ok(result)
+}
 
 pub(crate) fn run_describe(args: DescribeArgs) -> Result<()> {
     if let (Some(start), Some(end)) = (args.start, args.end) {
@@ -92,19 +157,19 @@ pub(crate) fn run_scan(args: ScanArgs) -> Result<()> {
 
     match args.out {
         Some(path) => {
-            let f = fs::File::create(&path)
-                .with_context(|| format!("creating output file {}", path.display()))?;
-            let mut w = BufWriter::new(f);
-            scan.for_each_username(|u| {
-                let _ = writeln!(w, "{u}");
+            write_text_file_atomic(&path, |w| {
+                scan.try_for_each_username(|u| {
+                    writeln!(w, "{u}")?;
+                    Ok(())
+                })
             })?;
-            w.flush()?;
         }
         None => {
             let stdout = io::stdout();
             let mut w = BufWriter::new(stdout.lock());
-            scan.for_each_username(|u| {
-                let _ = writeln!(w, "{u}");
+            scan.try_for_each_username(|u| {
+                writeln!(w, "{u}")?;
+                Ok(())
             })?;
             w.flush()?;
         }
@@ -276,13 +341,12 @@ pub(crate) fn run_count(args: CountArgs) -> Result<()> {
                 w.flush()?;
             } else {
                 let path = args.out.unwrap();
-                let f = fs::File::create(&path)
-                    .with_context(|| format!("creating output file {}", path.display()))?;
-                let mut w = BufWriter::new(f);
-                for (ym, n) in &counts {
-                    writeln!(w, "{ym}\t{n}")?;
-                }
-                w.flush()?;
+                write_text_file_atomic(&path, |w| {
+                    for (ym, n) in &counts {
+                        writeln!(w, "{ym}\t{n}")?;
+                    }
+                    Ok(())
+                })?;
             }
         }
         CountMode::Author => {
@@ -500,4 +564,27 @@ pub(crate) fn run_parents(args: ParentsArgs) -> Result<()> {
         stats.unresolved
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn staged_text_write_error_preserves_existing_final() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out.txt");
+        fs::write(&out, "old\n").unwrap();
+
+        let res: Result<()> = write_text_file_atomic(&out, |w| {
+            writeln!(w, "new")?;
+            anyhow::bail!("synthetic write failure")
+        });
+
+        assert!(res.is_err());
+        assert_eq!(fs::read_to_string(&out).unwrap(), "old\n");
+        let staging = dir.path().join("_staging");
+        let leftovers = fs::read_dir(staging).map(|it| it.count()).unwrap_or(0);
+        assert_eq!(leftovers, 0, "failed staged write should be cleaned up");
+    }
 }

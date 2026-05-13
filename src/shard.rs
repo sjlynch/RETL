@@ -1,6 +1,7 @@
 pub use crate::username_stream::UsernameStream;
 
 use crate::shard_common;
+use crate::util::unique_scratch_dir;
 use ahash::RandomState;
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
@@ -12,6 +13,7 @@ use std::path::{Path, PathBuf};
 
 /// Disk-backed sharded dedup writer: concurrent-safe.
 pub struct ShardedWriter {
+    run_root: PathBuf,
     base_dir: PathBuf,
     shards: Vec<Mutex<BufWriter<File>>>,
     count: usize,
@@ -21,7 +23,8 @@ pub struct ShardedWriter {
 impl ShardedWriter {
     pub fn create(work_dir: &Path, prefix: &str, count: usize) -> Result<Self> {
         let count = count.max(1);
-        let shards_dir = work_dir.join(format!("{prefix}_shards"));
+        let run_root = unique_scratch_dir(work_dir, prefix, "shards");
+        let shards_dir = run_root.join("shards");
         fs::create_dir_all(&shards_dir)?;
 
         let mut shards = Vec::with_capacity(count);
@@ -34,11 +37,16 @@ impl ShardedWriter {
         let state = shard_common::seeded_state("usernames");
 
         Ok(Self {
+            run_root,
             base_dir: shards_dir,
             shards,
             count,
             state,
         })
+    }
+
+    pub fn scratch_root(&self) -> &Path {
+        &self.run_root
     }
 
     #[inline]
@@ -63,34 +71,53 @@ impl ShardedWriter {
 
     /// Deduplicate each shard independently and return ordered deduped files.
     pub fn dedup(self, prefix: &str) -> Result<Vec<PathBuf>> {
-        self.flush_all()?;
-        drop(self.shards); // ensure writers are closed
+        let (deduped, _scratch_root) = self.dedup_with_scratch(prefix)?;
+        Ok(deduped)
+    }
 
-        let dedup_dir = self.base_dir.parent().unwrap().join(format!("{prefix}_dedup"));
+    /// Deduplicate each shard independently, returning the files plus the
+    /// per-run scratch root that owns them. Callers that hand the files to a
+    /// lazy consumer should keep this root alive until that consumer is done.
+    pub fn dedup_with_scratch(self, prefix: &str) -> Result<(Vec<PathBuf>, PathBuf)> {
+        self.flush_all()?;
+        let ShardedWriter {
+            run_root,
+            base_dir,
+            shards,
+            count,
+            state: _,
+        } = self;
+        drop(shards); // ensure writers are closed
+
+        let dedup_dir = run_root.join(format!("{prefix}_dedup"));
         fs::create_dir_all(&dedup_dir)?;
 
-        let shard_paths: Vec<PathBuf> = (0..self.count)
-            .map(|i| self.base_dir.join(format!("shard_{:04}.tmp", i)))
+        let shard_paths: Vec<PathBuf> = (0..count)
+            .map(|i| base_dir.join(format!("shard_{:04}.tmp", i)))
             .collect();
 
         let deduped: Vec<PathBuf> = shard_paths
             .par_iter()
             .map(|shard_path| -> Result<PathBuf> {
                 let out_path = dedup_dir.join(
-                    shard_path.file_name().unwrap().to_string_lossy().replace(".tmp", ".txt")
+                    shard_path
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .replace(".tmp", ".txt"),
                 );
                 dedup_single_shard(shard_path, &out_path)?;
                 Ok(out_path)
             })
             .collect::<Result<Vec<_>>>()?;
 
-        Ok(deduped)
+        Ok((deduped, run_root))
     }
 }
 
 fn dedup_single_shard(input: &Path, output: &Path) -> Result<()> {
-    let in_file = File::open(input)
-        .with_context(|| format!("open shard for dedup: {}", input.display()))?;
+    let in_file =
+        File::open(input).with_context(|| format!("open shard for dedup: {}", input.display()))?;
     let mut reader = BufReader::new(in_file);
 
     let out_file = File::create(output)
@@ -108,7 +135,9 @@ fn dedup_single_shard(input: &Path, output: &Path) -> Result<()> {
         }
         if buf.ends_with('\n') {
             let _ = buf.pop();
-            if buf.ends_with('\r') { let _ = buf.pop(); }
+            if buf.ends_with('\r') {
+                let _ = buf.pop();
+            }
         }
         if !buf.is_empty() {
             if seen.insert(buf.clone()) {

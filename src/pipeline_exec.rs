@@ -19,7 +19,9 @@ use crate::stitch::{concat_tsvs, stitch_tmp_parts, stitch_tmp_parts_to_json_arra
 use crate::streaming::{
     process_file_for_usernames_with_skip, stream_job, StreamJobResult, WhitelistMatchTracker,
 };
-use crate::util::{create_with_backoff, remove_with_backoff, with_thread_pool};
+use crate::util::{
+    create_with_backoff, remove_dir_all_with_backoff, remove_with_backoff, with_thread_pool,
+};
 use crate::zstd_jsonl::{
     for_each_line_cfg, for_each_line_with_progress_cfg, parse_minimal, MinimalRecord,
 };
@@ -86,6 +88,12 @@ fn is_partial_scan_error(e: &anyhow::Error) -> bool {
         .any(|cause| cause.downcast_ref::<PartialScanError>().is_some())
 }
 
+fn cleanup_scratch_dir(path: &Path, label: &str) {
+    if let Err(e) = remove_dir_all_with_backoff(path, 8, 50) {
+        tracing::warn!(path=%path.display(), error=%e, %label, "failed to remove scratch dir");
+    }
+}
+
 fn warn_dedupe_zero_keys(key: &KeyExtractor, input_records: u64) {
     match key {
         KeyExtractor::JsonPointer(ptr) => {
@@ -133,51 +141,62 @@ impl RedditETL {
 
             let shard_writer =
                 ShardedWriter::create(&work_dir, "usernames", self.opts.shard_count)?;
-            let read_buf = self.opts.read_buffer_bytes;
+            let scratch_root = shard_writer.scratch_root().to_path_buf();
+            let result = (|| -> Result<UsernameStream> {
+                let read_buf = self.opts.read_buffer_bytes;
 
-            let total_bytes = total_compressed_size(&files);
-            let pb = if self.opts.progress {
-                Some(make_progress_bar_labeled(
-                    total_bytes,
-                    self.opts.progress_label.as_deref(),
-                ))
-            } else {
-                None
-            };
+                let total_bytes = total_compressed_size(&files);
+                let pb = if self.opts.progress {
+                    Some(make_progress_bar_labeled(
+                        total_bytes,
+                        self.opts.progress_label.as_deref(),
+                    ))
+                } else {
+                    None
+                };
 
-            // Per-run counter of files skipped by the decoder. Surfaced to
-            // observers via tracing at the end of the run. Per-file detail is
-            // already logged by `warn_decode_skip`; this aggregate makes the
-            // total visible without parsing log output.
-            let skip_count = std::sync::Arc::new(AtomicU64::new(0));
-            let skip_count_inner = skip_count.clone();
+                // Per-run counter of files skipped by the decoder. Surfaced to
+                // observers via tracing at the end of the run. Per-file detail is
+                // already logged by `warn_decode_skip`; this aggregate makes the
+                // total visible without parsing log output.
+                let skip_count = std::sync::Arc::new(AtomicU64::new(0));
+                let skip_count_inner = skip_count.clone();
 
-            crate::concurrency::for_each_file_limited(&files, self.opts.file_concurrency, |job| {
-                let skip_count_per_call = skip_count_inner.clone();
-                process_file_for_usernames_with_skip(
-                    job,
-                    read_buf,
-                    &subreddit,
-                    &shard_writer,
-                    pb.clone(),
-                    move |_path, _err| {
-                        skip_count_per_call.fetch_add(1, Ordering::Relaxed);
+                crate::concurrency::for_each_file_limited(
+                    &files,
+                    self.opts.file_concurrency,
+                    |job| {
+                        let skip_count_per_call = skip_count_inner.clone();
+                        process_file_for_usernames_with_skip(
+                            job,
+                            read_buf,
+                            &subreddit,
+                            &shard_writer,
+                            pb.clone(),
+                            move |_path, _err| {
+                                skip_count_per_call.fetch_add(1, Ordering::Relaxed);
+                            },
+                        )
+                        .with_context(|| format!("processing {}", job.path.display()))
                     },
-                )
-                .with_context(|| format!("processing {}", job.path.display()))
-            })?;
+                )?;
 
-            let skipped = skip_count.load(Ordering::Relaxed);
-            if skipped > 0 {
-                tracing::warn!(
-                    skipped_files = skipped,
-                    "usernames: {} input file(s) skipped due to zstd decode errors; see prior warnings for paths",
-                    skipped
-                );
+                let skipped = skip_count.load(Ordering::Relaxed);
+                if skipped > 0 {
+                    tracing::warn!(
+                        skipped_files = skipped,
+                        "usernames: {} input file(s) skipped due to zstd decode errors; see prior warnings for paths",
+                        skipped
+                    );
+                }
+
+                let (deduped_files, scratch_root) = shard_writer.dedup_with_scratch("usernames")?;
+                UsernameStream::from_deduped_files_with_cleanup(deduped_files, vec![scratch_root])
+            })();
+            if result.is_err() {
+                cleanup_scratch_dir(&scratch_root, "usernames");
             }
-
-            let deduped_files = shard_writer.dedup("usernames")?;
-            UsernameStream::from_deduped_files(deduped_files)
+            result
         })
     }
 }
@@ -193,25 +212,32 @@ impl ScanPlan {
             let work_dir = plan.etl.ensure_work_dir()?;
             let shard_writer =
                 ShardedWriter::create(&work_dir, "usernames_q", plan.etl.opts.shard_count)?;
+            let scratch_root = shard_writer.scratch_root().to_path_buf();
 
-            scan_records(
-                &plan.etl,
-                &plan.query,
-                /*show_progress=*/ true,
-                |min, _kind, _line| {
-                    if let Some(a) = min.author.as_deref() {
-                        let a = a.trim();
-                        if a.is_empty() {
-                            return Ok(());
+            let result = (|| -> Result<UsernameStream> {
+                scan_records(
+                    &plan.etl,
+                    &plan.query,
+                    /*show_progress=*/ true,
+                    |min, _kind, _line| {
+                        if let Some(a) = min.author.as_deref() {
+                            let a = a.trim();
+                            if a.is_empty() {
+                                return Ok(());
+                            }
+                            shard_writer.write(a)?;
                         }
-                        shard_writer.write(a)?;
-                    }
-                    Ok(())
-                },
-            )?;
+                        Ok(())
+                    },
+                )?;
 
-            let deduped = shard_writer.dedup("usernames_q")?;
-            UsernameStream::from_deduped_files(deduped)
+                let (deduped, scratch_root) = shard_writer.dedup_with_scratch("usernames_q")?;
+                UsernameStream::from_deduped_files_with_cleanup(deduped, vec![scratch_root])
+            })();
+            if result.is_err() {
+                cleanup_scratch_dir(&scratch_root, "usernames_q");
+            }
+            result
         })
     }
 
@@ -225,6 +251,21 @@ impl ScanPlan {
         let mut it = self.usernames()?;
         while let Some(u) = it.next() {
             f(&u);
+        }
+        Ok(())
+    }
+
+    /// Fallible variant of [`ScanPlan::for_each_username`]. Callback errors and
+    /// stream open/read errors are returned to the caller instead of being
+    /// ignored or logged-and-skipped.
+    pub fn try_for_each_username<F>(self, mut f: F) -> Result<()>
+    where
+        F: FnMut(&str) -> Result<()>,
+    {
+        let mut it = self.usernames()?;
+        while let Some(u) = it.try_next() {
+            let u = u?;
+            f(&u)?;
         }
         Ok(())
     }
@@ -504,26 +545,31 @@ impl ScanPlan {
             let work_dir = plan.etl.ensure_work_dir()?;
             let kv =
                 ShardedKVWriter::create(&work_dir, "author_counts", plan.etl.opts.shard_count)?;
+            let scratch_root = kv.scratch_root().to_path_buf();
 
-            scan_records(
-                &plan.etl,
-                &plan.query,
-                /*show_progress=*/ false,
-                |min, _kind, _line| {
-                    if let Some(a) = min.author.as_deref() {
-                        let a = a.trim();
-                        if a.is_empty() {
-                            return Ok(());
+            let result = (|| -> Result<()> {
+                scan_records(
+                    &plan.etl,
+                    &plan.query,
+                    /*show_progress=*/ false,
+                    |min, _kind, _line| {
+                        if let Some(a) = min.author.as_deref() {
+                            let a = a.trim();
+                            if a.is_empty() {
+                                return Ok(());
+                            }
+                            kv.write_kv(a, 1)?;
                         }
-                        kv.write_kv(a, 1)?;
-                    }
-                    Ok(())
-                },
-            )?;
+                        Ok(())
+                    },
+                )?;
 
-            let shards = kv.reduce_sum("author_counts")?;
-            concat_tsvs(&shards, out_path, plan.etl.opts.write_buffer_bytes)?;
-            Ok(())
+                let (shards, _scratch_root) = kv.reduce_sum_with_scratch("author_counts")?;
+                concat_tsvs(&shards, out_path, plan.etl.opts.write_buffer_bytes)?;
+                Ok(())
+            })();
+            cleanup_scratch_dir(&scratch_root, "author_counts");
+            result
         })
     }
 
@@ -534,26 +580,31 @@ impl ScanPlan {
         with_thread_pool(parallelism, || {
             let work_dir = plan.etl.ensure_work_dir()?;
             let kv = ShardedKVWriter::create(&work_dir, "first_seen", plan.etl.opts.shard_count)?;
+            let scratch_root = kv.scratch_root().to_path_buf();
 
-            scan_records(
-                &plan.etl,
-                &plan.query,
-                /*show_progress=*/ false,
-                |min, _kind, _line| {
-                    if let (Some(a), Some(ts)) = (min.author.as_deref(), min.created_utc) {
-                        let a = a.trim();
-                        if a.is_empty() {
-                            return Ok(());
+            let result = (|| -> Result<()> {
+                scan_records(
+                    &plan.etl,
+                    &plan.query,
+                    /*show_progress=*/ false,
+                    |min, _kind, _line| {
+                        if let (Some(a), Some(ts)) = (min.author.as_deref(), min.created_utc) {
+                            let a = a.trim();
+                            if a.is_empty() {
+                                return Ok(());
+                            }
+                            kv.write_kv(a, ts)?;
                         }
-                        kv.write_kv(a, ts)?;
-                    }
-                    Ok(())
-                },
-            )?;
+                        Ok(())
+                    },
+                )?;
 
-            let shards = kv.reduce_min("first_seen")?;
-            concat_tsvs(&shards, out_path, plan.etl.opts.write_buffer_bytes)?;
-            Ok(())
+                let (shards, _scratch_root) = kv.reduce_min_with_scratch("first_seen")?;
+                concat_tsvs(&shards, out_path, plan.etl.opts.write_buffer_bytes)?;
+                Ok(())
+            })();
+            cleanup_scratch_dir(&scratch_root, "first_seen");
+            result
         })
     }
 

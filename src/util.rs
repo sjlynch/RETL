@@ -111,9 +111,10 @@ where
 use std::fs;
 use std::fs::File;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 // Named Windows error codes commonly seen on filter-driver / sharing /
 // removable-volume hiccups. Used by `is_retriable_io_error` below; named so
@@ -128,6 +129,27 @@ const WIN_ERR_NO_SUCH_DEVICE: i32 = 433;    // ERROR_NO_SUCH_DEVICE
 const WIN_ERR_FILE_INVALID: i32 = 1006;     // ERROR_FILE_INVALID — volume changed
 const WIN_ERR_IO_DEVICE: i32 = 1117;        // ERROR_IO_DEVICE
 const WIN_ERR_USER_MAPPED_FILE: i32 = 1224; // ERROR_USER_MAPPED_FILE
+
+static SCRATCH_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Return a process-unique scratch directory path under `work_dir`.
+///
+/// The directory name carries the logical `prefix`, scratch `kind`, PID,
+/// process-local counter, and current nanoseconds so separate `retl` processes
+/// sharing the same work dir do not reuse fixed shard roots.
+pub(crate) fn unique_scratch_dir(work_dir: &Path, prefix: &str, kind: &str) -> PathBuf {
+    let counter = SCRATCH_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    work_dir.join(format!(
+        "{prefix}_{kind}_{}_{}_{}",
+        std::process::id(),
+        counter,
+        nanos
+    ))
+}
 
 /// Return true for transient/retriable I/O errors often seen on Windows when
 /// filter drivers (AV/backup), USB/NAS volumes, or sharing violations occur.
@@ -190,6 +212,17 @@ pub fn remove_with_backoff(path: &Path, tries: usize, delay_ms: u64) -> Result<(
         Err(e) => Err(e),
     })
     .with_context(|| format!("remove {}", path.display()))
+}
+
+/// Recursively remove a scratch directory with retries/backoff.
+/// Succeeds if the directory doesn't exist.
+pub(crate) fn remove_dir_all_with_backoff(path: &Path, tries: usize, delay_ms: u64) -> Result<()> {
+    with_backoff(tries, delay_ms, || match fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    })
+    .with_context(|| format!("remove_dir_all {}", path.display()))
 }
 
 /// Rename a file with retries/backoff for transient errors.
