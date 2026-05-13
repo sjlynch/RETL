@@ -137,13 +137,24 @@ fn integrity_help_advertises_modes_and_sample() {
 }
 
 #[test]
-fn aggregate_help_requires_inputs_and_out() {
+fn aggregate_help_requires_inputs_out_and_runtime_flags_only() {
     let assert = retl().args(["aggregate", "--help"]).assert().success();
     let pred = contains("INPUTS")
         .and(contains("--out"))
         .and(contains("--by"))
         .and(contains("--metric"))
-        .and(contains("--top"));
+        .and(contains("--top"))
+        .and(contains("--parallelism"))
+        .and(contains("--no-progress"))
+        .and(contains("--shards-dir"))
+        .and(contains("--data-dir").not())
+        .and(contains("--work-dir").not())
+        .and(contains("--start").not())
+        .and(contains("--end").not())
+        .and(contains("--source").not())
+        .and(contains("--subreddit").not())
+        .and(contains("--include-deleted").not())
+        .and(contains("--file-concurrency").not());
     assert.stdout(pred);
 }
 

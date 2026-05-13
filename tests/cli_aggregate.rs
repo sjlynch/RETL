@@ -41,7 +41,8 @@ fn aggregate_by_subreddit_writes_count_tsv() {
     retl()
         .args([
             "aggregate",
-            "--no-progress",
+            "--parallelism",
+            "1",
             "--by",
             "subreddit",
             "--out",
@@ -137,7 +138,6 @@ fn aggregate_json_pointer_sum_and_month_grouping() {
 fn aggregate_fails_when_all_inputs_fail() {
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("counts.json");
-    let work = dir.path().join("work");
     let missing_a = dir.path().join("missing-a.jsonl");
     let missing_b = dir.path().join("missing-b.jsonl");
 
@@ -145,8 +145,6 @@ fn aggregate_fails_when_all_inputs_fail() {
         .args([
             "aggregate",
             "--no-progress",
-            "--work-dir",
-            work.to_str().unwrap(),
             "--out",
             out.to_str().unwrap(),
             missing_a.to_str().unwrap(),
@@ -169,15 +167,12 @@ fn aggregate_fails_when_all_inputs_are_malformed() {
     let dir = tempfile::tempdir().unwrap();
     let bad = dir.path().join("bad.jsonl");
     let out = dir.path().join("counts.json");
-    let work = dir.path().join("work");
     fs::write(&bad, "not-json\n").unwrap();
 
     retl()
         .args([
             "aggregate",
             "--no-progress",
-            "--work-dir",
-            work.to_str().unwrap(),
             "--out",
             out.to_str().unwrap(),
             bad.to_str().unwrap(),
@@ -200,15 +195,12 @@ fn aggregate_plain_count_does_not_warn_about_resume() {
     let dir = tempfile::tempdir().unwrap();
     let input = dir.path().join("input.jsonl");
     let out = dir.path().join("counts.json");
-    let work = dir.path().join("work");
     write_jsonl(&input, &[json!({"id":"a"})]);
 
     retl()
         .args([
             "aggregate",
             "--no-progress",
-            "--work-dir",
-            work.to_str().unwrap(),
             "--out",
             out.to_str().unwrap(),
             input.to_str().unwrap(),
@@ -223,7 +215,6 @@ fn aggregate_shards_dir_preserves_unrelated_files() {
     let dir = tempfile::tempdir().unwrap();
     let input = dir.path().join("input.jsonl");
     let out = dir.path().join("counts.json");
-    let work = dir.path().join("work");
     let shards = dir.path().join("caller_shards");
     fs::create_dir(&shards).unwrap();
     let unrelated_txt = shards.join("keep.txt");
@@ -236,8 +227,6 @@ fn aggregate_shards_dir_preserves_unrelated_files() {
         .args([
             "aggregate",
             "--no-progress",
-            "--work-dir",
-            work.to_str().unwrap(),
             "--shards-dir",
             shards.to_str().unwrap(),
             "--out",
