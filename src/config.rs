@@ -32,6 +32,8 @@ pub enum Sources {
 /// User-facing options with sensible defaults and builder chaining.
 #[derive(Clone, Debug)]
 pub struct ETLOptions {
+    /// Corpus base directory containing `comments/` and `submissions/`.
+    /// Defaults to `./data`, matching the `retl` CLI and README examples.
     pub base_dir: PathBuf,
     pub comments_dir: PathBuf,
     pub submissions_dir: PathBuf,
@@ -81,7 +83,7 @@ pub struct ETLOptions {
 
 impl Default for ETLOptions {
     fn default() -> Self {
-        let base = PathBuf::from("../reddit");
+        let base = PathBuf::from("./data");
         // Defaults chosen to be safe but noticeably faster than std defaults.
         // Adjust at runtime via io_* builder methods.
         let default_read = 256 * 1024;
@@ -245,5 +247,52 @@ impl ETLOptions {
     pub fn with_resume(mut self, yes: bool) -> Self {
         self.resume = yes;
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::paths::{plan_files_checked, Discovered};
+    use crate::pipeline::RedditETL;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn reddit_etl_new_planning_error_mentions_documented_default_data_dir() {
+        let etl = RedditETL::new();
+        assert_eq!(etl.opts.base_dir, PathBuf::from("./data"));
+        assert_eq!(
+            etl.opts.comments_dir,
+            PathBuf::from("./data").join("comments")
+        );
+        assert_eq!(
+            etl.opts.submissions_dir,
+            PathBuf::from("./data").join("submissions")
+        );
+
+        let discovered = Discovered {
+            comments: BTreeMap::new(),
+            submissions: BTreeMap::new(),
+        };
+        let err = plan_files_checked(
+            &discovered,
+            &etl.opts.comments_dir,
+            &etl.opts.submissions_dir,
+            etl.opts.sources,
+            etl.opts.start,
+            etl.opts.end,
+        )
+        .expect_err("empty default corpus should produce a planning error");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&etl.opts.comments_dir.display().to_string()),
+            "{msg}"
+        );
+        assert!(
+            msg.contains(&etl.opts.submissions_dir.display().to_string()),
+            "{msg}"
+        );
+        assert!(!msg.contains("../reddit"), "{msg}");
     }
 }
