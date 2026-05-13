@@ -6,7 +6,7 @@ use crate::filters::ym_from_epoch;
 use crate::json_utils::is_comment_record;
 use crate::mem::{available_memory_fraction, is_low_memory};
 use crate::parents_ids::{IdShards, SharedIdsetCache, WorkerShardCache};
-use crate::paths::{discover_all, plan_files, FileJob, FileKind};
+use crate::paths::{discover_all, plan_files_checked, FileJob, FileKind};
 use crate::pipeline::RedditETL;
 use crate::progress::{make_count_progress, make_progress_bar_labeled, total_compressed_size};
 use crate::util::{
@@ -21,7 +21,6 @@ use std::fs;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -40,6 +39,9 @@ const IDSET_CACHE_LOW_CAP: usize = 128;
 const ATTACH_FINGERPRINT_VERSION: u32 = 1;
 const ATTACH_FORMAT_VERSION: u32 = 1;
 const ATTACH_SIDECAR_SUFFIX: &str = ".parents-attach.json";
+const RESOLVER_FINGERPRINT_VERSION: u32 = 1;
+const RESOLVER_FORMAT_VERSION: u32 = 1;
+const RESOLVER_SIDECAR_SUFFIX: &str = ".parents-resolve.json";
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x100000001b3;
 
@@ -137,6 +139,46 @@ struct AttachFileIdentity {
     len: Option<u64>,
     modified_unix_secs: Option<i64>,
     modified_nanos: Option<u32>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct ResolverFingerprint {
+    version: u32,
+    resolver_format_version: u32,
+    source: ResolverSourceFingerprint,
+    resolution_range: AttachResolutionRange,
+    parent_ids: ParentIdsFingerprint,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct ResolverSourceFingerprint {
+    kind: String,
+    month: String,
+    file: AttachFileIdentity,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct ParentIdsFingerprint {
+    t1: ParentIdSetFingerprint,
+    t3: ParentIdSetFingerprint,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct ParentIdSetFingerprint {
+    kind: String,
+    storage: String,
+    ids: u64,
+    digest: String,
+    shard_count: u64,
+    backing_shards: Vec<ParentIdShardFingerprint>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct ParentIdShardFingerprint {
+    index: u64,
+    ids: u64,
+    digest: String,
+    len: u64,
 }
 
 pub struct ParentIds {
@@ -240,10 +282,13 @@ fn idset_cache_cap_for_free_memory(free: f64) -> usize {
 fn build_id_shard_index(
     files: &[FileJob],
     ids: &ParentIds,
+    parent_ids_fp: &ParentIdsFingerprint,
+    resolution_range: &AttachResolutionRange,
     comments_out: &Path,
     submissions_out: &Path,
     resume: bool,
     read_buf: usize,
+    write_buf: usize,
     file_concurrency: usize,
     pb: Option<&indicatif::ProgressBar>,
 ) -> Result<(HashMap<YearMonth, PathBuf>, HashMap<YearMonth, PathBuf>)> {
@@ -257,10 +302,6 @@ fn build_id_shard_index(
     let idset_cap = idset_cache_cap_for_free_memory(available_memory_fraction());
     let idset_cache: Arc<SharedIdsetCache> = Arc::new(SharedIdsetCache::new(idset_cap));
 
-    // Track per-file errors so we can warn-and-continue rather than
-    // silently dropping bad files (or failing the whole job).
-    let resolve_err_count = AtomicUsize::new(0);
-
     // Limit file concurrency to reduce RAM spikes while resolving.
     crate::concurrency::for_each_file_limited(files, file_concurrency, |job| -> Result<()> {
         let (out_dir, prefix) = match job.kind {
@@ -268,6 +309,8 @@ fn build_id_shard_index(
             FileKind::Submission => (submissions_out, "RS"),
         };
         let out = out_dir.join(format!("{}_{}.json", prefix, job.ym));
+        let sidecar_path = resolver_fingerprint_path(&out);
+        let fingerprint = build_resolver_fingerprint(job, parent_ids_fp, resolution_range);
 
         // Always record the shard path for downstream lookups, even on
         // resume — attach() needs the shard map populated regardless of
@@ -282,9 +325,11 @@ fn build_id_shard_index(
         };
 
         if resume && out.exists() {
-            // Validate that the existing JSON parses; treat unreadable /
-            // corrupt files as missing and rebuild them.
-            let valid = match File::open(&out) {
+            // Validate both the shard JSON and its resolver fingerprint. The
+            // sidecar binds this cache shard to the current ParentIds, source
+            // corpus file, source kind/month, resolver format, and requested
+            // resolver window; stale-but-parseable shards are rebuilt.
+            let valid_json = match File::open(&out) {
                 Ok(f) => match job.kind {
                     FileKind::Comment => {
                         serde_json::from_reader::<_, HashMap<String, String>>(BufReader::new(f))
@@ -298,16 +343,16 @@ fn build_id_shard_index(
                 },
                 Err(_) => false,
             };
-            if valid {
+            if valid_json && resolver_fingerprint_matches(&sidecar_path, &fingerprint) {
                 record_shard(out.clone());
                 if let Some(pb) = pb {
                     let sz = fs::metadata(&job.path).map(|m| m.len()).unwrap_or(0);
                     pb.inc(sz);
                 }
                 return Ok(());
-            } else {
+            }
+            if !valid_json {
                 tracing::warn!(path=%out.display(), "resume: existing parent shard is unreadable/corrupt, rebuilding");
-                let _ = fs::remove_file(&out);
             }
         }
 
@@ -382,7 +427,8 @@ fn build_id_shard_index(
         // after a crash mid-write.
         let tmp = out.with_extension("json.tmp");
         let write_res = (|| -> Result<()> {
-            let f = File::create(&tmp).with_context(|| format!("create tmp {}", tmp.display()))?;
+            let f = create_with_backoff(&tmp, 16, 50)
+                .with_context(|| format!("create tmp {}", tmp.display()))?;
             let mut w = BufWriter::new(f);
             match job.kind {
                 FileKind::Comment => serde_json::to_writer(&mut w, &out_map_c)?,
@@ -393,28 +439,16 @@ fn build_id_shard_index(
             Ok(())
         })();
 
-        match write_res {
-            Ok(_) => {
-                record_shard(out.clone());
-            }
-            Err(e) => {
-                resolve_err_count.fetch_add(1, Ordering::Relaxed);
-                // Best-effort cleanup so a stale .tmp doesn't linger.
-                let _ = fs::remove_file(&tmp);
-                tracing::warn!(path=%out.display(), error=%e, "failed writing parent shard");
-            }
+        if let Err(e) = write_res {
+            let _ = remove_with_backoff(&tmp, 8, 50);
+            return Err(e).with_context(|| format!("write parent shard {}", out.display()));
         }
+
+        write_resolver_fingerprint_atomic(&sidecar_path, &fingerprint, write_buf)?;
+        record_shard(out.clone());
 
         Ok(())
     })?;
-
-    let resolve_errs = resolve_err_count.load(Ordering::Relaxed);
-    if resolve_errs > 0 {
-        tracing::warn!(
-            error_count = resolve_errs,
-            "resolve_parent_maps completed with shard write errors"
-        );
-    }
 
     Ok((comment_shards.into_inner(), submission_shards.into_inner()))
 }
@@ -559,14 +593,18 @@ fn attach_shard_set_fingerprint(
     }
 }
 
-fn finish_unordered_digest(entries: usize, sum: u64, xor: u64) -> AttachMapDigest {
+fn finish_unordered_digest_string(entries: u64, sum: u64, xor: u64) -> String {
     let mut hash = FNV_OFFSET_BASIS;
-    update_digest_u64(&mut hash, entries as u64);
+    update_digest_u64(&mut hash, entries);
     update_digest_u64(&mut hash, sum);
     update_digest_u64(&mut hash, xor);
+    format!("{hash:016x}")
+}
+
+fn finish_unordered_digest(entries: usize, sum: u64, xor: u64) -> AttachMapDigest {
     AttachMapDigest {
         entries: entries as u64,
-        digest: format!("{hash:016x}"),
+        digest: finish_unordered_digest_string(entries as u64, sum, xor),
     }
 }
 
@@ -595,6 +633,113 @@ fn attach_submission_map_digest(map: &HashMap<String, (String, String)>) -> Atta
         xor ^= entry_hash.rotate_left((entry_hash & 63) as u32);
     }
     finish_unordered_digest(map.len(), sum, xor)
+}
+
+fn update_unordered_id_digest(count: &mut u64, sum: &mut u64, xor: &mut u64, id: &str) {
+    let mut entry_hash = FNV_OFFSET_BASIS;
+    update_digest_str(&mut entry_hash, id);
+    *count += 1;
+    *sum = sum.wrapping_add(entry_hash);
+    *xor ^= entry_hash.rotate_left((entry_hash & 63) as u32);
+}
+
+fn fingerprint_mem_id_set(kind: &str, ids: &AHashSet<String>) -> ParentIdSetFingerprint {
+    let mut count = 0u64;
+    let mut sum = 0u64;
+    let mut xor = 0u64;
+    for id in ids {
+        update_unordered_id_digest(&mut count, &mut sum, &mut xor, id);
+    }
+    ParentIdSetFingerprint {
+        kind: kind.to_string(),
+        storage: "memory".to_string(),
+        ids: count,
+        digest: finish_unordered_digest_string(count, sum, xor),
+        shard_count: 0,
+        backing_shards: Vec::new(),
+    }
+}
+
+fn fingerprint_empty_id_set(kind: &str) -> ParentIdSetFingerprint {
+    ParentIdSetFingerprint {
+        kind: kind.to_string(),
+        storage: "empty".to_string(),
+        ids: 0,
+        digest: finish_unordered_digest_string(0, 0, 0),
+        shard_count: 0,
+        backing_shards: Vec::new(),
+    }
+}
+
+fn fingerprint_id_shard_file(path: &Path) -> Result<(u64, u64, u64)> {
+    let f = File::open(path).with_context(|| format!("open parent-id shard {}", path.display()))?;
+    let r = BufReader::new(f);
+    let mut count = 0u64;
+    let mut sum = 0u64;
+    let mut xor = 0u64;
+    for line in r.lines() {
+        let mut id = line.with_context(|| format!("read parent-id shard {}", path.display()))?;
+        if id.ends_with('\r') {
+            id.pop();
+        }
+        if !id.is_empty() {
+            update_unordered_id_digest(&mut count, &mut sum, &mut xor, &id);
+        }
+    }
+    Ok((count, sum, xor))
+}
+
+fn fingerprint_sharded_id_set(kind: &str, shards: &IdShards) -> Result<ParentIdSetFingerprint> {
+    let mut total_count = 0u64;
+    let mut total_sum = 0u64;
+    let mut total_xor = 0u64;
+    let mut backing_shards = Vec::with_capacity(shards.count);
+
+    for idx in 0..shards.count {
+        let path = shards.path_for(idx);
+        let metadata = fs::metadata(&path)
+            .with_context(|| format!("stat parent-id shard {}", path.display()))?;
+        let (count, sum, xor) = fingerprint_id_shard_file(&path)?;
+        total_count += count;
+        total_sum = total_sum.wrapping_add(sum);
+        total_xor ^= xor;
+        backing_shards.push(ParentIdShardFingerprint {
+            index: idx as u64,
+            ids: count,
+            digest: finish_unordered_digest_string(count, sum, xor),
+            len: metadata.len(),
+        });
+    }
+
+    Ok(ParentIdSetFingerprint {
+        kind: kind.to_string(),
+        storage: "sharded".to_string(),
+        ids: total_count,
+        digest: finish_unordered_digest_string(total_count, total_sum, total_xor),
+        shard_count: shards.count as u64,
+        backing_shards,
+    })
+}
+
+fn parent_id_set_fingerprint(
+    kind: &str,
+    mem: Option<&AHashSet<String>>,
+    sharded: Option<&IdShards>,
+) -> Result<ParentIdSetFingerprint> {
+    if let Some(shards) = sharded {
+        fingerprint_sharded_id_set(kind, shards)
+    } else if let Some(ids) = mem {
+        Ok(fingerprint_mem_id_set(kind, ids))
+    } else {
+        Ok(fingerprint_empty_id_set(kind))
+    }
+}
+
+fn parent_ids_fingerprint(ids: &ParentIds) -> Result<ParentIdsFingerprint> {
+    Ok(ParentIdsFingerprint {
+        t1: parent_id_set_fingerprint("t1", ids.t1_ids_mem.as_ref(), ids.t1_ids_sharded.as_ref())?,
+        t3: parent_id_set_fingerprint("t3", ids.t3_ids_mem.as_ref(), ids.t3_ids_sharded.as_ref())?,
+    })
 }
 
 fn attach_parent_cache_fingerprint(parents: &ParentMaps) -> AttachParentCacheFingerprint {
@@ -628,6 +773,105 @@ fn build_attach_fingerprint(
         resolution_range: resolution_range.clone(),
         parent_cache: parent_cache.clone(),
     }
+}
+
+fn resolver_fingerprint_path(final_dest: &Path) -> PathBuf {
+    let mut sidecar = final_dest.as_os_str().to_os_string();
+    sidecar.push(RESOLVER_SIDECAR_SUFFIX);
+    PathBuf::from(sidecar)
+}
+
+fn resolver_kind_label(kind: FileKind) -> &'static str {
+    match kind {
+        FileKind::Comment => "comments",
+        FileKind::Submission => "submissions",
+    }
+}
+
+fn build_resolver_fingerprint(
+    job: &FileJob,
+    parent_ids: &ParentIdsFingerprint,
+    resolution_range: &AttachResolutionRange,
+) -> ResolverFingerprint {
+    ResolverFingerprint {
+        version: RESOLVER_FINGERPRINT_VERSION,
+        resolver_format_version: RESOLVER_FORMAT_VERSION,
+        source: ResolverSourceFingerprint {
+            kind: resolver_kind_label(job.kind).to_string(),
+            month: job.ym.to_string(),
+            file: attach_file_identity(&job.path),
+        },
+        resolution_range: resolution_range.clone(),
+        parent_ids: parent_ids.clone(),
+    }
+}
+
+fn resolver_fingerprint_matches(sidecar_path: &Path, expected: &ResolverFingerprint) -> bool {
+    match File::open(sidecar_path) {
+        Ok(f) => match serde_json::from_reader::<_, ResolverFingerprint>(BufReader::new(f)) {
+            Ok(actual) if &actual == expected => true,
+            Ok(_) => {
+                tracing::debug!(path=%sidecar_path.display(), "resume: parent resolver fingerprint changed, rebuilding");
+                false
+            }
+            Err(e) => {
+                tracing::warn!(path=%sidecar_path.display(), error=%e, "resume: parent resolver fingerprint sidecar is unreadable, rebuilding");
+                false
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::debug!(path=%sidecar_path.display(), "resume: parent resolver fingerprint sidecar missing, rebuilding");
+            false
+        }
+        Err(e) => {
+            tracing::warn!(path=%sidecar_path.display(), error=%e, "resume: parent resolver fingerprint sidecar cannot be opened, rebuilding");
+            false
+        }
+    }
+}
+
+fn write_resolver_fingerprint_atomic(
+    sidecar_path: &Path,
+    fingerprint: &ResolverFingerprint,
+    write_buf_bytes: usize,
+) -> Result<()> {
+    let mut staged = sidecar_path.as_os_str().to_os_string();
+    staged.push(INPROGRESS_EXT);
+    let staged = PathBuf::from(staged);
+
+    if let Some(parent) = sidecar_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create resolver sidecar parent {}", parent.display()))?;
+    }
+
+    let file = create_with_backoff(&staged, 16, 50)
+        .with_context(|| format!("create staged resolver fingerprint {}", staged.display()))?;
+    let mut writer = BufWriter::with_capacity(write_buf_bytes, file);
+    let write_result = (|| -> Result<()> {
+        serde_json::to_writer_pretty(&mut writer, fingerprint)?;
+        writer.write_all(b"\n")?;
+        writer.flush()?;
+        Ok(())
+    })();
+
+    if let Err(e) = write_result {
+        drop(writer);
+        let _ = remove_with_backoff(&staged, 8, 50);
+        return Err(e)
+            .with_context(|| format!("write staged resolver fingerprint {}", staged.display()));
+    }
+    drop(writer);
+
+    if let Err(e) = replace_file_atomic_backoff(&staged, sidecar_path) {
+        let _ = remove_with_backoff(&staged, 8, 50);
+        return Err(e).with_context(|| {
+            format!(
+                "publish resolver fingerprint sidecar {}",
+                sidecar_path.display()
+            )
+        });
+    }
+    Ok(())
 }
 
 fn attach_fingerprint_matches(sidecar_path: &Path, expected: &AttachFingerprint) -> bool {
@@ -801,27 +1045,22 @@ impl RedditETL {
             fs::create_dir_all(&submissions_out)?;
 
             let discovered = discover_all(&self.opts.comments_dir, &self.opts.submissions_dir);
-            let files = plan_files(
+            let files = plan_files_checked(
                 &discovered,
+                &self.opts.comments_dir,
+                &self.opts.submissions_dir,
                 crate::config::Sources::Both,
                 self.opts.start,
                 self.opts.end,
-            );
-            if files.is_empty() {
-                tracing::warn!(
-                    comments_dir = %self.opts.comments_dir.display(),
-                    submissions_dir = %self.opts.submissions_dir.display(),
-                    start = ?self.opts.start,
-                    end = ?self.opts.end,
-                    "resolve_parent_maps planned zero corpus files; returning empty parent maps"
-                );
-                return Ok(ParentMaps {
-                    comments: HashMap::new(),
-                    submissions: HashMap::new(),
-                    comment_shards: Some(HashMap::new()),
-                    submission_shards: Some(HashMap::new()),
-                });
-            }
+            )
+            .with_context(|| {
+                format!(
+                    "resolve_parent_maps planned zero corpus files for resolver range {:?}..={:?}",
+                    self.opts.start, self.opts.end
+                )
+            })?;
+            let parent_ids_fp = parent_ids_fingerprint(ids)?;
+            let resolution_range = attach_resolution_range(self.opts.start, self.opts.end);
 
             let total_bytes = total_compressed_size(&files);
             let pb = if self.opts.progress {
@@ -836,10 +1075,13 @@ impl RedditETL {
             let (comment_shards, submission_shards) = build_id_shard_index(
                 &files,
                 ids,
+                &parent_ids_fp,
+                &resolution_range,
                 &comments_out,
                 &submissions_out,
                 resume,
                 self.opts.read_buffer_bytes,
+                self.opts.write_buffer_bytes,
                 self.opts.file_concurrency,
                 pb.as_ref(),
             )?;
@@ -865,6 +1107,16 @@ impl RedditETL {
                         .ok()
                         .into_iter()
                         .flat_map(|it| it.filter_map(|e| e.ok().map(|e| e.path())))
+                        .filter(|p| {
+                            p.file_name()
+                                .and_then(|name| name.to_str())
+                                .map(|name| {
+                                    name.ends_with(".json")
+                                        && !name.ends_with(RESOLVER_SIDECAR_SUFFIX)
+                                        && !name.ends_with(INPROGRESS_EXT)
+                                })
+                                .unwrap_or(false)
+                        })
                         .collect();
                     v.sort();
                     v
@@ -1004,15 +1256,26 @@ impl RedditETL {
                             let f = File::open(in_path)?;
                             let r = BufReader::new(f);
 
-                            for line in r.lines() {
-                                let line = line?;
+                            for (line_idx, line) in r.lines().enumerate() {
+                                let line_no = line_idx + 1;
+                                let line = line.with_context(|| {
+                                    format!(
+                                        "read parent attach input {} at line {}",
+                                        in_path.display(),
+                                        line_no
+                                    )
+                                })?;
                                 if line.is_empty() {
                                     continue;
                                 }
-                                let mut v: Value = match serde_json::from_str(&line) {
-                                    Ok(x) => x,
-                                    Err(_) => continue,
-                                };
+                                let mut v: Value =
+                                    serde_json::from_str(&line).with_context(|| {
+                                        format!(
+                                            "malformed JSON in parent attach input {} at line {}",
+                                            in_path.display(),
+                                            line_no
+                                        )
+                                    })?;
 
                                 let has_body = v.get("body").is_some();
                                 let has_parent_id = v.get("parent_id").is_some();

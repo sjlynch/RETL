@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use serde::Deserialize;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read};
@@ -86,6 +86,25 @@ pub fn parse_minimal(line: &str) -> Result<MinimalRecord> {
     Ok(serde_json::from_str(line)?)
 }
 
+/// Build the standardized fatal error for malformed JSONL records.
+///
+/// Policy: valid zstd frames that contain syntactically invalid JSONL are not
+/// treated as corrupt-frame skips. Scan/export/dedupe callers abort the file
+/// and surface the path plus 1-based line number so resumable outputs are not
+/// marked complete with partial data.
+pub fn malformed_json_error(
+    path: &Path,
+    line_number: u64,
+    source: impl std::fmt::Display,
+) -> anyhow::Error {
+    anyhow!(
+        "malformed JSON in {} at line {}: {}",
+        path.display(),
+        line_number,
+        source
+    )
+}
+
 // ----------------------------- Streaming ----------------------------------
 
 /// Options for [`for_each_line_with_opts`].
@@ -151,6 +170,7 @@ pub fn for_each_line_with_opts_status(
     );
     match result {
         Ok(()) => Ok(true),
+        Err(LineStreamAttemptError::Open(e)) => Err(e),
         Err(LineStreamAttemptError::Decode(e)) => {
             warn_decode_skip(path, &e);
             if let Some(cb) = on_skip.as_deref_mut() {
@@ -329,6 +349,7 @@ impl<R: Read> Read for CountingReader<R> {
 }
 
 enum LineStreamAttemptError {
+    Open(anyhow::Error),
     Decode(anyhow::Error),
     Callback(anyhow::Error),
 }
@@ -351,8 +372,11 @@ fn for_each_line_attempt<'borrow, 'cb: 'borrow>(
     throttle: bool,
     on_line: &mut impl FnMut(&str) -> Result<()>,
 ) -> std::result::Result<(), LineStreamAttemptError> {
-    let file =
-        open_with_backoff(path, 16, 50).map_err(|e| LineStreamAttemptError::Decode(e.into()))?;
+    let file = open_with_backoff(path, 16, 50).map_err(|e| {
+        LineStreamAttemptError::Open(
+            anyhow::Error::new(e).context(format!("open zstd input {}", path.display())),
+        )
+    })?;
     let counter = Arc::new(AtomicU64::new(0));
     let cnt = CountingReader {
         inner: file,
@@ -487,6 +511,10 @@ mod tests {
             res
         );
 
+        let status = for_each_line_cfg_status(&path, 16 * 1024, |_line| Ok(()))
+            .expect("status API should not bubble corrupt-frame decode errors");
+        assert!(!status, "status API must report the corrupt file as incomplete");
+
         // The *_with_skip variant must also skip gracefully AND surface the
         // skip event to the caller via `on_skip`. The path passed to the
         // callback must match the file we tried to read, and the captured
@@ -555,6 +583,22 @@ mod tests {
             lines_seen, 50,
             "all lines must be delivered on healthy files"
         );
+    }
+
+    #[test]
+    fn missing_file_open_error_propagates_without_skip_callback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.zst");
+
+        let mut skip_count = 0usize;
+        let err =
+            for_each_line_cfg_with_skip(&path, 16 * 1024, |_, _| skip_count += 1, |_line| Ok(()))
+                .expect_err("missing input must be a fatal open error");
+
+        assert_eq!(skip_count, 0, "on_skip must not fire for open errors");
+        let msg = err.to_string();
+        assert!(msg.contains("open zstd input"), "unexpected error: {msg}");
+        assert!(msg.contains("missing.zst"), "unexpected error: {msg}");
     }
 
     #[test]

@@ -6,6 +6,7 @@ use retl::{ParentAttachStats, ParentIds, ParentMaps, RedditETL, Sources, YearMon
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
+use std::path::Path;
 
 /// End-to-end parents pipeline over a tiny synthetic corpus:
 /// 1) Build a small test corpus under a temp dir (RC/RS 2006-01 for r/programming).
@@ -308,6 +309,270 @@ fn attach_resume_rebuilds_when_resolution_window_expands() {
             .and_then(|v| v.as_str()),
         Some("December parent")
     );
+}
+
+#[test]
+fn resolve_resume_rebuilds_when_parent_ids_change() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("corpus");
+    let work_dir = tmp.path().join("work");
+    let cache_dir = tmp.path().join("parents_cache");
+    let ym = YearMonth::new(2006, 1);
+
+    write_comment_parent_corpus(&base, ym, &[("p1", "parent one"), ("p2", "parent two")]);
+    let spool1 = tmp.path().join("spool1.jsonl");
+    let spool2 = tmp.path().join("spool2.jsonl");
+    write_parent_ref_spool(&spool1, "t1_p1");
+    write_parent_ref_spool(&spool2, "t1_p2");
+
+    let ids1 = collect_parent_ids_for_test(&base, &work_dir, &spool1);
+    RedditETL::new()
+        .base_dir(&base)
+        .work_dir(&work_dir)
+        .date_range(Some(ym), Some(ym))
+        .progress(false)
+        .resolve_parent_maps(&ids1, &cache_dir, true)
+        .unwrap();
+    let first = read_comment_cache(&cache_dir, ym);
+    assert_eq!(first.get("p1").map(String::as_str), Some("parent one"));
+    assert!(!first.contains_key("p2"));
+
+    let ids2 = collect_parent_ids_for_test(&base, &work_dir, &spool2);
+    RedditETL::new()
+        .base_dir(&base)
+        .work_dir(&work_dir)
+        .date_range(Some(ym), Some(ym))
+        .progress(false)
+        .resolve_parent_maps(&ids2, &cache_dir, true)
+        .unwrap();
+    let second = read_comment_cache(&cache_dir, ym);
+    assert_eq!(second.get("p2").map(String::as_str), Some("parent two"));
+    assert!(
+        !second.contains_key("p1"),
+        "resume reused a parent-cache shard from the prior ParentIds"
+    );
+}
+
+#[test]
+fn resolve_resume_rebuilds_when_corpus_path_changes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base1 = tmp.path().join("corpus1");
+    let base2 = tmp.path().join("corpus2");
+    let work_dir = tmp.path().join("work");
+    let cache_dir = tmp.path().join("parents_cache");
+    let ym = YearMonth::new(2006, 1);
+
+    write_comment_parent_corpus(&base1, ym, &[("p1", "old corpus body")]);
+    write_comment_parent_corpus(&base2, ym, &[("p1", "new corpus body")]);
+    let spool = tmp.path().join("spool.jsonl");
+    write_parent_ref_spool(&spool, "t1_p1");
+    let ids = collect_parent_ids_for_test(&base1, &work_dir, &spool);
+
+    RedditETL::new()
+        .base_dir(&base1)
+        .work_dir(&work_dir)
+        .date_range(Some(ym), Some(ym))
+        .progress(false)
+        .resolve_parent_maps(&ids, &cache_dir, true)
+        .unwrap();
+    assert_eq!(
+        read_comment_cache(&cache_dir, ym)
+            .get("p1")
+            .map(String::as_str),
+        Some("old corpus body")
+    );
+
+    RedditETL::new()
+        .base_dir(&base2)
+        .work_dir(&work_dir)
+        .date_range(Some(ym), Some(ym))
+        .progress(false)
+        .resolve_parent_maps(&ids, &cache_dir, true)
+        .unwrap();
+    assert_eq!(
+        read_comment_cache(&cache_dir, ym)
+            .get("p1")
+            .map(String::as_str),
+        Some("new corpus body"),
+        "resume reused a parent-cache shard from a different corpus path"
+    );
+}
+
+#[test]
+fn resolve_parent_maps_errors_on_zero_planned_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ym = YearMonth::new(2006, 1);
+    let err = match RedditETL::new()
+        .base_dir(tmp.path().join("empty_corpus"))
+        .date_range(Some(ym), Some(ym))
+        .progress(false)
+        .resolve_parent_maps(&ParentIds::new(), &tmp.path().join("cache"), true)
+    {
+        Ok(_) => panic!("resolve_parent_maps unexpectedly succeeded"),
+        Err(err) => err,
+    };
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("planned zero corpus files") || msg.contains("no input files found"),
+        "unexpected error: {msg}"
+    );
+}
+
+#[test]
+fn resolve_parent_maps_propagates_cache_write_failure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("corpus");
+    let work_dir = tmp.path().join("work");
+    let cache_dir = tmp.path().join("parents_cache");
+    let ym = YearMonth::new(2006, 1);
+
+    write_comment_parent_corpus(&base, ym, &[("p1", "parent body")]);
+    let spool = tmp.path().join("spool.jsonl");
+    write_parent_ref_spool(&spool, "t1_p1");
+    let ids = collect_parent_ids_for_test(&base, &work_dir, &spool);
+
+    fs::create_dir_all(cache_dir.join("comments").join("RC_2006-01.json")).unwrap();
+    let err = match RedditETL::new()
+        .base_dir(&base)
+        .work_dir(&work_dir)
+        .date_range(Some(ym), Some(ym))
+        .progress(false)
+        .resolve_parent_maps(&ids, &cache_dir, false)
+    {
+        Ok(_) => panic!("resolve_parent_maps unexpectedly succeeded"),
+        Err(err) => err,
+    };
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("write parent shard"),
+        "unexpected error: {msg}"
+    );
+}
+
+#[test]
+fn attach_parents_errors_on_malformed_spool_json_with_location() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input = tmp.path().join("part_RC_2006-01.jsonl");
+    fs::write(
+        &input,
+        "{\"id\":\"ok\",\"body\":\"child\",\"parent_id\":\"t1_p1\",\"created_utc\":1136073600}\n{bad json}\n",
+    )
+    .unwrap();
+    let parents = ParentMaps {
+        comments: HashMap::new(),
+        submissions: HashMap::new(),
+        comment_shards: Some(HashMap::new()),
+        submission_shards: Some(HashMap::new()),
+    };
+
+    let err = RedditETL::new()
+        .progress(false)
+        .attach_parents_jsonls_parallel_with_stats(
+            vec![input.clone()],
+            &tmp.path().join("attached"),
+            &parents,
+            false,
+        )
+        .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains(&input.display().to_string()),
+        "unexpected error: {msg}"
+    );
+    assert!(msg.contains("line 2"), "unexpected error: {msg}");
+}
+
+#[test]
+fn parent_id_collections_sharing_work_dir_keep_held_ids_alive() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("corpus");
+    let work_dir = tmp.path().join("work");
+    let ym = YearMonth::new(2006, 1);
+
+    write_comment_parent_corpus(
+        &base,
+        ym,
+        &[("p1", "first parent"), ("p2", "second parent")],
+    );
+    let spool1 = tmp.path().join("spool1.jsonl");
+    let spool2 = tmp.path().join("spool2.jsonl");
+    write_parent_ref_spool(&spool1, "t1_p1");
+    write_parent_ref_spool(&spool2, "t1_p2");
+
+    let ids1 = collect_parent_ids_for_test(&base, &work_dir, &spool1);
+    let ids2 = collect_parent_ids_for_test(&base, &work_dir, &spool2);
+
+    RedditETL::new()
+        .base_dir(&base)
+        .work_dir(&work_dir)
+        .date_range(Some(ym), Some(ym))
+        .progress(false)
+        .resolve_parent_maps(&ids1, &tmp.path().join("cache1"), false)
+        .unwrap();
+    let first = read_comment_cache(&tmp.path().join("cache1"), ym);
+    assert_eq!(first.get("p1").map(String::as_str), Some("first parent"));
+    assert!(!first.contains_key("p2"));
+
+    RedditETL::new()
+        .base_dir(&base)
+        .work_dir(&work_dir)
+        .date_range(Some(ym), Some(ym))
+        .progress(false)
+        .resolve_parent_maps(&ids2, &tmp.path().join("cache2"), false)
+        .unwrap();
+    let second = read_comment_cache(&tmp.path().join("cache2"), ym);
+    assert_eq!(second.get("p2").map(String::as_str), Some("second parent"));
+    assert!(!second.contains_key("p1"));
+}
+
+fn write_comment_parent_corpus(base: &Path, ym: YearMonth, parents: &[(&str, &str)]) {
+    let lines: Vec<String> = parents
+        .iter()
+        .map(|(id, body)| {
+            serde_json::json!({
+                "author": "parent_author",
+                "body": body,
+                "created_utc": 1136073600,
+                "id": id,
+                "score": 1,
+                "subreddit": "programming"
+            })
+            .to_string()
+        })
+        .collect();
+    write_zst_lines(
+        &base.join("comments").join(format!("RC_{}.zst", ym)),
+        &lines,
+    );
+}
+
+fn write_parent_ref_spool(path: &Path, parent_id: &str) {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).unwrap();
+    }
+    fs::write(
+        path,
+        format!(
+            "{{\"id\":\"child\",\"body\":\"child\",\"parent_id\":\"{}\",\"link_id\":\"t3_s\",\"created_utc\":1136073600}}\n",
+            parent_id
+        ),
+    )
+    .unwrap();
+}
+
+fn collect_parent_ids_for_test(base: &Path, work_dir: &Path, spool: &Path) -> ParentIds {
+    RedditETL::new()
+        .base_dir(base)
+        .work_dir(work_dir)
+        .progress(false)
+        .collect_parent_ids_from_jsonls(vec![spool.to_path_buf()])
+        .unwrap()
+}
+
+fn read_comment_cache(cache_dir: &Path, ym: YearMonth) -> HashMap<String, String> {
+    let path = cache_dir.join("comments").join(format!("RC_{}.json", ym));
+    let file = File::open(path).unwrap();
+    serde_json::from_reader(BufReader::new(file)).unwrap()
 }
 
 fn count_jsonl_lines(paths: &[std::path::PathBuf]) -> usize {

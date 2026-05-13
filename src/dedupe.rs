@@ -4,6 +4,7 @@ use crate::mem::{available_memory_fraction, is_low_memory, AdaptiveMemCfg};
 use crate::ndjson::{NdjsonReader, NdjsonWriter};
 use crate::progress::ProgressScope;
 use crate::util::{open_with_backoff, remove_with_backoff, replace_file_atomic_backoff, smoothstep_memory_fraction};
+use crate::zstd_jsonl::malformed_json_error;
 use anyhow::{Context, Result};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -109,6 +110,7 @@ pub fn build_runs_sorted(
         });
 
         let producer_result = run_producer(
+            input,
             cfg,
             &mut rdr,
             key,
@@ -134,6 +136,7 @@ pub fn build_runs_sorted(
 }
 
 fn run_producer(
+    input_path: &Path,
     cfg: &DedupeCfg,
     rdr: &mut NdjsonReader,
     key: &KeyExtractor,
@@ -148,14 +151,19 @@ fn run_producer(
     let mut last_eval = Instant::now() - Duration::from_millis(adaptive_mem.adapt_cooldown_ms * 2);
     let mut map: RunMap = ahash::AHashMap::with_capacity(MAP_INITIAL_CAPACITY);
     let mut run_idx: usize = 0;
+    let mut line_number: u64 = 0;
 
     loop {
         let n = rdr.read_line(&mut buf)?;
         if n == 0 { break; }
         pb.inc_bytes(n as u64);
+        line_number += 1;
 
         if buf.is_empty() { continue; }
-        if let Some(k) = key.key_from_line(&buf) {
+        if let Some(k) = key
+            .key_from_line(&buf)
+            .map_err(|e| malformed_json_error(input_path, line_number, e))?
+        {
             map.entry(k).or_default().push(buf.clone());
             buffered_bytes += buf.len() + 1;
         }
@@ -271,24 +279,30 @@ pub fn merge_runs_sorted(
     // accounting stays consistent across the three call sites below.
     fn advance_reader(
         reader: &mut BufReader<File>,
+        run_path: &Path,
         run_idx: usize,
         key: &KeyExtractor,
         read_bytes: &mut u64,
+        line_number: &mut u64,
         pb: &ProgressScope,
     ) -> Result<Option<HeapItem>> {
         let mut s = String::new();
         let n = reader.read_line(&mut s)?;
         if n == 0 { return Ok(None); }
         *read_bytes += n as u64;
+        *line_number += 1;
         pb.inc_bytes(n as u64);
         if s.ends_with('\n') { s.pop(); if s.ends_with('\r') { s.pop(); } }
-        Ok(key.key_from_line(&s).map(|k| HeapItem { key: k, run_idx, line: s }))
+        Ok(key
+            .key_from_line(&s)
+            .map_err(|e| malformed_json_error(run_path, *line_number, e))?
+            .map(|k| HeapItem { key: k, run_idx, line: s }))
     }
 
-    let mut readers: Vec<(BufReader<File>, u64)> = Vec::with_capacity(runs.len()); // (reader, bytes_read)
+    let mut readers: Vec<(BufReader<File>, u64, u64)> = Vec::with_capacity(runs.len()); // (reader, bytes_read, lines_read)
     for p in runs {
         let f = open_with_backoff(p, 16, 50).with_context(|| format!("open {}", p.display()))?;
-        readers.push((BufReader::with_capacity(cfg.read_buf_bytes, f), 0));
+        readers.push((BufReader::with_capacity(cfg.read_buf_bytes, f), 0, 0));
     }
 
     let tmp_out = output.with_extension("ndjson.inprogress");
@@ -300,8 +314,8 @@ pub fn merge_runs_sorted(
 
     // Prime heap
     for i in 0..readers.len() {
-        let (r, read_bytes) = &mut readers[i];
-        if let Some(item) = advance_reader(r, i, key, read_bytes, &pb)? {
+        let (r, read_bytes, line_number) = &mut readers[i];
+        if let Some(item) = advance_reader(r, &runs[i], i, key, read_bytes, line_number, &pb)? {
             heap.push(item);
         }
     }
@@ -316,8 +330,8 @@ pub fn merge_runs_sorted(
 
         // Pull next from the run we just popped from
         {
-            let (r, read_bytes) = &mut readers[top.run_idx];
-            if let Some(item) = advance_reader(r, top.run_idx, key, read_bytes, &pb)? {
+            let (r, read_bytes, line_number) = &mut readers[top.run_idx];
+            if let Some(item) = advance_reader(r, &runs[top.run_idx], top.run_idx, key, read_bytes, line_number, &pb)? {
                 heap.push(item);
             }
         }
@@ -328,8 +342,8 @@ pub fn merge_runs_sorted(
             let run_idx = item.run_idx;
             group_lines.push(item.line);
 
-            let (r, read_bytes) = &mut readers[run_idx];
-            if let Some(item) = advance_reader(r, run_idx, key, read_bytes, &pb)? {
+            let (r, read_bytes, line_number) = &mut readers[run_idx];
+            if let Some(item) = advance_reader(r, &runs[run_idx], run_idx, key, read_bytes, line_number, &pb)? {
                 heap.push(item);
             }
         }

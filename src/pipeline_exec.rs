@@ -23,7 +23,8 @@ use crate::util::{
     create_with_backoff, remove_dir_all_with_backoff, remove_with_backoff, with_thread_pool,
 };
 use crate::zstd_jsonl::{
-    for_each_line_cfg, for_each_line_with_progress_cfg, parse_minimal, MinimalRecord,
+    for_each_line_cfg, for_each_line_with_progress_cfg, malformed_json_error, parse_minimal,
+    MinimalRecord,
 };
 use anyhow::{anyhow, Context, Result};
 use indicatif::ProgressBar;
@@ -485,7 +486,6 @@ impl ScanPlan {
                         write_buf,
                         human_ts,
                         whitelist_tracker: whitelist_tracker.as_deref(),
-                        strict_whitelist: plan.etl.opts.strict_whitelist,
                         resume,
                         completed_keys: &completed_keys,
                     };
@@ -928,7 +928,6 @@ struct MonthJobCtx<'a> {
     write_buf: usize,
     human_ts: bool,
     whitelist_tracker: Option<&'a WhitelistMatchTracker>,
-    strict_whitelist: bool,
     resume: bool,
     completed_keys: &'a HashSet<String>,
 }
@@ -970,9 +969,10 @@ fn load_and_validate_manifest(
 
 /// Per-month closure body: skip if the month is already published (resume
 /// fast-path), otherwise atomically write the spool output via
-/// `write_jsonl_atomic`. Returns `Ok(None)` on resume-skip or transient atomic
-/// write failure (already logged); `Ok(Some(MonthResult))` on a successful
-/// publish whose entry the caller should commit to the manifest.
+/// `write_jsonl_atomic`. Returns `Ok(None)` on resume-skip or a tolerated zstd
+/// decode/partial-scan skip (already logged); `Ok(Some(MonthResult))` on a
+/// successful publish whose entry the caller should commit to the manifest.
+/// Non-decode output, malformed-JSON, and publish failures are fatal.
 fn process_month(job: &FileJob, ctx: &MonthJobCtx<'_>) -> Result<Option<MonthResult>> {
     let (file_prefix, key_prefix) = match job.kind {
         FileKind::Comment => (FILE_PREFIX_RC, "RC"),
@@ -1015,23 +1015,7 @@ fn process_month(job: &FileJob, ctx: &MonthJobCtx<'_>) -> Result<Option<MonthRes
             tracing::warn!(path=%job.path.display(), output=%out_path.display(), error=%e, "Skipping month after zstd decode error; staged spool output was discarded and resume will retry it");
             return Ok(None);
         }
-        Err(e) => {
-            if ctx.strict_whitelist
-                && e.chain().any(|cause| {
-                    cause
-                        .to_string()
-                        .starts_with("--whitelist matched zero fields")
-                })
-            {
-                return Err(e);
-            }
-            tracing::warn!(path=%out_path.display(), error=%e, "Skipping month: failed to atomically write spool output");
-            if let Some(pb) = ctx.pb {
-                let sz = fs::metadata(&job.path).map(|m| m.len()).unwrap_or(0);
-                pb.inc(sz);
-            }
-            return Ok(None);
-        }
+        Err(e) => return Err(e),
     };
 
     Ok(Some(MonthResult {
@@ -1339,22 +1323,30 @@ where
         etl.opts.file_concurrency,
         |job| -> Result<()> {
             let kind = job.kind;
+            let mut line_number: u64 = 0;
             let line_cb = |line: &str| -> Result<()> {
-                if let Ok(min) = parse_minimal(line) {
-                    if !matches_minimal(&min, targets_ref, query) {
-                        return Ok(());
-                    }
-                    if !within_bounds(&min, bounds) {
-                        return Ok(());
-                    }
-                    if query.requires_full_parse() {
-                        let val: serde_json::Value = serde_json::from_str(line)?;
-                        if !matches_full(&val, kind, query) {
-                            return Ok(());
-                        }
-                    }
-                    on_record(&min, kind, line)?;
+                line_number += 1;
+                let min = match parse_minimal(line) {
+                    Ok(min) => min,
+                    Err(_) => match serde_json::from_str::<serde_json::Value>(line) {
+                        Ok(_) => return Ok(()),
+                        Err(e) => return Err(malformed_json_error(&job.path, line_number, e)),
+                    },
+                };
+                if !matches_minimal(&min, targets_ref, query) {
+                    return Ok(());
                 }
+                if !within_bounds(&min, bounds) {
+                    return Ok(());
+                }
+                if query.requires_full_parse() {
+                    let val: serde_json::Value = serde_json::from_str(line)
+                        .map_err(|e| malformed_json_error(&job.path, line_number, e))?;
+                    if !matches_full(&val, kind, query) {
+                        return Ok(());
+                    }
+                }
+                on_record(&min, kind, line)?;
                 Ok(())
             };
             if let Some(pb) = &pb {

@@ -9,12 +9,71 @@ use rayon::prelude::*;
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+static PARENT_ID_SCRATCH_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) struct IdScratchRoot {
+    path: PathBuf,
+}
+
+impl IdScratchRoot {
+    fn create(work_dir: &Path) -> Result<Arc<Self>> {
+        let parent = work_dir.join("parent_ids");
+        fs::create_dir_all(&parent)
+            .with_context(|| format!("create parent-id scratch parent {}", parent.display()))?;
+
+        let pid = std::process::id();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let counter = PARENT_ID_SCRATCH_COUNTER.fetch_add(1, Ordering::Relaxed);
+
+        for attempt in 0..1024usize {
+            let path = parent.join(format!("run-p{pid}-{nanos:x}-{counter:x}-{attempt:x}"));
+            match fs::create_dir(&path) {
+                Ok(()) => return Ok(Arc::new(Self { path })),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("create parent-id scratch root {}", path.display())
+                    });
+                }
+            }
+        }
+
+        Err(anyhow::anyhow!(
+            "could not allocate a unique parent-id scratch root under {}",
+            parent.display()
+        ))
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for IdScratchRoot {
+    fn drop(&mut self) {
+        if let Err(e) = fs::remove_dir_all(&self.path) {
+            if e.kind() != io::ErrorKind::NotFound {
+                tracing::debug!(
+                    path = %self.path.display(),
+                    error = %e,
+                    "failed to remove parent-id scratch root"
+                );
+            }
+        }
+    }
+}
 
 pub(crate) struct IdShardWriter {
+    scratch_root: Arc<IdScratchRoot>,
     base_dir: PathBuf,
     count: usize,
     rs: RandomState,
@@ -22,8 +81,12 @@ pub(crate) struct IdShardWriter {
     writers: Vec<parking_lot::Mutex<BufWriter<File>>>,
 }
 impl IdShardWriter {
-    pub(crate) fn create(base_dir: &Path, kind: &'static str, count: usize) -> Result<Self> {
-        let dir = base_dir.join(format!("{kind}_ids_shards"));
+    pub(crate) fn create(
+        scratch_root: Arc<IdScratchRoot>,
+        kind: &'static str,
+        count: usize,
+    ) -> Result<Self> {
+        let dir = scratch_root.path().join(format!("{kind}_ids_shards"));
         fs::create_dir_all(&dir)?;
         let mut writers = Vec::with_capacity(count);
         for i in 0..count {
@@ -31,7 +94,14 @@ impl IdShardWriter {
             writers.push(parking_lot::Mutex::new(BufWriter::new(File::create(p)?)));
         }
         let rs = shard_common::seeded_state("parent_ids");
-        Ok(Self { base_dir: dir, count, rs, kind, writers })
+        Ok(Self {
+            scratch_root,
+            base_dir: dir,
+            count,
+            rs,
+            kind,
+            writers,
+        })
     }
     #[inline]
     fn idx(&self, id: &str) -> usize {
@@ -46,25 +116,57 @@ impl IdShardWriter {
         Ok(())
     }
     fn flush(&self) -> Result<()> {
-        for w in &self.writers { w.lock().flush()?; }
+        for w in &self.writers {
+            w.lock().flush()?;
+        }
         Ok(())
     }
     pub(crate) fn dedup(self) -> Result<IdShards> {
         self.flush()?;
-        let IdShardWriter { base_dir, count, rs, kind, writers } = self;
+        let IdShardWriter {
+            scratch_root,
+            base_dir,
+            count,
+            rs,
+            kind,
+            writers,
+        } = self;
         drop(writers);
 
         let out_dir = base_dir.parent().unwrap().join(format!("{kind}_ids_dedup"));
         fs::create_dir_all(&out_dir)?;
 
-        let tmp_paths: Vec<PathBuf> = (0..count).map(|i| base_dir.join(format!("{kind}_ids_{:04}.tmp", i))).collect();
+        let tmp_paths: Vec<PathBuf> = (0..count)
+            .map(|i| base_dir.join(format!("{kind}_ids_{:04}.tmp", i)))
+            .collect();
         tmp_paths.par_iter().try_for_each(|p| -> Result<()> {
-            let out = out_dir.join(p.file_name().unwrap().to_string_lossy().replace(".tmp", ".txt"));
+            let out = out_dir.join(
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace(".tmp", ".txt"),
+            );
             dedup_one(p, &out)?;
             Ok(())
         })?;
 
-        Ok(IdShards { dir: out_dir, count, rs, kind: kind.to_string() })
+        if let Err(e) = fs::remove_dir_all(&base_dir) {
+            if e.kind() != io::ErrorKind::NotFound {
+                tracing::debug!(
+                    path = %base_dir.display(),
+                    error = %e,
+                    "failed to remove parent-id raw shard scratch"
+                );
+            }
+        }
+
+        Ok(IdShards {
+            dir: out_dir,
+            count,
+            rs,
+            kind: kind.to_string(),
+            _scratch_root: scratch_root,
+        })
     }
 }
 
@@ -73,6 +175,7 @@ pub(crate) struct IdShards {
     pub(crate) count: usize,
     pub(crate) rs: RandomState,
     pub(crate) kind: String,
+    pub(crate) _scratch_root: Arc<IdScratchRoot>,
 }
 impl IdShards {
     #[inline]
@@ -94,9 +197,18 @@ fn dedup_one(input: &Path, output: &Path) -> Result<()> {
     loop {
         buf.clear();
         let n = r.read_line(&mut buf)?;
-        if n == 0 { break; }
-        if buf.ends_with('\n') { buf.pop(); if buf.ends_with('\r') { buf.pop(); } }
-        if !buf.is_empty() { set.insert(buf.clone()); }
+        if n == 0 {
+            break;
+        }
+        if buf.ends_with('\n') {
+            buf.pop();
+            if buf.ends_with('\r') {
+                buf.pop();
+            }
+        }
+        if !buf.is_empty() {
+            set.insert(buf.clone());
+        }
     }
 
     let out = File::create(output)?;
@@ -179,14 +291,17 @@ impl SharedIdsetCache {
         }
         // Load outside the lock so concurrent workers loading different shards
         // don't serialize on the I/O.
-        let f = File::open(path)
-            .with_context(|| format!("open idset shard {}", path.display()))?;
+        let f = File::open(path).with_context(|| format!("open idset shard {}", path.display()))?;
         let r = BufReader::new(f);
         let mut set: AHashSet<String> = AHashSet::with_capacity(64_000);
         for line in r.lines() {
             let mut s = line.with_context(|| format!("read idset shard {}", path.display()))?;
-            if s.ends_with('\r') { s.pop(); }
-            if !s.is_empty() { set.insert(s); }
+            if s.ends_with('\r') {
+                s.pop();
+            }
+            if !s.is_empty() {
+                set.insert(s);
+            }
         }
         let arc = Arc::new(set);
 
@@ -219,18 +334,25 @@ impl RedditETL {
 
         with_thread_pool(self.opts.parallelism, || {
             let work_dir = self.ensure_work_dir()?;
-            let ids_root = work_dir.join("parent_ids");
-            fs::create_dir_all(&ids_root)?;
+            let scratch_root = IdScratchRoot::create(&work_dir)?;
 
             // Fewer shards reduces disk thrash later; we keep a wider FIFO in memory.
             let shard_count = 256usize;
-            let t1_writer = IdShardWriter::create(&ids_root, "t1", shard_count)?;
-            let t3_writer = IdShardWriter::create(&ids_root, "t3", shard_count)?;
+            let t1_writer = IdShardWriter::create(scratch_root.clone(), "t1", shard_count)?;
+            let t3_writer = IdShardWriter::create(scratch_root, "t3", shard_count)?;
 
-            let total_bytes: u64 = paths.iter().map(|p| fs::metadata(p).map(|m| m.len()).unwrap_or(0)).sum();
+            let total_bytes: u64 = paths
+                .iter()
+                .map(|p| fs::metadata(p).map(|m| m.len()).unwrap_or(0))
+                .sum();
             let pb = if self.opts.progress {
-                Some(make_progress_bar_labeled(total_bytes, self.opts.progress_label.as_deref()))
-            } else { None };
+                Some(make_progress_bar_labeled(
+                    total_bytes,
+                    self.opts.progress_label.as_deref(),
+                ))
+            } else {
+                None
+            };
 
             let read_buf = self.opts.read_buffer_bytes;
 
@@ -303,7 +425,10 @@ impl RedditETL {
 
             let errors = err_count.load(Ordering::Relaxed);
             if errors > 0 {
-                tracing::warn!(error_count = errors, "collect_parent_ids_from_jsonls completed with errors");
+                tracing::warn!(
+                    error_count = errors,
+                    "collect_parent_ids_from_jsonls completed with errors"
+                );
             }
             let parent_refs = parent_ref_count.load(Ordering::Relaxed);
             if parent_refs == 0 {
