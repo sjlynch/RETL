@@ -335,8 +335,10 @@ pub(crate) struct ParentsArgs {
     #[arg(long, short)]
     pub(crate) out: PathBuf,
     /// Resume the parents pipeline by reusing cache shards and skipping
-    /// already-attached output files. `export` is the other CLI subcommand that
-    /// supports `--resume`; aggregate/count/scan/integrity/first-seen do not.
+    /// already-attached output files only when their attach fingerprint still
+    /// matches the spool file, parent cache, resolution window, and attach
+    /// format. `export` is the other CLI subcommand that supports `--resume`;
+    /// aggregate/count/scan/integrity/first-seen do not.
     #[arg(long)]
     pub(crate) resume: bool,
     /// Months of slack added on each side of the spool's date range when

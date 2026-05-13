@@ -165,6 +165,37 @@ fn aggregate_fails_when_all_inputs_fail() {
 }
 
 #[test]
+fn aggregate_fails_when_all_inputs_are_malformed() {
+    let dir = tempfile::tempdir().unwrap();
+    let bad = dir.path().join("bad.jsonl");
+    let out = dir.path().join("counts.json");
+    let work = dir.path().join("work");
+    fs::write(&bad, "not-json\n").unwrap();
+
+    retl()
+        .args([
+            "aggregate",
+            "--no-progress",
+            "--work-dir",
+            work.to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+            bad.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("malformed JSON").and(predicate::str::contains("line 1")))
+        .stderr(predicate::str::contains(
+            "aggregate failed: 1 of 1 input(s) failed",
+        ));
+
+    assert!(
+        !out.exists(),
+        "total malformed input should not publish an empty aggregate"
+    );
+}
+
+#[test]
 fn aggregate_plain_count_does_not_warn_about_resume() {
     let dir = tempfile::tempdir().unwrap();
     let input = dir.path().join("input.jsonl");

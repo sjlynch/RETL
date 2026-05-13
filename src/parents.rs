@@ -9,9 +9,12 @@ use crate::parents_ids::{IdShards, SharedIdsetCache, WorkerShardCache};
 use crate::paths::{discover_all, plan_files, FileJob, FileKind};
 use crate::pipeline::RedditETL;
 use crate::progress::{make_count_progress, make_progress_bar_labeled, total_compressed_size};
-use crate::util::{replace_file_atomic_backoff, with_thread_pool};
+use crate::util::{
+    create_with_backoff, remove_with_backoff, replace_file_atomic_backoff, with_thread_pool,
+};
 use crate::zstd_jsonl::{for_each_line_with_progress_cfg_no_throttle, parse_minimal};
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
@@ -20,6 +23,7 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use ahash::AHashSet;
 
@@ -33,6 +37,11 @@ const IDSET_CACHE_MEDIUM_FREE_THRESHOLD: f64 = 0.20;
 const IDSET_CACHE_HIGH_CAP: usize = 512;
 const IDSET_CACHE_MEDIUM_CAP: usize = 256;
 const IDSET_CACHE_LOW_CAP: usize = 128;
+const ATTACH_FINGERPRINT_VERSION: u32 = 1;
+const ATTACH_FORMAT_VERSION: u32 = 1;
+const ATTACH_SIDECAR_SUFFIX: &str = ".parents-attach.json";
+const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+const FNV_PRIME: u64 = 0x100000001b3;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ParentAttachStats {
@@ -83,6 +92,51 @@ impl ParentAttachDiagnostics {
         self.records_with_link_id += other.records_with_link_id;
         self.comment_shaped_records += other.comment_shaped_records;
     }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct AttachFingerprint {
+    version: u32,
+    attach_format_version: u32,
+    input: AttachFileIdentity,
+    resolution_range: AttachResolutionRange,
+    parent_cache: AttachParentCacheFingerprint,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct AttachResolutionRange {
+    start: Option<String>,
+    end: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct AttachParentCacheFingerprint {
+    comment_shards: AttachShardSetFingerprint,
+    submission_shards: AttachShardSetFingerprint,
+    eager_comments: AttachMapDigest,
+    eager_submissions: AttachMapDigest,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct AttachShardSetFingerprint {
+    index_present: bool,
+    shards: u64,
+    digest: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct AttachMapDigest {
+    entries: u64,
+    digest: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct AttachFileIdentity {
+    path: String,
+    exists: bool,
+    len: Option<u64>,
+    modified_unix_secs: Option<i64>,
+    modified_nanos: Option<u32>,
 }
 
 pub struct ParentIds {
@@ -374,6 +428,284 @@ fn attach_inprogress_path(staging_dir: &Path, final_dest: &Path) -> Result<PathB
     Ok(staged)
 }
 
+fn attach_fingerprint_path(final_dest: &Path) -> PathBuf {
+    let mut sidecar = final_dest.as_os_str().to_os_string();
+    sidecar.push(ATTACH_SIDECAR_SUFFIX);
+    PathBuf::from(sidecar)
+}
+
+fn system_time_parts(t: SystemTime) -> (i64, u32) {
+    match t.duration_since(UNIX_EPOCH) {
+        Ok(d) => (
+            i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
+            d.subsec_nanos(),
+        ),
+        Err(e) => {
+            let d = e.duration();
+            (
+                -i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
+                d.subsec_nanos(),
+            )
+        }
+    }
+}
+
+fn attach_file_identity(path: &Path) -> AttachFileIdentity {
+    let stable_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let metadata = fs::metadata(path).ok();
+    let modified = metadata
+        .as_ref()
+        .and_then(|m| m.modified().ok())
+        .map(system_time_parts);
+    let (modified_unix_secs, modified_nanos) = match modified {
+        Some((secs, nanos)) => (Some(secs), Some(nanos)),
+        None => (None, None),
+    };
+
+    AttachFileIdentity {
+        path: stable_path.to_string_lossy().into_owned(),
+        exists: metadata.is_some(),
+        len: metadata.as_ref().map(|m| m.len()),
+        modified_unix_secs,
+        modified_nanos,
+    }
+}
+
+fn update_digest_bytes(hash: &mut u64, bytes: &[u8]) {
+    for byte in bytes {
+        *hash ^= u64::from(*byte);
+        *hash = hash.wrapping_mul(FNV_PRIME);
+    }
+}
+
+fn update_digest_bool(hash: &mut u64, value: bool) {
+    update_digest_bytes(hash, &[u8::from(value)]);
+}
+
+fn update_digest_u32(hash: &mut u64, value: u32) {
+    update_digest_bytes(hash, &value.to_le_bytes());
+}
+
+fn update_digest_u64(hash: &mut u64, value: u64) {
+    update_digest_bytes(hash, &value.to_le_bytes());
+}
+
+fn update_digest_i64(hash: &mut u64, value: i64) {
+    update_digest_bytes(hash, &value.to_le_bytes());
+}
+
+fn update_digest_str(hash: &mut u64, value: &str) {
+    update_digest_u64(hash, value.len() as u64);
+    update_digest_bytes(hash, value.as_bytes());
+}
+
+fn update_digest_option_u64(hash: &mut u64, value: Option<u64>) {
+    update_digest_bool(hash, value.is_some());
+    if let Some(value) = value {
+        update_digest_u64(hash, value);
+    }
+}
+
+fn update_digest_option_i64(hash: &mut u64, value: Option<i64>) {
+    update_digest_bool(hash, value.is_some());
+    if let Some(value) = value {
+        update_digest_i64(hash, value);
+    }
+}
+
+fn update_digest_option_u32(hash: &mut u64, value: Option<u32>) {
+    update_digest_bool(hash, value.is_some());
+    if let Some(value) = value {
+        update_digest_u32(hash, value);
+    }
+}
+
+fn update_file_identity_digest(hash: &mut u64, identity: &AttachFileIdentity) {
+    update_digest_str(hash, &identity.path);
+    update_digest_bool(hash, identity.exists);
+    update_digest_option_u64(hash, identity.len);
+    update_digest_option_i64(hash, identity.modified_unix_secs);
+    update_digest_option_u32(hash, identity.modified_nanos);
+}
+
+fn attach_shard_set_fingerprint(
+    shards: Option<&HashMap<YearMonth, PathBuf>>,
+) -> AttachShardSetFingerprint {
+    let index_present = shards.is_some();
+    let mut entries = Vec::new();
+    if let Some(shards) = shards {
+        entries.extend(
+            shards
+                .iter()
+                .map(|(ym, path)| (*ym, attach_file_identity(path))),
+        );
+    }
+    entries.sort_by(|(a_ym, a_id), (b_ym, b_id)| {
+        a_ym.cmp(b_ym).then_with(|| a_id.path.cmp(&b_id.path))
+    });
+
+    let mut hash = FNV_OFFSET_BASIS;
+    update_digest_bool(&mut hash, index_present);
+    update_digest_u64(&mut hash, entries.len() as u64);
+    for (ym, identity) in &entries {
+        update_digest_str(&mut hash, &ym.to_string());
+        update_file_identity_digest(&mut hash, identity);
+    }
+
+    AttachShardSetFingerprint {
+        index_present,
+        shards: entries.len() as u64,
+        digest: format!("{hash:016x}"),
+    }
+}
+
+fn finish_unordered_digest(entries: usize, sum: u64, xor: u64) -> AttachMapDigest {
+    let mut hash = FNV_OFFSET_BASIS;
+    update_digest_u64(&mut hash, entries as u64);
+    update_digest_u64(&mut hash, sum);
+    update_digest_u64(&mut hash, xor);
+    AttachMapDigest {
+        entries: entries as u64,
+        digest: format!("{hash:016x}"),
+    }
+}
+
+fn attach_comment_map_digest(map: &HashMap<String, String>) -> AttachMapDigest {
+    let mut sum = 0u64;
+    let mut xor = 0u64;
+    for (id, body) in map {
+        let mut entry_hash = FNV_OFFSET_BASIS;
+        update_digest_str(&mut entry_hash, id);
+        update_digest_str(&mut entry_hash, body);
+        sum = sum.wrapping_add(entry_hash);
+        xor ^= entry_hash.rotate_left((entry_hash & 63) as u32);
+    }
+    finish_unordered_digest(map.len(), sum, xor)
+}
+
+fn attach_submission_map_digest(map: &HashMap<String, (String, String)>) -> AttachMapDigest {
+    let mut sum = 0u64;
+    let mut xor = 0u64;
+    for (id, (title, selftext)) in map {
+        let mut entry_hash = FNV_OFFSET_BASIS;
+        update_digest_str(&mut entry_hash, id);
+        update_digest_str(&mut entry_hash, title);
+        update_digest_str(&mut entry_hash, selftext);
+        sum = sum.wrapping_add(entry_hash);
+        xor ^= entry_hash.rotate_left((entry_hash & 63) as u32);
+    }
+    finish_unordered_digest(map.len(), sum, xor)
+}
+
+fn attach_parent_cache_fingerprint(parents: &ParentMaps) -> AttachParentCacheFingerprint {
+    AttachParentCacheFingerprint {
+        comment_shards: attach_shard_set_fingerprint(parents.comment_shards.as_ref()),
+        submission_shards: attach_shard_set_fingerprint(parents.submission_shards.as_ref()),
+        eager_comments: attach_comment_map_digest(&parents.comments),
+        eager_submissions: attach_submission_map_digest(&parents.submissions),
+    }
+}
+
+fn attach_resolution_range(
+    start: Option<YearMonth>,
+    end: Option<YearMonth>,
+) -> AttachResolutionRange {
+    AttachResolutionRange {
+        start: start.map(|ym| ym.to_string()),
+        end: end.map(|ym| ym.to_string()),
+    }
+}
+
+fn build_attach_fingerprint(
+    input: &Path,
+    parent_cache: &AttachParentCacheFingerprint,
+    resolution_range: &AttachResolutionRange,
+) -> AttachFingerprint {
+    AttachFingerprint {
+        version: ATTACH_FINGERPRINT_VERSION,
+        attach_format_version: ATTACH_FORMAT_VERSION,
+        input: attach_file_identity(input),
+        resolution_range: resolution_range.clone(),
+        parent_cache: parent_cache.clone(),
+    }
+}
+
+fn attach_fingerprint_matches(sidecar_path: &Path, expected: &AttachFingerprint) -> bool {
+    match File::open(sidecar_path) {
+        Ok(f) => match serde_json::from_reader::<_, AttachFingerprint>(BufReader::new(f)) {
+            Ok(actual) if &actual == expected => true,
+            Ok(_) => {
+                tracing::debug!(path=%sidecar_path.display(), "resume: attach fingerprint changed, rebuilding");
+                false
+            }
+            Err(e) => {
+                tracing::warn!(path=%sidecar_path.display(), error=%e, "resume: attach fingerprint sidecar is unreadable, rebuilding");
+                false
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::debug!(path=%sidecar_path.display(), "resume: attach fingerprint sidecar missing, rebuilding");
+            false
+        }
+        Err(e) => {
+            tracing::warn!(path=%sidecar_path.display(), error=%e, "resume: attach fingerprint sidecar cannot be opened, rebuilding");
+            false
+        }
+    }
+}
+
+fn write_attach_fingerprint_atomic(
+    staging_dir: &Path,
+    sidecar_path: &Path,
+    fingerprint: &AttachFingerprint,
+    write_buf_bytes: usize,
+) -> Result<()> {
+    let file_name = sidecar_path.file_name().ok_or_else(|| {
+        anyhow::anyhow!(
+            "attach fingerprint sidecar has no file name: {}",
+            sidecar_path.display()
+        )
+    })?;
+    let mut staged = staging_dir.join(file_name);
+    staged.as_mut_os_string().push(INPROGRESS_EXT);
+
+    fs::create_dir_all(staging_dir)
+        .with_context(|| format!("create staging dir {}", staging_dir.display()))?;
+    if let Some(parent) = sidecar_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create sidecar parent {}", parent.display()))?;
+    }
+
+    let file = create_with_backoff(&staged, 16, 50)
+        .with_context(|| format!("create staged attach fingerprint {}", staged.display()))?;
+    let mut writer = BufWriter::with_capacity(write_buf_bytes, file);
+    let write_result = (|| -> Result<()> {
+        serde_json::to_writer_pretty(&mut writer, fingerprint)?;
+        writer.write_all(b"\n")?;
+        writer.flush()?;
+        Ok(())
+    })();
+
+    if let Err(e) = write_result {
+        drop(writer);
+        let _ = remove_with_backoff(&staged, 8, 50);
+        return Err(e)
+            .with_context(|| format!("write staged attach fingerprint {}", staged.display()));
+    }
+    drop(writer);
+
+    if let Err(e) = replace_file_atomic_backoff(&staged, sidecar_path) {
+        let _ = remove_with_backoff(&staged, 8, 50);
+        return Err(e).with_context(|| {
+            format!(
+                "publish attach fingerprint sidecar {}",
+                sidecar_path.display()
+            )
+        });
+    }
+    Ok(())
+}
+
 fn validate_jsonl_file(path: &Path) -> bool {
     let Ok(f) = File::open(path) else {
         return false;
@@ -611,6 +943,8 @@ impl RedditETL {
 
             let comment_shards = parents.comment_shards.as_ref();
             let submission_shards = parents.submission_shards.as_ref();
+            let parent_cache_fingerprint = attach_parent_cache_fingerprint(parents);
+            let resolution_range = attach_resolution_range(self.opts.start, self.opts.end);
 
             let indexed_inputs: Vec<(usize, PathBuf)> = inputs.into_iter().enumerate().collect();
             let attached = std::sync::Mutex::new(vec![None; indexed_inputs.len()]);
@@ -622,21 +956,31 @@ impl RedditETL {
                     let name = in_path.file_name().unwrap().to_string_lossy().to_string();
                     let out_path = out_dir.join(name);
                     let inprogress_path = attach_inprogress_path(&staging_dir, &out_path)?;
+                    let sidecar_path = attach_fingerprint_path(&out_path);
+                    let fingerprint = build_attach_fingerprint(
+                        in_path,
+                        &parent_cache_fingerprint,
+                        &resolution_range,
+                    );
 
                     if resume && out_path.exists() && !inprogress_path.exists() {
-                        if validate_jsonl_file(&out_path) {
-                            if let Some(pb) = &pb {
-                                pb.inc(1);
+                        if attach_fingerprint_matches(&sidecar_path, &fingerprint) {
+                            if validate_jsonl_file(&out_path) {
+                                if let Some(pb) = &pb {
+                                    pb.inc(1);
+                                }
+                                let diagnostics = ParentAttachDiagnostics {
+                                    resume_skipped_files: 1,
+                                    ..Default::default()
+                                };
+                                attached.lock().unwrap()[*idx] =
+                                    Some((out_path, ParentAttachStats::default(), diagnostics));
+                                return Ok(());
                             }
-                            let diagnostics = ParentAttachDiagnostics {
-                                resume_skipped_files: 1,
-                                ..Default::default()
-                            };
-                            attached.lock().unwrap()[*idx] =
-                                Some((out_path, ParentAttachStats::default(), diagnostics));
-                            return Ok(());
+                            tracing::warn!(path=%out_path.display(), "resume: existing attached JSONL is unreadable/corrupt, rebuilding");
+                        } else {
+                            tracing::debug!(path=%out_path.display(), sidecar=%sidecar_path.display(), "resume: attached JSONL fingerprint missing or stale, rebuilding");
                         }
-                        tracing::warn!(path=%out_path.display(), "resume: existing attached JSONL is unreadable/corrupt, rebuilding");
                     }
 
                     // Per-worker FIFO caches of parsed shard JSON. See
@@ -770,6 +1114,13 @@ impl RedditETL {
 
                             Ok((file_stats, diagnostics))
                         },
+                    )?;
+
+                    write_attach_fingerprint_atomic(
+                        &staging_dir,
+                        &sidecar_path,
+                        &fingerprint,
+                        self.opts.write_buffer_bytes,
                     )?;
 
                     if let Some(pb) = &pb {

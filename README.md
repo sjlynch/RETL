@@ -369,7 +369,7 @@ finer-grained control or want to embed RETL in a larger Rust program.
 
 ## Quick Start
 
-Place your corpus under `./data/`:
+Place your corpus under `./data/` (the default base directory for both the CLI and library):
 
 ~~~text
 ./data/comments/RC_2006-01.zst

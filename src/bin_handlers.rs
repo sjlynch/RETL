@@ -477,12 +477,8 @@ pub(crate) fn run_parents(args: ParentsArgs) -> Result<()> {
         &args.cache,
         args.resume,
     )?;
-    let (attached, stats) = build(None, None).attach_parents_jsonls_parallel_with_stats(
-        spool_parts,
-        &args.out,
-        &parents,
-        args.resume,
-    )?;
+    let (attached, stats) = build(None, Some((wstart, wend)))
+        .attach_parents_jsonls_parallel_with_stats(spool_parts, &args.out, &parents, args.resume)?;
 
     if stats.total() > 0 && stats.unresolved_rate() > 0.05 {
         tracing::warn!(
