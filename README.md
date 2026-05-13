@@ -135,9 +135,10 @@ builder methods.
 
 ## Command-Line Interface
 
-The `retl` binary exposes the main ETL subcommands. Most data-processing
-commands accept a shared set of selection/runtime flags (see
-`retl <subcommand> --help` for the full list):
+The `retl` binary exposes the main ETL subcommands. Corpus-scanning commands
+(`scan`, `dedupe`, `export`, `count`, `integrity`, and `first-seen`) accept a
+shared set of selection/runtime flags (see `retl <subcommand> --help` for the
+full list):
 
 | Common flag | Purpose |
 | --- | --- |
@@ -301,11 +302,15 @@ process exits with status `2`.
 
 ### `aggregate` — fold JSONL inputs into JSON or TSV rollups
 
-Aggregates one or more JSONL inputs using the `retl::Aggregator` pipeline
-(each input is processed in parallel; per-input shard intermediates land under
-`--shards-dir`, which defaults to `agg_shards/` next to `--out`). With no
-`--by`, the CLI keeps the original built-in record-count fallback and writes a
-JSON aggregate state:
+Aggregates one or more already-filtered JSONL inputs using the
+`retl::Aggregator` pipeline (each input is processed in parallel; per-input
+shard intermediates land under `--shards-dir`, which defaults to `agg_shards/`
+next to `--out`). `aggregate` does not scan the RC/RS corpus and does not
+accept corpus selectors such as `--data-dir`, `--start`, or `--subreddit`; run
+`retl export --format spool ...` first if you need to filter the corpus. Its
+runtime flags are limited to `--parallelism`, `--no-progress`, and
+`--shards-dir`. With no `--by`, the CLI keeps the original built-in
+record-count fallback and writes a JSON aggregate state:
 
 ~~~sh
 retl aggregate \
