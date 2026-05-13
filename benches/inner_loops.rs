@@ -397,13 +397,15 @@ fn bench_process_bucket_streaming(c: &mut Criterion) {
     // Generous in-memory budget so flush/backpressure overhead doesn't
     // dominate; this bench is about the per-line read+key-extract loop.
     let cfg = BucketingCfg {
-        soft_low_frac: 0.0,
+        mem: retl::AdaptiveMemCfg {
+            soft_low_frac: 0.0,
+            high_frac: 1.0,
+            adapt_cooldown_ms: 1_000,
+        },
         hard_low_frac: 0.0,
-        high_frac: 1.0,
         backoff_ms: 0,
         micro_min_buf_mb: 256,
         micro_max_buf_mb: 256,
-        adapt_cooldown_ms: 1_000,
         inflight_bytes: 0,
         inflight_groups: 8,
     };

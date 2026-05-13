@@ -81,6 +81,69 @@ fn aggregate_over_jsonl_inputs() {
 }
 
 #[test]
+fn aggregate_same_basename_inputs_get_distinct_shards() {
+    let tmp = tempfile::tempdir().unwrap();
+    let run_a = tmp.path().join("run_a");
+    let run_b = tmp.path().join("run_b");
+    fs::create_dir_all(&run_a).unwrap();
+    fs::create_dir_all(&run_b).unwrap();
+    let a = run_a.join("part_RC_2006-01.jsonl");
+    let b = run_b.join("part_RC_2006-01.jsonl");
+    fs::write(&a, "{\"id\":\"a1\"}\n{\"id\":\"a2\"}\n").unwrap();
+    fs::write(&b, "{\"id\":\"b1\"}\n").unwrap();
+    let shards_dir = tmp.path().join("agg_shards");
+
+    let (agg, built, errors) = RedditETL::new()
+        .progress(false)
+        .parallelism(2)
+        .aggregate_jsonls_parallel_collect::<RecCount>(vec![a, b], &shards_dir)
+        .unwrap();
+
+    assert_eq!(agg.count, 3);
+    assert_eq!(built, 2);
+    assert_eq!(errors, 0);
+
+    let mut shard_names: Vec<String> = fs::read_dir(&shards_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("agg_") && name.ends_with(".json"))
+        .collect();
+    shard_names.sort();
+    assert_eq!(shard_names.len(), 2);
+    assert_ne!(shard_names[0], shard_names[1]);
+    assert!(shard_names.iter().all(|name| name.contains("RC_2006-01")));
+}
+
+#[test]
+fn aggregate_malformed_json_line_counts_shard_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bad = tmp.path().join("bad.jsonl");
+    fs::write(&bad, "{\"id\":\"ok\"}\nnot-json\n").unwrap();
+    let shards_dir = tmp.path().join("agg_shards");
+
+    let (agg, built, errors) = RedditETL::new()
+        .progress(false)
+        .aggregate_jsonls_parallel_collect::<RecCount>(vec![bad], &shards_dir)
+        .unwrap();
+
+    assert_eq!(agg.count, 0, "malformed shard should be dropped");
+    assert_eq!(built, 0);
+    assert_eq!(errors, 1);
+    let shard_count = fs::read_dir(&shards_dir)
+        .unwrap()
+        .filter(|entry| {
+            entry
+                .as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".json")
+        })
+        .count();
+    assert_eq!(shard_count, 0);
+}
+
+#[test]
 fn aggregate_clears_stale_shards_between_runs() {
     let tmp = tempfile::tempdir().unwrap();
     let a = tmp.path().join("a.jsonl");

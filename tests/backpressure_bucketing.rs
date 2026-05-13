@@ -77,13 +77,15 @@ fn process_bucket_streaming_blocks_producer_when_consumer_is_slow() {
     // Tight backpressure budget: 4 MiB inflight, 2 in-flight groups.
     // per_flush_cap = inflight_bytes / 2 = 2 MiB.
     let cfg = BucketingCfg {
-        soft_low_frac: 0.0,    // never engage the soft-low (free-RAM) path
-        hard_low_frac: 0.0,    // never sleep on hard-low
-        high_frac: 1.0,
+        mem: retl::AdaptiveMemCfg {
+            soft_low_frac: 0.0, // never engage the soft-low (free-RAM) path
+            high_frac: 1.0,
+            adapt_cooldown_ms: 50,
+        },
+        hard_low_frac: 0.0, // never sleep on hard-low
         backoff_ms: 0,
-        micro_min_buf_mb: 64,  // generous adaptive target — we want the
-        micro_max_buf_mb: 64,  //   per_flush_cap to be the binding constraint
-        adapt_cooldown_ms: 50,
+        micro_min_buf_mb: 64, // generous adaptive target — we want the
+        micro_max_buf_mb: 64, //   per_flush_cap to be the binding constraint
         inflight_bytes: 4 * 1024 * 1024,
         inflight_groups: 2,
     };
