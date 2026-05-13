@@ -66,11 +66,11 @@ fn warn_decode_skip(path: &Path, e: &anyhow::Error) {
     let abs = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     // Emit a multi-line message to stderr (separate from progress bars) and to tracing.
     let msg = format!(
-        "Skipping zstd file after decode error\n  path : {}\n  error: {}\n\
+        "Zstd decode error while streaming file\n  path : {}\n  error: {}\n\
          note : This usually indicates file corruption (often late/trailing). \
                 Quick integrity sampling may miss trailing corruption. \
                 Consider running a Full integrity check or re-downloading this month. \
-                The pipeline will skip this file and continue.",
+                Tolerant callers skip this file; strict callers surface it as fatal.",
         abs.display(),
         e
     );
@@ -297,6 +297,7 @@ pub fn for_each_line_with_progress_cfg_status(
 ///
 /// Useful for stages that briefly use more RAM (e.g., building parent
 /// caches) where the backoff would otherwise dominate runtime.
+#[allow(dead_code)]
 pub fn for_each_line_with_progress_cfg_no_throttle(
     path: &Path,
     read_buf_bytes: usize,
@@ -304,6 +305,26 @@ pub fn for_each_line_with_progress_cfg_no_throttle(
     on_line: impl FnMut(&str) -> Result<()>,
 ) -> Result<()> {
     for_each_line_with_opts(
+        path,
+        LineStreamOpts {
+            read_buf_bytes: Some(read_buf_bytes),
+            progress: Some(&mut on_progress),
+            throttle: false,
+            ..Default::default()
+        },
+        on_line,
+    )
+}
+
+/// Like [`for_each_line_with_progress_cfg_no_throttle`] but returns
+/// `Ok(false)` when a zstd decode error was tolerated.
+pub fn for_each_line_with_progress_cfg_no_throttle_status(
+    path: &Path,
+    read_buf_bytes: usize,
+    mut on_progress: impl FnMut(u64),
+    on_line: impl FnMut(&str) -> Result<()>,
+) -> Result<bool> {
+    for_each_line_with_opts_status(
         path,
         LineStreamOpts {
             read_buf_bytes: Some(read_buf_bytes),
