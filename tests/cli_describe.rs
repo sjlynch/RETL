@@ -46,6 +46,23 @@ fn describe_reports_available_ranges_counts_and_bytes() {
 }
 
 #[test]
+fn describe_reports_missing_month_holes() {
+    let base = make_corpus_multi_month(&[YearMonth::new(2006, 1), YearMonth::new(2006, 3)]);
+
+    retl()
+        .args(["describe", "--data-dir", base.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(
+            contains("missing_month_count\tmissing_months")
+                .and(contains("rc\t2006-01..=2006-03\t2"))
+                .and(contains("\t1\t2006-02"))
+                .and(contains("rs\t2006-01..=2006-03\t2"))
+                .and(contains("total\t\t4").and(contains("\t2\t-"))),
+        );
+}
+
+#[test]
 fn describe_honors_source_selection() {
     let base = make_corpus_multi_month(&[YearMonth::new(2006, 1)]);
     let rc = base.join("comments").join("RC_2006-01.zst");

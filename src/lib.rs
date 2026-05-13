@@ -207,11 +207,15 @@ pub use crate::concurrency::for_each_file_limited;
 #[doc(hidden)]
 pub use crate::date::iter_year_months;
 #[doc(hidden)]
-pub use crate::filters::{bounds_tuple, resolve_target_subs_from, within_bounds};
+pub use crate::filters::{bounds_tuple, resolve_target_subs_from, within_bounds, DateBounds};
 #[doc(hidden)]
 pub use crate::kv_shard::ShardedKVWriter;
 #[doc(hidden)]
-pub use crate::paths::{plan_files, discover_all, FileKind, FileJob, Discovered, PlanningError, SourceStatus, plan_files_checked};
+pub use crate::paths::{
+    discover_all, format_year_month_ranges, log_missing_month_warnings, missing_month_diagnostics,
+    plan_files, plan_files_checked, Discovered, FileJob, FileKind, MissingMonthDiagnostic,
+    PlanningError, SourceStatus,
+};
 #[doc(hidden)]
 pub use crate::shard::ShardedWriter;
 #[doc(hidden)]

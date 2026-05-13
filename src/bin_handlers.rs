@@ -3,9 +3,9 @@
 
 use anyhow::{Context, Result};
 use retl::{
-    create_with_backoff, discover_all, plan_files, remove_with_backoff,
-    replace_file_atomic_backoff, total_compressed_size, ExportFormat, FileKind, IntegrityMode,
-    KeyExtractor, RedditETL, Sources, YearMonth,
+    create_with_backoff, discover_all, format_year_month_ranges, missing_month_diagnostics,
+    plan_files, remove_with_backoff, replace_file_atomic_backoff, total_compressed_size,
+    ExportFormat, FileKind, IntegrityMode, KeyExtractor, RedditETL, Sources, YearMonth,
 };
 use std::collections::BTreeMap;
 use std::fs;
@@ -105,19 +105,43 @@ pub(crate) fn run_describe(args: DescribeArgs) -> Result<()> {
         };
         let jobs = plan_files(&discovered, source_for_kind(kind), args.start, args.end);
         let bytes = total_compressed_size(&jobs);
-        rows.push((source_label(kind), available_range(map), jobs.len(), bytes));
+        let diagnostics =
+            missing_month_diagnostics(&discovered, source_for_kind(kind), args.start, args.end);
+        let missing_months = diagnostics
+            .first()
+            .map(|d| format_year_month_ranges(&d.months))
+            .unwrap_or_else(|| "-".to_string());
+        let missing_count = diagnostics.first().map(|d| d.months.len()).unwrap_or(0);
+        rows.push((
+            source_label(kind),
+            available_range(map),
+            jobs.len(),
+            bytes,
+            missing_count,
+            missing_months,
+        ));
     }
 
-    let total_files: usize = rows.iter().map(|(_, _, files, _)| *files).sum();
-    let total_bytes: u64 = rows.iter().map(|(_, _, _, bytes)| *bytes).sum();
+    let total_files: usize = rows.iter().map(|(_, _, files, _, _, _)| *files).sum();
+    let total_bytes: u64 = rows.iter().map(|(_, _, _, bytes, _, _)| *bytes).sum();
+    let total_missing: usize = rows.iter().map(|(_, _, _, _, missing, _)| *missing).sum();
 
     let stdout = io::stdout();
     let mut w = BufWriter::new(stdout.lock());
-    writeln!(w, "source\tavailable\tfiles_in_range\tcompressed_bytes")?;
-    for (label, available, files, bytes) in rows {
-        writeln!(w, "{label}\t{available}\t{files}\t{bytes}")?;
+    writeln!(
+        w,
+        "source\tavailable\tfiles_in_range\tcompressed_bytes\tmissing_month_count\tmissing_months"
+    )?;
+    for (label, available, files, bytes, missing_count, missing_months) in rows {
+        writeln!(
+            w,
+            "{label}\t{available}\t{files}\t{bytes}\t{missing_count}\t{missing_months}"
+        )?;
     }
-    writeln!(w, "total\t\t{total_files}\t{total_bytes}")?;
+    writeln!(
+        w,
+        "total\t\t{total_files}\t{total_bytes}\t{total_missing}\t-"
+    )?;
     w.flush()?;
     Ok(())
 }
