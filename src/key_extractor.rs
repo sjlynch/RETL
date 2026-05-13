@@ -1,4 +1,5 @@
 use crate::zstd_jsonl::parse_minimal;
+use anyhow::Result;
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -40,23 +41,33 @@ impl KeyExtractor {
 
     /// Extract the key directly from a raw JSON line using the MinimalRecord fast path,
     /// or fallback to serde parsing for pointer/custom variants.
-    pub fn key_from_line(&self, line: &str) -> Option<String> {
+    ///
+    /// Malformed JSON is returned as `Err`; a well-formed record whose key is
+    /// absent/non-extractable returns `Ok(None)`. Callers that process files
+    /// should add path + line-number context before surfacing the error.
+    pub fn key_from_line(&self, line: &str) -> Result<Option<String>> {
         match self {
-            KeyExtractor::AuthorLowerFast => {
-                let rec = parse_minimal(line).ok()?;
-                rec.author.map(|s| s.to_lowercase())
-            }
-            KeyExtractor::SubredditLowerFast => {
-                let rec = parse_minimal(line).ok()?;
-                rec.subreddit.map(|s| s.to_lowercase())
-            }
+            KeyExtractor::AuthorLowerFast => match parse_minimal(line) {
+                Ok(rec) => Ok(rec.author.map(|s| s.to_lowercase())),
+                Err(_) => {
+                    let v: Value = serde_json::from_str(line)?;
+                    Ok(v.get("author").and_then(|x| x.as_str()).map(|s| s.to_lowercase()))
+                }
+            },
+            KeyExtractor::SubredditLowerFast => match parse_minimal(line) {
+                Ok(rec) => Ok(rec.subreddit.map(|s| s.to_lowercase())),
+                Err(_) => {
+                    let v: Value = serde_json::from_str(line)?;
+                    Ok(v.get("subreddit").and_then(|x| x.as_str()).map(|s| s.to_lowercase()))
+                }
+            },
             KeyExtractor::JsonPointer(ptr) => {
-                let v: Value = serde_json::from_str(line).ok()?;
-                v.pointer(ptr).and_then(json_pointer_value_to_key)
+                let v: Value = serde_json::from_str(line)?;
+                Ok(v.pointer(ptr).and_then(json_pointer_value_to_key))
             }
             KeyExtractor::ByValue(f) => {
-                let v: Value = serde_json::from_str(line).ok()?;
-                f(&v)
+                let v: Value = serde_json::from_str(line)?;
+                Ok(f(&v))
             }
         }
     }
@@ -80,7 +91,7 @@ mod tests {
     #[test]
     fn json_pointer_coerces_non_string_scalar_values() {
         let key = KeyExtractor::json_pointer("/score");
-        assert_eq!(key.key_from_line(r#"{"score":42}"#).as_deref(), Some("42"));
+        assert_eq!(key.key_from_line(r#"{"score":42}"#).unwrap().as_deref(), Some("42"));
         assert_eq!(
             key.key_from_value(&json!({ "score": -7 })).as_deref(),
             Some("-7")
@@ -88,7 +99,7 @@ mod tests {
 
         let key = KeyExtractor::json_pointer("/stickied");
         assert_eq!(
-            key.key_from_line(r#"{"stickied":true}"#).as_deref(),
+            key.key_from_line(r#"{"stickied":true}"#).unwrap().as_deref(),
             Some("true")
         );
         assert_eq!(
@@ -100,7 +111,14 @@ mod tests {
     #[test]
     fn json_pointer_ignores_null_and_missing_values() {
         let key = KeyExtractor::json_pointer("/score");
-        assert_eq!(key.key_from_line(r#"{"score":null}"#), None);
-        assert_eq!(key.key_from_line(r#"{"other":42}"#), None);
+        assert_eq!(key.key_from_line(r#"{"score":null}"#).unwrap(), None);
+        assert_eq!(key.key_from_line(r#"{"other":42}"#).unwrap(), None);
+    }
+
+    #[test]
+    fn malformed_json_is_distinct_from_missing_key() {
+        let key = KeyExtractor::author_lowercase_fast();
+        assert_eq!(key.key_from_line(r#"{"subreddit":"x"}"#).unwrap(), None);
+        assert!(key.key_from_line(r#"{"author":"alice""#).is_err());
     }
 }

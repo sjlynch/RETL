@@ -324,7 +324,11 @@ pub(crate) fn run_integrity(args: IntegrityArgs) -> Result<()> {
 }
 
 pub(crate) fn run_aggregate(args: AggregateArgs) -> Result<()> {
-    let etl = build_etl(&args.common)?;
+    let mut etl = RedditETL::new().progress(!args.runtime.no_progress);
+    if let Some(p) = args.runtime.parallelism {
+        etl = etl.parallelism(p);
+    }
+
     let shards_dir = args.shards_dir.unwrap_or_else(|| {
         args.out
             .parent()

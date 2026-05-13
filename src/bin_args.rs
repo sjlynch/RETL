@@ -294,10 +294,21 @@ pub(crate) enum IntegrityModeArg {
     Full,
 }
 
+#[derive(Args, Debug, Clone)]
+pub(crate) struct AggregateRuntimeOpts {
+    /// Number of Rayon worker threads (defaults to the global pool).
+    #[arg(long)]
+    pub(crate) parallelism: Option<usize>,
+
+    /// Disable progress bars.
+    #[arg(long)]
+    pub(crate) no_progress: bool,
+}
+
 #[derive(Args, Debug)]
 pub(crate) struct AggregateArgs {
     #[command(flatten)]
-    pub(crate) common: CommonOpts,
+    pub(crate) runtime: AggregateRuntimeOpts,
     /// JSONL input files to aggregate.
     #[arg(required = true, num_args = 1..)]
     pub(crate) inputs: Vec<PathBuf>,

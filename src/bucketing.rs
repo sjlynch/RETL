@@ -15,6 +15,7 @@ use crate::config::ETLOptions;
 use crate::key_extractor::KeyExtractor;
 use crate::mem::{available_memory_fraction, is_low_memory, AdaptiveMemCfg};
 use crate::util::{open_with_backoff, smoothstep_memory_fraction};
+use crate::zstd_jsonl::malformed_json_error;
 
 /// Adaptive streaming configuration used during micro-bucket processing.
 #[derive(Clone, Debug)]
@@ -109,10 +110,12 @@ fn route_lines_to_shards(
         // Reusable line buffer — avoids the per-line String allocation from
         // `BufReader::lines()` (mirrors `zstd_jsonl::for_each_line_attempt`).
         let mut line = String::with_capacity(16 * 1024);
+        let mut line_number: u64 = 0;
         loop {
             line.clear();
             let n = r.read_line(&mut line)?;
             if n == 0 { break; }
+            line_number += 1;
             // Strip trailing \r?\n so the slice fed to KeyExtractor matches
             // what extractors see in the rest of the pipeline.
             if line.ends_with('\n') {
@@ -120,7 +123,10 @@ fn route_lines_to_shards(
                 if line.ends_with('\r') { line.pop(); }
             }
             if line.is_empty() { continue; }
-            if let Some(k) = key.key_from_line(&line) {
+            if let Some(k) = key
+                .key_from_line(&line)
+                .map_err(|e| malformed_json_error(p, line_number, e))?
+            {
                 let idx = stable_index(&state, &k, shards);
                 let mut w = writers[idx].lock();
                 w.write_all(line.as_bytes())?;
@@ -311,17 +317,25 @@ where
             // from `BufReader::lines()` and the per-line
             // `serde_json::from_str::<Value>` DOM parse.
             let mut line = String::with_capacity(16 * 1024);
+            let mut line_number: u64 = 0;
             loop {
                 line.clear();
                 let n = r.read_line(&mut line)?;
                 if n == 0 { break; }
+                line_number += 1;
                 if line.ends_with('\n') {
                     line.pop();
                     if line.ends_with('\r') { line.pop(); }
                 }
                 if line.is_empty() { continue; }
 
-                let k = match key.key_from_line(&line) { Some(x) => x, None => continue };
+                let k = match key
+                    .key_from_line(&line)
+                    .map_err(|e| malformed_json_error(bucket, line_number, e))?
+                {
+                    Some(x) => x,
+                    None => continue,
+                };
                 let idx = stable_index(&rs, &k, mb_count);
 
                 let add = line.len() + 1;
