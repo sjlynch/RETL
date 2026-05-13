@@ -1,20 +1,12 @@
-//! T11: an interrupted export must not leave a half-written `.zst` at the
-//! final destination.
+//! Regression test: an interrupted export must not leave a half-written
+//! `.zst` at the final destination.
 //!
-//! Pre-#T1 (today): `export_partitioned` writes the encoder directly to the
-//! destination path. If decoding the source aborts mid-stream (truncated tail,
-//! checksum failure, etc.) the wrapper logs a warning and `stream_job` returns
-//! `Ok(partial_records)`. `enc.finish()` then succeeds and a partial,
-//! corrupt-by-omission `.zst` is left at the destination. This test FAILS
-//! today; that failure is the load-bearing tripwire for the #T1 fix.
-//!
-//! Post-#T1 (target): writes go to a staging path (e.g. `*.zst.inprogress`)
-//! and only get atomically renamed to the destination on full success. On a
-//! decode error the destination must remain absent.
-//!
-//! Until #T1 lands this test is ignored to keep CI green; flip on the `ignore`
-//! attribute (or remove it entirely) once the staging-rename fix is merged so
-//! it acts as a regression guard going forward.
+//! `export_partitioned` writes compressed output through a staging path and
+//! atomically promotes it only after the source month streams successfully. If
+//! decoding aborts mid-stream (truncated tail, checksum failure, etc.), the
+//! destination month must remain absent even though the export wrapper returns
+//! `Ok` after warning/skipping the interrupted source. This keeps final output
+//! directories free of corrupt-by-omission `.zst` files.
 
 #[path = "common/mod.rs"]
 mod common;
@@ -24,9 +16,6 @@ use retl::{ExportFormat, RedditETL, Sources, YearMonth};
 use std::fs;
 
 #[test]
-#[ignore = "Pre-#T1: export_partitioned writes directly to dest, so a \
-            mid-file decode error leaves a partial .zst at destination. \
-            Un-ignore once #T1's staging+atomic-rename fix lands."]
 fn interrupted_export_leaves_no_half_written_zst_at_destination() {
     // Build a corpus, then drop a *truncated* RC monthly into it so the
     // streaming decoder fails mid-file during export.
