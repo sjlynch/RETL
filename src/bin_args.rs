@@ -92,6 +92,41 @@ pub(crate) struct CommonOpts {
     pub(crate) include_deleted: bool,
 }
 
+#[derive(Args, Debug, Clone)]
+pub(crate) struct QueryOpts {
+    /// Author allow-list entry (repeatable). `--author-in` is an alias.
+    #[arg(long = "author", visible_alias = "author-in", value_name = "NAME")]
+    pub(crate) authors: Vec<String>,
+
+    /// Author deny-list entry (repeatable).
+    #[arg(long = "exclude-author", value_name = "NAME")]
+    pub(crate) exclude_authors: Vec<String>,
+
+    /// Regex matched against author names.
+    #[arg(long = "author-regex", value_name = "REGEX")]
+    pub(crate) author_regex: Option<String>,
+
+    /// Keyword/text filter matched in comment bodies and submission titles/selftext.
+    #[arg(long = "keyword", value_name = "TEXT")]
+    pub(crate) keywords: Vec<String>,
+
+    /// Minimum score (inclusive).
+    #[arg(long = "min-score", value_name = "N")]
+    pub(crate) min_score: Option<i64>,
+
+    /// Maximum score (inclusive).
+    #[arg(long = "max-score", value_name = "N")]
+    pub(crate) max_score: Option<i64>,
+
+    /// Keep only records that contain an http(s) URL in text or submission URL.
+    #[arg(long = "contains-url")]
+    pub(crate) contains_url: bool,
+
+    /// Submission domain allow-list entry (repeatable). Comments have no domain and are dropped.
+    #[arg(long = "domain", value_name = "DOMAIN")]
+    pub(crate) domains: Vec<String>,
+}
+
 #[derive(ValueEnum, Clone, Copy, Debug)]
 pub(crate) enum SourceArg {
     Rc,
@@ -136,6 +171,8 @@ pub(crate) struct DescribeArgs {
 pub(crate) struct ScanArgs {
     #[command(flatten)]
     pub(crate) common: CommonOpts,
+    #[command(flatten)]
+    pub(crate) query: QueryOpts,
     /// Output file for usernames (default: stdout).
     #[arg(long, short)]
     pub(crate) out: Option<PathBuf>,
@@ -145,6 +182,8 @@ pub(crate) struct ScanArgs {
 pub(crate) struct DedupeArgs {
     #[command(flatten)]
     pub(crate) common: CommonOpts,
+    #[command(flatten)]
+    pub(crate) query: QueryOpts,
     /// Key to deduplicate: `author`, `subreddit`, or `json:/pointer`.
     /// JSON pointers should reference a scalar; strings, numbers, and bools are emitted as text.
     #[arg(long, value_name = "KEY")]
@@ -162,6 +201,8 @@ pub(crate) struct DedupeArgs {
 pub(crate) struct ExportArgs {
     #[command(flatten)]
     pub(crate) common: CommonOpts,
+    #[command(flatten)]
+    pub(crate) query: QueryOpts,
     /// Output format.
     #[arg(long, value_enum, default_value_t = ExportFmt::Jsonl)]
     pub(crate) format: ExportFmt,
@@ -218,6 +259,8 @@ pub(crate) enum ExportFmt {
 pub(crate) struct CountArgs {
     #[command(flatten)]
     pub(crate) common: CommonOpts,
+    #[command(flatten)]
+    pub(crate) query: QueryOpts,
     /// Count mode: per month (`month`) or per author (`author`, writes TSV).
     #[arg(long, value_enum, default_value_t = CountMode::Month)]
     pub(crate) mode: CountMode,
@@ -324,6 +367,8 @@ pub(crate) struct ParentsArgs {
 pub(crate) struct FirstSeenArgs {
     #[command(flatten)]
     pub(crate) common: CommonOpts,
+    #[command(flatten)]
+    pub(crate) query: QueryOpts,
     /// Output TSV file: `<author>\t<earliest_created_utc>` per line.
     #[arg(long, short)]
     pub(crate) out: PathBuf,

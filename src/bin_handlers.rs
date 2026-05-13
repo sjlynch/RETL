@@ -88,7 +88,7 @@ fn available_range(map: &BTreeMap<YearMonth, PathBuf>) -> String {
 
 pub(crate) fn run_scan(args: ScanArgs) -> Result<()> {
     let etl = build_etl(&args.common)?;
-    let scan = plan!(etl, args.common);
+    let scan = plan!(etl, args.common, args.query);
 
     match args.out {
         Some(path) => {
@@ -119,7 +119,7 @@ pub(crate) fn run_dedupe(args: DedupeArgs) -> Result<()> {
         etl = etl.inflight_bytes(b);
     }
     let work_dir = args.common.work_dir.clone();
-    let scan = plan!(etl, args.common);
+    let scan = plan!(etl, args.common, args.query);
 
     if args.out == Path::new("-") {
         let tmp_path = stdout_dedupe_path(&work_dir);
@@ -205,7 +205,7 @@ pub(crate) fn run_export(args: ExportArgs) -> Result<()> {
         etl = etl.resume(true);
     }
     let work_dir = args.common.work_dir.clone();
-    let scan = plan!(etl, args.common);
+    let scan = plan!(etl, args.common, args.query);
     let to_stdout = args.out == Path::new("-");
 
     match args.format {
@@ -261,7 +261,7 @@ pub(crate) fn run_export(args: ExportArgs) -> Result<()> {
 
 pub(crate) fn run_count(args: CountArgs) -> Result<()> {
     let etl = build_etl(&args.common)?;
-    let scan = plan!(etl, args.common);
+    let scan = plan!(etl, args.common, args.query);
 
     match args.mode {
         CountMode::Month => {
@@ -419,7 +419,7 @@ fn write_grouped_tsv(out: &Path, rows: Vec<(String, String)>) -> Result<()> {
 
 pub(crate) fn run_first_seen(args: FirstSeenArgs) -> Result<()> {
     let etl = build_etl(&args.common)?;
-    let scan = plan!(etl, args.common);
+    let scan = plan!(etl, args.common, args.query);
     scan.build_first_seen_index_to_tsv(&args.out)?;
     Ok(())
 }

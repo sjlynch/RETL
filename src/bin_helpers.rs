@@ -346,19 +346,41 @@ pub(crate) fn build_etl(common: &CommonOpts) -> Result<RedditETL> {
 /// Inlined as a macro because `ScanPlan` is not re-exported from the crate root
 /// and we want to avoid widening the public API just for the CLI.
 macro_rules! plan {
-    ($etl:expr, $common:expr) => {{
+    ($etl:expr, $common:expr, $query:expr) => {{
         let common = &$common;
-        let scan = $etl.scan();
-        let scan = if common.subreddits.is_empty() {
-            scan
-        } else {
-            scan.subreddits(common.subreddits.iter().map(String::as_str))
-        };
-        if common.include_deleted {
-            scan.include_pseudo_users()
-        } else {
-            scan
+        let query = &$query;
+        let mut scan = $etl.scan();
+        if !common.subreddits.is_empty() {
+            scan = scan.subreddits(common.subreddits.iter().map(String::as_str));
         }
+        if !query.authors.is_empty() {
+            scan = scan.authors_in(query.authors.iter().map(String::as_str));
+        }
+        if !query.exclude_authors.is_empty() {
+            scan = scan.authors_out(query.exclude_authors.iter().map(String::as_str));
+        }
+        if let Some(author_regex) = &query.author_regex {
+            scan = scan.author_regex(author_regex.as_str());
+        }
+        if !query.keywords.is_empty() {
+            scan = scan.keywords_any(query.keywords.iter().map(String::as_str));
+        }
+        if let Some(min_score) = query.min_score {
+            scan = scan.min_score(min_score);
+        }
+        if let Some(max_score) = query.max_score {
+            scan = scan.max_score(max_score);
+        }
+        if query.contains_url {
+            scan = scan.contains_url(true);
+        }
+        if !query.domains.is_empty() {
+            scan = scan.domains_in(query.domains.iter().map(String::as_str));
+        }
+        if common.include_deleted {
+            scan = scan.include_pseudo_users();
+        }
+        scan
     }};
 }
 pub(crate) use plan;

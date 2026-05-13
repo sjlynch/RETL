@@ -146,6 +146,13 @@ commands accept a shared set of selection/runtime flags (see
 | `--start <YYYY-MM>` / `--end <YYYY-MM>` | Inclusive month range. Omit either to leave that side unbounded. |
 | `--source rc\|rs\|both` | Comments only, submissions only, or both (default). |
 | `--subreddit <NAME>` (`-s`) | Subreddit selector. Repeatable; omit for "any subreddit". |
+| `--author <NAME>` / `--author-in <NAME>` | Author allow-list selector. Repeatable. |
+| `--exclude-author <NAME>` | Author deny-list selector. Repeatable. |
+| `--author-regex <REGEX>` | Keep authors matching a regex. |
+| `--keyword <TEXT>` | Keep records containing a keyword in body/title/selftext. Repeatable. |
+| `--min-score <N>` / `--max-score <N>` | Inclusive score thresholds. |
+| `--contains-url` | Keep records with an HTTP(S) URL in text or submission URL. |
+| `--domain <DOMAIN>` | Submission-domain allow-list. Repeatable; comments are dropped when this filter is active. |
 | `--include-deleted` | Include pseudo-users (`[deleted]`, `[removed]`, and empty authors) that are filtered by default. |
 | `--parallelism <N>` / `--file-concurrency <N>` | Rayon threads / concurrent monthly files. |
 | `--no-progress` | Disable progress bars. |
@@ -230,6 +237,26 @@ retl export \
   --human-timestamps \
   --format jsonl \
   --out askscience_2016Q1.jsonl
+
+# Keyword + score + URL-filtered export
+retl export \
+  --data-dir ./data \
+  --start 2020-01 --end 2020-12 \
+  --subreddit rust \
+  --keyword async \
+  --min-score 10 \
+  --contains-url \
+  --format jsonl \
+  --out rust_async_links_2020.jsonl
+
+# Domain-only submissions query (comments have no submission `domain` field)
+retl export \
+  --data-dir ./data \
+  --source rs \
+  --start 2020-01 --end 2020-12 \
+  --domain nytimes.com \
+  --format jsonl \
+  --out nytimes_submissions_2020.jsonl
 
 # Spool monthly parts (input for parents pipeline / aggregation)
 retl export --start 2006-01 --end 2006-01 -s programming --format spool --out ./spool

@@ -3,9 +3,70 @@ mod common;
 
 use assert_cmd::Command;
 use common::{make_corpus_basic, read_lines};
+use retl::{KeyExtractor, RedditETL, YearMonth};
 
 fn retl() -> Command {
     Command::cargo_bin("retl").expect("retl binary should be built")
+}
+
+#[test]
+fn dedupe_keys_to_lines_applies_author_regex() {
+    let base = make_corpus_basic();
+    let out = base.join("regex_authors.txt");
+    let work = base.join("work_regex_authors");
+
+    let n = RedditETL::new()
+        .base_dir(&base)
+        .work_dir(&work)
+        .date_range(Some(YearMonth::new(2006, 1)), Some(YearMonth::new(2006, 1)))
+        .progress(false)
+        .scan()
+        .author_regex("^a")
+        .dedupe_keys_to_lines(&KeyExtractor::author_lowercase_fast(), &out)
+        .unwrap();
+
+    assert_eq!(n, 1);
+    assert_eq!(read_lines(&out), vec!["alice"]);
+}
+
+#[test]
+fn dedupe_keys_to_lines_rejects_invalid_author_regex() {
+    let base = make_corpus_basic();
+    let out = base.join("invalid_regex.txt");
+    let work = base.join("work_invalid_regex");
+
+    let err = RedditETL::new()
+        .base_dir(&base)
+        .work_dir(&work)
+        .date_range(Some(YearMonth::new(2006, 1)), Some(YearMonth::new(2006, 1)))
+        .progress(false)
+        .scan()
+        .author_regex("[")
+        .dedupe_keys_to_lines(&KeyExtractor::author_lowercase_fast(), &out)
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("author_regex"), "{msg}");
+}
+
+#[test]
+fn dedupe_keys_to_lines_rejects_contradictory_score_range() {
+    let base = tempfile::tempdir().unwrap().keep();
+    let out = base.join("bad_scores.txt");
+    let work = base.join("work_bad_scores");
+
+    let err = RedditETL::new()
+        .base_dir(&base)
+        .work_dir(&work)
+        .date_range(Some(YearMonth::new(2006, 1)), Some(YearMonth::new(2006, 1)))
+        .progress(false)
+        .scan()
+        .min_score(10)
+        .max_score(1)
+        .dedupe_keys_to_lines(&KeyExtractor::author_lowercase_fast(), &out)
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("min_score"), "{msg}");
+    assert!(msg.contains("max_score"), "{msg}");
 }
 
 #[test]

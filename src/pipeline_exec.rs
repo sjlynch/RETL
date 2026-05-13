@@ -10,7 +10,7 @@ use crate::filters::{
 use crate::key_extractor::KeyExtractor;
 use crate::kv_shard::ShardedKVWriter;
 use crate::paths::{discover_all, plan_files_checked, FileJob, FileKind};
-use crate::pipeline::{log_domain_filter_comment_drop, RedditETL, ScanPlan};
+use crate::pipeline::{RedditETL, ScanPlan};
 use crate::progress::{make_progress_bar_labeled, total_compressed_size};
 use crate::progress_manifest::{ManifestAccumulator, MonthEntry};
 use crate::query::QuerySpec;
@@ -252,10 +252,10 @@ impl ScanPlan {
     /// `MinimalRecord` fast path; `json:/pointer` extractors parse full JSON
     /// only for key extraction.
     pub fn dedupe_keys_to_lines(self, key: &KeyExtractor, out_path: &Path) -> Result<u64> {
-        log_domain_filter_comment_drop(&self.query, self.etl.opts.sources);
-        let parallelism = self.etl.opts.parallelism;
+        let plan = self.build()?;
+        let parallelism = plan.etl.opts.parallelism;
         with_thread_pool(parallelism, || {
-            let work_dir = self.etl.ensure_work_dir()?;
+            let work_dir = plan.etl.ensure_work_dir()?;
             let unique = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
@@ -269,14 +269,14 @@ impl ScanPlan {
                 let f = create_with_backoff(&input, 16, 50)
                     .with_context(|| format!("create {}", input.display()))?;
                 let writer = Mutex::new(BufWriter::with_capacity(
-                    self.etl.opts.write_buffer_bytes,
+                    plan.etl.opts.write_buffer_bytes,
                     f,
                 ));
                 let matched_records = AtomicU64::new(0);
 
                 scan_records(
-                    &self.etl,
-                    &self.query,
+                    &plan.etl,
+                    &plan.query,
                     /*show_progress=*/ true,
                     |_min, _kind, line| {
                         matched_records.fetch_add(1, Ordering::Relaxed);
@@ -294,9 +294,9 @@ impl ScanPlan {
                     .flush()?;
 
                 let mut cfg = DedupeCfg {
-                    read_buf_bytes: self.etl.opts.read_buffer_bytes,
-                    write_buf_bytes: self.etl.opts.write_buffer_bytes,
-                    inflight_bytes: self.etl.opts.inflight_bytes,
+                    read_buf_bytes: plan.etl.opts.read_buffer_bytes,
+                    write_buf_bytes: plan.etl.opts.write_buffer_bytes,
+                    inflight_bytes: plan.etl.opts.inflight_bytes,
                     ..DedupeCfg::default()
                 };
                 if cfg.inflight_bytes > 0 {
