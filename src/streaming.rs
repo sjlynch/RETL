@@ -8,7 +8,7 @@ use crate::query::QuerySpec;
 use crate::shard::ShardedWriter;
 use crate::zstd_jsonl::{
     for_each_line_cfg_status, for_each_line_cfg_with_skip, for_each_line_with_progress_cfg_status,
-    for_each_line_with_progress_cfg_with_skip, parse_minimal,
+    for_each_line_with_progress_cfg_with_skip, malformed_json_error, parse_minimal,
 };
 use anyhow::{anyhow, Result};
 use indicatif::ProgressBar;
@@ -360,12 +360,18 @@ pub fn stream_job<W: Write + ?Sized>(
         },
     };
 
+    let mut line_number: u64 = 0;
     let mut on_line = |line: &str| -> Result<()> {
+        line_number += 1;
         if whitelist_error.is_some() {
             return Ok(());
         }
-        let Ok(min) = parse_minimal(line) else {
-            return Ok(());
+        let min = match parse_minimal(line) {
+            Ok(min) => min,
+            Err(_) => match serde_json::from_str::<Value>(line) {
+                Ok(_) => return Ok(()),
+                Err(e) => return Err(malformed_json_error(&job.path, line_number, e)),
+            },
         };
         if !matches_minimal(&min, targets, query) {
             return Ok(());
@@ -432,10 +438,15 @@ pub fn process_file_for_usernames_with_skip(
     pb: Option<ProgressBar>,
     mut on_skip: impl FnMut(&std::path::Path, &anyhow::Error),
 ) -> Result<()> {
-    let handle_line = |line: &str| -> Result<()> {
+    let mut line_number: u64 = 0;
+    let mut handle_line = |line: &str| -> Result<()> {
+        line_number += 1;
         let min = match parse_minimal(line) {
-            Ok(m) => m,
-            Err(_) => return Ok(()),
+            Ok(min) => min,
+            Err(_) => match serde_json::from_str::<Value>(line) {
+                Ok(_) => return Ok(()),
+                Err(e) => return Err(malformed_json_error(&job.path, line_number, e)),
+            },
         };
         if !matches_subreddit_basic(&min, subreddit) {
             return Ok(());

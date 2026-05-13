@@ -439,7 +439,7 @@ proptest! {
         let key = KeyExtractor::author_lowercase_fast();
         let keys: Vec<String> = once
             .iter()
-            .filter_map(|line| key.key_from_line(line))
+            .filter_map(|line| key.key_from_line(line).expect("valid JSON in dedupe output"))
             .collect();
         let unique_keys: HashSet<&String> = keys.iter().collect();
         prop_assert_eq!(unique_keys.len(), keys.len());
