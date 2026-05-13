@@ -3,6 +3,7 @@ use crate::pipeline::RedditETL;
 use crate::progress::make_progress_bar_labeled;
 use crate::shard_common;
 use crate::util::with_thread_pool;
+use crate::zstd_jsonl::malformed_json_error;
 use ahash::{AHashSet, RandomState};
 use anyhow::{Context, Result};
 use rayon::prelude::*;
@@ -356,60 +357,63 @@ impl RedditETL {
 
             let read_buf = self.opts.read_buffer_bytes;
 
-            // Surface I/O / parse errors instead of silently dropping them. Each
-            // worker writes a tracing::warn! on failure and bumps the shared
-            // counter; the total is reported back via tracing at the end.
-            let err_count = AtomicUsize::new(0);
             let parent_ref_count = AtomicUsize::new(0);
 
-            paths.par_iter().for_each(|p| {
-                let res = (|| -> Result<()> {
-                    let f = File::open(p).with_context(|| format!("open {}", p.display()))?;
-                    let mut r = BufReader::with_capacity(read_buf, f);
-                    let mut buf = String::with_capacity(64 * 1024);
-                    loop {
-                        buf.clear();
-                        let n = r.read_line(&mut buf)
-                            .with_context(|| format!("read {}", p.display()))?;
-                        if n == 0 { break; }
-                        if buf.ends_with('\n') { buf.pop(); if buf.ends_with('\r') { buf.pop(); } }
-                        if buf.is_empty() { continue; }
-
-                        let v: Value = match serde_json::from_str(&buf) {
-                            Ok(x) => x,
-                            Err(_) => {
-                                // Single malformed line should not abort the file;
-                                // count it but do not bail.
-                                err_count.fetch_add(1, Ordering::Relaxed);
-                                if let Some(pb) = &pb { pb.inc(n as u64); }
-                                continue;
-                            }
-                        };
-                        if let Some(parent_id) = v.get("parent_id").and_then(|x| x.as_str()) {
-                            parent_ref_count.fetch_add(1, Ordering::Relaxed);
-                            if let Some(rest) = parent_id.strip_prefix("t1_") {
-                                t1_writer.write(rest)?;
-                            } else if let Some(rest) = parent_id.strip_prefix("t3_") {
-                                t3_writer.write(rest)?;
-                            }
-                        }
-                        if let Some(link_id) = v.get("link_id").and_then(|x| x.as_str()) {
-                            parent_ref_count.fetch_add(1, Ordering::Relaxed);
-                            if let Some(rest) = link_id.strip_prefix("t3_") {
-                                t3_writer.write(rest)?;
-                            }
-                        }
-
-                        if let Some(pb) = &pb { pb.inc(n as u64); }
+            paths.par_iter().try_for_each(|p| -> Result<()> {
+                let f = File::open(p)
+                    .with_context(|| format!("open parent-id spool input {}", p.display()))?;
+                let mut r = BufReader::with_capacity(read_buf, f);
+                let mut buf = String::with_capacity(64 * 1024);
+                let mut line_number = 0u64;
+                loop {
+                    buf.clear();
+                    let n = r.read_line(&mut buf).with_context(|| {
+                        format!(
+                            "read parent-id spool input {} near line {}",
+                            p.display(),
+                            line_number + 1
+                        )
+                    })?;
+                    if n == 0 {
+                        break;
                     }
-                    Ok(())
-                })();
+                    line_number += 1;
+                    if buf.ends_with('\n') {
+                        buf.pop();
+                        if buf.ends_with('\r') {
+                            buf.pop();
+                        }
+                    }
+                    if buf.is_empty() {
+                        if let Some(pb) = &pb {
+                            pb.inc(n as u64);
+                        }
+                        continue;
+                    }
 
-                if let Err(e) = res {
-                    err_count.fetch_add(1, Ordering::Relaxed);
-                    tracing::warn!(path=%p.display(), error=%e, "collect_parent_ids: skipped file due to error");
+                    let v: Value = serde_json::from_str(&buf)
+                        .map_err(|e| malformed_json_error(p, line_number, e))?;
+                    if let Some(parent_id) = v.get("parent_id").and_then(|x| x.as_str()) {
+                        parent_ref_count.fetch_add(1, Ordering::Relaxed);
+                        if let Some(rest) = parent_id.strip_prefix("t1_") {
+                            t1_writer.write(rest)?;
+                        } else if let Some(rest) = parent_id.strip_prefix("t3_") {
+                            t3_writer.write(rest)?;
+                        }
+                    }
+                    if let Some(link_id) = v.get("link_id").and_then(|x| x.as_str()) {
+                        parent_ref_count.fetch_add(1, Ordering::Relaxed);
+                        if let Some(rest) = link_id.strip_prefix("t3_") {
+                            t3_writer.write(rest)?;
+                        }
+                    }
+
+                    if let Some(pb) = &pb {
+                        pb.inc(n as u64);
+                    }
                 }
-            });
+                Ok(())
+            })?;
 
             let t1_shards = t1_writer.dedup()?;
             let t3_shards = t3_writer.dedup()?;
@@ -423,13 +427,6 @@ impl RedditETL {
                 pb.finish_with_message(final_msg);
             }
 
-            let errors = err_count.load(Ordering::Relaxed);
-            if errors > 0 {
-                tracing::warn!(
-                    error_count = errors,
-                    "collect_parent_ids_from_jsonls completed with errors"
-                );
-            }
             let parent_refs = parent_ref_count.load(Ordering::Relaxed);
             if parent_refs == 0 {
                 tracing::warn!(
