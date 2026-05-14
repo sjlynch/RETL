@@ -129,6 +129,14 @@ pub(crate) struct QueryOpts {
     /// Submission domain allow-list entry (repeatable). Comments have no domain and are dropped.
     #[arg(long = "domain", value_name = "DOMAIN")]
     pub(crate) domains: Vec<String>,
+
+    /// Full-record JSON Pointer predicate. Repeatable. Syntax: `exists:/path`,
+    /// `/path=value`, `/path!=value`, `/path>10`, `/path>=10`, `/path<10`,
+    /// `/path<=10`, or `/path~=REGEX`. Values use JSON scalars when possible
+    /// (`true`, `false`, `null`, numbers, or quoted strings); otherwise they
+    /// are treated as strings.
+    #[arg(long = "json", value_name = "PREDICATE")]
+    pub(crate) json_predicates: Vec<String>,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug)]

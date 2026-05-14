@@ -411,6 +411,7 @@ impl ScanPlan {
             let targets =
                 resolve_target_subs_from(&plan.etl.opts.subreddit, &plan.query.subreddits);
             let files = plan_pipeline_files(&plan.etl)?;
+            warn_if_unfiltered_undated_query(&plan.etl, &plan.query, &files);
 
             let resume = plan.etl.opts.resume;
             let resume_fingerprint = build_resume_fingerprint(&plan.etl, &plan.query, "spool")?;
@@ -626,6 +627,7 @@ impl ScanPlan {
 
         with_thread_pool(parallelism, || {
             let files = plan_pipeline_files(&plan.etl)?;
+            warn_if_unfiltered_undated_query(&plan.etl, &plan.query, &files);
 
             let comments_dir = out_base_dir.join("comments");
             let submissions_dir = out_base_dir.join("submissions");
@@ -765,6 +767,24 @@ fn plan_pipeline_files(etl: &RedditETL) -> Result<Vec<FileJob>> {
     Ok(jobs)
 }
 
+fn warn_if_unfiltered_undated_query(etl: &RedditETL, query: &QuerySpec, files: &[FileJob]) {
+    if etl.opts.start.is_some()
+        || etl.opts.end.is_some()
+        || etl.opts.subreddit.is_some()
+        || query.has_selective_filters()
+    {
+        return;
+    }
+
+    let file_count = files.len();
+    let compressed_bytes = total_compressed_size(files);
+    tracing::warn!(
+        files = file_count,
+        compressed_bytes = compressed_bytes,
+        "running an unfiltered, undated query over the full corpus (files={file_count}, compressed_bytes={compressed_bytes}); pass --subreddit and/or --start/--end to narrow the scope"
+    );
+}
+
 fn validate_export_whitelist(etl: &RedditETL) -> Result<()> {
     if matches!(&etl.opts.whitelist_fields, Some(fields) if fields.is_empty()) {
         anyhow::bail!("--whitelist must include at least one non-empty field");
@@ -880,6 +900,7 @@ fn build_resume_fingerprint(etl: &RedditETL, query: &QuerySpec, operation: &str)
             "keywords_any": query.keywords_any.as_ref(),
             "domains_in": query.domains_in.as_ref(),
             "contains_url": query.contains_url,
+            "json_predicates": query.json_predicates_fingerprint(),
             "filter_pseudo_users": query.filter_pseudo_users,
         }
     });
@@ -1132,6 +1153,7 @@ fn extract_common(
     let parallelism = etl.opts.parallelism;
     with_thread_pool(parallelism, || {
         let files = plan_pipeline_files(etl)?;
+        warn_if_unfiltered_undated_query(etl, query, &files);
 
         let work_dir = etl.ensure_work_dir()?;
         let resume = etl.opts.resume;
@@ -1312,6 +1334,7 @@ where
     let read_buf = etl.opts.read_buffer_bytes;
 
     let files = plan_pipeline_files(etl)?;
+    warn_if_unfiltered_undated_query(etl, query, &files);
 
     let pb = if show_progress && etl.opts.progress {
         let total_bytes = total_compressed_size(&files);

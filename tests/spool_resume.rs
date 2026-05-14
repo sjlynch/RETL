@@ -47,6 +47,30 @@ fn write_marker_comment_corpus(base: &Path, marker: &str) {
     fs::create_dir_all(base.join("submissions")).unwrap();
 }
 
+fn make_over18_submission_corpus() -> PathBuf {
+    let base = tempfile::tempdir().unwrap().keep();
+    let rs_path = base.join("submissions").join("RS_2006-01.zst");
+    let lines = vec![
+        json!({
+            "id":"safe", "author":"alice", "subreddit":"programming",
+            "created_utc":1136073600_i64, "score":1, "domain":"example.com",
+            "title":"safe", "selftext":"", "over_18": false, "is_self": true,
+            "num_comments": 2
+        })
+        .to_string(),
+        json!({
+            "id":"nsfw", "author":"alice", "subreddit":"programming",
+            "created_utc":1136073601_i64, "score":1, "domain":"example.com",
+            "title":"nsfw", "selftext":"", "over_18": true, "is_self": true,
+            "num_comments": 3
+        })
+        .to_string(),
+    ];
+    write_zst_lines(&rs_path, &lines);
+    fs::create_dir_all(base.join("comments")).unwrap();
+    base
+}
+
 fn spool_run(base: &Path, out_dir: &Path, resume: bool) -> u64 {
     let (_parts, n) = RedditETL::new()
         .base_dir(base)
@@ -217,6 +241,49 @@ fn resume_fingerprint_change_rebuilds_spool_parts() {
     assert!(
         !rewritten.contains("programming"),
         "stale programming record was reused"
+    );
+}
+
+#[test]
+fn resume_fingerprint_changes_when_json_pointer_predicates_change() {
+    let base = make_over18_submission_corpus();
+    let out_dir = base.join("spool_json_fingerprint");
+
+    let first = RedditETL::new()
+        .base_dir(&base)
+        .sources(Sources::Submissions)
+        .date_range(Some(YearMonth::new(2006, 1)), Some(YearMonth::new(2006, 1)))
+        .progress(false)
+        .resume(true)
+        .scan()
+        .json_eq("/over_18", false)
+        .extract_spool_monthly(&out_dir)
+        .unwrap()
+        .1;
+    assert_eq!(first, 1);
+    let part = out_dir.join("part_RS_2006-01.jsonl");
+    assert!(fs::read_to_string(&part).unwrap().contains("safe"));
+
+    let second = RedditETL::new()
+        .base_dir(&base)
+        .sources(Sources::Submissions)
+        .date_range(Some(YearMonth::new(2006, 1)), Some(YearMonth::new(2006, 1)))
+        .progress(false)
+        .resume(true)
+        .scan()
+        .json_eq("/over_18", true)
+        .extract_spool_monthly(&out_dir)
+        .unwrap()
+        .1;
+    assert_eq!(second, 1, "changed JSON predicate must reprocess the month");
+    let rewritten = fs::read_to_string(&part).unwrap();
+    assert!(
+        rewritten.contains("nsfw"),
+        "expected rebuilt nsfw part, got {rewritten}"
+    );
+    assert!(
+        !rewritten.contains("safe"),
+        "stale JSON-filtered part was reused"
     );
 }
 

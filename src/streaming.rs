@@ -1,7 +1,9 @@
 //! Streaming primitives: the one-pass record filter/writer (`stream_job`) with progress,
 //! and the usernames collector for a single monthly file.
 
-use crate::filters::{matches_minimal, matches_subreddit_basic, within_bounds, DateBounds};
+use crate::filters::{
+    matches_full, matches_minimal, matches_subreddit_basic, within_bounds, DateBounds,
+};
 use crate::json_whitelist::WhitelistTokenizer;
 use crate::paths::FileJob;
 use crate::query::QuerySpec;
@@ -378,6 +380,13 @@ pub fn stream_job<W: Write + ?Sized>(
         }
         if !within_bounds(&min, bounds) {
             return Ok(());
+        }
+        if query.requires_full_parse() {
+            let val: Value = serde_json::from_str(line)
+                .map_err(|e| malformed_json_error(&job.path, line_number, e))?;
+            if !matches_full(&val, job.kind, query) {
+                return Ok(());
+            }
         }
 
         match write_path {

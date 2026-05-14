@@ -23,8 +23,9 @@
 //!    - [`YearMonth`] / `iter_year_months` — inclusive month range cursors.
 //!    - [`ScanPlan`] / [`QuerySpec`] — the query builder returned by
 //!      [`RedditETL::scan`], plus subreddit / author / regex / keyword / domain
-//!      / score filters. `ScanPlan::build` returns [`QueryBuildError`] for
-//!      contradictory or malformed query settings. `QuerySpec` exposes
+//!      / score / JSON-pointer predicate filters. `ScanPlan::build` returns
+//!      [`QueryBuildError`] for contradictory or malformed query settings.
+//!      `QuerySpec` exposes
 //!      `requires_full_parse()` to choose between the [`MinimalRecord`] fast-path
 //!      and a full `serde_json::Value` parse.
 //!
@@ -143,7 +144,7 @@ pub use crate::config::{ConfigBuildError, ETLOptions, Sources};
 pub use crate::date::YearMonth;
 pub use crate::pipeline::{RedditETL, ScanPlan};
 pub use crate::pipeline_exec::ExportFormat;
-pub use crate::query::{QueryBuildError, QuerySpec};
+pub use crate::query::{JsonPointerPredicate, NumericComparison, QueryBuildError, QuerySpec};
 pub use crate::shard::UsernameStream;
 
 pub use crate::aggregate::Aggregator;
