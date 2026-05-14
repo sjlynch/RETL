@@ -11,9 +11,10 @@ demonstrates the library API.
 
 1. **extract** — discover monthly files, decode the zstd frames as JSONL,
    filter against a `QuerySpec`, write results.
-2. **spool** — `extract_spool_monthly` writes one file per month to
-   `<out_dir>/_staging/<file>.inprogress`, atomically promotes it on
-   completion, and (when `resume = true`) records `_progress.json`.
+2. **spool** — `extract_spool_monthly` writes one file per month to a unique
+   `<out_dir>/_staging/<file>.retl-<pid>-<nonce>.inprogress`, atomically
+   promotes it on completion, and (when `resume = true`) records
+   `_progress.json`.
 3. **parents** — `ParentIds` collects referenced parent IDs, then
    `ParentMaps` resolves and stitches parent payloads back onto records.
 4. **aggregate** — `bucketize_shard` → `build_runs_sorted` →
@@ -42,21 +43,23 @@ When you add a new filter or key extractor, prefer extending `MinimalRecord`
 
 ## Atomic-write invariants
 
-- Every published file is staged at `<out_dir>/_staging/<name>.inprogress`,
-  then promoted to its final path with
-  `util::replace_file_atomic_backoff(tmp, dest)`.
+- Every published file is staged at a unique
+  `<out_dir>/_staging/<name>.retl-<pid>-<nonce>.inprogress`, then promoted to
+  its final path with `util::replace_file_atomic_backoff(tmp, dest)`.
 - Library code **never** writes to a final path directly. If you add a new
   output, route through `atomic_write::write_jsonl_atomic` /
-  `write_zst_atomic` (or replicate their staging+rename dance) so a crashed
-  run never leaves a partial file readers can mistake for complete output.
+  `write_zst_atomic` (or replicate their unique staging+rename dance) so a
+  crashed run never leaves a partial file readers can mistake for complete
+  output. Staging sweeps must not delete live files from another PID.
 - `replace_file_atomic_backoff` relies on Windows
   `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` for an atomic swap — readers see
   either the old or new content, never `NotFound`. Do **not** pre-remove the
   destination.
 - All open/create/rename/remove go through `*_with_backoff` helpers that
   retry the transient Windows error codes (5, 32, 33, 225, 433, 1006, 1117,
-  1224, 21) — sharing/AV/USB hiccups. Don't add raw `fs::*` calls in hot
-  publish paths.
+  1224, 21) — sharing/AV/USB hiccups. Use `create_new_with_backoff` for
+  staged files so a temp-path collision fails instead of truncating another
+  writer. Don't add raw `fs::*` calls in hot publish paths.
 
 ## zstd decoding
 

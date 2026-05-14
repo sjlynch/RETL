@@ -97,6 +97,7 @@ fn scan_help_advertises_common_flags() {
         .and(contains("--max-score"))
         .and(contains("--contains-url"))
         .and(contains("--domain"))
+        .and(contains("--json"))
         .and(contains("--include-deleted"))
         .and(contains("--whitelist").not())
         .and(contains("--strict-whitelist").not())
@@ -114,7 +115,8 @@ fn export_help_advertises_format_and_out() {
         .and(contains("zst"))
         .and(contains("partitioned-jsonl"))
         .and(contains("--out"))
-        .and(contains("--pretty"));
+        .and(contains("--pretty"))
+        .and(contains("Field-indent the JSON array"));
     assert.stdout(pred);
 }
 
@@ -133,7 +135,8 @@ fn integrity_help_advertises_modes_and_sample() {
     let pred = contains("--mode")
         .and(contains("quick"))
         .and(contains("full"))
-        .and(contains("--sample-bytes"));
+        .and(contains("--sample-bytes"))
+        .and(contains("--collect"));
     assert.stdout(pred);
 }
 
@@ -145,6 +148,8 @@ fn aggregate_help_requires_inputs_out_and_runtime_flags_only() {
         .and(contains("--by"))
         .and(contains("--metric"))
         .and(contains("--top"))
+        .and(contains("--scientific"))
+        .and(contains("Field-indent the final JSON"))
         .and(contains("--parallelism"))
         .and(contains("--no-progress"))
         .and(contains("--shards-dir"))

@@ -6,15 +6,16 @@ use std::hash::{BuildHasher, Hash, Hasher};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use crate::util::{create_dir_all_with_backoff, create_with_backoff, replace_file_atomic_backoff};
+use crate::atomic_write::{ensure_staging_dir, unique_inprogress_path};
+use crate::util::{create_dir_all_with_backoff, create_new_with_backoff, replace_file_atomic_backoff};
 
 /// Partitioned writers that route each user aggregate to a stable partition file.
 /// Writes are user-keyed: the same `user` always goes to the same partition.
 /// You provide the bytes to write via a lambda (closure) that gets a `&mut dyn Write`.
 ///
 /// File layout:
-///   <dir>/_staging/<stem>_part_XXXX.inprogress  (temp)
-///   <dir>/<stem>_part_XXXX.ndjson               (final, after finalize())
+///   `<dir>/_staging/<stem>_part_XXXX.ndjson.retl-<pid>-<nonce>.inprogress`
+///   `<dir>/<stem>_part_XXXX.ndjson` (final, after finalize())
 ///
 /// Notes:
 ///  - You are responsible for writing line terminators (`\n`) inside the lambda.
@@ -35,20 +36,18 @@ impl PartitionWriters {
     /// Writes go into a staging directory and are atomically promoted on `finalize()`.
     pub fn new(dir: &Path, stem: &str, parts: usize, write_buf: usize) -> Result<Self> {
         let parts = parts.max(1);
-        let staging = dir.join("_staging");
-        create_dir_all_with_backoff(&staging, 16, 50)
-            .with_context(|| format!("create staging dir {}", staging.display()))?;
         create_dir_all_with_backoff(dir, 16, 50)
             .with_context(|| format!("create partition dir {}", dir.display()))?;
+        let staging = ensure_staging_dir(dir)?;
 
         let mut writers = Vec::with_capacity(parts);
         let mut tmp_paths = Vec::with_capacity(parts);
         let mut final_paths = Vec::with_capacity(parts);
 
         for i in 0..parts {
-            let tmp = staging.join(format!("{}_part_{:04}.inprogress", stem, i));
             let final_p = dir.join(format!("{}_part_{:04}.ndjson", stem, i));
-            let f = create_with_backoff(&tmp, 16, 50)
+            let tmp = unique_inprogress_path(&staging, &final_p)?;
+            let f = create_new_with_backoff(&tmp, 16, 50)
                 .with_context(|| format!("create {}", tmp.display()))?;
             writers.push(Mutex::new(BufWriter::with_capacity(write_buf, f)));
             tmp_paths.push(tmp);

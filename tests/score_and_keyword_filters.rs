@@ -11,6 +11,7 @@
 #[path = "common/mod.rs"]
 mod common;
 
+use assert_cmd::Command;
 use common::*;
 use retl::{RedditETL, Sources, YearMonth};
 use serde_json::json;
@@ -54,6 +55,10 @@ impl<'a> MakeWriter<'a> for CaptureLogs {
             buf: self.buf.clone(),
         }
     }
+}
+
+fn retl() -> Command {
+    Command::cargo_bin("retl").expect("retl binary should be built")
 }
 
 /// Build a corpus of 4 RC records with controlled author/score values so
@@ -135,19 +140,22 @@ fn corpus_with_keywords_in_submissions() -> PathBuf {
             "subreddit":"programming","author":"u_a","id":"s1",
             "domain":"example.com","title":"Rust news","selftext":"",
             "created_utc":1136074600_i64,"score":1_i64
-        }).to_string(),
+        })
+        .to_string(),
         // Match in selftext only.
         json!({
             "subreddit":"programming","author":"u_b","id":"s2",
             "domain":"example.com","title":"Hi","selftext":"discussing rust internals",
             "created_utc":1136074601_i64,"score":1_i64
-        }).to_string(),
+        })
+        .to_string(),
         // No match anywhere.
         json!({
             "subreddit":"programming","author":"u_c","id":"s3",
             "domain":"example.com","title":"unrelated","selftext":"about python",
             "created_utc":1136074602_i64,"score":1_i64
-        }).to_string(),
+        })
+        .to_string(),
     ];
     write_zst_lines(&rs, &lines);
     std::fs::create_dir_all(dir.join("comments")).unwrap();
@@ -186,6 +194,89 @@ fn keywords_any_is_case_insensitive() {
         .count_by_month()
         .unwrap();
     assert_eq!(counts.get(&YearMonth::new(2006, 1)).copied(), Some(2));
+}
+
+fn corpus_with_unicode_keywords() -> PathBuf {
+    let dir = tempfile::tempdir().unwrap().keep();
+    let rc = dir.join("comments").join("RC_2006-01.zst");
+    let rc_lines: Vec<String> = vec![
+        json!({"subreddit":"programming","author":"u_upper","id":"c1","body":"CAFÉ meetup","parent_id":"t3_s1","created_utc":1136074600_i64,"score":1_i64}).to_string(),
+        json!({"subreddit":"programming","author":"u_title","id":"c2","body":"Café review","parent_id":"t3_s1","created_utc":1136074601_i64,"score":1_i64}).to_string(),
+        json!({"subreddit":"programming","author":"u_lower","id":"c3","body":"café notes","parent_id":"t3_s1","created_utc":1136074602_i64,"score":1_i64}).to_string(),
+        json!({"subreddit":"programming","author":"u_none","id":"c4","body":"tea notes","parent_id":"t3_s1","created_utc":1136074603_i64,"score":1_i64}).to_string(),
+    ];
+    write_zst_lines(&rc, &rc_lines);
+
+    let rs = dir.join("submissions").join("RS_2006-01.zst");
+    let rs_lines: Vec<String> = vec![
+        json!({
+            "subreddit":"programming","author":"u_submit_title","id":"s1",
+            "domain":"example.com","title":"Café launch","selftext":"",
+            "created_utc":1136074700_i64,"score":1_i64
+        })
+        .to_string(),
+        json!({
+            "subreddit":"programming","author":"u_submit_selftext","id":"s2",
+            "domain":"example.com","title":"hello","selftext":"CAFÉ details",
+            "created_utc":1136074701_i64,"score":1_i64
+        })
+        .to_string(),
+        json!({
+            "subreddit":"programming","author":"u_submit_none","id":"s3",
+            "domain":"example.com","title":"tea","selftext":"plain",
+            "created_utc":1136074702_i64,"score":1_i64
+        })
+        .to_string(),
+    ];
+    write_zst_lines(&rs, &rs_lines);
+    dir
+}
+
+#[test]
+fn keywords_any_unicode_case_insensitive_matches_comments_and_submissions() {
+    let base = corpus_with_unicode_keywords();
+    let counts = RedditETL::new()
+        .base_dir(&base)
+        .sources(Sources::Both)
+        .date_range(Some(YearMonth::new(2006, 1)), Some(YearMonth::new(2006, 1)))
+        .progress(false)
+        .scan()
+        .subreddit("programming")
+        .keywords_any(["café"])
+        .count_by_month()
+        .unwrap();
+    assert_eq!(counts.get(&YearMonth::new(2006, 1)).copied(), Some(5));
+}
+
+#[test]
+fn cli_keyword_unicode_case_insensitive() {
+    let base = corpus_with_unicode_keywords();
+    let cwd = tempfile::tempdir().unwrap();
+    let out = cwd.path().join("unicode_keyword.jsonl");
+
+    retl()
+        .arg("export")
+        .arg("--data-dir")
+        .arg(&base)
+        .args([
+            "--start",
+            "2006-01",
+            "--end",
+            "2006-01",
+            "--subreddit",
+            "programming",
+            "--keyword",
+            "café",
+            "--format",
+            "jsonl",
+            "--no-progress",
+            "--out",
+        ])
+        .arg(&out)
+        .assert()
+        .success();
+
+    assert_eq!(read_jsonl_values(&out).len(), 5);
 }
 
 /// `contains_url` should match `https://` as well, not only `http://`.

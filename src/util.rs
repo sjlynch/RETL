@@ -317,7 +317,7 @@ pub fn open_with_backoff(path: &Path, tries: usize, delay_ms: u64) -> io::Result
     })
 }
 
-/// Create a file with retries/backoff for transient errors.
+/// Create or truncate a file with retries/backoff for transient errors.
 pub fn create_with_backoff(path: &Path, tries: usize, delay_ms: u64) -> io::Result<File> {
     with_backoff(tries, delay_ms, || {
         #[cfg(test)]
@@ -357,6 +357,20 @@ pub fn read_dir_with_backoff(
         #[cfg(test)]
         maybe_inject_retriable_io_error_for_tests(TestIoOp::ReadDir, path)?;
         fs::read_dir(path)?.collect()
+    })
+}
+
+/// Create a brand-new file with retries/backoff for transient errors.
+///
+/// Unlike [`create_with_backoff`], this uses `create_new(true)` so an
+/// unexpected path collision returns `AlreadyExists` instead of truncating an
+/// existing staged file.
+pub fn create_new_with_backoff(path: &Path, tries: usize, delay_ms: u64) -> io::Result<File> {
+    with_backoff(tries, delay_ms, || {
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
     })
 }
 
