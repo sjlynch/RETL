@@ -18,8 +18,8 @@ use crate::bin_args::{
     FirstSeenArgs, IntegrityArgs, IntegrityModeArg, ParentsArgs, ScanArgs, SourceArg,
 };
 use crate::bin_helpers::{
-    build_etl, discover_spool_parts, plan, stream_extract_to_stdout, stream_path_output_to_stdout,
-    GroupBySpec, GroupMetricAgg, MetricSpec, RecCount,
+    build_etl, discover_spool_parts, emit_partial_read_report, plan, stream_extract_to_stdout,
+    stream_path_output_to_stdout, GroupBySpec, GroupMetricAgg, MetricSpec, RecCount,
 };
 
 const CLI_TEXT_WRITE_BUF_BYTES: usize = 64 * 1024;
@@ -177,6 +177,7 @@ fn available_range(map: &BTreeMap<YearMonth, PathBuf>) -> String {
 
 pub(crate) fn run_scan(args: ScanArgs) -> Result<()> {
     let etl = build_etl(&args.common)?;
+    let partial_reporter = etl.partial_read_reporter();
     let scan = plan!(etl, args.common, args.query);
 
     match args.out {
@@ -198,6 +199,7 @@ pub(crate) fn run_scan(args: ScanArgs) -> Result<()> {
             w.flush()?;
         }
     }
+    emit_partial_read_report(&partial_reporter)?;
     Ok(())
 }
 
@@ -207,6 +209,7 @@ pub(crate) fn run_dedupe(args: DedupeArgs) -> Result<()> {
     if let Some(b) = args.inflight_bytes {
         etl = etl.inflight_bytes(b);
     }
+    let partial_reporter = etl.partial_read_reporter();
     let work_dir = args.common.work_dir.clone();
     let scan = plan!(etl, args.common, args.query);
 
@@ -232,6 +235,7 @@ pub(crate) fn run_dedupe(args: DedupeArgs) -> Result<()> {
     } else {
         scan.dedupe_keys_to_lines(&key, &args.out)?;
     }
+    emit_partial_read_report(&partial_reporter)?;
     Ok(())
 }
 
@@ -293,6 +297,7 @@ pub(crate) fn run_export(args: ExportArgs) -> Result<()> {
     if args.resume {
         etl = etl.resume(true);
     }
+    let partial_reporter = etl.partial_read_reporter();
     let work_dir = args.common.work_dir.clone();
     let scan = plan!(etl, args.common, args.query);
     let to_stdout = args.out == Path::new("-");
@@ -331,12 +336,6 @@ pub(crate) fn run_export(args: ExportArgs) -> Result<()> {
                     export_format_name(args.format)
                 );
             }
-            if args.resume {
-                anyhow::bail!(
-                    "--resume is not supported with --format {}; use jsonl/json/spool for resumable exports",
-                    export_format_name(args.format)
-                );
-            }
             let partition_format = match args.format {
                 ExportFmt::Zst => ExportFormat::Zst,
                 ExportFmt::PartitionedJsonl => ExportFormat::Jsonl,
@@ -345,11 +344,13 @@ pub(crate) fn run_export(args: ExportArgs) -> Result<()> {
             scan.export_partitioned(&args.out, partition_format)?;
         }
     }
+    emit_partial_read_report(&partial_reporter)?;
     Ok(())
 }
 
 pub(crate) fn run_count(args: CountArgs) -> Result<()> {
     let etl = build_etl(&args.common)?;
+    let partial_reporter = etl.partial_read_reporter();
     let scan = plan!(etl, args.common, args.query);
 
     match args.mode {
@@ -387,6 +388,7 @@ pub(crate) fn run_count(args: CountArgs) -> Result<()> {
             }
         }
     }
+    emit_partial_read_report(&partial_reporter)?;
     Ok(())
 }
 
@@ -525,8 +527,10 @@ fn write_grouped_tsv(out: &Path, rows: Vec<(String, String)>) -> Result<()> {
 
 pub(crate) fn run_first_seen(args: FirstSeenArgs) -> Result<()> {
     let etl = build_etl(&args.common)?;
+    let partial_reporter = etl.partial_read_reporter();
     let scan = plan!(etl, args.common, args.query);
     scan.build_first_seen_index_to_tsv(&args.out)?;
+    emit_partial_read_report(&partial_reporter)?;
     Ok(())
 }
 

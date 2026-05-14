@@ -18,13 +18,14 @@
 //!    - [`ETLOptions`] / [`Sources`] — base dirs, date range, parallelism,
 //!      `file_concurrency` (default `1` to bound peak RAM on giant zstd
 //!      windows), `inflight_bytes` (default 256 MiB; cap on producer→consumer
-//!      backpressure), `adaptive_mem` thresholds, `resume`, IO buffer sizes,
-//!      `zst_level`.
+//!      backpressure), `adaptive_mem` thresholds, `resume`, `allow_partial`,
+//!      IO buffer sizes, `zst_level`.
 //!    - [`YearMonth`] / `iter_year_months` — inclusive month range cursors.
 //!    - [`ScanPlan`] / [`QuerySpec`] — the query builder returned by
 //!      [`RedditETL::scan`], plus subreddit / author / regex / keyword / domain
-//!      / score filters. `ScanPlan::build` returns [`QueryBuildError`] for
-//!      contradictory or malformed query settings. `QuerySpec` exposes
+//!      / score / JSON-pointer predicate filters. `ScanPlan::build` returns
+//!      [`QueryBuildError`] for contradictory or malformed query settings.
+//!      `QuerySpec` exposes
 //!      `requires_full_parse()` to choose between the [`MinimalRecord`] fast-path
 //!      and a full `serde_json::Value` parse.
 //!
@@ -44,7 +45,8 @@
 //!    - [`for_each_line_cfg`] / [`quick_validate_zst`] / [`validate_zst_full`]
 //!      — zstd readers configured with `window_log_max(31)` so frames written
 //!      at the spec's max window size decode without "Frame requires too much
-//!      memory."
+//!      memory." Corpus scans are strict by default; opt into
+//!      `allow_partial` only when lossy skipped-file reporting is acceptable.
 //!
 //! 4. **Emit**
 //!    - [`stream_job`](crate::streaming::stream_job) drives the per-file
@@ -76,7 +78,8 @@
 //!      path directly. See [`crate::atomic_write`] for the staging contract.
 //!    - The optional resume manifest at `<out_dir>/_progress.json` (see
 //!      [`progress_manifest`](crate::progress_manifest)) records each
-//!      committed month so a crashed run can skip what already landed.
+//!      committed month so a crashed run can skip what already landed; months
+//!      skipped by `allow_partial` are intentionally left uncommitted.
 //!
 //! 7. **Verify**
 //!    - [`IntegrityMode::Quick`] / [`IntegrityMode::Full`] +
@@ -142,11 +145,13 @@ mod json_whitelist;
 mod key_extractor;
 mod ndjson;
 
-pub use crate::config::{ConfigBuildError, ETLOptions, Sources};
+pub use crate::config::{
+    ConfigBuildError, ETLOptions, PartialReadReport, PartialReadReporter, SkippedFile, Sources,
+};
 pub use crate::date::YearMonth;
 pub use crate::pipeline::{RedditETL, ScanPlan};
 pub use crate::pipeline_exec::ExportFormat;
-pub use crate::query::{QueryBuildError, QuerySpec};
+pub use crate::query::{JsonPointerPredicate, NumericComparison, QueryBuildError, QuerySpec};
 pub use crate::shard::UsernameStream;
 
 pub use crate::aggregate::Aggregator;
@@ -235,6 +240,8 @@ pub use crate::zstd_jsonl::{parse_minimal, MinimalRecord};
 #[doc(hidden)]
 pub use crate::filters::matches_minimal;
 #[doc(hidden)]
-pub use crate::streaming::{apply_human_timestamps, rewrite_human_timestamps_bytes};
+pub use crate::streaming::{
+    apply_human_timestamps, project_whitelist_line_for_tests, rewrite_human_timestamps_bytes,
+};
 #[doc(hidden)]
 pub use crate::zstd_jsonl::for_each_line_cfg;
