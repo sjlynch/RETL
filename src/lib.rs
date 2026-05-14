@@ -186,7 +186,7 @@ pub use crate::integrity::IntegrityMode;
 pub use crate::zstd_jsonl::{quick_validate_zst, validate_zst_full};
 
 //export partition writers (lambda-capable)
-pub use crate::partition::PartitionWriters;
+pub use crate::partition::{PartitionWriters, MAX_PARTITIONS};
 
 //export robust file ops from util so binaries can import from crate root.
 pub use crate::util::{
