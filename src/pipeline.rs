@@ -111,15 +111,39 @@ impl RedditETL {
         self
     }
     /// Override the inflight-bytes backpressure budget used by bucketing/dedupe
-    /// producer/consumer pairs. See `ETLOptions::inflight_bytes`.
+    /// producer/consumer pairs.
+    ///
+    /// Setting this alone does **not** bound the bucketing worst-case peak —
+    /// `inflight_groups` adds a multiplier on top, so the actual peak is
+    /// `(1 + inflight_groups) * inflight_bytes / 2`. See
+    /// [`ETLOptions::inflight_bytes`] for the full formula and
+    /// [`Self::inflight_budget`] for a helper that derives both values.
     pub fn inflight_bytes(mut self, bytes: usize) -> Self {
         self.opts = self.opts.with_inflight_bytes(bytes);
         self
     }
     /// Override the bounded-channel depth used by bucketing producer/consumer
-    /// pairs. See `ETLOptions::inflight_groups`.
+    /// pairs.
+    ///
+    /// Paired with `inflight_bytes`: raising this raises the bucketing memory
+    /// peak by `inflight_bytes / 2` per added group. See
+    /// [`ETLOptions::inflight_groups`] for the worst-case formula and
+    /// [`Self::inflight_budget`] for a helper that derives both values
+    /// together.
     pub fn inflight_groups(mut self, groups: usize) -> Self {
         self.opts = self.opts.with_inflight_groups(groups);
+        self
+    }
+
+    /// Set both `inflight_bytes` and `inflight_groups` from a single budget so
+    /// the bucketing worst-case peak is bounded by the declared value.
+    ///
+    /// Equivalent to `.inflight_bytes(bytes).inflight_groups(1)`. Prefer this
+    /// when you want the value you pass to be the actual RAM ceiling; use the
+    /// individual setters only when you need to tune throughput (deeper
+    /// channel) and have measured headroom.
+    pub fn inflight_budget(mut self, bytes: usize) -> Self {
+        self.opts = self.opts.with_inflight_budget(bytes);
         self
     }
     /// Override the adaptive-memory policy used by bucketing/dedupe producers.
