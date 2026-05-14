@@ -5,6 +5,7 @@ use crate::date::YearMonth;
 use crate::filters::ym_from_epoch;
 use crate::json_utils::is_comment_record_for_parent_attach;
 use crate::mem::{available_memory_fraction, is_low_memory};
+use crate::ndjson::{read_line_capped, DEFAULT_MAX_LINE_BYTES};
 use crate::parents_ids::{IdShards, SharedIdsetCache, WorkerShardCache};
 use crate::paths::{discover_all, plan_files_checked, FileJob, FileKind};
 use crate::pipeline::RedditETL;
@@ -21,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -497,28 +498,27 @@ fn build_id_shard_index(
             ));
         }
 
-        // Atomic write: serialize to a sibling .tmp first, fsync the data
-        // path via BufWriter::flush, then atomically replace the dest.
-        // Prevents readers from observing torn / half-written shard JSON
-        // after a crash mid-write.
-        let tmp = out.with_extension("json.tmp");
-        let write_res = (|| -> Result<()> {
-            let f = create_with_backoff(&tmp, 16, 50)
-                .with_context(|| format!("create tmp {}", tmp.display()))?;
-            let mut w = BufWriter::new(f);
+        // Atomic write: stage under `<out_dir>/_staging/<basename>.retl-<pid>-<nonce>.inprogress`,
+        // serialize the shard map into the staged file, flush, then atomically
+        // replace the dest. Routing through `_staging/` keeps concurrent shard
+        // writers from colliding on a shared sibling temp and lets a
+        // subsequent run's sweep recover crash leftovers — see
+        // `sweep_stale_inprogress` in `resolve_parent_maps`.
+        let out_parent = out
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let shard_staging = ensure_staging_dir(&out_parent)
+            .with_context(|| format!("ensure staging dir under {}", out_parent.display()))?;
+        write_jsonl_atomic(&shard_staging, &out, write_buf, |w| -> Result<()> {
             match job.kind {
-                FileKind::Comment => serde_json::to_writer(&mut w, &out_map_c)?,
-                FileKind::Submission => serde_json::to_writer(&mut w, &out_map_s)?,
+                FileKind::Comment => serde_json::to_writer(w, &out_map_c)?,
+                FileKind::Submission => serde_json::to_writer(w, &out_map_s)?,
             }
-            w.flush()?;
-            replace_file_atomic_backoff(&tmp, &out)?;
             Ok(())
-        })();
-
-        if let Err(e) = write_res {
-            let _ = remove_with_backoff(&tmp, 8, 50);
-            return Err(e).with_context(|| format!("write parent shard {}", out.display()));
-        }
+        })
+        .with_context(|| format!("write parent shard {}", out.display()))?;
 
         write_resolver_fingerprint_atomic(&sidecar_path, &fingerprint, write_buf)?;
         record_shard(out.clone());
@@ -769,14 +769,16 @@ fn fingerprint_empty_id_set(kind: &str) -> ParentIdSetFingerprint {
 fn fingerprint_id_shard_file(path: &Path) -> Result<(u64, u64, u64)> {
     let f = open_with_backoff(path, 16, 50)
         .with_context(|| format!("open parent-id shard {}", path.display()))?;
-    let r = BufReader::new(f);
+    let mut r = BufReader::new(f);
     let mut count = 0u64;
     let mut sum = 0u64;
     let mut xor = 0u64;
-    for line in r.lines() {
-        let mut id = line.with_context(|| format!("read parent-id shard {}", path.display()))?;
-        if id.ends_with('\r') {
-            id.pop();
+    let mut id = String::new();
+    loop {
+        let n = read_line_capped(&mut r, &mut id, DEFAULT_MAX_LINE_BYTES, path)
+            .with_context(|| format!("read parent-id shard {}", path.display()))?;
+        if n == 0 {
+            break;
         }
         if !id.is_empty() {
             update_unordered_id_digest(&mut count, &mut sum, &mut xor, &id);
@@ -1050,19 +1052,22 @@ fn validate_jsonl_file(path: &Path) -> bool {
     let Ok(f) = open_with_backoff(path, 16, 50) else {
         return false;
     };
-    let r = BufReader::new(f);
-    for line in r.lines() {
-        let Ok(line) = line else {
-            return false;
-        };
-        if line.trim().is_empty() {
-            continue;
-        }
-        if serde_json::from_str::<Value>(&line).is_err() {
-            return false;
+    let mut r = BufReader::new(f);
+    let mut buf = String::new();
+    loop {
+        match read_line_capped(&mut r, &mut buf, DEFAULT_MAX_LINE_BYTES, path) {
+            Ok(0) => return true,
+            Ok(_) => {
+                if buf.trim().is_empty() {
+                    continue;
+                }
+                if serde_json::from_str::<Value>(&buf).is_err() {
+                    return false;
+                }
+            }
+            Err(_) => return false,
         }
     }
-    true
 }
 
 fn looks_like_rc_spool_path(path: &Path) -> bool {
@@ -1085,23 +1090,22 @@ fn diagnose_initial_attach_shape(inputs: &[(usize, PathBuf)], read_buf: usize) -
     let mut shape = ParentAttachInitialShape::default();
 
     while shape.parsed_records < ATTACH_INITIAL_DIAGNOSTIC_SAMPLE_RECORDS {
-        buf.clear();
-        let n = r.read_line(&mut buf).with_context(|| {
-            format!(
-                "read initial parent attach input {} near line {}",
-                first_input.display(),
-                line_number + 1
-            )
-        })?;
+        let n = read_line_capped(&mut r, &mut buf, DEFAULT_MAX_LINE_BYTES, first_input)
+            .with_context(|| {
+                format!(
+                    "read initial parent attach input {} near line {}",
+                    first_input.display(),
+                    line_number + 1
+                )
+            })?;
         if n == 0 {
             break;
         }
         line_number += 1;
-        let line = buf.trim_end_matches(|c| c == '\r' || c == '\n');
-        if line.trim().is_empty() {
+        if buf.trim().is_empty() {
             continue;
         }
-        let v: Value = serde_json::from_str(line).with_context(|| {
+        let v: Value = serde_json::from_str(&buf).with_context(|| {
             format!(
                 "malformed JSON in initial parent attach input {} at line {}",
                 first_input.display(),
@@ -1206,6 +1210,13 @@ impl RedditETL {
                     submissions_out.display()
                 )
             })?;
+
+            // Sweep crash leftovers under `<cache>/_staging/`: shard writers
+            // stage there now (see `build_id_shard_index`), and any file owned
+            // by a no-longer-running PID is a partial flush from a prior
+            // crashed run that should not be promoted.
+            sweep_stale_inprogress(&comments_out, true)?;
+            sweep_stale_inprogress(&submissions_out, true)?;
 
             let discovered = discover_all(&self.opts.comments_dir, &self.opts.submissions_dir);
             let files = plan_files_checked(
@@ -1375,7 +1386,16 @@ impl RedditETL {
                 &indexed_inputs,
                 self.opts.file_concurrency,
                 |(idx, in_path)| -> Result<()> {
-                    let name = in_path.file_name().unwrap().to_string_lossy().to_string();
+                    let name = in_path
+                        .file_name()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "attach_parents input path has no file name: {}",
+                                in_path.display()
+                            )
+                        })?
+                        .to_string_lossy()
+                        .to_string();
                     let out_path = out_dir.join(name);
                     let inprogress_exists = attach_inprogress_exists(&staging_dir, &out_path)?;
                     let sidecar_path = attach_fingerprint_path(&out_path);
@@ -1424,22 +1444,33 @@ impl RedditETL {
                                 ..Default::default()
                             };
                             let f = open_with_backoff(in_path, 16, 50)?;
-                            let r = BufReader::new(f);
+                            let mut r = BufReader::new(f);
+                            let mut line_buf = String::new();
+                            let mut line_no: u64 = 0;
 
-                            for (line_idx, line) in r.lines().enumerate() {
-                                let line_no = line_idx + 1;
-                                let line = line.with_context(|| {
+                            loop {
+                                let n = read_line_capped(
+                                    &mut r,
+                                    &mut line_buf,
+                                    DEFAULT_MAX_LINE_BYTES,
+                                    in_path,
+                                )
+                                .with_context(|| {
                                     format!(
                                         "read parent attach input {} at line {}",
                                         in_path.display(),
-                                        line_no
+                                        line_no + 1
                                     )
                                 })?;
-                                if line.is_empty() {
+                                if n == 0 {
+                                    break;
+                                }
+                                line_no += 1;
+                                if line_buf.is_empty() {
                                     continue;
                                 }
                                 let mut v: Value =
-                                    serde_json::from_str(&line).with_context(|| {
+                                    serde_json::from_str(&line_buf).with_context(|| {
                                         format!(
                                             "malformed JSON in parent attach input {} at line {}",
                                             in_path.display(),
@@ -1586,5 +1617,36 @@ impl RedditETL {
             warn_if_no_comment_shaped_records(diagnostics);
             Ok((out_paths, stats))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::RedditETL;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    #[test]
+    fn attach_parents_with_no_file_name_input_returns_err() {
+        let etl = RedditETL::new();
+        let out_dir = tempfile::tempdir().expect("create out dir");
+        let parents = ParentMaps {
+            comments: HashMap::new(),
+            submissions: HashMap::new(),
+            comment_shards: None,
+            submission_shards: None,
+        };
+
+        // `..` has no `file_name()` per `Path::file_name` semantics. The function
+        // should surface a clean `Err` (from whichever guard fires first) rather
+        // than panicking inside the rayon worker.
+        let inputs = vec![PathBuf::from("..")];
+        let result =
+            etl.attach_parents_jsonls_parallel_with_stats(inputs, out_dir.path(), &parents, false);
+        assert!(
+            result.is_err(),
+            "expected Err for input path with no file_name(), got Ok"
+        );
     }
 }
