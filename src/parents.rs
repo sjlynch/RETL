@@ -3,7 +3,7 @@ use crate::atomic_write::{
 };
 use crate::date::YearMonth;
 use crate::filters::ym_from_epoch;
-use crate::json_utils::is_comment_record;
+use crate::json_utils::is_comment_record_for_parent_attach;
 use crate::mem::{available_memory_fraction, is_low_memory};
 use crate::parents_ids::{IdShards, SharedIdsetCache, WorkerShardCache};
 use crate::paths::{discover_all, plan_files_checked, FileJob, FileKind};
@@ -95,6 +95,62 @@ impl ParentAttachDiagnostics {
         self.records_with_parent_id += other.records_with_parent_id;
         self.records_with_link_id += other.records_with_link_id;
         self.comment_shaped_records += other.comment_shaped_records;
+    }
+}
+
+const ATTACH_INITIAL_DIAGNOSTIC_SAMPLE_RECORDS: u64 = 100;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ParentAttachInitialShape {
+    parsed_records: u64,
+    records_with_body: u64,
+    records_with_parent_id: u64,
+    records_with_link_id: u64,
+    records_with_body_and_parent_id: u64,
+    records_with_prefixed_parent_id: u64,
+}
+
+impl ParentAttachInitialShape {
+    fn observe(&mut self, v: &Value) {
+        let has_body = v.get("body").is_some();
+        let parent_id = v.get("parent_id").and_then(|x| x.as_str());
+        let has_parent_id = v.get("parent_id").is_some();
+        let has_link_id = v.get("link_id").is_some();
+
+        self.parsed_records += 1;
+        if has_body {
+            self.records_with_body += 1;
+        }
+        if has_parent_id {
+            self.records_with_parent_id += 1;
+        }
+        if has_link_id {
+            self.records_with_link_id += 1;
+        }
+        if has_body && has_parent_id {
+            self.records_with_body_and_parent_id += 1;
+        }
+        if parent_id
+            .map(|id| id.starts_with("t1_") || id.starts_with("t3_"))
+            .unwrap_or(false)
+        {
+            self.records_with_prefixed_parent_id += 1;
+        }
+    }
+
+    fn no_legacy_comment_shape(self) -> bool {
+        self.parsed_records > 0 && self.records_with_body_and_parent_id == 0
+    }
+
+    fn observed_shape(self) -> &'static str {
+        match (self.records_with_parent_id > 0, self.records_with_body > 0) {
+            (true, false) => "sample records had `parent_id` but no `body`",
+            (false, true) => "sample records had `body` but no `parent_id`",
+            (false, false) => "sample records had neither `body` nor `parent_id`",
+            (true, true) => {
+                "sample records mixed `body` and `parent_id`, but no single record had both"
+            }
+        }
     }
 }
 
@@ -207,6 +263,18 @@ impl ParentIds {
             t3_ids_sharded: Some(t3),
         }
     }
+    /// Return true when neither the comment (`t1_`) nor submission (`t3_`)
+    /// parent-id backing contains any IDs.
+    pub fn is_empty(&self) -> bool {
+        fn backing_empty(mem: Option<&AHashSet<String>>, sharded: Option<&IdShards>) -> bool {
+            mem.map_or(true, |ids| ids.is_empty())
+                && sharded.map_or(true, |shards| shards.total_ids == 0)
+        }
+
+        backing_empty(self.t1_ids_mem.as_ref(), self.t1_ids_sharded.as_ref())
+            && backing_empty(self.t3_ids_mem.as_ref(), self.t3_ids_sharded.as_ref())
+    }
+
     #[inline]
     pub fn contains_t1<'a>(
         &self,
@@ -984,6 +1052,63 @@ fn looks_like_rc_spool_path(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn diagnose_initial_attach_shape(inputs: &[(usize, PathBuf)], read_buf: usize) -> Result<()> {
+    let Some((_, first_input)) = inputs.first() else {
+        return Ok(());
+    };
+
+    let f = File::open(first_input)
+        .with_context(|| format!("open initial parent attach input {}", first_input.display()))?;
+    let mut r = BufReader::with_capacity(read_buf, f);
+    let mut buf = String::with_capacity(64 * 1024);
+    let mut line_number = 0u64;
+    let mut shape = ParentAttachInitialShape::default();
+
+    while shape.parsed_records < ATTACH_INITIAL_DIAGNOSTIC_SAMPLE_RECORDS {
+        buf.clear();
+        let n = r.read_line(&mut buf).with_context(|| {
+            format!(
+                "read initial parent attach input {} near line {}",
+                first_input.display(),
+                line_number + 1
+            )
+        })?;
+        if n == 0 {
+            break;
+        }
+        line_number += 1;
+        let line = buf.trim_end_matches(|c| c == '\r' || c == '\n');
+        if line.trim().is_empty() {
+            continue;
+        }
+        let v: Value = serde_json::from_str(line).with_context(|| {
+            format!(
+                "malformed JSON in initial parent attach input {} at line {}",
+                first_input.display(),
+                line_number
+            )
+        })?;
+        shape.observe(&v);
+    }
+
+    if shape.no_legacy_comment_shape()
+        && (shape.records_with_parent_id > 0 || looks_like_rc_spool_path(first_input))
+    {
+        let observed_shape = shape.observed_shape();
+        tracing::error!(
+            path = %first_input.display(),
+            sampled_records = shape.parsed_records,
+            records_with_body = shape.records_with_body,
+            records_with_parent_id = shape.records_with_parent_id,
+            records_with_link_id = shape.records_with_link_id,
+            records_with_prefixed_parent_id = shape.records_with_prefixed_parent_id,
+            "parents attach initial sample found no records with both `body` and `parent_id` ({observed_shape}); using relaxed parent_id-based matching for records whose `parent_id` starts with `t1_`/`t3_`; if this spool was produced with --whitelist/.whitelist_fields, include body,parent_id,link_id to retain child comment text and parent-resolution context"
+        );
+    }
+
+    Ok(())
+}
+
 fn warn_if_no_comment_shaped_records(diagnostics: ParentAttachDiagnostics) {
     if diagnostics.files_scanned == 0
         || diagnostics.parsed_records == 0
@@ -1000,7 +1125,7 @@ fn warn_if_no_comment_shaped_records(diagnostics: ParentAttachDiagnostics) {
         records_with_body = diagnostics.records_with_body,
         records_with_parent_id = diagnostics.records_with_parent_id,
         records_with_link_id = diagnostics.records_with_link_id,
-        "parents attach found zero comment-shaped records in the spool; comment records must include `body` and `parent_id`, and parent resolution also requires `link_id`; if the spool was produced with --whitelist/.whitelist_fields, include body,parent_id,link_id or the output will be a no-op copy"
+        "parents attach found zero records with a usable `parent_id`; comment records must include a `parent_id` starting with `t1_` or `t3_`, and parent resolution also benefits from `link_id`; if the spool was produced with --whitelist/.whitelist_fields, include parent_id,link_id (and body if you need the child comment text) or the output will be a no-op copy"
     );
 }
 
@@ -1207,6 +1332,7 @@ impl RedditETL {
             let resolution_range = attach_resolution_range(self.opts.start, self.opts.end);
 
             let indexed_inputs: Vec<(usize, PathBuf)> = inputs.into_iter().enumerate().collect();
+            diagnose_initial_attach_shape(&indexed_inputs, self.opts.read_buffer_bytes)?;
             let attached = std::sync::Mutex::new(vec![None; indexed_inputs.len()]);
 
             crate::concurrency::for_each_file_limited(
@@ -1302,7 +1428,7 @@ impl RedditETL {
                                     diagnostics.records_with_link_id += 1;
                                 }
 
-                                let is_comment = is_comment_record(&v);
+                                let is_comment = is_comment_record_for_parent_attach(&v);
                                 if is_comment {
                                     diagnostics.comment_shaped_records += 1;
                                     // Own-month is derived from the consuming record's

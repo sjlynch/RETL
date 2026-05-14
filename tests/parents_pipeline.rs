@@ -116,6 +116,33 @@ fn spool_resolve_attach_parents_end_to_end() {
 }
 
 #[test]
+fn parent_attach_stats_unresolved_rate_boundaries() {
+    assert_eq!(ParentAttachStats::default().total(), 0);
+    assert_eq!(ParentAttachStats::default().unresolved_rate(), 0.0);
+
+    let all_resolved = ParentAttachStats {
+        resolved: 20,
+        unresolved: 0,
+    };
+    assert_eq!(all_resolved.total(), 20);
+    assert_eq!(all_resolved.unresolved_rate(), 0.0);
+
+    let threshold = ParentAttachStats {
+        resolved: 95,
+        unresolved: 5,
+    };
+    assert_eq!(threshold.total(), 100);
+    assert!((threshold.unresolved_rate() - 0.05).abs() < f64::EPSILON);
+
+    let high = ParentAttachStats {
+        resolved: 1,
+        unresolved: 1,
+    };
+    assert_eq!(high.total(), 2);
+    assert_eq!(high.unresolved_rate(), 0.5);
+}
+
+#[test]
 fn unresolved_parent_is_absent_and_counted() {
     let tmp = tempfile::tempdir().unwrap();
     let input = tmp.path().join("part_RC_2006-01.jsonl");

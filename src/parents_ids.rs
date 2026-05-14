@@ -140,16 +140,19 @@ impl IdShardWriter {
         let tmp_paths: Vec<PathBuf> = (0..count)
             .map(|i| base_dir.join(format!("{kind}_ids_{:04}.tmp", i)))
             .collect();
-        tmp_paths.par_iter().try_for_each(|p| -> Result<()> {
-            let out = out_dir.join(
-                p.file_name()
-                    .unwrap()
-                    .to_string_lossy()
-                    .replace(".tmp", ".txt"),
-            );
-            dedup_one(p, &out)?;
-            Ok(())
-        })?;
+        let shard_counts: Vec<usize> = tmp_paths
+            .par_iter()
+            .map(|p| -> Result<usize> {
+                let out = out_dir.join(
+                    p.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .replace(".tmp", ".txt"),
+                );
+                dedup_one(p, &out)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let total_ids = shard_counts.into_iter().sum();
 
         if let Err(e) = fs::remove_dir_all(&base_dir) {
             if e.kind() != io::ErrorKind::NotFound {
@@ -164,6 +167,7 @@ impl IdShardWriter {
         Ok(IdShards {
             dir: out_dir,
             count,
+            total_ids,
             rs,
             kind: kind.to_string(),
             _scratch_root: scratch_root,
@@ -174,6 +178,7 @@ impl IdShardWriter {
 pub(crate) struct IdShards {
     pub(crate) dir: PathBuf,
     pub(crate) count: usize,
+    pub(crate) total_ids: usize,
     pub(crate) rs: RandomState,
     pub(crate) kind: String,
     pub(crate) _scratch_root: Arc<IdScratchRoot>,
@@ -189,7 +194,7 @@ impl IdShards {
     }
 }
 
-fn dedup_one(input: &Path, output: &Path) -> Result<()> {
+fn dedup_one(input: &Path, output: &Path) -> Result<usize> {
     let f = File::open(input).with_context(|| format!("open {}", input.display()))?;
     let mut r = BufReader::new(f);
     let mut set: AHashSet<String> = AHashSet::with_capacity(64_000);
@@ -212,6 +217,7 @@ fn dedup_one(input: &Path, output: &Path) -> Result<()> {
         }
     }
 
+    let unique_count = set.len();
     let out = File::create(output)?;
     let mut w = BufWriter::new(out);
     for s in set {
@@ -219,7 +225,7 @@ fn dedup_one(input: &Path, output: &Path) -> Result<()> {
         w.write_all(b"\n")?;
     }
     w.flush()?;
-    Ok(())
+    Ok(unique_count)
 }
 
 /// Per-rayon-worker FIFO cache of parsed parent shard JSON files.

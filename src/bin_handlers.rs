@@ -7,9 +7,10 @@ use retl::{
     plan_files, remove_with_backoff, replace_file_atomic_backoff, total_compressed_size,
     ExportFormat, FileKind, IntegrityMode, KeyExtractor, RedditETL, Sources, YearMonth,
 };
+use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -516,6 +517,69 @@ pub(crate) fn run_first_seen(args: FirstSeenArgs) -> Result<()> {
     Ok(())
 }
 
+fn first_spool_record_keys(spool_parts: &[PathBuf]) -> Result<Option<(PathBuf, Vec<String>)>> {
+    for path in spool_parts {
+        let f = fs::File::open(path)
+            .with_context(|| format!("opening spool part {}", path.display()))?;
+        let r = BufReader::new(f);
+        for (line_idx, line) in r.lines().enumerate() {
+            let line = line.with_context(|| {
+                format!(
+                    "reading spool part {} near line {}",
+                    path.display(),
+                    line_idx + 1
+                )
+            })?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let v: Value = serde_json::from_str(&line).with_context(|| {
+                format!(
+                    "parsing spool part {} line {} while diagnosing missing parent IDs",
+                    path.display(),
+                    line_idx + 1
+                )
+            })?;
+            let keys = match v {
+                Value::Object(map) => {
+                    let mut keys: Vec<String> = map.keys().cloned().collect();
+                    keys.sort();
+                    keys
+                }
+                other => vec![format!("<non-object:{}>", other_type_name(&other))],
+            };
+            return Ok(Some((path.clone(), keys)));
+        }
+    }
+    Ok(None)
+}
+
+fn other_type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+fn bail_empty_parent_ids(spool_parts: &[PathBuf]) -> Result<()> {
+    let observed = match first_spool_record_keys(spool_parts)? {
+        Some((path, keys)) => format!(
+            "first record in {} contained keys: [{}]",
+            path.display(),
+            keys.join(",")
+        ),
+        None => "the discovered spool parts contained no JSON records".to_string(),
+    };
+
+    anyhow::bail!(
+        "parents pipeline found no usable parent references in the spool: no `t1_`/`t3_` `parent_id` or `link_id` values were collected. This usually means the spool was produced with --whitelist/.whitelist_fields that omitted `parent_id` and `link_id`; {observed}. Re-run export/spool with --whitelist including body,parent_id,link_id (body is optional for matching but preserves the child comment text)."
+    );
+}
+
 pub(crate) fn run_parents(args: ParentsArgs) -> Result<()> {
     let (spool_parts, min_ym, max_ym) = discover_spool_parts(&args.spool)?;
 
@@ -564,6 +628,10 @@ pub(crate) fn run_parents(args: ParentsArgs) -> Result<()> {
     };
 
     let ids = build(None, None).collect_parent_ids_from_jsonls(spool_parts.clone())?;
+    if ids.is_empty() {
+        return bail_empty_parent_ids(&spool_parts);
+    }
+
     let parents = build(Some(Sources::Both), Some((wstart, wend))).resolve_parent_maps(
         &ids,
         &args.cache,

@@ -572,7 +572,7 @@ RedditETL::new()
 
 Collect parent IDs from your spooled JSONL, resolve parent contents by scanning the corpus, then attach parents back onto your records:
 
-**Important:** if the spool is produced with `--whitelist` / `.whitelist_fields(...)`, the fields `body`, `parent_id`, and `link_id` **MUST** be preserved for any spool destined for the parents pipeline. For example, include at least `body,parent_id,link_id` alongside your analysis fields. If those fields are dropped, `retl parents` cannot identify/resolve comment parents and will warn that it found zero comment-shaped records.
+**Important:** if the spool is produced with `--whitelist` / `.whitelist_fields(...)`, preserve at least `parent_id` and `link_id` for any spool destined for the parents pipeline. Include `body` too when you want the child comment text retained in the attached output (recommended: `body,parent_id,link_id` alongside your analysis fields). If `parent_id`/`link_id` are dropped, `retl parents` fails fast with an actionable whitelist diagnostic instead of scanning the corpus for a no-op run.
 
 ~~~rust
 use retl::{ParentIds, ParentMaps, RedditETL, Sources, YearMonth};
