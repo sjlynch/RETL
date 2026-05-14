@@ -279,6 +279,29 @@ mod tests {
         let right = GroupMetricAgg::new(GroupBySpec::Author, MetricSpec::default());
         left.merge(right);
     }
+
+    #[test]
+    fn value_to_month_rejects_invalid_string_months() {
+        assert_eq!(string_to_month("2024-00-01T00:00:00Z"), None);
+        assert_eq!(string_to_month("2024-13-01T00:00:00Z"), None);
+        assert_eq!(string_to_month("2024-99-01T00:00:00Z"), None);
+    }
+
+    #[test]
+    fn value_to_month_accepts_valid_string_month_prefixes() {
+        for month in [
+            "01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12",
+        ] {
+            assert_eq!(
+                string_to_month(&format!("2024-{month}-01T00:00:00Z")),
+                Some(format!("2024-{month}"))
+            );
+        }
+    }
+
+    fn string_to_month(s: &str) -> Option<String> {
+        value_to_month(&Value::String(s.to_string()))
+    }
 }
 
 fn value_to_month(v: &Value) -> Option<String> {
@@ -291,10 +314,15 @@ fn value_to_month(v: &Value) -> Option<String> {
 }
 
 fn looks_like_year_month_prefix(s: &str) -> bool {
-    s.len() >= 7
+    if !(s.len() >= 7
         && s.as_bytes()[4] == b'-'
         && s.as_bytes()[0..4].iter().all(u8::is_ascii_digit)
-        && s.as_bytes()[5..7].iter().all(u8::is_ascii_digit)
+        && s.as_bytes()[5..7].iter().all(u8::is_ascii_digit))
+    {
+        return false;
+    }
+
+    matches!(s[5..7].parse::<u8>(), Ok(1..=12))
 }
 
 fn unix_seconds_to_month(secs: i64) -> Option<String> {
