@@ -204,7 +204,7 @@ pub use crate::bucketing::{
 pub use crate::json_utils::{author_lower, is_comment_record, subreddit_lower};
 
 // export NDJSON helpers
-pub use crate::ndjson::{NdjsonReader, NdjsonWriter};
+pub use crate::ndjson::{read_line_capped, NdjsonReader, NdjsonWriter, DEFAULT_MAX_LINE_BYTES};
 
 // export streaming whitelist tokenizer for tests/benches
 #[doc(hidden)]

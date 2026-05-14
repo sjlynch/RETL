@@ -5,6 +5,7 @@ use crate::date::YearMonth;
 use crate::filters::ym_from_epoch;
 use crate::json_utils::is_comment_record_for_parent_attach;
 use crate::mem::{available_memory_fraction, is_low_memory};
+use crate::ndjson::{read_line_capped, DEFAULT_MAX_LINE_BYTES};
 use crate::parents_ids::{IdShards, SharedIdsetCache, WorkerShardCache};
 use crate::paths::{discover_all, plan_files_checked, FileJob, FileKind};
 use crate::pipeline::RedditETL;
@@ -21,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -769,14 +770,16 @@ fn fingerprint_empty_id_set(kind: &str) -> ParentIdSetFingerprint {
 fn fingerprint_id_shard_file(path: &Path) -> Result<(u64, u64, u64)> {
     let f = open_with_backoff(path, 16, 50)
         .with_context(|| format!("open parent-id shard {}", path.display()))?;
-    let r = BufReader::new(f);
+    let mut r = BufReader::new(f);
     let mut count = 0u64;
     let mut sum = 0u64;
     let mut xor = 0u64;
-    for line in r.lines() {
-        let mut id = line.with_context(|| format!("read parent-id shard {}", path.display()))?;
-        if id.ends_with('\r') {
-            id.pop();
+    let mut id = String::new();
+    loop {
+        let n = read_line_capped(&mut r, &mut id, DEFAULT_MAX_LINE_BYTES, path)
+            .with_context(|| format!("read parent-id shard {}", path.display()))?;
+        if n == 0 {
+            break;
         }
         if !id.is_empty() {
             update_unordered_id_digest(&mut count, &mut sum, &mut xor, &id);
@@ -1050,19 +1053,22 @@ fn validate_jsonl_file(path: &Path) -> bool {
     let Ok(f) = open_with_backoff(path, 16, 50) else {
         return false;
     };
-    let r = BufReader::new(f);
-    for line in r.lines() {
-        let Ok(line) = line else {
-            return false;
-        };
-        if line.trim().is_empty() {
-            continue;
-        }
-        if serde_json::from_str::<Value>(&line).is_err() {
-            return false;
+    let mut r = BufReader::new(f);
+    let mut buf = String::new();
+    loop {
+        match read_line_capped(&mut r, &mut buf, DEFAULT_MAX_LINE_BYTES, path) {
+            Ok(0) => return true,
+            Ok(_) => {
+                if buf.trim().is_empty() {
+                    continue;
+                }
+                if serde_json::from_str::<Value>(&buf).is_err() {
+                    return false;
+                }
+            }
+            Err(_) => return false,
         }
     }
-    true
 }
 
 fn looks_like_rc_spool_path(path: &Path) -> bool {
@@ -1085,23 +1091,22 @@ fn diagnose_initial_attach_shape(inputs: &[(usize, PathBuf)], read_buf: usize) -
     let mut shape = ParentAttachInitialShape::default();
 
     while shape.parsed_records < ATTACH_INITIAL_DIAGNOSTIC_SAMPLE_RECORDS {
-        buf.clear();
-        let n = r.read_line(&mut buf).with_context(|| {
-            format!(
-                "read initial parent attach input {} near line {}",
-                first_input.display(),
-                line_number + 1
-            )
-        })?;
+        let n = read_line_capped(&mut r, &mut buf, DEFAULT_MAX_LINE_BYTES, first_input)
+            .with_context(|| {
+                format!(
+                    "read initial parent attach input {} near line {}",
+                    first_input.display(),
+                    line_number + 1
+                )
+            })?;
         if n == 0 {
             break;
         }
         line_number += 1;
-        let line = buf.trim_end_matches(|c| c == '\r' || c == '\n');
-        if line.trim().is_empty() {
+        if buf.trim().is_empty() {
             continue;
         }
-        let v: Value = serde_json::from_str(line).with_context(|| {
+        let v: Value = serde_json::from_str(&buf).with_context(|| {
             format!(
                 "malformed JSON in initial parent attach input {} at line {}",
                 first_input.display(),
@@ -1424,22 +1429,33 @@ impl RedditETL {
                                 ..Default::default()
                             };
                             let f = open_with_backoff(in_path, 16, 50)?;
-                            let r = BufReader::new(f);
+                            let mut r = BufReader::new(f);
+                            let mut line_buf = String::new();
+                            let mut line_no: u64 = 0;
 
-                            for (line_idx, line) in r.lines().enumerate() {
-                                let line_no = line_idx + 1;
-                                let line = line.with_context(|| {
+                            loop {
+                                let n = read_line_capped(
+                                    &mut r,
+                                    &mut line_buf,
+                                    DEFAULT_MAX_LINE_BYTES,
+                                    in_path,
+                                )
+                                .with_context(|| {
                                     format!(
                                         "read parent attach input {} at line {}",
                                         in_path.display(),
-                                        line_no
+                                        line_no + 1
                                     )
                                 })?;
-                                if line.is_empty() {
+                                if n == 0 {
+                                    break;
+                                }
+                                line_no += 1;
+                                if line_buf.is_empty() {
                                     continue;
                                 }
                                 let mut v: Value =
-                                    serde_json::from_str(&line).with_context(|| {
+                                    serde_json::from_str(&line_buf).with_context(|| {
                                         format!(
                                             "malformed JSON in parent attach input {} at line {}",
                                             in_path.display(),

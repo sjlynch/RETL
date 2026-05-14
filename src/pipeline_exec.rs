@@ -38,7 +38,7 @@ use indicatif::ProgressBar;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::fs;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1424,16 +1424,19 @@ fn validate_jsonl_part(path: &Path) -> Result<MonthEntry> {
     let mut buf = String::new();
     let mut lines = 0_u64;
     loop {
-        buf.clear();
-        let n = reader.read_line(&mut buf)?;
+        let n = crate::ndjson::read_line_capped(
+            &mut reader,
+            &mut buf,
+            crate::ndjson::DEFAULT_MAX_LINE_BYTES,
+            path,
+        )?;
         if n == 0 {
             break;
         }
-        let line = buf.trim_end_matches(['\r', '\n']);
-        if line.is_empty() {
+        if buf.is_empty() {
             continue;
         }
-        let _: serde_json::Value = serde_json::from_str(line)
+        let _: serde_json::Value = serde_json::from_str(&buf)
             .with_context(|| format!("validating JSONL part {}", path.display()))?;
         lines += 1;
     }
