@@ -303,8 +303,9 @@ retl integrity --mode quick --sample-bytes 65536 --source rc --start 2006-02 --e
 retl integrity --mode full --source both --start 2006-01 --end 2006-04
 ~~~
 
-Bad files print one `path<TAB>error` line per failure on stdout and the
-process exits with status `2`.
+Bad files print one `path<TAB>error` line per failure on stdout as soon as
+they are discovered, and the process exits with status `2`. Pass `--collect`
+to buffer the failure list and print it only after all files finish.
 
 ### `aggregate` — fold JSONL inputs into JSON or TSV rollups
 
@@ -637,6 +638,18 @@ let bad_full = RedditETL::new()
     .date_range(Some(YearMonth::new(2006, 2)), Some(YearMonth::new(2006, 2)))
     .progress(false)
     .check_corpus_integrity(IntegrityMode::Full)?;
+
+// The return value materializes the full failure list. For long runs, stream
+// failures incrementally while still receiving the final Vec:
+let bad_streamed = RedditETL::new()
+    .base_dir("./data")
+    .sources(Sources::Comments)
+    .date_range(Some(YearMonth::new(2006, 2)), Some(YearMonth::new(2006, 2)))
+    .progress(false)
+    .check_corpus_integrity_with_failure_sink(IntegrityMode::Full, |path, err| {
+        println!("{}\t{}", path.display(), err);
+        Ok(())
+    })?;
 ~~~
 
 ---

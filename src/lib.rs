@@ -80,7 +80,10 @@
 //!
 //! 7. **Verify**
 //!    - [`IntegrityMode::Quick`] / [`IntegrityMode::Full`] +
-//!      `RedditETL::check_corpus_integrity` validate `.zst` files.
+//!      `RedditETL::check_corpus_integrity` validate `.zst` files and return a
+//!      materialized failure list.
+//!    - [`RedditETL::check_corpus_integrity_with_failure_sink`] streams each
+//!      failure to a caller-provided callback during long runs.
 //!    - [`quick_validate_zst`] / [`validate_zst_full`] are the underlying
 //!      decoders, also re-exported for direct use.
 //!

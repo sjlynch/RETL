@@ -398,13 +398,27 @@ pub(crate) fn run_integrity(args: IntegrityArgs) -> Result<()> {
         },
         IntegrityModeArg::Full => IntegrityMode::Full,
     };
-    let bad = etl.check_corpus_integrity(mode)?;
+    let bad = if args.collect {
+        etl.check_corpus_integrity(mode)?
+    } else {
+        let print_lock = std::sync::Mutex::new(());
+        etl.check_corpus_integrity_with_failure_sink(mode, |path, err| {
+            let _guard = print_lock.lock().unwrap();
+            let stdout = io::stdout();
+            let mut w = stdout.lock();
+            writeln!(w, "{}\t{}", path.display(), err)?;
+            w.flush()?;
+            Ok(())
+        })?
+    };
     if bad.is_empty() {
         eprintln!("OK: no corruption detected.");
     } else {
         eprintln!("FAILED: {} file(s) failed integrity check:", bad.len());
-        for (p, e) in &bad {
-            println!("{}\t{}", p.display(), e);
+        if args.collect {
+            for (p, e) in &bad {
+                println!("{}\t{}", p.display(), e);
+            }
         }
         std::process::exit(2);
     }

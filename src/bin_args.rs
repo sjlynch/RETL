@@ -290,6 +290,12 @@ pub(crate) struct IntegrityArgs {
     /// Bytes (decompressed) to sample per file in quick mode.
     #[arg(long, default_value_t = 64 * 1024)]
     pub(crate) sample_bytes: u64,
+    /// Collect failures and print them only after all files finish.
+    ///
+    /// By default, integrity streams one `path<TAB>error` line to stdout as soon
+    /// as each failure is discovered.
+    #[arg(long)]
+    pub(crate) collect: bool,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug)]

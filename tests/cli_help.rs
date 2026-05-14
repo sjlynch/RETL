@@ -133,7 +133,8 @@ fn integrity_help_advertises_modes_and_sample() {
     let pred = contains("--mode")
         .and(contains("quick"))
         .and(contains("full"))
-        .and(contains("--sample-bytes"));
+        .and(contains("--sample-bytes"))
+        .and(contains("--collect"));
     assert.stdout(pred);
 }
 
