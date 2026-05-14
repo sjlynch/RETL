@@ -3,14 +3,16 @@
 
 use anyhow::{Context, Result};
 use retl::{
-    create_dir_all_with_backoff, create_new_with_backoff, discover_all, format_year_month_ranges,
-    missing_month_diagnostics, open_with_backoff, plan_files, read_line_capped,
-    remove_with_backoff, replace_file_atomic_backoff, total_compressed_size, AggregateBuildReport,
-    ExportFormat, FileKind, IntegrityMode, KeyExtractor, RedditETL, Sources, YearMonth,
+    create_dir_all_with_backoff, create_new_with_backoff, discover_sources_checked,
+    for_each_line_cfg, format_year_month_ranges, missing_month_diagnostics, open_with_backoff,
+    plan_files, plan_files_checked, read_line_capped, remove_with_backoff,
+    replace_file_atomic_backoff, total_compressed_size, AggregateBuildReport, ExportFormat,
+    FileKind, IntegrityMode, KeyExtractor, RedditETL, Sources, TabularExportOptions, YearMonth,
     DEFAULT_MAX_LINE_BYTES,
 };
+use serde::Serialize;
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 #[cfg(test)]
 use std::fs;
 use std::io::{self, BufReader, BufWriter, Write};
@@ -19,7 +21,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::bin_args::{
     AggregateArgs, CountArgs, CountMode, DedupeArgs, DescribeArgs, ExportArgs, ExportFmt,
-    FirstSeenArgs, IntegrityArgs, IntegrityModeArg, ParentsArgs, ScanArgs, SourceArg,
+    FirstSeenArgs, IntegrityArgs, IntegrityModeArg, ParentsArgs, SampleArgs, ScanArgs, SchemaArgs,
+    SchemaFmt, SourceArg,
 };
 use crate::bin_helpers::{
     build_etl, discover_spool_parts, emit_partial_read_report, plan, stream_extract_to_stdout,
@@ -91,6 +94,17 @@ where
 }
 
 pub(crate) fn run_describe(args: DescribeArgs) -> Result<()> {
+    if args.schema {
+        return run_schema(SchemaArgs {
+            data_dir: args.data_dir,
+            start: args.start,
+            end: args.end,
+            source: args.source,
+            sample_per_month: args.schema_sample,
+            format: args.schema_format,
+        });
+    }
+
     if let (Some(start), Some(end)) = (args.start, args.end) {
         if start > end {
             anyhow::bail!("invalid date range: start {start} is after end {end}");
@@ -99,7 +113,8 @@ pub(crate) fn run_describe(args: DescribeArgs) -> Result<()> {
 
     let comments_dir = args.data_dir.join("comments");
     let submissions_dir = args.data_dir.join("submissions");
-    let discovered = discover_all(&comments_dir, &submissions_dir);
+    let discovered =
+        discover_sources_checked(&comments_dir, &submissions_dir, Sources::from(args.source))?;
 
     let mut rows = Vec::new();
     for kind in describe_kinds(args.source) {
@@ -179,10 +194,181 @@ fn available_range(map: &BTreeMap<YearMonth, PathBuf>) -> String {
     }
 }
 
+#[derive(Debug)]
+struct SchemaSampleDone;
+
+impl std::fmt::Display for SchemaSampleDone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("schema sample complete")
+    }
+}
+
+impl std::error::Error for SchemaSampleDone {}
+
+fn schema_sample_done() -> anyhow::Error {
+    anyhow::anyhow!(SchemaSampleDone)
+}
+
+fn is_schema_sample_done(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.downcast_ref::<SchemaSampleDone>().is_some())
+}
+
+#[derive(Default)]
+struct SchemaFieldStats {
+    present_records: u64,
+    type_counts: HashMap<&'static str, u64>,
+}
+
+#[derive(Serialize)]
+struct SchemaRow {
+    field: String,
+    #[serde(rename = "type")]
+    type_name: String,
+    presence_pct: f64,
+    present_records: u64,
+    sampled_records: u64,
+}
+
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+fn most_common_type(stats: &SchemaFieldStats) -> String {
+    stats
+        .type_counts
+        .iter()
+        .max_by(|(left_ty, left_count), (right_ty, right_count)| {
+            left_count
+                .cmp(right_count)
+                .then_with(|| right_ty.cmp(left_ty))
+        })
+        .map(|(ty, _)| (*ty).to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn collect_schema(args: &SchemaArgs) -> Result<Vec<SchemaRow>> {
+    if let (Some(start), Some(end)) = (args.start, args.end) {
+        if start > end {
+            anyhow::bail!("invalid date range: start {start} is after end {end}");
+        }
+    }
+
+    let comments_dir = args.data_dir.join("comments");
+    let submissions_dir = args.data_dir.join("submissions");
+    let discovered =
+        discover_sources_checked(&comments_dir, &submissions_dir, Sources::from(args.source))?;
+    let jobs = plan_files_checked(
+        &discovered,
+        &comments_dir,
+        &submissions_dir,
+        Sources::from(args.source),
+        args.start,
+        args.end,
+    )?;
+
+    let mut fields = BTreeMap::<String, SchemaFieldStats>::new();
+    let mut sampled_records = 0_u64;
+    for job in &jobs {
+        if args.sample_per_month == 0 {
+            continue;
+        }
+        let mut sampled_this_month = 0_usize;
+        let mut line_number = 0_u64;
+        let result = for_each_line_cfg(&job.path, 256 * 1024, |line| -> Result<()> {
+            if sampled_this_month >= args.sample_per_month {
+                return Err(schema_sample_done());
+            }
+            line_number += 1;
+            let value: Value = serde_json::from_str(line).with_context(|| {
+                format!(
+                    "parsing {} line {} while discovering schema",
+                    job.path.display(),
+                    line_number
+                )
+            })?;
+            sampled_this_month += 1;
+            sampled_records += 1;
+            if let Some(map) = value.as_object() {
+                for (field, value) in map {
+                    let stats = fields.entry(field.clone()).or_default();
+                    stats.present_records += 1;
+                    *stats.type_counts.entry(json_type_name(value)).or_insert(0) += 1;
+                }
+            }
+            if sampled_this_month >= args.sample_per_month {
+                return Err(schema_sample_done());
+            }
+            Ok(())
+        });
+        match result {
+            Ok(()) => {}
+            Err(e) if is_schema_sample_done(&e) => {}
+            Err(e) => return Err(e),
+        }
+    }
+
+    Ok(fields
+        .into_iter()
+        .map(|(field, stats)| SchemaRow {
+            field,
+            type_name: most_common_type(&stats),
+            presence_pct: if sampled_records == 0 {
+                0.0
+            } else {
+                stats.present_records as f64 * 100.0 / sampled_records as f64
+            },
+            present_records: stats.present_records,
+            sampled_records,
+        })
+        .collect())
+}
+
+pub(crate) fn run_schema(args: SchemaArgs) -> Result<()> {
+    let rows = collect_schema(&args)?;
+    let stdout = io::stdout();
+    let mut w = BufWriter::new(stdout.lock());
+    match args.format {
+        SchemaFmt::Tsv => {
+            writeln!(
+                w,
+                "field\ttype\tpresence_pct\tpresent_records\tsampled_records"
+            )?;
+            for row in rows {
+                writeln!(
+                    w,
+                    "{}\t{}\t{:.2}\t{}\t{}",
+                    row.field,
+                    row.type_name,
+                    row.presence_pct,
+                    row.present_records,
+                    row.sampled_records
+                )?;
+            }
+        }
+        SchemaFmt::Json => {
+            serde_json::to_writer_pretty(&mut w, &rows)?;
+            writeln!(w)?;
+        }
+    }
+    w.flush()?;
+    Ok(())
+}
+
 pub(crate) fn run_scan(args: ScanArgs) -> Result<()> {
     let etl = build_etl(&args.common)?;
     let partial_reporter = etl.partial_read_reporter();
-    let scan = plan!(etl, args.common, args.query);
+    let mut scan = plan!(etl, args.common, args.query);
+    if let Some(limit) = args.limit {
+        scan = scan.limit(limit);
+    }
 
     match args.out {
         Some(path) => {
@@ -292,6 +478,8 @@ fn export_format_name(fmt: ExportFmt) -> &'static str {
     match fmt {
         ExportFmt::Jsonl => "jsonl",
         ExportFmt::Json => "json",
+        ExportFmt::Csv => "csv",
+        ExportFmt::Tsv => "tsv",
         ExportFmt::Spool => "spool",
         ExportFmt::Zst => "zst",
         ExportFmt::PartitionedJsonl => "partitioned-jsonl",
@@ -326,7 +514,10 @@ pub(crate) fn run_export(args: ExportArgs) -> Result<()> {
     }
     let partial_reporter = etl.partial_read_reporter();
     let work_dir = args.common.work_dir.clone();
-    let scan = plan!(etl, args.common, args.query);
+    let mut scan = plan!(etl, args.common, args.query);
+    if let Some(limit) = args.limit {
+        scan = scan.limit(limit);
+    }
     let to_stdout = args.out == Path::new("-");
 
     match args.format {
@@ -347,6 +538,32 @@ pub(crate) fn run_export(args: ExportArgs) -> Result<()> {
                 scan.extract_to_json(&args.out, pretty)?;
             }
         }
+        ExportFmt::Csv => {
+            if args.whitelist.is_empty() {
+                anyhow::bail!("--format csv requires --whitelist so the CSV schema is fixed");
+            }
+            let fields = args.whitelist.clone();
+            if to_stdout {
+                stream_extract_to_stdout(&work_dir, "stdout.csv", |p| {
+                    scan.extract_to_csv(p, fields, TabularExportOptions::default())
+                })?;
+            } else {
+                scan.extract_to_csv(&args.out, fields, TabularExportOptions::default())?;
+            }
+        }
+        ExportFmt::Tsv => {
+            if args.whitelist.is_empty() {
+                anyhow::bail!("--format tsv requires --whitelist so the TSV schema is fixed");
+            }
+            let fields = args.whitelist.clone();
+            if to_stdout {
+                stream_extract_to_stdout(&work_dir, "stdout.tsv", |p| {
+                    scan.extract_to_tsv(p, fields, TabularExportOptions::default())
+                })?;
+            } else {
+                scan.extract_to_tsv(&args.out, fields, TabularExportOptions::default())?;
+            }
+        }
         ExportFmt::Spool => {
             if to_stdout {
                 anyhow::bail!("--out - is not valid for --format spool (it expects a directory)");
@@ -355,6 +572,100 @@ pub(crate) fn run_export(args: ExportArgs) -> Result<()> {
                 .with_context(|| format!("creating spool dir {}", args.out.display()))?;
             let (parts, n) = scan.extract_spool_monthly(&args.out)?;
             eprintln!("Spooled {} records across {} part files", n, parts.len());
+        }
+        ExportFmt::Zst | ExportFmt::PartitionedJsonl => {
+            if to_stdout {
+                anyhow::bail!(
+                    "--out - is not valid for --format {} (it expects a directory)",
+                    export_format_name(args.format)
+                );
+            }
+            let partition_format = match args.format {
+                ExportFmt::Zst => ExportFormat::Zst,
+                ExportFmt::PartitionedJsonl => ExportFormat::Jsonl,
+                _ => unreachable!(),
+            };
+            scan.export_partitioned(&args.out, partition_format)?;
+        }
+    }
+    emit_partial_read_report(&partial_reporter)?;
+    Ok(())
+}
+
+pub(crate) fn run_sample(args: SampleArgs) -> Result<()> {
+    let mut etl = build_etl(&args.common)?;
+    if !args.whitelist.is_empty() {
+        if args.whitelist.iter().all(|field| field.trim().is_empty()) {
+            anyhow::bail!("--whitelist must include at least one non-empty field");
+        }
+        etl = etl.whitelist_fields(args.whitelist.iter().cloned());
+    }
+    if args.strict_whitelist {
+        etl = etl.strict_whitelist(true);
+    }
+    if args.human_timestamps {
+        etl = etl.timestamps_human_readable(true);
+    }
+    let partial_reporter = etl.partial_read_reporter();
+    let work_dir = args.common.work_dir.clone();
+    let scan = plan!(etl, args.common, args.query).limit(args.limit);
+    let to_stdout = args.out == Path::new("-");
+
+    match args.format {
+        ExportFmt::Jsonl => {
+            if to_stdout {
+                stream_extract_to_stdout(&work_dir, "sample.jsonl", |p| scan.extract_to_jsonl(p))?;
+            } else {
+                scan.extract_to_jsonl(&args.out)?;
+            }
+        }
+        ExportFmt::Json => {
+            if to_stdout {
+                stream_extract_to_stdout(&work_dir, "sample.json", |p| {
+                    scan.extract_to_json(p, args.pretty)
+                })?;
+            } else {
+                scan.extract_to_json(&args.out, args.pretty)?;
+            }
+        }
+        ExportFmt::Csv => {
+            if args.whitelist.is_empty() {
+                anyhow::bail!("--format csv requires --whitelist so the CSV schema is fixed");
+            }
+            let fields = args.whitelist.clone();
+            if to_stdout {
+                stream_extract_to_stdout(&work_dir, "sample.csv", |p| {
+                    scan.extract_to_csv(p, fields, TabularExportOptions::default())
+                })?;
+            } else {
+                scan.extract_to_csv(&args.out, fields, TabularExportOptions::default())?;
+            }
+        }
+        ExportFmt::Tsv => {
+            if args.whitelist.is_empty() {
+                anyhow::bail!("--format tsv requires --whitelist so the TSV schema is fixed");
+            }
+            let fields = args.whitelist.clone();
+            if to_stdout {
+                stream_extract_to_stdout(&work_dir, "sample.tsv", |p| {
+                    scan.extract_to_tsv(p, fields, TabularExportOptions::default())
+                })?;
+            } else {
+                scan.extract_to_tsv(&args.out, fields, TabularExportOptions::default())?;
+            }
+        }
+        ExportFmt::Spool => {
+            if to_stdout {
+                anyhow::bail!("--out - is not valid for --format spool (it expects a directory)");
+            }
+            create_dir_all_with_backoff(&args.out, 16, 50)
+                .with_context(|| format!("creating spool dir {}", args.out.display()))?;
+            let (parts, n) = scan.extract_spool_monthly(&args.out)?;
+            eprintln!(
+                "Spooled {} sample records across {} part files",
+                n,
+                parts.len()
+            );
         }
         ExportFmt::Zst | ExportFmt::PartitionedJsonl => {
             if to_stdout {
@@ -583,14 +894,15 @@ fn first_spool_record_keys(spool_parts: &[PathBuf]) -> Result<Option<(PathBuf, V
         let mut buf = String::new();
         let mut line_no = 0u64;
         loop {
-            let n = read_line_capped(&mut r, &mut buf, DEFAULT_MAX_LINE_BYTES, path)
-                .with_context(|| {
+            let n = read_line_capped(&mut r, &mut buf, DEFAULT_MAX_LINE_BYTES, path).with_context(
+                || {
                     format!(
                         "reading spool part {} near line {}",
                         path.display(),
                         line_no + 1
                     )
-                })?;
+                },
+            )?;
             if n == 0 {
                 break;
             }

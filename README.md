@@ -167,7 +167,7 @@ By default, scans exclude records whose `author` is `[deleted]`, `[removed]`, or
 
 ### Date ranges and missing months
 
-When `--start` or `--end` is set, RETL filters individual records by the same inclusive month bounds it uses for file planning. Records without `created_utc` are dropped while any date bound is active. If files are missing inside the requested range (for example Jan and Mar exist but Feb is absent), corpus-scanning commands emit a warning and `retl describe` reports the missing month list.
+When `--start` or `--end` is set, RETL filters individual records by the same inclusive month bounds it uses for file planning. Records without `created_utc` are dropped while any date bound is active. If files are missing inside the requested range (for example Jan and Mar exist but Feb is absent), corpus-scanning commands emit a warning and `retl describe` reports the missing month list. Discovery errors (for example a `comments/` path that is a file or cannot be read) fail fast with the directory name; filenames like `RC_2024-00.zst` or `RS_2024-99.zst` are warned and skipped because their months are invalid.
 
 ### `describe` — inspect the discovered corpus
 
@@ -185,6 +185,40 @@ retl describe --data-dir ./data --source both --start 2016-01 --end 2016-12
 ~~~
 
 Aliases: `retl ls`, `retl plan`.
+
+### Analyst-facing exports & exploration
+
+Start with a cheap preview before launching a long scan:
+
+~~~sh
+retl sample --data-dir ./data --source rc --subreddit programming --limit 10 --out -
+~~~
+
+`retl sample` (aliases: `preview`, `head`) defaults to `--limit 10 --format jsonl --out -` and accepts the same query flags as `export`. `retl export` and `retl scan` also accept `--limit N` (alias `--head N`); the streaming loop stops as soon as the shared limit is reached. With `--file-concurrency > 1`, workers already decoding a monthly file may produce a small bounded over-shoot.
+
+Discover fields without decoding a whole month:
+
+~~~sh
+retl schema --data-dir ./data --source rs --start 2018-01 --end 2018-12 --sample 100
+# field  type    presence_pct  present_records  sampled_records
+~~~
+
+`retl describe --schema` is equivalent and honors `--start`, `--end`, and `--source`. Schema output is TSV by default; pass `--format json` (or `describe --schema-format json`) for tooling.
+
+Export directly to spreadsheet/duckdb-friendly delimited text:
+
+~~~sh
+retl export \
+  --data-dir ./data \
+  --source rs \
+  --start 2020-01 --end 2020-12 \
+  --subreddit rust \
+  --format csv \
+  --whitelist id,author,created_utc,subreddit,score,title,domain \
+  --out rust_submissions_2020.csv
+~~~
+
+CSV uses standard doubled-quote escaping and CRLF row endings. TSV uses literal tab separators and refuses values containing tabs; use CSV when fields may contain arbitrary text. Missing whitelisted fields render as empty cells.
 
 ### `scan` — emit unique usernames
 
@@ -236,11 +270,13 @@ Formats:
 * `--format jsonl` → single stitched `.jsonl` file (default).
 * `--format json`  → single `.json` file containing a JSON array (`--pretty`
   field-indents records, matching `aggregate --pretty`).
+* `--format csv` → single RFC4180-style CSV file. Requires `--whitelist` to define the fixed column order; missing fields render as empty cells.
+* `--format tsv` → single tab-separated file. Requires `--whitelist`; values containing literal tabs are rejected with a warning because TSV has no standard escaping.
 * `--format spool` → per-source per-month files (`part_RC_YYYY-MM.jsonl`, `part_RS_YYYY-MM.jsonl`) under the directory passed to `--out`. Use this for the parents-pipeline workflow.
 * `--format zst` → corpus-style partitioned `.zst` output under `<out>/comments/RC_YYYY-MM.zst` and `<out>/submissions/RS_YYYY-MM.zst`.
 * `--format partitioned-jsonl` → the same corpus-style directory layout, but as uncompressed `.jsonl` files.
 
-Export-only modifiers include `--whitelist a,b,c`, `--strict-whitelist`, `--human-timestamps`, `--zst-level <N>`, and `--resume`. With `--resume`, `jsonl`/`json` exports checkpoint per-month `.part_*.jsonl` files under `--work-dir`; `spool`, `zst`, and `partitioned-jsonl` use `_progress.json` under `--out`. The checkpoint includes a fingerprint of the query and output-affecting config; changing filters, sources, date range, whitelist fields, `--human-timestamps`, or (for ZST) `--zst-level` discards stale parts instead of mixing results from different runs. Partitioned ZST resume validates completed `.zst` outputs with a full decode before skipping them.
+Export-only modifiers include `--whitelist a,b,c`, `--strict-whitelist`, `--human-timestamps`, `--limit N`, `--zst-level <N>`, and `--resume`. With `--resume`, `jsonl`/`json` exports checkpoint per-month `.part_*.jsonl` files under `--work-dir`; `spool`, `zst`, and `partitioned-jsonl` use `_progress.json` under `--out`. The checkpoint includes a fingerprint of the query and output-affecting config; changing filters, sources, date range, whitelist fields, `--limit`, `--human-timestamps`, or (for ZST) `--zst-level` discards stale parts instead of mixing results from different runs. Partitioned ZST resume validates completed `.zst` outputs with a full decode before skipping them.
 
 Corpus scans and exports are strict by default: zstd decode errors fail the command instead of returning plausible partial results. Pass `--allow-partial` to preserve the explicit lossy mode; skipped file counts and paths are emitted as a JSON object on stderr, and skipped months are not committed to resume manifests.
 
@@ -382,6 +418,16 @@ the subcommands directly:
 cargo build --release
 ./target/release/retl --help
 ./target/release/retl export --help
+~~~
+
+Preview a few matching records first:
+
+~~~sh
+./target/release/retl sample \
+  --data-dir ./data \
+  --start 2006-01 --end 2006-01 \
+  --subreddit programming \
+  --limit 10
 ~~~
 
 Count comments in `r/programming` for one month:

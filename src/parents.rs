@@ -7,7 +7,7 @@ use crate::json_utils::is_comment_record_for_parent_attach;
 use crate::mem::{available_memory_fraction, is_low_memory};
 use crate::ndjson::{read_line_capped, DEFAULT_MAX_LINE_BYTES};
 use crate::parents_ids::{IdShards, SharedIdsetCache, WorkerShardCache};
-use crate::paths::{discover_all, plan_files_checked, FileJob, FileKind};
+use crate::paths::{discover_all_checked, plan_files_checked, FileJob, FileKind};
 use crate::pipeline::RedditETL;
 use crate::progress::{make_count_progress, make_progress_bar_labeled, total_compressed_size};
 use crate::util::{
@@ -1218,7 +1218,8 @@ impl RedditETL {
             sweep_stale_inprogress(&comments_out, true)?;
             sweep_stale_inprogress(&submissions_out, true)?;
 
-            let discovered = discover_all(&self.opts.comments_dir, &self.opts.submissions_dir);
+            let discovered =
+                discover_all_checked(&self.opts.comments_dir, &self.opts.submissions_dir)?;
             let files = plan_files_checked(
                 &discovered,
                 &self.opts.comments_dir,

@@ -25,6 +25,11 @@ pub(crate) enum Command {
     /// Inspect discovered corpus months, file counts, and compressed bytes without decoding.
     #[command(alias = "ls", alias = "plan")]
     Describe(DescribeArgs),
+    /// Discover top-level JSON fields and their common types from sampled records.
+    Schema(SchemaArgs),
+    /// Print a small sample of matching records (defaults to 10 JSONL records on stdout).
+    #[command(alias = "preview", alias = "head")]
+    Sample(SampleArgs),
     /// Scan and emit unique usernames matching the query selection.
     Scan(ScanArgs),
     /// Emit distinct keys (author, subreddit, or JSON pointer) matching the query selection.
@@ -183,6 +188,80 @@ pub(crate) struct DescribeArgs {
     /// Source selection: rc (comments), rs (submissions), or both.
     #[arg(long, value_enum, default_value_t = SourceArg::Both)]
     pub(crate) source: SourceArg,
+
+    /// Decode a small sample from each selected month and report field schema.
+    #[arg(long)]
+    pub(crate) schema: bool,
+
+    /// Records sampled per selected month when --schema is set.
+    #[arg(long = "schema-sample", default_value_t = 100)]
+    pub(crate) schema_sample: usize,
+
+    /// Schema output format when --schema is set.
+    #[arg(long = "schema-format", visible_alias = "format", value_enum, default_value_t = SchemaFmt::Tsv)]
+    pub(crate) schema_format: SchemaFmt,
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct SchemaArgs {
+    /// Path to corpus base dir (containing `comments/` and `submissions/`).
+    #[arg(long, default_value = "./data")]
+    pub(crate) data_dir: PathBuf,
+
+    /// Inclusive start month (YYYY-MM).
+    #[arg(long, value_name = "YYYY-MM")]
+    pub(crate) start: Option<YearMonth>,
+
+    /// Inclusive end month (YYYY-MM).
+    #[arg(long, value_name = "YYYY-MM")]
+    pub(crate) end: Option<YearMonth>,
+
+    /// Source selection: rc (comments), rs (submissions), or both.
+    #[arg(long, value_enum, default_value_t = SourceArg::Both)]
+    pub(crate) source: SourceArg,
+
+    /// Records sampled per selected month.
+    #[arg(long = "sample", default_value_t = 100)]
+    pub(crate) sample_per_month: usize,
+
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = SchemaFmt::Tsv)]
+    pub(crate) format: SchemaFmt,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug)]
+pub(crate) enum SchemaFmt {
+    Tsv,
+    Json,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct SampleArgs {
+    #[command(flatten)]
+    pub(crate) common: CommonOpts,
+    #[command(flatten)]
+    pub(crate) query: QueryOpts,
+    /// Output format for the sample.
+    #[arg(long, value_enum, default_value_t = ExportFmt::Jsonl)]
+    pub(crate) format: ExportFmt,
+    /// Output destination (default stdout). Directories are required for spool/zst/partitioned-jsonl.
+    #[arg(long, short, default_value = "-")]
+    pub(crate) out: PathBuf,
+    /// Maximum matching records to emit. With file_concurrency >1, already-running workers may overshoot slightly.
+    #[arg(long, visible_alias = "head", default_value_t = 10)]
+    pub(crate) limit: u64,
+    /// Field-indent the JSON array (only with `--format json`).
+    #[arg(long)]
+    pub(crate) pretty: bool,
+    /// Whitelist of top-level fields to keep. Required for csv/tsv.
+    #[arg(long, value_delimiter = ',')]
+    pub(crate) whitelist: Vec<String>,
+    /// Error if `--whitelist` matches zero fields in sampled records.
+    #[arg(long)]
+    pub(crate) strict_whitelist: bool,
+    /// Convert `created_utc` to RFC3339 strings on JSON-family exports.
+    #[arg(long)]
+    pub(crate) human_timestamps: bool,
 }
 
 #[derive(Args, Debug)]
@@ -194,6 +273,10 @@ pub(crate) struct ScanArgs {
     /// Output file for usernames (default: stdout).
     #[arg(long, short)]
     pub(crate) out: Option<PathBuf>,
+    /// Stop after approximately N matching records have been scanned/emitted.
+    /// With file_concurrency >1, already-running workers may emit a bounded over-shoot.
+    #[arg(long, visible_alias = "head")]
+    pub(crate) limit: Option<u64>,
 }
 
 #[derive(Args, Debug)]
@@ -244,15 +327,20 @@ pub(crate) struct ExportArgs {
     #[arg(long)]
     pub(crate) zst_level: Option<i32>,
     /// Whitelist of top-level fields to keep on export. Comma-separated, repeatable.
+    /// Required for csv/tsv; missing fields render as empty cells.
     /// Comments use `body`/`parent_id`/`link_id`; submissions use `title`/`selftext`/`domain`.
     #[arg(long, value_delimiter = ',')]
     pub(crate) whitelist: Vec<String>,
     /// Error if `--whitelist` matches zero fields in the first sampled records.
     #[arg(long)]
     pub(crate) strict_whitelist: bool,
-    /// Convert `created_utc` to RFC3339 strings on export.
+    /// Convert `created_utc` to RFC3339 strings on JSON-family exports.
     #[arg(long)]
     pub(crate) human_timestamps: bool,
+    /// Stop after approximately N records have been emitted.
+    /// With file_concurrency >1, already-running workers may emit a bounded over-shoot.
+    #[arg(long, visible_alias = "head")]
+    pub(crate) limit: Option<u64>,
     /// Per-flush byte budget for bucketing/dedupe (`per_flush_cap = N / 2`).
     /// 0 disables the explicit cap and falls back to memory-fraction sampling.
     /// NOTE: this is NOT the worst-case peak — see `--inflight-groups`.
@@ -279,6 +367,10 @@ pub(crate) enum ExportFmt {
     Jsonl,
     /// Single `.json` file containing a JSON array of records.
     Json,
+    /// Single RFC4180-style CSV file (requires --whitelist).
+    Csv,
+    /// Single tab-separated file (requires --whitelist; literal tabs in values are rejected).
+    Tsv,
     /// Per-source per-month `part_RC_YYYY-MM.jsonl` / `part_RS_YYYY-MM.jsonl`.
     Spool,
     /// Corpus-style partitioned `.zst` files under `comments/` and `submissions/`.

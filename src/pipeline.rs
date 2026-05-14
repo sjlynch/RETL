@@ -185,6 +185,7 @@ impl RedditETL {
                 ..Default::default()
             }
             .normalize(),
+            limit: None,
         }
     }
 
@@ -204,6 +205,7 @@ impl RedditETL {
 pub struct ScanPlan {
     pub(crate) etl: RedditETL,
     pub(crate) query: QuerySpec,
+    pub(crate) limit: Option<u64>,
 }
 
 /// Input accepted by [`ScanPlan::author_regex`]. Passing a raw pattern defers
@@ -425,6 +427,14 @@ impl ScanPlan {
     pub fn json_regex(self, pointer: impl Into<String>, pattern: impl Into<String>) -> Self {
         self.json_predicate(JsonPointerPredicate::regex(pointer, pattern))
     }
+    /// Stop after approximately `n` matching records have been emitted.
+    ///
+    /// With `file_concurrency > 1`, already-running monthly workers may emit a
+    /// small bounded over-shoot before they observe the shared limit.
+    pub fn limit(mut self, n: u64) -> Self {
+        self.limit = Some(n);
+        self
+    }
     pub fn include_pseudo_users(mut self) -> Self {
         self.query.filter_pseudo_users = false;
         self
@@ -481,8 +491,7 @@ mod tests {
     fn ensure_work_dir_retries_transient_create_dir_all() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let work_dir = tmp.path().join("work");
-        let _guard =
-            inject_retriable_io_errors_for_tests(TestIoOp::CreateDirAll, &work_dir, 1);
+        let _guard = inject_retriable_io_errors_for_tests(TestIoOp::CreateDirAll, &work_dir, 1);
 
         let etl = RedditETL::new().work_dir(&work_dir);
         let created = etl.ensure_work_dir().expect("ensure work dir");

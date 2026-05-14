@@ -324,3 +324,71 @@ fn export_format_zst_writes_partitioned_decodable_corpus() {
         );
     }
 }
+
+#[test]
+fn export_csv_requires_whitelist_and_renders_header_and_rows() {
+    let base = make_corpus_basic();
+    let cwd = tempfile::tempdir().unwrap();
+    let out = cwd.path().join("submissions.csv");
+
+    retl()
+        .arg("export")
+        .arg("--data-dir")
+        .arg(&base)
+        .args([
+            "--source",
+            "rs",
+            "--format",
+            "csv",
+            "--whitelist",
+            "author,title,score",
+            "--no-progress",
+            "--out",
+        ])
+        .arg(&out)
+        .assert()
+        .success();
+
+    let csv = std::fs::read_to_string(&out).unwrap();
+    assert!(csv.starts_with("author,title,score\r\n"), "{csv:?}");
+    assert!(csv.contains("bob,Rust news,183\r\n"), "{csv:?}");
+
+    retl()
+        .arg("export")
+        .arg("--data-dir")
+        .arg(&base)
+        .args([
+            "--source",
+            "rs",
+            "--format",
+            "csv",
+            "--no-progress",
+            "--out",
+        ])
+        .arg(cwd.path().join("bad.csv"))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("requires --whitelist"));
+}
+
+#[test]
+fn sample_defaults_to_ten_jsonl_records_but_honors_limit() {
+    let base = make_corpus_basic();
+
+    let assert = retl()
+        .arg("sample")
+        .arg("--data-dir")
+        .arg(&base)
+        .args(["--source", "rc", "--limit", "1", "--no-progress"])
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let lines: Vec<&str> = stdout
+        .lines()
+        .filter(|line| line.starts_with('{'))
+        .collect();
+    assert_eq!(lines.len(), 1, "stdout was {stdout:?}");
+    let value: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(value["subreddit"], "programming");
+}

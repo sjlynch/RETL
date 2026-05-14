@@ -16,6 +16,7 @@ use anyhow::{anyhow, Result};
 use indicatif::ProgressBar;
 use serde_json::{Map, Value};
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
@@ -30,6 +31,81 @@ const TIMESTAMP_KEY_PATTERNS: &[&[u8]] =
 pub(crate) const WHITELIST_ZERO_MATCH_SAMPLE: u64 = 100;
 
 const WHITELIST_ZERO_MATCH_HINT: &str = "check field names. Comments use `body`/`parent_id`/`link_id`; submissions use `title`/`selftext`/`domain`.";
+
+#[derive(Debug)]
+struct RecordLimitReached;
+
+impl std::fmt::Display for RecordLimitReached {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("record limit reached")
+    }
+}
+
+impl std::error::Error for RecordLimitReached {}
+
+pub(crate) fn record_limit_reached_error() -> anyhow::Error {
+    anyhow!(RecordLimitReached)
+}
+
+pub(crate) fn is_record_limit_reached(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.downcast_ref::<RecordLimitReached>().is_some())
+}
+
+#[derive(Debug)]
+pub(crate) struct RecordLimit {
+    max: u64,
+    claimed: AtomicU64,
+}
+
+impl RecordLimit {
+    pub(crate) fn new(max: u64) -> Self {
+        Self::new_with_claimed(max, 0)
+    }
+
+    pub(crate) fn new_with_claimed(max: u64, claimed: u64) -> Self {
+        Self {
+            max,
+            claimed: AtomicU64::new(claimed.min(max)),
+        }
+    }
+
+    pub(crate) fn is_zero(&self) -> bool {
+        self.max == 0
+    }
+
+    pub(crate) fn is_exhausted(&self) -> bool {
+        self.claimed.load(Ordering::Relaxed) >= self.max
+    }
+
+    pub(crate) fn try_claim(&self) -> bool {
+        let mut cur = self.claimed.load(Ordering::Relaxed);
+        loop {
+            if cur >= self.max {
+                return false;
+            }
+            match self.claimed.compare_exchange_weak(
+                cur,
+                cur + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+}
+
+#[inline]
+pub(crate) fn claim_record_or_stop(limit: Option<&RecordLimit>) -> Result<()> {
+    if let Some(limit) = limit {
+        if !limit.try_claim() {
+            return Err(record_limit_reached_error());
+        }
+    }
+    Ok(())
+}
 
 /// One projection emission reported to the [`WhitelistMatchTracker`]. The
 /// tracker keeps the fast and slow paths' counters separate so the zero-match
@@ -57,10 +133,11 @@ struct WhitelistMatchState {
 /// after filtering and reports once if every sampled record projected to `{}`.
 ///
 /// The fast and slow paths are tracked independently — the warning and
-/// `strict_whitelist` failure fire only when the fast path (the dominant
-/// production path) accumulates a full sample of empty projections, so a
-/// stray tokenizer-fallback line cannot suppress a real zero-match condition
-/// nor cause a spurious failure when the fast path is healthy.
+/// `strict_whitelist` failure fire when the fast path (the dominant
+/// production path) accumulates a full empty sample, or at finalization for a
+/// smaller all-empty sample. A stray tokenizer-fallback line cannot suppress a
+/// real zero-match condition nor cause a spurious failure when the fast path is
+/// healthy.
 #[derive(Debug)]
 pub(crate) struct WhitelistMatchTracker {
     strict: bool,
@@ -95,12 +172,38 @@ impl WhitelistMatchTracker {
             }
         }
 
+        Self::report_if_zero_match(&mut state, self.strict, false)
+    }
+
+    pub(crate) fn finalize(&self) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("whitelist validation state lock poisoned"))?;
+        Self::report_if_zero_match(&mut state, self.strict, true)
+    }
+
+    fn report_if_zero_match(
+        state: &mut WhitelistMatchState,
+        strict: bool,
+        final_check: bool,
+    ) -> Result<()> {
+        if state.reported || state.fast_seen == 0 {
+            return Ok(());
+        }
         let fast_sample_full = state.fast_seen == WHITELIST_ZERO_MATCH_SAMPLE;
+        if !(fast_sample_full || final_check) {
+            return Ok(());
+        }
         let fast_all_empty = state.fast_empty == state.fast_seen;
-        if fast_sample_full && fast_all_empty && !state.reported {
-            state.reported = true;
-            let slow_matched = state.slow_seen.saturating_sub(state.slow_empty);
-            let msg = if slow_matched > 0 {
+        if !fast_all_empty {
+            return Ok(());
+        }
+
+        state.reported = true;
+        let slow_matched = state.slow_seen.saturating_sub(state.slow_empty);
+        let msg = if fast_sample_full {
+            if slow_matched > 0 {
                 format!(
                     "--whitelist matched zero fields on the first {} fast-path records \
                      ({} slow-path emissions matched and were excluded from this check); {}",
@@ -111,13 +214,23 @@ impl WhitelistMatchTracker {
                     "--whitelist matched zero fields on the first {} records; {}",
                     WHITELIST_ZERO_MATCH_SAMPLE, WHITELIST_ZERO_MATCH_HINT
                 )
-            };
-            if self.strict {
-                return Err(anyhow!(msg));
             }
-            tracing::warn!("{}", msg);
+        } else if slow_matched > 0 {
+            format!(
+                "--whitelist matched zero fields on all {} fast-path records \
+                 ({} slow-path emissions matched and were excluded from this check); {}",
+                state.fast_seen, slow_matched, WHITELIST_ZERO_MATCH_HINT
+            )
+        } else {
+            format!(
+                "--whitelist matched zero fields on all {} records; {}",
+                state.fast_seen, WHITELIST_ZERO_MATCH_HINT
+            )
+        };
+        if strict {
+            return Err(anyhow!(msg));
         }
-
+        tracing::warn!("{}", msg);
         Ok(())
     }
 }
@@ -438,6 +551,7 @@ pub fn stream_job<W: Write + ?Sized>(
         whitelist_tracker,
         false,
         None,
+        None,
     )
 }
 
@@ -454,11 +568,11 @@ pub(crate) fn stream_job_with_partial_policy<W: Write + ?Sized>(
     whitelist_tracker: Option<&WhitelistMatchTracker>,
     allow_partial: bool,
     partial_reporter: Option<&crate::config::PartialReadReporter>,
+    record_limit: Option<&RecordLimit>,
 ) -> Result<StreamJobResult> {
     let mut written: u64 = 0;
     let mut ts_buf = String::new();
     let mut tok_buf = String::new();
-    let mut whitelist_error: Option<anyhow::Error> = None;
 
     // Build the streaming tokenizer once per file so the small key-set is
     // hashed exactly once and the buffers above are reused across every line.
@@ -480,9 +594,6 @@ pub(crate) fn stream_job_with_partial_policy<W: Write + ?Sized>(
     let mut line_number: u64 = 0;
     let mut on_line = |line: &str| -> Result<()> {
         line_number += 1;
-        if whitelist_error.is_some() {
-            return Ok(());
-        }
         let min = match parse_minimal(line) {
             Ok(min) => min,
             Err(_) => match serde_json::from_str::<Value>(line) {
@@ -504,6 +615,8 @@ pub(crate) fn stream_job_with_partial_policy<W: Write + ?Sized>(
             }
         }
 
+        claim_record_or_stop(record_limit)?;
+
         match write_path {
             StreamWritePath::Raw => write_raw_line(writer, line, &mut written),
             StreamWritePath::Timestamps => {
@@ -522,9 +635,7 @@ pub(crate) fn stream_job_with_partial_policy<W: Write + ?Sized>(
                     line_number,
                 )?;
                 if let Some(tracker) = whitelist_tracker {
-                    if let Err(e) = tracker.observe(emission) {
-                        whitelist_error = Some(e);
-                    }
+                    tracker.observe(emission)?;
                 }
                 Ok(())
             }
@@ -542,7 +653,7 @@ pub(crate) fn stream_job_with_partial_policy<W: Write + ?Sized>(
             reporter.record(path, err);
         }
     };
-    let complete = for_each_line_with_opts_status(
+    let stream_result = for_each_line_with_opts_status(
         &job.path,
         LineStreamOpts {
             read_buf_bytes: Some(read_buf_bytes),
@@ -553,10 +664,15 @@ pub(crate) fn stream_job_with_partial_policy<W: Write + ?Sized>(
             ..Default::default()
         },
         |s| on_line(s),
-    )?;
+    );
+    let complete = match stream_result {
+        Ok(complete) => complete,
+        Err(e) if is_record_limit_reached(&e) => true,
+        Err(e) => return Err(e),
+    };
 
-    if let Some(e) = whitelist_error {
-        return Err(e);
+    if let Some(tracker) = whitelist_tracker {
+        tracker.finalize()?;
     }
 
     Ok(StreamJobResult { written, complete })

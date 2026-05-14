@@ -13,7 +13,7 @@ use crate::filters::{
 use crate::key_extractor::KeyExtractor;
 use crate::kv_shard::ShardedKVWriter;
 use crate::paths::{
-    discover_all, log_missing_month_warnings, plan_files_checked, FileJob, FileKind,
+    discover_sources_checked, log_missing_month_warnings, plan_files_checked, FileJob, FileKind,
 };
 use crate::pipeline::{RedditETL, ScanPlan};
 use crate::progress::{make_progress_bar_labeled, total_compressed_size};
@@ -22,8 +22,8 @@ use crate::query::QuerySpec;
 use crate::shard::{ShardedWriter, UsernameStream};
 use crate::stitch::{concat_tsvs, stitch_tmp_parts, stitch_tmp_parts_to_json_array};
 use crate::streaming::{
-    process_file_for_usernames_with_skip, stream_job_with_partial_policy, StreamJobResult,
-    WhitelistMatchTracker,
+    claim_record_or_stop, is_record_limit_reached, process_file_for_usernames_with_skip,
+    stream_job_with_partial_policy, RecordLimit, StreamJobResult, WhitelistMatchTracker,
 };
 use crate::util::{
     create_dir_all_with_backoff, create_with_backoff, open_with_backoff, read_dir_with_backoff,
@@ -35,6 +35,7 @@ use crate::zstd_jsonl::{
 };
 use anyhow::{anyhow, Context, Result};
 use indicatif::ProgressBar;
+use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::fs;
@@ -48,6 +49,48 @@ use std::sync::{Arc, Mutex};
 pub enum ExportFormat {
     Jsonl,
     Zst,
+}
+
+/// Options for [`ScanPlan::extract_to_csv`] and [`ScanPlan::extract_to_tsv`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TabularExportOptions {
+    /// Emit a header row containing the requested field names.
+    pub header: bool,
+}
+
+impl Default for TabularExportOptions {
+    fn default() -> Self {
+        Self { header: true }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TabularFormat {
+    Csv,
+    Tsv,
+}
+
+impl TabularFormat {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Csv => "csv",
+            Self::Tsv => "tsv",
+        }
+    }
+
+    fn tmp_dir_name(self) -> &'static str {
+        match self {
+            Self::Csv => "extract_csv_q_tmp",
+            Self::Tsv => "extract_tsv_q_tmp",
+        }
+    }
+
+    fn row_suffix(self) -> &'static str {
+        match self {
+            Self::Csv => ".csvpart",
+            Self::Tsv => ".tsvpart",
+        }
+    }
 }
 
 /// Summary returned by [`ScanPlan::dedupe_keys_to_lines_with_stats`].
@@ -114,6 +157,18 @@ fn complete_stream_job(job: &FileJob, result: StreamJobResult) -> Result<u64> {
         }
         .into())
     }
+}
+
+fn record_limit_from(limit: Option<u64>) -> Option<Arc<RecordLimit>> {
+    limit.map(|n| Arc::new(RecordLimit::new(n)))
+}
+
+fn record_limit_from_with_claimed(limit: Option<u64>, claimed: u64) -> Option<Arc<RecordLimit>> {
+    limit.map(|n| Arc::new(RecordLimit::new_with_claimed(n, claimed)))
+}
+
+fn committed_line_count(months: &HashMap<String, MonthEntry>) -> u64 {
+    months.values().map(|entry| entry.lines).sum()
 }
 
 fn is_partial_scan_error(e: &anyhow::Error) -> bool {
@@ -293,6 +348,7 @@ impl ScanPlan {
                     &plan.etl,
                     &plan.query,
                     /*show_progress=*/ true,
+                    plan.limit,
                     |min, _kind, _line| {
                         if let Some(a) = min.author.as_deref() {
                             let a = a.trim();
@@ -355,6 +411,7 @@ impl ScanPlan {
             "extract_jsonl_q_tmp",
             out_path,
             Finalize::Jsonl,
+            plan.limit,
         )
     }
 
@@ -407,6 +464,7 @@ impl ScanPlan {
                     &plan.etl,
                     &plan.query,
                     /*show_progress=*/ true,
+                    plan.limit,
                     |_min, _kind, line| {
                         matched_records.fetch_add(1, Ordering::Relaxed);
                         let mut w = writer
@@ -498,6 +556,67 @@ impl ScanPlan {
             "extract_json_q_tmp",
             out_path,
             Finalize::JsonArray { pretty },
+            plan.limit,
+        )
+    }
+
+    /// Export matching records as CSV. `fields` is the fixed top-level schema;
+    /// missing fields render as empty cells.
+    pub fn extract_to_csv<I, S>(
+        self,
+        out_path: &Path,
+        fields: I,
+        opts: TabularExportOptions,
+    ) -> Result<()>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.extract_to_tabular(out_path, fields, opts, TabularFormat::Csv)
+    }
+
+    /// Export matching records as TSV. `fields` is the fixed top-level schema;
+    /// missing fields render as empty cells. Values containing a literal tab
+    /// are rejected because TSV has no standard escaping convention.
+    pub fn extract_to_tsv<I, S>(
+        self,
+        out_path: &Path,
+        fields: I,
+        opts: TabularExportOptions,
+    ) -> Result<()>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.extract_to_tabular(out_path, fields, opts, TabularFormat::Tsv)
+    }
+
+    fn extract_to_tabular<I, S>(
+        self,
+        out_path: &Path,
+        fields: I,
+        opts: TabularExportOptions,
+        format: TabularFormat,
+    ) -> Result<()>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let fields = normalize_tabular_fields(fields)?;
+        let mut scan = self;
+        scan.etl.opts.whitelist_fields = Some(fields.clone());
+        let plan = scan.build()?;
+        log_pseudo_user_filter(&plan.query);
+        let targets = resolve_target_subs_from(&plan.etl.opts.subreddit, &plan.query.subreddits);
+        extract_tabular_common(
+            &plan.etl,
+            &plan.query,
+            targets.as_ref(),
+            out_path,
+            &fields,
+            opts,
+            format,
+            plan.limit,
         )
     }
 
@@ -530,7 +649,8 @@ impl ScanPlan {
             warn_if_unfiltered_undated_query(&plan.etl, &plan.query, &files);
 
             let resume = plan.etl.opts.resume;
-            let resume_fingerprint = build_resume_fingerprint(&plan.etl, &plan.query, "spool")?;
+            let resume_fingerprint =
+                build_resume_fingerprint(&plan.etl, &plan.query, "spool", plan.limit)?;
             // Resume manifest: load on entry, validate each entry against the
             // current query/config fingerprint and the file actually on disk,
             // then snapshot surviving keys before any worker mutates the accumulator.
@@ -562,6 +682,8 @@ impl ScanPlan {
                 }
             }
 
+            let resumed_lines = committed_line_count(&initial_months);
+
             // Persist the (pruned) manifest before any work, so a crash mid-
             // prune cannot resurrect entries we already know are stale.
             let accumulator = if resume {
@@ -583,6 +705,7 @@ impl ScanPlan {
             let whitelist_tracker = whitelist
                 .as_ref()
                 .map(|_| Arc::new(WhitelistMatchTracker::new(plan.etl.opts.strict_whitelist)));
+            let record_limit = record_limit_from_with_claimed(plan.limit, resumed_lines);
             let targets_ref = targets.as_ref();
             let bounds = bounds_tuple(plan.etl.opts.start, plan.etl.opts.end);
             let read_buf = plan.etl.opts.read_buffer_bytes;
@@ -605,6 +728,7 @@ impl ScanPlan {
                         write_buf,
                         human_ts,
                         whitelist_tracker: whitelist_tracker.as_deref(),
+                        record_limit: record_limit.as_deref(),
                         resume,
                         completed_keys: &completed_keys,
                         allow_partial: plan.etl.opts.allow_partial,
@@ -646,6 +770,7 @@ impl ScanPlan {
                 &plan.etl,
                 &plan.query,
                 /*show_progress=*/ false,
+                plan.limit,
                 |min, _kind, _line| {
                     if let Some(ts) = min.created_utc {
                         let ym = ym_from_epoch(ts);
@@ -673,6 +798,7 @@ impl ScanPlan {
                     &plan.etl,
                     &plan.query,
                     /*show_progress=*/ false,
+                    plan.limit,
                     |min, _kind, _line| {
                         if let Some(a) = min.author.as_deref() {
                             let a = a.trim();
@@ -708,6 +834,7 @@ impl ScanPlan {
                     &plan.etl,
                     &plan.query,
                     /*show_progress=*/ false,
+                    plan.limit,
                     |min, _kind, _line| {
                         if let (Some(a), Some(ts)) = (min.author.as_deref(), min.created_utc) {
                             let a = a.trim();
@@ -767,12 +894,14 @@ impl ScanPlan {
                 &plan.etl,
                 &plan.query,
                 partitioned_resume_operation(format),
+                plan.limit,
             )?;
             let (initial_months, completed_keys) = if resume {
                 load_and_validate_partitioned_manifest(out_base_dir, &resume_fingerprint, format)?
             } else {
                 (HashMap::new(), HashSet::new())
             };
+            let resumed_lines = committed_line_count(&initial_months);
             let accumulator = if resume {
                 crate::progress_manifest::save(
                     out_base_dir,
@@ -792,6 +921,7 @@ impl ScanPlan {
             let whitelist_tracker = whitelist
                 .as_ref()
                 .map(|_| Arc::new(WhitelistMatchTracker::new(plan.etl.opts.strict_whitelist)));
+            let record_limit = record_limit_from_with_claimed(plan.limit, resumed_lines);
             let targets_ref = targets.as_ref();
             let bounds = bounds_tuple(plan.etl.opts.start, plan.etl.opts.end);
             let total_bytes = total_compressed_size(&files);
@@ -814,6 +944,13 @@ impl ScanPlan {
                 |job| -> Result<()> {
                     let key = export_part_key(job);
                     let out_path = partitioned_output_path(out_base_dir, job, format);
+
+                    if record_limit
+                        .as_ref()
+                        .is_some_and(|limit| limit.is_exhausted())
+                    {
+                        return Ok(());
+                    }
 
                     if resume && completed_keys.contains(&key) {
                         if let Some(pb) = &pb {
@@ -839,6 +976,7 @@ impl ScanPlan {
                                     whitelist_tracker.as_deref(),
                                     plan.etl.opts.allow_partial,
                                     Some(&plan.etl.opts.partial_read_reporter),
+                                    record_limit.as_deref(),
                                 )?;
                                 complete_stream_job(job, result)
                             })
@@ -858,6 +996,7 @@ impl ScanPlan {
                                     whitelist_tracker.as_deref(),
                                     plan.etl.opts.allow_partial,
                                     Some(&plan.etl.opts.partial_read_reporter),
+                                    record_limit.as_deref(),
                                 )?;
                                 complete_stream_job(job, result)
                             })
@@ -928,7 +1067,11 @@ fn plan_pipeline_files(etl: &RedditETL) -> Result<Vec<FileJob>> {
     if let Some(err) = etl.opts.build_error.clone() {
         return Err(err.into());
     }
-    let discovered = discover_all(&etl.opts.comments_dir, &etl.opts.submissions_dir);
+    let discovered = discover_sources_checked(
+        &etl.opts.comments_dir,
+        &etl.opts.submissions_dir,
+        etl.opts.sources,
+    )?;
     let jobs = plan_files_checked(
         &discovered,
         &etl.opts.comments_dir,
@@ -1047,7 +1190,12 @@ fn extract_scratch_dir(
 /// Fingerprint every query/config knob that can change the bytes written by a
 /// resumable extract/spool operation. If it changes between `--resume` runs,
 /// stale month parts are discarded instead of being stitched into the new run.
-fn build_resume_fingerprint(etl: &RedditETL, query: &QuerySpec, operation: &str) -> Result<String> {
+fn build_resume_fingerprint(
+    etl: &RedditETL,
+    query: &QuerySpec,
+    operation: &str,
+    limit: Option<u64>,
+) -> Result<String> {
     let zst_level = (operation == "partitioned-zst").then_some(etl.opts.zst_level);
     let input = serde_json::json!({
         "operation": operation,
@@ -1064,6 +1212,7 @@ fn build_resume_fingerprint(etl: &RedditETL, query: &QuerySpec, operation: &str)
         "strict_whitelist": etl.opts.strict_whitelist,
         "human_readable_timestamps": etl.opts.human_readable_timestamps,
         "zst_level": zst_level,
+        "limit": limit,
         "query": {
             "subreddits": query.subreddits.as_ref(),
             "authors_in": query.authors_in.as_ref(),
@@ -1131,6 +1280,7 @@ struct MonthJobCtx<'a> {
     write_buf: usize,
     human_ts: bool,
     whitelist_tracker: Option<&'a WhitelistMatchTracker>,
+    record_limit: Option<&'a RecordLimit>,
     resume: bool,
     completed_keys: &'a HashSet<String>,
     allow_partial: bool,
@@ -1188,6 +1338,10 @@ fn process_month(job: &FileJob, ctx: &MonthJobCtx<'_>) -> Result<Option<MonthRes
         .join(format!("{}_{}.jsonl", file_prefix, job.ym));
     let key = crate::progress_manifest::month_key(key_prefix, job.ym);
 
+    if ctx.record_limit.is_some_and(|limit| limit.is_exhausted()) {
+        return Ok(None);
+    }
+
     // Resume fast-path: skip the month entirely if it's already in the
     // manifest (and the on-disk file matched at load time). Still bump the
     // progress bar by the input file's compressed size so the user sees the
@@ -1214,6 +1368,7 @@ fn process_month(job: &FileJob, ctx: &MonthJobCtx<'_>) -> Result<Option<MonthRes
             ctx.whitelist_tracker,
             ctx.allow_partial,
             ctx.partial_reporter,
+            ctx.record_limit,
         )?;
         complete_stream_job(job, result)
     }) {
@@ -1449,6 +1604,355 @@ fn validate_jsonl_part(path: &Path) -> Result<MonthEntry> {
     })
 }
 
+fn normalize_tabular_fields<I, S>(fields: I) -> Result<Vec<String>>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let fields: Vec<String> = fields
+        .into_iter()
+        .filter_map(|field| {
+            let field = field.into();
+            let field = field.trim();
+            (!field.is_empty()).then(|| field.to_string())
+        })
+        .collect();
+    if fields.is_empty() {
+        anyhow::bail!("CSV/TSV export requires at least one whitelisted field");
+    }
+    Ok(fields)
+}
+
+fn tabular_part_path(tmp_dir: &Path, key: &str, format: TabularFormat) -> PathBuf {
+    tmp_dir.join(format!(".part_{}{}", key, format.row_suffix()))
+}
+
+fn tabular_part_paths(tmp_dir: &Path, format: TabularFormat) -> Result<Vec<PathBuf>> {
+    let suffix = format.row_suffix();
+    let mut paths = Vec::new();
+    for entry in read_dir_with_backoff(tmp_dir, 16, 50)
+        .with_context(|| format!("read_dir {}", tmp_dir.display()))?
+    {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if name.starts_with(".part_") && name.ends_with(suffix) {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+fn write_csv_cell<W: Write + ?Sized>(out: &mut W, cell: &str) -> Result<()> {
+    let quote = cell
+        .as_bytes()
+        .iter()
+        .any(|b| matches!(b, b',' | b'"' | b'\n' | b'\r'));
+    if !quote {
+        out.write_all(cell.as_bytes())?;
+        return Ok(());
+    }
+    out.write_all(b"\"")?;
+    for b in cell.as_bytes() {
+        if *b == b'"' {
+            out.write_all(b"\"\"")?;
+        } else {
+            out.write_all(&[*b])?;
+        }
+    }
+    out.write_all(b"\"")?;
+    Ok(())
+}
+
+fn value_to_tabular_cell(value: Option<&Value>) -> Result<String> {
+    let Some(value) = value else {
+        return Ok(String::new());
+    };
+    match value {
+        Value::Null => Ok(String::new()),
+        Value::String(s) => Ok(s.clone()),
+        Value::Bool(b) => Ok(b.to_string()),
+        Value::Number(n) => Ok(n.to_string()),
+        Value::Array(_) | Value::Object(_) => Ok(serde_json::to_string(value)?),
+    }
+}
+
+fn write_tabular_row<W: Write + ?Sized>(
+    out: &mut W,
+    fields: &[String],
+    cells: &[String],
+    format: TabularFormat,
+) -> Result<()> {
+    match format {
+        TabularFormat::Csv => {
+            for (i, cell) in cells.iter().enumerate() {
+                if i > 0 {
+                    out.write_all(b",")?;
+                }
+                write_csv_cell(out, cell)?;
+            }
+            out.write_all(b"\r\n")?;
+        }
+        TabularFormat::Tsv => {
+            for (field, cell) in fields.iter().zip(cells.iter()) {
+                if cell.contains('\t') {
+                    tracing::warn!(
+                        field,
+                        "refusing to emit TSV value containing a literal tab; use --format csv for robust escaping"
+                    );
+                    anyhow::bail!(
+                        "TSV export cannot represent a literal tab in field {field:?}; use --format csv"
+                    );
+                }
+            }
+            for (i, cell) in cells.iter().enumerate() {
+                if i > 0 {
+                    out.write_all(b"\t")?;
+                }
+                out.write_all(cell.as_bytes())?;
+            }
+            out.write_all(b"\n")?;
+        }
+    }
+    Ok(())
+}
+
+fn tabular_cells_from_value(value: &Value, fields: &[String]) -> Result<(Vec<String>, bool)> {
+    let map = value.as_object();
+    let mut matched_any = false;
+    let mut cells = Vec::with_capacity(fields.len());
+    for field in fields {
+        let field_value = map.and_then(|map| map.get(field));
+        if field_value.is_some() {
+            matched_any = true;
+        }
+        cells.push(value_to_tabular_cell(field_value)?);
+    }
+    Ok((cells, matched_any))
+}
+
+fn write_tabular_header<W: Write + ?Sized>(
+    out: &mut W,
+    fields: &[String],
+    format: TabularFormat,
+) -> Result<()> {
+    write_tabular_row(out, fields, fields, format)
+}
+
+fn stitch_tabular_parts(
+    tmp_dir: &Path,
+    out_path: &Path,
+    fields: &[String],
+    opts: TabularExportOptions,
+    format: TabularFormat,
+    write_buf: usize,
+) -> Result<()> {
+    let parts = tabular_part_paths(tmp_dir, format)?;
+    let parent = out_path.parent().unwrap_or_else(|| Path::new("."));
+    let staging_dir = ensure_staging_dir(parent)?;
+    write_jsonl_atomic(&staging_dir, out_path, write_buf, |out| {
+        if opts.header {
+            write_tabular_header(out, fields, format)?;
+        }
+        for path in &parts {
+            let mut r = BufReader::new(open_with_backoff(path, 16, 50)?);
+            std::io::copy(&mut r, out)?;
+        }
+        Ok(())
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stream_tabular_job<W: Write + ?Sized>(
+    job: &FileJob,
+    writer: &mut W,
+    targets: Option<&Vec<String>>,
+    query: &QuerySpec,
+    fields: &[String],
+    format: TabularFormat,
+    pb: Option<ProgressBar>,
+    bounds: Option<DateBounds>,
+    read_buf_bytes: usize,
+    whitelist_tracker: Option<&WhitelistMatchTracker>,
+    allow_partial: bool,
+    partial_reporter: Option<&crate::config::PartialReadReporter>,
+    record_limit: Option<&RecordLimit>,
+) -> Result<StreamJobResult> {
+    let mut written = 0_u64;
+    let mut line_number = 0_u64;
+    let mut on_line = |line: &str| -> Result<()> {
+        line_number += 1;
+        let min = match parse_minimal(line) {
+            Ok(min) => min,
+            Err(_) => match serde_json::from_str::<Value>(line) {
+                Ok(_) => return Ok(()),
+                Err(e) => return Err(malformed_json_error(&job.path, line_number, e)),
+            },
+        };
+        if !matches_minimal(&min, targets, query) || !within_bounds(&min, bounds) {
+            return Ok(());
+        }
+        if query.requires_full_parse() {
+            let val: Value = serde_json::from_str(line)
+                .map_err(|e| malformed_json_error(&job.path, line_number, e))?;
+            if !matches_full(&val, job.kind, query) {
+                return Ok(());
+            }
+        }
+        claim_record_or_stop(record_limit)?;
+        let val: Value = serde_json::from_str(line)
+            .map_err(|e| malformed_json_error(&job.path, line_number, e))?;
+        let (cells, matched_any) = tabular_cells_from_value(&val, fields)?;
+        write_tabular_row(writer, fields, &cells, format)?;
+        written += 1;
+        if let Some(tracker) = whitelist_tracker {
+            tracker.observe(crate::streaming::WhitelistEmission {
+                emitted_empty_projection: !matched_any,
+                used_slow_path: false,
+            })?;
+        }
+        Ok(())
+    };
+
+    let partial_read_policy = if allow_partial {
+        PartialReadPolicy::AllowPartial
+    } else {
+        PartialReadPolicy::Strict
+    };
+    let mut progress_cb = pb.map(|pb| move |delta| pb.inc(delta));
+    let mut skip_cb = |path: &Path, err: &anyhow::Error| {
+        if let Some(reporter) = partial_reporter {
+            reporter.record(path, err);
+        }
+    };
+    let stream_result = for_each_line_with_opts_status(
+        &job.path,
+        LineStreamOpts {
+            read_buf_bytes: Some(read_buf_bytes),
+            progress: progress_cb.as_mut().map(|cb| cb as &mut dyn FnMut(u64)),
+            on_skip: allow_partial.then_some(&mut skip_cb as &mut dyn FnMut(&Path, &anyhow::Error)),
+            partial_read_policy,
+            ..Default::default()
+        },
+        |s| on_line(s),
+    );
+    let complete = match stream_result {
+        Ok(complete) => complete,
+        Err(e) if is_record_limit_reached(&e) => true,
+        Err(e) => return Err(e),
+    };
+    if let Some(tracker) = whitelist_tracker {
+        tracker.finalize()?;
+    }
+    Ok(StreamJobResult { written, complete })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn extract_tabular_common(
+    etl: &RedditETL,
+    query: &QuerySpec,
+    targets: Option<&Vec<String>>,
+    out_path: &Path,
+    fields: &[String],
+    opts: TabularExportOptions,
+    format: TabularFormat,
+    limit: Option<u64>,
+) -> Result<()> {
+    let parallelism = etl.opts.parallelism;
+    with_thread_pool(parallelism, || {
+        let files = plan_pipeline_files(etl)?;
+        warn_if_unfiltered_undated_query(etl, query, &files);
+
+        let work_dir = etl.ensure_work_dir()?;
+        let tmp_dir = extract_scratch_dir(&work_dir, format.tmp_dir_name(), out_path, false, None)?;
+        create_dir_all_with_backoff(&tmp_dir, 16, 50).with_context(|| {
+            format!(
+                "creating {} extract work dir {}",
+                format.label(),
+                tmp_dir.display()
+            )
+        })?;
+        let staging_dir = ensure_staging_dir(&tmp_dir)?;
+        sweep_stale_inprogress(&tmp_dir, true)?;
+
+        let whitelist_tracker = Some(Arc::new(WhitelistMatchTracker::new(
+            etl.opts.strict_whitelist,
+        )));
+        let record_limit = record_limit_from(limit);
+        let total_bytes = total_compressed_size(&files);
+        let pb = if etl.opts.progress {
+            Some(make_progress_bar_labeled(
+                total_bytes,
+                etl.opts.progress_label.as_deref(),
+            ))
+        } else {
+            None
+        };
+
+        let bounds = bounds_tuple(etl.opts.start, etl.opts.end);
+        let read_buf = etl.opts.read_buffer_bytes;
+        let write_buf = etl.opts.write_buffer_bytes;
+
+        crate::concurrency::for_each_file_limited(
+            &files,
+            etl.opts.file_concurrency,
+            |job| -> Result<()> {
+                if record_limit
+                    .as_ref()
+                    .is_some_and(|limit| limit.is_exhausted())
+                {
+                    return Ok(());
+                }
+                let key = export_part_key(job);
+                let tmp_file = tabular_part_path(&tmp_dir, &key, format);
+                let lines = match write_jsonl_atomic(&staging_dir, &tmp_file, write_buf, |w| {
+                    let result = stream_tabular_job(
+                        job,
+                        w,
+                        targets,
+                        query,
+                        fields,
+                        format,
+                        pb.clone(),
+                        bounds,
+                        read_buf,
+                        whitelist_tracker.as_deref(),
+                        etl.opts.allow_partial,
+                        Some(&etl.opts.partial_read_reporter),
+                        record_limit.as_deref(),
+                    )?;
+                    complete_stream_job(job, result)
+                }) {
+                    Ok(lines) => lines,
+                    Err(e) if etl.opts.allow_partial && is_partial_scan_error(&e) => {
+                        tracing::warn!(path=%job.path.display(), part=%tmp_file.display(), error=%e, "Skipping tabular export month after zstd decode error; staged part was discarded");
+                        return Ok(());
+                    }
+                    Err(e) => return Err(e),
+                };
+                if lines == 0 {
+                    let _ = remove_with_backoff(&tmp_file, 8, 50);
+                }
+                Ok(())
+            },
+        )?;
+
+        if let Some(pb) = pb {
+            pb.finish_with_message("done");
+        }
+        stitch_tabular_parts(&tmp_dir, out_path, fields, opts, format, write_buf)?;
+        if let Err(e) = remove_dir_all_with_backoff(&tmp_dir, 8, 50) {
+            tracing::warn!(path=%tmp_dir.display(), error=%e, "failed to remove tabular extract scratch dir");
+        }
+        Ok(())
+    })
+}
+
 /// Shared extraction logic used by:
 ///  - `ScanPlan::extract_to_jsonl`
 ///  - `ScanPlan::extract_to_json`
@@ -1460,6 +1964,7 @@ fn extract_common(
     tmp_dir_name: &str,
     out_path: &Path,
     finalize: Finalize,
+    limit: Option<u64>,
 ) -> Result<()> {
     validate_export_whitelist(etl)?;
     let parallelism = etl.opts.parallelism;
@@ -1470,7 +1975,7 @@ fn extract_common(
         let work_dir = etl.ensure_work_dir()?;
         let resume = etl.opts.resume;
         let resume_fingerprint = if resume {
-            Some(build_resume_fingerprint(etl, query, "extract")?)
+            Some(build_resume_fingerprint(etl, query, "extract", limit)?)
         } else {
             None
         };
@@ -1492,6 +1997,7 @@ fn extract_common(
             } else {
                 (HashMap::new(), HashSet::new())
             };
+        let resumed_lines = committed_line_count(&initial_months);
         let accumulator = if let Some(fingerprint) = resume_fingerprint.as_ref() {
             crate::progress_manifest::save(&tmp_dir, &initial_months, Some(fingerprint))?;
             Some(ManifestAccumulator::new(
@@ -1507,6 +2013,7 @@ fn extract_common(
         let whitelist_tracker = whitelist
             .as_ref()
             .map(|_| Arc::new(WhitelistMatchTracker::new(etl.opts.strict_whitelist)));
+        let record_limit = record_limit_from_with_claimed(limit, resumed_lines);
 
         let total_bytes = total_compressed_size(&files);
         let pb = if etl.opts.progress {
@@ -1530,6 +2037,13 @@ fn extract_common(
             |job| -> Result<()> {
                 let key = export_part_key(job);
                 let tmp_file = export_part_path(&tmp_dir, &key);
+
+                if record_limit
+                    .as_ref()
+                    .is_some_and(|limit| limit.is_exhausted())
+                {
+                    return Ok(());
+                }
 
                 if resume && completed_keys.contains(&key) {
                     if let Some(pb) = &pb {
@@ -1574,6 +2088,7 @@ fn extract_common(
                         whitelist_tracker.as_deref(),
                         etl.opts.allow_partial,
                         Some(&etl.opts.partial_read_reporter),
+                        record_limit.as_deref(),
                     )?;
                     complete_stream_job(job, result)
                 }) {
@@ -1638,6 +2153,7 @@ fn scan_records<F>(
     etl: &RedditETL,
     query: &QuerySpec,
     show_progress: bool,
+    limit: Option<u64>,
     on_record: F,
 ) -> Result<()>
 where
@@ -1647,6 +2163,10 @@ where
     let targets_ref = targets.as_ref();
     let bounds = bounds_tuple(etl.opts.start, etl.opts.end);
     let read_buf = etl.opts.read_buffer_bytes;
+    let record_limit = record_limit_from(limit);
+    if record_limit.as_ref().is_some_and(|limit| limit.is_zero()) {
+        return Ok(());
+    }
 
     let files = plan_pipeline_files(etl)?;
     warn_if_unfiltered_undated_query(etl, query, &files);
@@ -1661,10 +2181,16 @@ where
         None
     };
 
-    crate::concurrency::for_each_file_limited(
+    let fanout = crate::concurrency::for_each_file_limited(
         &files,
         etl.opts.file_concurrency,
         |job| -> Result<()> {
+            if record_limit
+                .as_ref()
+                .is_some_and(|limit| limit.is_exhausted())
+            {
+                return Ok(());
+            }
             let kind = job.kind;
             let mut line_number: u64 = 0;
             let line_cb = |line: &str| -> Result<()> {
@@ -1689,6 +2215,7 @@ where
                         return Ok(());
                     }
                 }
+                claim_record_or_stop(record_limit.as_deref())?;
                 on_record(&min, kind, line)?;
                 Ok(())
             };
@@ -1717,7 +2244,12 @@ where
             )?;
             Ok(())
         },
-    )?;
+    );
+    match fanout {
+        Ok(()) => {}
+        Err(e) if is_record_limit_reached(&e) => {}
+        Err(e) => return Err(e),
+    }
 
     if let Some(pb) = pb {
         pb.finish_with_message("done");

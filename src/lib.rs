@@ -31,8 +31,9 @@
 //!      and a full `serde_json::Value` parse.
 //!
 //! 2. **Discover & plan**
-//!    - `discover_all` / `plan_files` (doc(hidden)) walk the corpus and emit
-//!      [`FileJob`]s honoring the configured sources and date bounds.
+//!    - `discover_sources_checked` / `plan_files_checked` (doc(hidden)) walk
+//!      the corpus and emit [`FileJob`]s honoring the configured sources and
+//!      date bounds while surfacing directory/filename diagnostics.
 //!    - [`for_each_file_limited`](crate::concurrency::for_each_file_limited)
 //!      drives the per-file fan-out under a scoped Rayon pool.
 //!
@@ -153,7 +154,7 @@ pub use crate::config::{
 };
 pub use crate::date::YearMonth;
 pub use crate::pipeline::{RedditETL, ScanPlan};
-pub use crate::pipeline_exec::{DedupeKeySummary, ExportFormat};
+pub use crate::pipeline_exec::{DedupeKeySummary, ExportFormat, TabularExportOptions};
 pub use crate::query::{JsonPointerPredicate, NumericComparison, QueryBuildError, QuerySpec};
 pub use crate::shard::UsernameStream;
 
@@ -232,9 +233,9 @@ pub use crate::filters::{bounds_tuple, resolve_target_subs_from, within_bounds, 
 pub use crate::kv_shard::ShardedKVWriter;
 #[doc(hidden)]
 pub use crate::paths::{
-    discover_all, format_year_month_ranges, log_missing_month_warnings, missing_month_diagnostics,
-    plan_files, plan_files_checked, Discovered, FileJob, FileKind, MissingMonthDiagnostic,
-    PlanningError, SourceStatus,
+    discover_all, discover_all_checked, discover_sources_checked, format_year_month_ranges,
+    log_missing_month_warnings, missing_month_diagnostics, plan_files, plan_files_checked,
+    Discovered, FileJob, FileKind, MissingMonthDiagnostic, PlanningError, SourceStatus,
 };
 #[doc(hidden)]
 pub use crate::shard::ShardedWriter;

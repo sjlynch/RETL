@@ -76,6 +76,61 @@ fn typo_whitelist_warns_after_initial_sample_matches_zero_fields() {
 }
 
 #[test]
+fn small_typo_whitelist_warns_at_end_of_stream() {
+    let base = make_corpus_n_records(1);
+    let out = base.join("small_typo_whitelist.jsonl");
+    let logs = CaptureLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .with_writer(logs.clone())
+        .finish();
+
+    tracing::subscriber::with_default(subscriber, || {
+        RedditETL::new()
+            .base_dir(&base)
+            .sources(Sources::Comments)
+            .progress(false)
+            .whitelist_fields(["not_a_real_field"])
+            .scan()
+            .extract_to_jsonl(&out)
+            .unwrap();
+    });
+
+    let logs = logs.contents();
+    assert!(
+        logs.contains("--whitelist matched zero fields on all 1 records"),
+        "expected small-sample typo whitelist warning, got logs: {logs:?}"
+    );
+}
+
+#[test]
+fn strict_whitelist_errors_on_one_record_and_publishes_no_output() {
+    let base = make_corpus_n_records(1);
+    let out = base.join("strict_one_record_typo.jsonl");
+
+    let err = RedditETL::new()
+        .base_dir(&base)
+        .sources(Sources::Comments)
+        .progress(false)
+        .whitelist_fields(["not_a_real_field"])
+        .strict_whitelist(true)
+        .scan()
+        .extract_to_jsonl(&out)
+        .unwrap_err();
+
+    let chain = format!("{err:#}");
+    assert!(
+        chain.contains("--whitelist matched zero fields on all 1 records"),
+        "unexpected error: {chain}"
+    );
+    assert!(
+        !out.exists(),
+        "strict whitelist failure must not publish output"
+    );
+}
+
+#[test]
 fn strict_whitelist_errors_instead_of_warning() {
     let base = make_corpus_n_records(100);
     let out = base.join("strict_typo_whitelist.jsonl");

@@ -1,5 +1,7 @@
 use crate::concurrency::for_each_file_limited;
-use crate::paths::{discover_all, log_missing_month_warnings, plan_files_checked, FileJob};
+use crate::paths::{
+    discover_sources_checked, log_missing_month_warnings, plan_files_checked, FileJob,
+};
 use crate::progress::make_count_progress;
 use crate::util::{open_with_backoff, with_thread_pool};
 use crate::RedditETL;
@@ -168,7 +170,11 @@ impl RedditETL {
     where
         F: Fn(&Path, &str) -> Result<()> + Send + Sync,
     {
-        let discovered = discover_all(&self.opts.comments_dir, &self.opts.submissions_dir);
+        let discovered = discover_sources_checked(
+            &self.opts.comments_dir,
+            &self.opts.submissions_dir,
+            self.opts.sources,
+        )?;
         let files = plan_files_checked(
             &discovered,
             &self.opts.comments_dir,

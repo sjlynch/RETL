@@ -2,7 +2,7 @@
 mod common;
 
 use assert_cmd::Command;
-use common::make_corpus_multi_month;
+use common::{make_corpus_basic, make_corpus_multi_month};
 use predicates::prelude::*;
 use predicates::str::contains;
 use retl::YearMonth;
@@ -82,5 +82,67 @@ fn describe_honors_source_selection() {
             contains(format!("rc\t2006-01..=2006-01\t1\t{rc_bytes}"))
                 .and(contains(format!("total\t\t1\t{rc_bytes}")))
                 .and(predicate::str::contains("rs\t").not()),
+        );
+}
+
+#[test]
+fn describe_errors_when_source_path_is_regular_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path();
+    fs::write(base.join("comments"), "not a directory").unwrap();
+    fs::create_dir(base.join("submissions")).unwrap();
+
+    retl()
+        .args([
+            "describe",
+            "--data-dir",
+            base.to_str().unwrap(),
+            "--source",
+            "rc",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("failed to discover comments corpus directory"));
+}
+
+#[test]
+fn describe_skips_invalid_month_filenames() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path();
+    let comments = base.join("comments");
+    let submissions = base.join("submissions");
+    fs::create_dir(&comments).unwrap();
+    fs::create_dir(&submissions).unwrap();
+    fs::write(comments.join("RC_2024-00.zst"), b"").unwrap();
+    fs::write(comments.join("RC_2024-01.zst"), b"").unwrap();
+    fs::write(submissions.join("RS_2024-99.zst"), b"").unwrap();
+
+    retl()
+        .args(["describe", "--data-dir", base.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(contains("rc\t2024-01..=2024-01\t1").and(contains("rs\t<none>\t0")));
+}
+
+#[test]
+fn schema_reports_top_level_fields_as_tsv() {
+    let base = make_corpus_basic();
+
+    retl()
+        .args([
+            "schema",
+            "--data-dir",
+            base.to_str().unwrap(),
+            "--source",
+            "rs",
+            "--sample",
+            "1",
+        ])
+        .assert()
+        .success()
+        .stdout(
+            contains("field\ttype\tpresence_pct")
+                .and(contains("author\tstring\t100.00"))
+                .and(contains("score\tnumber\t100.00")),
         );
 }
