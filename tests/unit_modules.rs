@@ -402,6 +402,131 @@ fn dedupe_single_run_still_applies_merge_callback() {
     assert_eq!(merged, vec!["u00", "u01", "u02", "u03", "u04"]);
 }
 
+/// Regression: before the atomic-write fix, `merge_runs_sorted` staged its
+/// temp via `output.with_extension("ndjson.inprogress")`, which strips the
+/// final extension. Two concurrent merges with destinations `out/x.txt` and
+/// `out/x.json` in the same directory both resolved to `out/x.ndjson.inprogress`
+/// and clobbered each other's staged file. The fix routes through
+/// `<parent>/_staging/<basename>.retl-<pid>-<nonce>.inprogress`, so the basename
+/// (including the original extension) is preserved and each writer gets a
+/// unique PID/nonce-suffixed staged path.
+#[test]
+fn merge_runs_sorted_concurrent_writes_share_dir_with_distinct_stems() {
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    let dir = tempfile::tempdir().unwrap();
+    let out_dir = dir.path().to_path_buf();
+
+    // Two independent input run files, one per "merge job". Each contains
+    // one author's worth of (sorted-by-key) lines so `merge_runs_sorted` has
+    // real work to do — empty-runs would short-circuit through a different
+    // code path.
+    let runs_dir_a = out_dir.join("runs_a");
+    let runs_dir_b = out_dir.join("runs_b");
+    fs::create_dir_all(&runs_dir_a).unwrap();
+    fs::create_dir_all(&runs_dir_b).unwrap();
+    let run_a = runs_dir_a.join("run_0001.ndjson");
+    let run_b = runs_dir_b.join("run_0001.ndjson");
+    fs::write(
+        &run_a,
+        b"{\"author\":\"alice\"}\n{\"author\":\"alice\"}\n{\"author\":\"bob\"}\n",
+    )
+    .unwrap();
+    fs::write(
+        &run_b,
+        b"{\"author\":\"carol\"}\n{\"author\":\"carol\"}\n{\"author\":\"dave\"}\n",
+    )
+    .unwrap();
+
+    // Destinations share a stem (`x.*`) and parent directory — the legacy
+    // `with_extension("ndjson.inprogress")` would map both to the same temp.
+    let dest_txt = out_dir.join("x.txt");
+    let dest_json = out_dir.join("x.json");
+
+    let cfg = DedupeCfg {
+        mem: retl::AdaptiveMemCfg { soft_low_frac: 0.0, high_frac: 1.0, adapt_cooldown_ms: 10_000 },
+        min_buf_mb: 1,
+        max_buf_mb: 1,
+        read_buf_bytes: 8 * 1024,
+        write_buf_bytes: 8 * 1024,
+        inflight_bytes: 0,
+    };
+
+    // Force both merges to be active inside the per-group callback at the
+    // same instant — that's exactly the window where the old code would
+    // have raced on the shared `out/x.ndjson.inprogress` temp.
+    let barrier = Arc::new(Barrier::new(2));
+
+    let cfg_a = cfg.clone();
+    let dest_a = dest_txt.clone();
+    let runs_a = vec![run_a.clone()];
+    let bar_a = Arc::clone(&barrier);
+    let h_a = thread::spawn(move || {
+        let key = KeyExtractor::author_lowercase_fast();
+        let mut first = true;
+        merge_runs_sorted(&runs_a, &dest_a, &key, &cfg_a, |k, _group, w| {
+            if first {
+                bar_a.wait();
+                first = false;
+            }
+            writeln!(w, "{}=A", k)?;
+            Ok(())
+        })
+    });
+
+    let cfg_b = cfg.clone();
+    let dest_b = dest_json.clone();
+    let runs_b = vec![run_b.clone()];
+    let bar_b = Arc::clone(&barrier);
+    let h_b = thread::spawn(move || {
+        let key = KeyExtractor::author_lowercase_fast();
+        let mut first = true;
+        merge_runs_sorted(&runs_b, &dest_b, &key, &cfg_b, |k, _group, w| {
+            if first {
+                bar_b.wait();
+                first = false;
+            }
+            writeln!(w, "{}=B", k)?;
+            Ok(())
+        })
+    });
+
+    h_a.join().unwrap().expect("merge A succeeded");
+    h_b.join().unwrap().expect("merge B succeeded");
+
+    // Both destinations exist and contain their own merge output — neither
+    // truncated the other's staged file.
+    assert!(dest_txt.is_file(), "destination x.txt was not published");
+    assert!(dest_json.is_file(), "destination x.json was not published");
+
+    let txt = common::read_lines(&dest_txt);
+    let json = common::read_lines(&dest_json);
+    assert_eq!(txt, vec!["alice=A", "bob=A"], "x.txt mismatched");
+    assert_eq!(json, vec!["carol=B", "dave=B"], "x.json mismatched");
+
+    // Staged files were cleaned up by the atomic-write helper after publish.
+    let staging = out_dir.join("_staging");
+    if staging.exists() {
+        let leftovers: Vec<PathBuf> = fs::read_dir(&staging)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|s| s.to_str())
+                    .map(|n| n.ends_with(".inprogress"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "successful merges should leave no staged leftovers, found: {:?}",
+            leftovers
+        );
+    }
+}
+
 // ---------- kv_shard ----------
 
 #[test]
