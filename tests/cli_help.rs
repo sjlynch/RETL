@@ -97,6 +97,7 @@ fn scan_help_advertises_common_flags() {
         .and(contains("--max-score"))
         .and(contains("--contains-url"))
         .and(contains("--domain"))
+        .and(contains("--json"))
         .and(contains("--include-deleted"))
         .and(contains("--whitelist").not())
         .and(contains("--strict-whitelist").not())
@@ -134,7 +135,8 @@ fn integrity_help_advertises_modes_and_sample() {
     let pred = contains("--mode")
         .and(contains("quick"))
         .and(contains("full"))
-        .and(contains("--sample-bytes"));
+        .and(contains("--sample-bytes"))
+        .and(contains("--collect"));
     assert.stdout(pred);
 }
 

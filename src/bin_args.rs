@@ -90,6 +90,12 @@ pub(crate) struct CommonOpts {
     /// Include pseudo-users that are excluded by default: [deleted], [removed], and empty authors.
     #[arg(long = "include-deleted", alias = "include-pseudo-users")]
     pub(crate) include_deleted: bool,
+
+    /// Allow corrupt/truncated zstd monthly files to be skipped instead of
+    /// failing the scan/export. Skipped paths are reported as JSON on stderr;
+    /// resumable exports leave those months uncommitted so a later run retries.
+    #[arg(long)]
+    pub(crate) allow_partial: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -129,6 +135,14 @@ pub(crate) struct QueryOpts {
     /// Submission domain allow-list entry (repeatable). Comments have no domain and are dropped.
     #[arg(long = "domain", value_name = "DOMAIN")]
     pub(crate) domains: Vec<String>,
+
+    /// Full-record JSON Pointer predicate. Repeatable. Syntax: `exists:/path`,
+    /// `/path=value`, `/path!=value`, `/path>10`, `/path>=10`, `/path<10`,
+    /// `/path<=10`, or `/path~=REGEX`. Values use JSON scalars when possible
+    /// (`true`, `false`, `null`, numbers, or quoted strings); otherwise they
+    /// are treated as strings.
+    #[arg(long = "json", value_name = "PREDICATE")]
+    pub(crate) json_predicates: Vec<String>,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug)]
@@ -236,11 +250,10 @@ pub(crate) struct ExportArgs {
     pub(crate) inflight_bytes: Option<usize>,
     /// Resume a prior export with the same query/config/corpus. `jsonl`/`json`
     /// reuse per-month `.part_*.jsonl` files and `_progress.json` in a namespaced
-    /// scratch dir under `--work-dir`; `spool` reuses part files and
-    /// `_progress.json` in `--out`. Changing filters, corpus paths, sources,
-    /// date range, whitelist, or timestamp formatting invalidates the checkpoint
-    /// and rebuilds the parts. `zst` and `partitioned-jsonl` exports are not
-    /// currently resumable.
+    /// scratch dir under `--work-dir`; `spool`, `zst`, and `partitioned-jsonl`
+    /// use `_progress.json` under `--out`. Changing filters, corpus paths,
+    /// sources, date range, whitelist, timestamp formatting, or (for ZST)
+    /// zst level invalidates the checkpoint and rebuilds the parts.
     #[arg(long)]
     pub(crate) resume: bool,
 }
@@ -290,6 +303,12 @@ pub(crate) struct IntegrityArgs {
     /// Bytes (decompressed) to sample per file in quick mode.
     #[arg(long, default_value_t = 64 * 1024)]
     pub(crate) sample_bytes: u64,
+    /// Collect failures and print them only after all files finish.
+    ///
+    /// By default, integrity streams one `path<TAB>error` line to stdout as soon
+    /// as each failure is discovered.
+    #[arg(long)]
+    pub(crate) collect: bool,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug)]

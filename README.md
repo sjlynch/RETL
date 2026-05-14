@@ -9,7 +9,7 @@
 ## Features
 
 - 🚀 **Streaming, single‑pass processing** of `.zst` JSONL monthly dumps (RC/RS)
-- 🧠 **Intuitive query builder (DSL)**: subreddits, authors (allow/deny), regex, keywords, URL presence, domains, score thresholds
+- 🧠 **Intuitive query builder (DSL)**: subreddits, authors (allow/deny), regex, Unicode-aware keywords, URL presence, domains, score thresholds, and arbitrary JSON-pointer predicates
 - 🧰 **Exports**:
   - JSONL / JSON array (stitched)
   - Partitioned per source/month in corpus layout as JSONL or ZST (CLI: `retl export --format partitioned-jsonl` / `--format zst`)
@@ -156,6 +156,7 @@ and validation flags because it does not filter records by query:
 | `--min-score <N>` / `--max-score <N>` | Inclusive score thresholds. |
 | `--contains-url` | Keep records with an HTTP(S) URL in text or submission URL. |
 | `--domain <DOMAIN>` | Submission-domain allow-list. Repeatable; comments are dropped when this filter is active. |
+| `--json <PREDICATE>` | Full-record JSON Pointer predicate. Repeatable. Examples: `exists:/link_flair_text`, `/over_18=false`, `/is_self=true`, `/num_comments>=100`, `/link_flair_text~=^Question` (quote predicates containing `>` or `<` in shells). |
 | `--include-deleted` | Include pseudo-users (`[deleted]`, `[removed]`, and empty authors) that are filtered by default. |
 | `--parallelism <N>` / `--file-concurrency <N>` | Rayon threads / concurrent monthly files. |
 | `--no-progress` | Disable progress bars. |
@@ -233,7 +234,9 @@ Formats:
 * `--format zst` → corpus-style partitioned `.zst` output under `<out>/comments/RC_YYYY-MM.zst` and `<out>/submissions/RS_YYYY-MM.zst`.
 * `--format partitioned-jsonl` → the same corpus-style directory layout, but as uncompressed `.jsonl` files.
 
-Export-only modifiers include `--whitelist a,b,c`, `--strict-whitelist`, `--human-timestamps`, `--zst-level <N>`, and `--resume`. With `--resume`, `jsonl`/`json` exports checkpoint per-month `.part_*.jsonl` files under `--work-dir`, while `spool` checkpoints `part_RC_*` / `part_RS_*` and `_progress.json` under `--out`. The checkpoint includes a fingerprint of the query and output-affecting config; changing filters, sources, date range, whitelist fields, or `--human-timestamps` discards stale parts instead of mixing results from different runs. `--resume` is not currently supported for `zst` or `partitioned-jsonl`.
+Export-only modifiers include `--whitelist a,b,c`, `--strict-whitelist`, `--human-timestamps`, `--zst-level <N>`, and `--resume`. With `--resume`, `jsonl`/`json` exports checkpoint per-month `.part_*.jsonl` files under `--work-dir`; `spool`, `zst`, and `partitioned-jsonl` use `_progress.json` under `--out`. The checkpoint includes a fingerprint of the query and output-affecting config; changing filters, sources, date range, whitelist fields, `--human-timestamps`, or (for ZST) `--zst-level` discards stale parts instead of mixing results from different runs. Partitioned ZST resume validates completed `.zst` outputs with a full decode before skipping them.
+
+Corpus scans and exports are strict by default: zstd decode errors fail the command instead of returning plausible partial results. Pass `--allow-partial` to preserve the explicit lossy mode; skipped file counts and paths are emitted as a JSON object on stderr, and skipped months are not committed to resume manifests.
 
 ~~~sh
 # JSONL with a field whitelist and human timestamps
@@ -265,6 +268,17 @@ retl export \
   --domain nytimes.com \
   --format jsonl \
   --out nytimes_submissions_2020.jsonl
+
+# JSON-pointer predicates on full records
+retl export \
+  --data-dir ./data \
+  --source rs \
+  --start 2020-01 --end 2020-12 \
+  --json '/over_18=false' \
+  --json '/is_self=true' \
+  --json '/num_comments>=25' \
+  --format jsonl \
+  --out self_posts_with_discussion.jsonl
 
 # Spool monthly parts (input for parents pipeline / aggregation)
 retl export --start 2006-01 --end 2006-01 -s programming --format spool --out ./spool
@@ -304,8 +318,9 @@ retl integrity --mode quick --sample-bytes 65536 --source rc --start 2006-02 --e
 retl integrity --mode full --source both --start 2006-01 --end 2006-04
 ~~~
 
-Bad files print one `path<TAB>error` line per failure on stdout and the
-process exits with status `2`.
+Bad files print one `path<TAB>error` line per failure on stdout as soon as
+they are discovered, and the process exits with status `2`. Pass `--collect`
+to buffer the failure list and print it only after all files finish.
 
 ### `aggregate` — fold JSONL inputs into JSON or TSV rollups
 
@@ -463,6 +478,15 @@ All examples below operate on the same API you saw in the Quick Start.
   Reddit comments do not have `domain`; when used with `Sources::Both` or
   `Sources::Comments`, comments are dropped and RETL emits a warning. Use
   `Sources::Submissions` when you intend a domain-only scan.
+- `.keywords_any([...])` is case-insensitive for Unicode text too: ASCII-only
+  keyword/haystack pairs stay on the zero-allocation Aho-Corasick fast path,
+  while non-ASCII keywords or text fields use a lowercase fallback.
+- `.json_exists("/path")`, `.json_eq("/path", value)`, `.json_number_gte(...)`,
+  and `.json_regex("/path", pattern)` filter on arbitrary JSON Pointer fields.
+  These predicates opt that query into full-record parsing only when present.
+  CLI syntax mirrors the API: `--json exists:/link_flair_text`,
+  `--json '/over_18=false'`, `--json '/is_self=true'`, and
+  `--json '/num_comments>=100'`.
 - `.exclude_common_bots()` merges RETL's default bot/service-account deny-list
   with any `.authors_out(...)` entries and `ETL_EXCLUDE_AUTHORS*` augments,
   regardless of builder call order. It does not affect pseudo-users; use
@@ -651,6 +675,18 @@ let bad_full = RedditETL::new()
     .date_range(Some(YearMonth::new(2006, 2)), Some(YearMonth::new(2006, 2)))
     .progress(false)
     .check_corpus_integrity(IntegrityMode::Full)?;
+
+// The return value materializes the full failure list. For long runs, stream
+// failures incrementally while still receiving the final Vec:
+let bad_streamed = RedditETL::new()
+    .base_dir("./data")
+    .sources(Sources::Comments)
+    .date_range(Some(YearMonth::new(2006, 2)), Some(YearMonth::new(2006, 2)))
+    .progress(false)
+    .check_corpus_integrity_with_failure_sink(IntegrityMode::Full, |path, err| {
+        println!("{}\t{}", path.display(), err);
+        Ok(())
+    })?;
 ~~~
 
 ---
