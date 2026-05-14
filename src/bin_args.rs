@@ -83,7 +83,7 @@ pub(crate) struct CommonOpts {
     #[arg(long, value_enum, default_value_t = SourceArg::Both)]
     pub(crate) source: SourceArg,
 
-    /// Subreddit name (repeat for multiple). If none given, all subreddits match.
+    /// Subreddit name (repeat for multiple). If none given, all subreddits match. Blank values are rejected.
     #[arg(long = "subreddit", short = 's')]
     pub(crate) subreddits: Vec<String>,
 
@@ -100,11 +100,11 @@ pub(crate) struct CommonOpts {
 
 #[derive(Args, Debug, Clone)]
 pub(crate) struct QueryOpts {
-    /// Author allow-list entry (repeatable). `--author-in` is an alias.
+    /// Author allow-list entry (repeatable). `--author-in` is an alias. Blank values are rejected.
     #[arg(long = "author", visible_alias = "author-in", value_name = "NAME")]
     pub(crate) authors: Vec<String>,
 
-    /// Author deny-list entry (repeatable).
+    /// Author deny-list entry (repeatable). Blank values are rejected.
     #[arg(long = "exclude-author", value_name = "NAME")]
     pub(crate) exclude_authors: Vec<String>,
 
@@ -116,7 +116,7 @@ pub(crate) struct QueryOpts {
     #[arg(long = "author-regex", value_name = "REGEX")]
     pub(crate) author_regex: Option<String>,
 
-    /// Keyword/text filter matched in comment bodies and submission titles/selftext.
+    /// Keyword/text filter matched in comment bodies and submission titles/selftext. Blank values are rejected.
     #[arg(long = "keyword", value_name = "TEXT")]
     pub(crate) keywords: Vec<String>,
 
@@ -128,11 +128,11 @@ pub(crate) struct QueryOpts {
     #[arg(long = "max-score", value_name = "N")]
     pub(crate) max_score: Option<i64>,
 
-    /// Keep only records that contain an http(s) URL in text or submission URL.
+    /// Keep only records that contain an http(s) URL in text or submission URL (positive-only filter).
     #[arg(long = "contains-url")]
     pub(crate) contains_url: bool,
 
-    /// Submission domain allow-list entry (repeatable). Comments have no domain and are dropped.
+    /// Submission domain allow-list entry (repeatable). Comments have no domain and are dropped. Blank values are rejected.
     #[arg(long = "domain", value_name = "DOMAIN")]
     pub(crate) domains: Vec<String>,
 

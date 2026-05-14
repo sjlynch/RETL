@@ -231,6 +231,46 @@ fn jsonl_resume_reuses_valid_month_parts_without_reading_sources() {
 }
 
 #[test]
+fn contains_url_false_reuses_default_resume_fingerprint() {
+    let base = tempfile::tempdir().unwrap().keep();
+    let work_dir = base.join("work_contains_url_false");
+    write_marker_corpus(&base, "default_url_filter");
+
+    let out = base.join("out.jsonl");
+    RedditETL::new()
+        .base_dir(&base)
+        .work_dir(&work_dir)
+        .sources(Sources::Comments)
+        .date_range(Some(YearMonth::new(2006, 1)), Some(YearMonth::new(2006, 1)))
+        .progress(false)
+        .resume(true)
+        .scan()
+        .extract_to_jsonl(&out)
+        .unwrap();
+    let first = fs::read_to_string(&out).unwrap();
+    assert!(first.contains("default_url_filter"));
+
+    // If `.contains_url(false)` changed the resume fingerprint, this second
+    // run would try to decode the corrupted source instead of reusing the
+    // completed part from the default/no-URL-filter query.
+    fs::write(base.join("comments").join("RC_2006-01.zst"), b"not zstd").unwrap();
+
+    RedditETL::new()
+        .base_dir(&base)
+        .work_dir(&work_dir)
+        .sources(Sources::Comments)
+        .date_range(Some(YearMonth::new(2006, 1)), Some(YearMonth::new(2006, 1)))
+        .progress(false)
+        .resume(true)
+        .scan()
+        .contains_url(false)
+        .extract_to_jsonl(&out)
+        .unwrap();
+
+    assert_eq!(fs::read_to_string(&out).unwrap(), first);
+}
+
+#[test]
 fn jsonl_resume_fingerprint_includes_corpus_paths() {
     let root = tempfile::tempdir().unwrap().keep();
     let corpus_a = root.join("corpus_a");

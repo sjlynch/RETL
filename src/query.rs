@@ -317,8 +317,10 @@ pub struct QuerySpec {
     /// Submissions only: matches the top-level `domain` field. Comments do not
     /// have this field and are rejected when the filter is active.
     pub domains_in: Option<Vec<String>>,
-    /// If true, keep only records with http(s) in text or a submission `url`
-    /// whose value starts with http(s).
+    /// Positive URL-presence filter. `Some(true)` keeps only records with
+    /// http(s) in text or a submission `url` whose value starts with http(s).
+    /// `Some(false)` is canonicalized to `None` during normalization; RETL
+    /// does not currently expose a negative "without URL" filter.
     pub contains_url: Option<bool>,
     /// Full-record predicates evaluated against arbitrary JSON Pointer paths.
     pub json_predicates: Vec<JsonPointerPredicate>,
@@ -376,7 +378,6 @@ impl QuerySpec {
             for s in kws.iter_mut() {
                 *s = s.trim().to_lowercase();
             }
-            kws.retain(|s| !s.is_empty());
             kws.sort();
             kws.dedup();
         }
@@ -386,6 +387,13 @@ impl QuerySpec {
             }
             domains.sort();
             domains.dedup();
+        }
+
+        // `contains_url(false)` is a no-op/clear request, not a negative URL
+        // predicate. Canonicalize direct QuerySpec construction too so resume
+        // fingerprints and selectivity match the builder default.
+        if self.contains_url == Some(false) {
+            self.contains_url = None;
         }
 
         // Reset any prior compiled cache; keywords may have changed shape.
@@ -406,13 +414,11 @@ impl QuerySpec {
             }
         }
 
-        if let Some(subreddits) = &self.subreddits {
-            if subreddits.is_empty() {
-                return Err(QueryBuildError::new(
-                    "subreddits cannot be an empty list; omit subreddits to match all",
-                ));
-            }
-        }
+        validate_string_list_filter("subreddits", &self.subreddits)?;
+        validate_string_list_filter("authors_in", &self.authors_in)?;
+        validate_string_list_filter("authors_out", &self.authors_out)?;
+        validate_string_list_filter("domains_in", &self.domains_in)?;
+        validate_string_list_filter("keywords_any", &self.keywords_any)?;
 
         if let (Some(allow), Some(deny)) = (&self.authors_in, &self.authors_out) {
             if let Some(author) = allow.iter().find(|a| deny.iter().any(|d| d == *a)) {
@@ -509,6 +515,26 @@ impl QuerySpec {
 }
 
 #[inline]
+fn validate_string_list_filter(
+    field: &'static str,
+    value: &Option<Vec<String>>,
+) -> Result<(), QueryBuildError> {
+    let Some(list) = value else {
+        return Ok(());
+    };
+    if list.is_empty() {
+        return Err(QueryBuildError::new(format!(
+            "{field} cannot be an empty list; omit {field} to match all"
+        )));
+    }
+    if list.iter().any(|s| s.is_empty()) {
+        return Err(QueryBuildError::new(format!(
+            "{field} contains a blank entry after normalization; blank entries are not allowed"
+        )));
+    }
+    Ok(())
+}
+
 pub fn normalize_str(s: &str) -> String {
     let s = s.trim().to_lowercase();
     if let Some(rest) = s.strip_prefix("r/") {

@@ -147,15 +147,15 @@ and validation flags because it does not filter records by query:
 | `--work-dir <PATH>` | Scratch directory for sharded writers (default `./etl_work`). |
 | `--start <YYYY-MM>` / `--end <YYYY-MM>` | Inclusive month range. Omit either to leave that side unbounded; the present side is still enforced against each record's `created_utc`. |
 | `--source rc\|rs\|both` | Comments only, submissions only, or both (default). |
-| `--subreddit <NAME>` (`-s`) | Subreddit selector. Repeatable; omit for "any subreddit". |
-| `--author <NAME>` / `--author-in <NAME>` | Author allow-list selector. Repeatable. |
-| `--exclude-author <NAME>` | Author deny-list selector. Repeatable. |
+| `--subreddit <NAME>` (`-s`) | Subreddit selector. Repeatable; omit for "any subreddit". Blank values are rejected. |
+| `--author <NAME>` / `--author-in <NAME>` | Author allow-list selector. Repeatable. Blank values are rejected. |
+| `--exclude-author <NAME>` | Author deny-list selector. Repeatable. Blank values are rejected. |
 | `--exclude-common-bots` | Exclude RETL's built-in bot/service-account list plus `ETL_EXCLUDE_AUTHORS*` augments; composes with `--exclude-author`. |
 | `--author-regex <REGEX>` | Keep authors matching a regex. |
-| `--keyword <TEXT>` | Keep records containing a keyword in body/title/selftext. Repeatable. |
+| `--keyword <TEXT>` | Keep records containing a keyword in body/title/selftext. Repeatable; blank values are rejected. |
 | `--min-score <N>` / `--max-score <N>` | Inclusive score thresholds. |
-| `--contains-url` | Keep records with an HTTP(S) URL in text or submission URL. |
-| `--domain <DOMAIN>` | Submission-domain allow-list. Repeatable; comments are dropped when this filter is active. |
+| `--contains-url` | Keep records with an HTTP(S) URL in text or submission URL. This is a positive-only filter. |
+| `--domain <DOMAIN>` | Submission-domain allow-list. Repeatable; comments are dropped when this filter is active. Blank values are rejected. |
 | `--json <PREDICATE>` | Full-record JSON Pointer predicate. Repeatable. Examples: `exists:/link_flair_text`, `/over_18=false`, `/is_self=true`, `/num_comments>=100`, `/link_flair_text~=^Question` (quote predicates containing `>` or `<` in shells). |
 | `--include-deleted` | Include pseudo-users (`[deleted]`, `[removed]`, and empty authors) that are filtered by default. |
 | `--parallelism <N>` / `--file-concurrency <N>` | Rayon threads / concurrent monthly files. |
@@ -479,11 +479,17 @@ All examples below operate on the same API you saw in the Quick Start.
 
 - `.contains_url(true)` keeps records with `http`/`https` in comment bodies,
   submission `selftext`/`title`, or a link-post submission whose top-level
-  `url` starts with `http`/`https`.
+  `url` starts with `http`/`https`. `.contains_url(false)` clears/disables
+  that positive filter and is equivalent to omitting it; RETL does not yet
+  provide a negative "without URL" filter.
 - `.domains_in([...])` matches the submission-only top-level `domain` field.
   Reddit comments do not have `domain`; when used with `Sources::Both` or
   `Sources::Comments`, comments are dropped and RETL emits a warning. Use
   `Sources::Submissions` when you intend a domain-only scan.
+- Empty explicit lists are invalid; omit a filter to match all values for that
+  field. Blank normalized entries in `.subreddits(...)`, `.authors_in(...)`,
+  `.authors_out(...)`, `.domains_in(...)`, and `.keywords_any(...)` return a
+  `QueryBuildError` before any corpus file is scanned.
 - `.keywords_any([...])` is case-insensitive for Unicode text too: ASCII-only
   keyword/haystack pairs stay on the zero-allocation Aho-Corasick fast path,
   while non-ASCII keywords or text fields use a lowercase fallback.
@@ -829,7 +835,9 @@ The three benchmark groups:
 - `ETL_EXCLUDE_AUTHORS` — comma/semicolon/whitespace-separated authors to add
   to the default bot/service exclusion list.
 - `ETL_EXCLUDE_AUTHORS_FILE` — path to a newline-separated file of additional
-  authors to exclude.
+  authors to exclude. If this variable is set to a non-blank path, the file
+  must be opened and read completely as UTF-8; missing/unreadable/invalid files
+  are fatal build errors before scanning starts.
 
 The merged exclusion list is applied by `.exclude_common_bots()` on a
 `ScanPlan`, or by passing `--exclude-common-bots` to scan-capable CLI commands

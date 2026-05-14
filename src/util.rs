@@ -1,4 +1,4 @@
-use crate::query::normalize_str;
+use crate::query::{normalize_str, QueryBuildError};
 use anyhow::{Context, Result};
 
 static INIT_ONCE: std::sync::Once = std::sync::Once::new();
@@ -17,7 +17,7 @@ pub fn init_tracing_for_binary() {
 
 /// Returns a normalized (lowercase) default list of bot/service authors to exclude.
 /// This is a conservative set focused on high-volume/systemic accounts.
-/// Feel free to extend as needed; merge_extra_exclusions() will add env/file entries.
+/// Feel free to extend as needed; try_merge_extra_exclusions() will add env/file entries.
 pub fn default_bot_authors() -> Vec<String> {
     // Hand-curated defaults (normalized to lowercase)
     let defaults = [
@@ -43,34 +43,53 @@ pub fn default_bot_authors() -> Vec<String> {
 /// Merge extra exclusions from env/file into the provided vector (in-place).
 /// - ETL_EXCLUDE_AUTHORS: comma/semicolon/space separated names
 /// - ETL_EXCLUDE_AUTHORS_FILE: path to newline-separated file of names
-/// All entries are normalized (lowercase), then the list is sort+dedup.
-pub fn merge_extra_exclusions(target: &mut Vec<String>) {
+///
+/// All entries are normalized (lowercase), then the list is sort+dedup. If
+/// `ETL_EXCLUDE_AUTHORS_FILE` is set to a non-blank path, failure to open or
+/// fully read it is fatal because the file is part of the query semantics.
+pub(crate) fn try_merge_extra_exclusions(
+    target: &mut Vec<String>,
+) -> std::result::Result<(), QueryBuildError> {
     use std::io::{BufRead, BufReader};
+
+    let mut extras = Vec::new();
 
     if let Ok(s) = std::env::var("ETL_EXCLUDE_AUTHORS") {
         for raw in s.split(|c: char| c == ',' || c == ';' || c.is_whitespace()) {
             let n = normalize_str(raw);
             if !n.is_empty() {
-                target.push(n);
+                extras.push(n);
             }
         }
     }
 
-    if let Ok(path) = std::env::var("ETL_EXCLUDE_AUTHORS_FILE") {
-        if !path.trim().is_empty() {
-            if let Ok(f) = open_with_backoff(std::path::Path::new(&path), 16, 50) {
-                let r = BufReader::new(f);
-                for line in r.lines().flatten() {
-                    let n = normalize_str(&line);
-                    if !n.is_empty() {
-                        target.push(n);
-                    }
+    if let Some(path_os) = std::env::var_os("ETL_EXCLUDE_AUTHORS_FILE") {
+        let path = std::path::PathBuf::from(path_os);
+        if !path.to_string_lossy().trim().is_empty() {
+            let f = open_with_backoff(&path, 16, 50).map_err(|e| {
+                QueryBuildError::new(format!(
+                    "ETL_EXCLUDE_AUTHORS_FILE {} cannot be opened: {e}",
+                    path.display()
+                ))
+            })?;
+            let r = BufReader::new(f);
+            for (idx, line) in r.lines().enumerate() {
+                let line_no = idx + 1;
+                let line = line.map_err(|e| {
+                    QueryBuildError::new(format!(
+                        "ETL_EXCLUDE_AUTHORS_FILE {} could not be read at line {line_no}: {e}",
+                        path.display()
+                    ))
+                })?;
+                let n = normalize_str(&line);
+                if !n.is_empty() {
+                    extras.push(n);
                 }
-            } else {
-                tracing::warn!("ETL_EXCLUDE_AUTHORS_FILE is set but cannot be opened: {}", path);
             }
         }
     }
+
+    target.extend(extras);
 
     // normalize + sort + dedup
     for s in target.iter_mut() {
@@ -78,6 +97,7 @@ pub fn merge_extra_exclusions(target: &mut Vec<String>) {
     }
     target.sort();
     target.dedup();
+    Ok(())
 }
 
 // -------- NEW: scoped Rayon thread pool helper --------
