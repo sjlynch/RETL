@@ -2,7 +2,10 @@ use crate::parents::ParentIds;
 use crate::pipeline::RedditETL;
 use crate::progress::make_progress_bar_labeled;
 use crate::shard_common;
-use crate::util::with_thread_pool;
+use crate::util::{
+    create_dir_all_with_backoff, create_dir_with_backoff, create_with_backoff, open_with_backoff,
+    remove_dir_all_with_backoff, with_thread_pool,
+};
 use crate::zstd_jsonl::malformed_json_error;
 use ahash::{AHashSet, RandomState};
 use anyhow::{Context, Result};
@@ -25,7 +28,7 @@ pub(crate) struct IdScratchRoot {
 impl IdScratchRoot {
     fn create(work_dir: &Path) -> Result<Arc<Self>> {
         let parent = work_dir.join("parent_ids");
-        fs::create_dir_all(&parent)
+        create_dir_all_with_backoff(&parent, 16, 50)
             .with_context(|| format!("create parent-id scratch parent {}", parent.display()))?;
 
         let pid = std::process::id();
@@ -37,7 +40,7 @@ impl IdScratchRoot {
 
         for attempt in 0..1024usize {
             let path = parent.join(format!("run-p{pid}-{nanos:x}-{counter:x}-{attempt:x}"));
-            match fs::create_dir(&path) {
+            match create_dir_with_backoff(&path, 16, 50) {
                 Ok(()) => return Ok(Arc::new(Self { path })),
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(e) => {
@@ -61,14 +64,12 @@ impl IdScratchRoot {
 
 impl Drop for IdScratchRoot {
     fn drop(&mut self) {
-        if let Err(e) = fs::remove_dir_all(&self.path) {
-            if e.kind() != io::ErrorKind::NotFound {
-                tracing::debug!(
-                    path = %self.path.display(),
-                    error = %e,
-                    "failed to remove parent-id scratch root"
-                );
-            }
+        if let Err(e) = remove_dir_all_with_backoff(&self.path, 8, 50) {
+            tracing::debug!(
+                path = %self.path.display(),
+                error = %e,
+                "failed to remove parent-id scratch root"
+            );
         }
     }
 }
@@ -88,11 +89,14 @@ impl IdShardWriter {
         count: usize,
     ) -> Result<Self> {
         let dir = scratch_root.path().join(format!("{kind}_ids_shards"));
-        fs::create_dir_all(&dir)?;
+        create_dir_all_with_backoff(&dir, 16, 50)
+            .with_context(|| format!("create parent-id shard dir {}", dir.display()))?;
         let mut writers = Vec::with_capacity(count);
         for i in 0..count {
             let p = dir.join(format!("{kind}_ids_{:04}.tmp", i));
-            writers.push(parking_lot::Mutex::new(BufWriter::new(File::create(p)?)));
+            let file = create_with_backoff(&p, 16, 50)
+                .with_context(|| format!("create parent-id shard {}", p.display()))?;
+            writers.push(parking_lot::Mutex::new(BufWriter::new(file)));
         }
         let rs = shard_common::seeded_state("parent_ids");
         Ok(Self {
@@ -135,35 +139,38 @@ impl IdShardWriter {
         drop(writers);
 
         let out_dir = base_dir.parent().unwrap().join(format!("{kind}_ids_dedup"));
-        fs::create_dir_all(&out_dir)?;
+        create_dir_all_with_backoff(&out_dir, 16, 50)
+            .with_context(|| format!("create parent-id dedup dir {}", out_dir.display()))?;
 
         let tmp_paths: Vec<PathBuf> = (0..count)
             .map(|i| base_dir.join(format!("{kind}_ids_{:04}.tmp", i)))
             .collect();
-        tmp_paths.par_iter().try_for_each(|p| -> Result<()> {
-            let out = out_dir.join(
-                p.file_name()
-                    .unwrap()
-                    .to_string_lossy()
-                    .replace(".tmp", ".txt"),
-            );
-            dedup_one(p, &out)?;
-            Ok(())
-        })?;
-
-        if let Err(e) = fs::remove_dir_all(&base_dir) {
-            if e.kind() != io::ErrorKind::NotFound {
-                tracing::debug!(
-                    path = %base_dir.display(),
-                    error = %e,
-                    "failed to remove parent-id raw shard scratch"
+        let shard_counts: Vec<usize> = tmp_paths
+            .par_iter()
+            .map(|p| -> Result<usize> {
+                let out = out_dir.join(
+                    p.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .replace(".tmp", ".txt"),
                 );
-            }
+                dedup_one(p, &out)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let total_ids = shard_counts.into_iter().sum();
+
+        if let Err(e) = remove_dir_all_with_backoff(&base_dir, 8, 50) {
+            tracing::debug!(
+                path = %base_dir.display(),
+                error = %e,
+                "failed to remove parent-id raw shard scratch"
+            );
         }
 
         Ok(IdShards {
             dir: out_dir,
             count,
+            total_ids,
             rs,
             kind: kind.to_string(),
             _scratch_root: scratch_root,
@@ -174,6 +181,7 @@ impl IdShardWriter {
 pub(crate) struct IdShards {
     pub(crate) dir: PathBuf,
     pub(crate) count: usize,
+    pub(crate) total_ids: usize,
     pub(crate) rs: RandomState,
     pub(crate) kind: String,
     pub(crate) _scratch_root: Arc<IdScratchRoot>,
@@ -189,8 +197,9 @@ impl IdShards {
     }
 }
 
-fn dedup_one(input: &Path, output: &Path) -> Result<()> {
-    let f = File::open(input).with_context(|| format!("open {}", input.display()))?;
+fn dedup_one(input: &Path, output: &Path) -> Result<usize> {
+    let f =
+        open_with_backoff(input, 16, 50).with_context(|| format!("open {}", input.display()))?;
     let mut r = BufReader::new(f);
     let mut set: AHashSet<String> = AHashSet::with_capacity(64_000);
 
@@ -212,14 +221,16 @@ fn dedup_one(input: &Path, output: &Path) -> Result<()> {
         }
     }
 
-    let out = File::create(output)?;
+    let unique_count = set.len();
+    let out = create_with_backoff(output, 16, 50)
+        .with_context(|| format!("create {}", output.display()))?;
     let mut w = BufWriter::new(out);
     for s in set {
         w.write_all(s.as_bytes())?;
         w.write_all(b"\n")?;
     }
     w.flush()?;
-    Ok(())
+    Ok(unique_count)
 }
 
 /// Per-rayon-worker FIFO cache of parsed parent shard JSON files.
@@ -250,7 +261,7 @@ impl<V: serde::de::DeserializeOwned + Clone> WorkerShardCache<V> {
                     self.cache.remove(&old);
                 }
             }
-            let file = File::open(path)
+            let file = open_with_backoff(path, 16, 50)
                 .with_context(|| format!("open parent shard {}", path.display()))?;
             let rdr = BufReader::new(file);
             let map: HashMap<String, V> = serde_json::from_reader(rdr)
@@ -292,7 +303,8 @@ impl SharedIdsetCache {
         }
         // Load outside the lock so concurrent workers loading different shards
         // don't serialize on the I/O.
-        let f = File::open(path).with_context(|| format!("open idset shard {}", path.display()))?;
+        let f = open_with_backoff(path, 16, 50)
+            .with_context(|| format!("open idset shard {}", path.display()))?;
         let r = BufReader::new(f);
         let mut set: AHashSet<String> = AHashSet::with_capacity(64_000);
         for line in r.lines() {
@@ -360,7 +372,7 @@ impl RedditETL {
             let parent_ref_count = AtomicUsize::new(0);
 
             paths.par_iter().try_for_each(|p| -> Result<()> {
-                let f = File::open(p)
+                let f = open_with_backoff(p, 16, 50)
                     .with_context(|| format!("open parent-id spool input {}", p.display()))?;
                 let mut r = BufReader::with_capacity(read_buf, f);
                 let mut buf = String::with_capacity(64 * 1024);

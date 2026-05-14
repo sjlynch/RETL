@@ -1,8 +1,11 @@
 use crate::date::YearMonth;
 use crate::mem::AdaptiveMemCfg;
+use parking_lot::Mutex;
+use serde::Serialize;
 use std::error::Error;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Structured error returned when ETL option builders contain invalid settings.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -30,6 +33,51 @@ pub enum Sources {
     Both,
 }
 
+/// A single input file skipped because `allow_partial` tolerated a zstd
+/// decode error.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SkippedFile {
+    pub path: PathBuf,
+    pub error: String,
+}
+
+/// Machine-readable snapshot of partial-read skips observed by a run.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct PartialReadReport {
+    pub skipped_file_count: usize,
+    pub skipped_files: Vec<SkippedFile>,
+}
+
+/// Shared collector for tolerated partial zstd reads.
+///
+/// Clone the handle before starting a consuming operation, then call
+/// [`PartialReadReporter::snapshot`] afterwards to inspect the skipped paths.
+#[derive(Clone, Debug, Default)]
+pub struct PartialReadReporter {
+    inner: Arc<Mutex<Vec<SkippedFile>>>,
+}
+
+impl PartialReadReporter {
+    pub fn record(&self, path: &Path, error: impl fmt::Display) {
+        self.inner.lock().push(SkippedFile {
+            path: path.to_path_buf(),
+            error: error.to_string(),
+        });
+    }
+
+    pub fn snapshot(&self) -> PartialReadReport {
+        let skipped_files = self.inner.lock().clone();
+        PartialReadReport {
+            skipped_file_count: skipped_files.len(),
+            skipped_files,
+        }
+    }
+
+    pub fn clear(&self) {
+        self.inner.lock().clear();
+    }
+}
+
 /// User-facing options with sensible defaults and builder chaining.
 #[derive(Clone, Debug)]
 pub struct ETLOptions {
@@ -44,12 +92,12 @@ pub struct ETLOptions {
     pub end: Option<YearMonth>,   // inclusive
     pub shard_count: usize,       // number of on-disk dedup shards
     pub whitelist_fields: Option<Vec<String>>,
-    pub strict_whitelist: bool,       // fail instead of warn when whitelisted keys match nothing
-    pub strict_key: bool,             // fail dedupe when matching records lack the requested key
-    pub parallelism: Option<usize>,   // Some(N) to set rayon threads, None to use default
-    pub work_dir: Option<PathBuf>,    // if None, create in base_dir/.reddit_etl_work/
-    pub file_concurrency: usize,      // limit number of monthly files processed concurrently
-    pub progress: bool,               // show progress bar
+    pub strict_whitelist: bool,     // fail instead of warn when whitelisted keys match nothing
+    pub strict_key: bool,           // fail dedupe when matching records lack the requested key
+    pub parallelism: Option<usize>, // Some(N) to set rayon threads, None to use default
+    pub work_dir: Option<PathBuf>,  // if None, create in base_dir/.reddit_etl_work/
+    pub file_concurrency: usize,    // limit number of monthly files processed concurrently
+    pub progress: bool,             // show progress bar
     pub progress_label: Option<String>, // optional label for progress bar
 
     // IO tuning
@@ -84,6 +132,13 @@ pub struct ETLOptions {
     /// `_progress.json`-style sidecar and skip months already committed by a
     /// prior run. Default false to preserve current behavior.
     pub resume: bool,
+
+    /// Opt-in lossy mode for corrupt zstd inputs. The default (`false`) treats
+    /// zstd decode errors as fatal so scans/exports cannot silently return
+    /// partial results. When `true`, corrupt monthly files are skipped, recorded
+    /// in [`partial_read_reporter`], and never committed to resume manifests.
+    pub allow_partial: bool,
+    pub partial_read_reporter: PartialReadReporter,
 
     #[doc(hidden)]
     pub build_error: Option<ConfigBuildError>,
@@ -126,6 +181,8 @@ impl Default for ETLOptions {
             inflight_groups: 8,
             adaptive_mem: AdaptiveMemCfg::default(),
             resume: false,
+            allow_partial: false,
+            partial_read_reporter: PartialReadReporter::default(),
             build_error: None,
         }
     }
@@ -156,7 +213,9 @@ impl ETLOptions {
         self.start = start;
         self.end = end;
         self.build_error = match (start, end) {
-            (Some(s), Some(e)) if s > e => Some(ConfigBuildError::InvalidDateRange { start: s, end: e }),
+            (Some(s), Some(e)) if s > e => {
+                Some(ConfigBuildError::InvalidDateRange { start: s, end: e })
+            }
             _ => None,
         };
         self
@@ -176,7 +235,11 @@ impl ETLOptions {
                 .filter_map(|field| {
                     let field = field.into();
                     let field = field.trim();
-                    if field.is_empty() { None } else { Some(field.to_string()) }
+                    if field.is_empty() {
+                        None
+                    } else {
+                        Some(field.to_string())
+                    }
                 })
                 .collect(),
         );
@@ -264,9 +327,19 @@ impl ETLOptions {
     }
 
     /// Opt in to resumable extract/export runs (`extract_to_jsonl`,
-    /// `extract_to_json`, `extract_spool_monthly`, and parents helpers).
+    /// `extract_to_json`, `extract_spool_monthly`, `export_partitioned`, and
+    /// parents helpers).
     pub fn with_resume(mut self, yes: bool) -> Self {
         self.resume = yes;
+        self
+    }
+
+    /// Opt in to lossy corpus scans/exports that skip corrupt zstd monthly
+    /// files instead of failing the operation. Skipped paths are collected in
+    /// [`PartialReadReporter`] and incomplete months are not committed to
+    /// resume manifests.
+    pub fn with_allow_partial(mut self, yes: bool) -> Self {
+        self.allow_partial = yes;
         self
     }
 }

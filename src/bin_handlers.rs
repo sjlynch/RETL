@@ -3,13 +3,16 @@
 
 use anyhow::{Context, Result};
 use retl::{
-    create_with_backoff, discover_all, format_year_month_ranges, missing_month_diagnostics,
-    plan_files, remove_with_backoff, replace_file_atomic_backoff, total_compressed_size,
-    ExportFormat, FileKind, IntegrityMode, KeyExtractor, RedditETL, Sources, YearMonth,
+    create_dir_all_with_backoff, create_new_with_backoff, discover_all, format_year_month_ranges,
+    missing_month_diagnostics, open_with_backoff, plan_files, remove_with_backoff,
+    replace_file_atomic_backoff, total_compressed_size, AggregateBuildReport, ExportFormat,
+    FileKind, IntegrityMode, KeyExtractor, RedditETL, Sources, YearMonth,
 };
+use serde_json::Value;
 use std::collections::BTreeMap;
+#[cfg(test)]
 use std::fs;
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -18,8 +21,8 @@ use crate::bin_args::{
     FirstSeenArgs, IntegrityArgs, IntegrityModeArg, ParentsArgs, ScanArgs, SourceArg,
 };
 use crate::bin_helpers::{
-    build_etl, discover_spool_parts, plan, stream_extract_to_stdout, stream_path_output_to_stdout,
-    GroupBySpec, GroupMetricAgg, MetricSpec, RecCount,
+    build_etl, discover_spool_parts, emit_partial_read_report, plan, stream_extract_to_stdout,
+    stream_path_output_to_stdout, GroupBySpec, GroupMetricAgg, MetricSpec, RecCount,
 };
 
 const CLI_TEXT_WRITE_BUF_BYTES: usize = 64 * 1024;
@@ -37,7 +40,7 @@ where
 {
     let parent = output_parent(final_path);
     let staging_dir = parent.join("_staging");
-    fs::create_dir_all(&staging_dir)
+    create_dir_all_with_backoff(&staging_dir, 16, 50)
         .with_context(|| format!("creating staging dir {}", staging_dir.display()))?;
 
     let file_name = final_path
@@ -48,7 +51,7 @@ where
     staged_name.push(format!(".{}.{}.inprogress", std::process::id(), counter));
     let staged = staging_dir.join(staged_name);
 
-    let file = create_with_backoff(&staged, 16, 50)
+    let file = create_new_with_backoff(&staged, 16, 50)
         .with_context(|| format!("creating staged output {}", staged.display()))?;
     let mut w = BufWriter::with_capacity(CLI_TEXT_WRITE_BUF_BYTES, file);
 
@@ -69,7 +72,7 @@ where
     drop(w);
 
     let parent = output_parent(final_path);
-    fs::create_dir_all(parent)
+    create_dir_all_with_backoff(parent, 16, 50)
         .with_context(|| format!("creating output parent {}", parent.display()))?;
 
     if let Err(e) = replace_file_atomic_backoff(&staged, final_path) {
@@ -177,6 +180,7 @@ fn available_range(map: &BTreeMap<YearMonth, PathBuf>) -> String {
 
 pub(crate) fn run_scan(args: ScanArgs) -> Result<()> {
     let etl = build_etl(&args.common)?;
+    let partial_reporter = etl.partial_read_reporter();
     let scan = plan!(etl, args.common, args.query);
 
     match args.out {
@@ -198,6 +202,7 @@ pub(crate) fn run_scan(args: ScanArgs) -> Result<()> {
             w.flush()?;
         }
     }
+    emit_partial_read_report(&partial_reporter)?;
     Ok(())
 }
 
@@ -213,21 +218,22 @@ pub(crate) fn run_dedupe(args: DedupeArgs) -> Result<()> {
     if args.strict_key {
         etl = etl.strict_key(true);
     }
+    let partial_reporter = etl.partial_read_reporter();
     let work_dir = args.common.work_dir.clone();
     let scan = plan!(etl, args.common, args.query);
 
     if args.out == Path::new("-") {
         let tmp_path = stdout_dedupe_path(&work_dir);
-        let _ = fs::remove_file(&tmp_path);
+        let _ = remove_with_backoff(&tmp_path, 8, 50);
         let stats = match scan.dedupe_keys_to_lines_with_stats(&key, &tmp_path) {
             Ok(stats) => stats,
             Err(e) => {
-                let _ = fs::remove_file(&tmp_path);
+                let _ = remove_with_backoff(&tmp_path, 8, 50);
                 return Err(e);
             }
         };
         let copy_result = (|| -> Result<()> {
-            let mut f = fs::File::open(&tmp_path)
+            let mut f = open_with_backoff(&tmp_path, 16, 50)
                 .with_context(|| format!("opening dedupe tempfile {}", tmp_path.display()))?;
             let stdout = io::stdout();
             let mut w = stdout.lock();
@@ -235,13 +241,14 @@ pub(crate) fn run_dedupe(args: DedupeArgs) -> Result<()> {
             w.flush()?;
             Ok(())
         })();
-        let _ = fs::remove_file(&tmp_path);
+        let _ = remove_with_backoff(&tmp_path, 8, 50);
         copy_result?;
         print_dedupe_summary(&stats);
     } else {
         let stats = scan.dedupe_keys_to_lines_with_stats(&key, &args.out)?;
         print_dedupe_summary(&stats);
     }
+    emit_partial_read_report(&partial_reporter)?;
     Ok(())
 }
 
@@ -316,6 +323,7 @@ pub(crate) fn run_export(args: ExportArgs) -> Result<()> {
     if args.resume {
         etl = etl.resume(true);
     }
+    let partial_reporter = etl.partial_read_reporter();
     let work_dir = args.common.work_dir.clone();
     let scan = plan!(etl, args.common, args.query);
     let to_stdout = args.out == Path::new("-");
@@ -342,7 +350,7 @@ pub(crate) fn run_export(args: ExportArgs) -> Result<()> {
             if to_stdout {
                 anyhow::bail!("--out - is not valid for --format spool (it expects a directory)");
             }
-            fs::create_dir_all(&args.out)
+            create_dir_all_with_backoff(&args.out, 16, 50)
                 .with_context(|| format!("creating spool dir {}", args.out.display()))?;
             let (parts, n) = scan.extract_spool_monthly(&args.out)?;
             eprintln!("Spooled {} records across {} part files", n, parts.len());
@@ -354,12 +362,6 @@ pub(crate) fn run_export(args: ExportArgs) -> Result<()> {
                     export_format_name(args.format)
                 );
             }
-            if args.resume {
-                anyhow::bail!(
-                    "--resume is not supported with --format {}; use jsonl/json/spool for resumable exports",
-                    export_format_name(args.format)
-                );
-            }
             let partition_format = match args.format {
                 ExportFmt::Zst => ExportFormat::Zst,
                 ExportFmt::PartitionedJsonl => ExportFormat::Jsonl,
@@ -368,11 +370,13 @@ pub(crate) fn run_export(args: ExportArgs) -> Result<()> {
             scan.export_partitioned(&args.out, partition_format)?;
         }
     }
+    emit_partial_read_report(&partial_reporter)?;
     Ok(())
 }
 
 pub(crate) fn run_count(args: CountArgs) -> Result<()> {
     let etl = build_etl(&args.common)?;
+    let partial_reporter = etl.partial_read_reporter();
     let scan = plan!(etl, args.common, args.query);
 
     match args.mode {
@@ -410,6 +414,7 @@ pub(crate) fn run_count(args: CountArgs) -> Result<()> {
             }
         }
     }
+    emit_partial_read_report(&partial_reporter)?;
     Ok(())
 }
 
@@ -421,13 +426,27 @@ pub(crate) fn run_integrity(args: IntegrityArgs) -> Result<()> {
         },
         IntegrityModeArg::Full => IntegrityMode::Full,
     };
-    let bad = etl.check_corpus_integrity(mode)?;
+    let bad = if args.collect {
+        etl.check_corpus_integrity(mode)?
+    } else {
+        let print_lock = std::sync::Mutex::new(());
+        etl.check_corpus_integrity_with_failure_sink(mode, |path, err| {
+            let _guard = print_lock.lock().unwrap();
+            let stdout = io::stdout();
+            let mut w = stdout.lock();
+            writeln!(w, "{}\t{}", path.display(), err)?;
+            w.flush()?;
+            Ok(())
+        })?
+    };
     if bad.is_empty() {
         eprintln!("OK: no corruption detected.");
     } else {
         eprintln!("FAILED: {} file(s) failed integrity check:", bad.len());
-        for (p, e) in &bad {
-            println!("{}\t{}", p.display(), e);
+        if args.collect {
+            for (p, e) in &bad {
+                println!("{}\t{}", p.display(), e);
+            }
         }
         std::process::exit(2);
     }
@@ -446,7 +465,7 @@ pub(crate) fn run_aggregate(args: AggregateArgs) -> Result<()> {
             .unwrap_or_else(|| std::path::Path::new("."))
             .join("agg_shards")
     });
-    fs::create_dir_all(&shards_dir)
+    create_dir_all_with_backoff(&shards_dir, 16, 50)
         .with_context(|| format!("creating shards_dir {}", shards_dir.display()))?;
 
     let input_count = args.inputs.len();
@@ -454,17 +473,24 @@ pub(crate) fn run_aggregate(args: AggregateArgs) -> Result<()> {
         let group_by = GroupBySpec::parse(&by)?;
         let metric = MetricSpec::parse(args.metric.as_deref())?;
         let top = args.top;
-        let (agg, built, errors) = etl
-            .aggregate_jsonls_parallel_collect_with::<GroupMetricAgg, _>(
-                args.inputs,
-                &shards_dir,
-                || GroupMetricAgg::new(group_by.clone(), metric.clone()),
-            )?;
-        ensure_aggregate_inputs_succeeded(input_count, built, errors)?;
-        write_grouped_tsv(&args.out, agg.rows(top))?;
+        let (agg, report) = etl.aggregate_jsonls_parallel_collect_with::<GroupMetricAgg, _>(
+            args.inputs,
+            &shards_dir,
+            || GroupMetricAgg::new(group_by.clone(), metric.clone()),
+        )?;
+        report_aggregate_input_issues(&report);
+        ensure_aggregate_inputs_succeeded(input_count, &report)?;
+        let rows = if args.scientific {
+            agg.rows_with_scientific(top, true)
+        } else {
+            agg.rows(top)
+        };
+        write_grouped_tsv(&args.out, rows)?;
         eprintln!(
-            "Aggregated {} shard(s) to TSV; {} input(s) failed during shard build",
-            built, errors
+            "Aggregated {} shard(s) to TSV; {} input(s) failed during shard build; {} input(s) skipped after partial read",
+            report.merged_shards,
+            report.fatal_count(),
+            report.partial_count()
         );
     } else {
         if args.metric.is_some() {
@@ -473,70 +499,142 @@ pub(crate) fn run_aggregate(args: AggregateArgs) -> Result<()> {
         if args.top.is_some() {
             anyhow::bail!("--top requires --by");
         }
-        let (agg, built, errors) =
+        let (agg, report) =
             etl.aggregate_jsonls_parallel_collect::<RecCount>(args.inputs, &shards_dir)?;
-        ensure_aggregate_inputs_succeeded(input_count, built, errors)?;
+        report_aggregate_input_issues(&report);
+        ensure_aggregate_inputs_succeeded(input_count, &report)?;
         write_rec_count_json(&args.out, &agg, args.pretty)?;
         eprintln!(
-            "Aggregated {} shard(s); {} input(s) failed during shard build",
-            built, errors
+            "Aggregated {} shard(s); {} input(s) failed during shard build; {} input(s) skipped after partial read",
+            report.merged_shards,
+            report.fatal_count(),
+            report.partial_count()
         );
     }
     Ok(())
 }
 
+fn report_aggregate_input_issues(report: &AggregateBuildReport) {
+    if !report.fatal_inputs.is_empty() {
+        eprintln!("Aggregate input(s) failed during shard build:");
+        for issue in &report.fatal_inputs {
+            eprintln!("  {}\t{}", issue.input.display(), issue.error);
+        }
+    }
+    if !report.partial_inputs.is_empty() {
+        eprintln!("Aggregate input(s) skipped after partial read:");
+        for issue in &report.partial_inputs {
+            eprintln!("  {}\t{}", issue.input.display(), issue.error);
+        }
+    }
+}
+
 fn ensure_aggregate_inputs_succeeded(
     input_count: usize,
-    built: usize,
-    errors: usize,
+    report: &AggregateBuildReport,
 ) -> Result<()> {
-    if input_count > 0 && (errors == input_count || built == 0) {
+    let errors = report.problem_count();
+    if input_count > 0 && (errors == input_count || report.merged_shards == 0) {
         anyhow::bail!(
-            "aggregate failed: {errors} of {input_count} input(s) failed during shard build; {built} shard(s) merged"
+            "aggregate failed: {errors} of {input_count} input(s) failed or were partial; {} shard(s) merged",
+            report.merged_shards
         );
     }
     Ok(())
 }
 
 fn write_rec_count_json(out: &Path, agg: &RecCount, pretty: bool) -> Result<()> {
-    let tmp = out.with_extension("json.inprogress");
-    {
-        let f = create_with_backoff(&tmp, 16, 50)
-            .with_context(|| format!("creating output tempfile {}", tmp.display()))?;
-        let mut w = BufWriter::new(f);
+    write_text_file_atomic(out, |w| {
         if pretty {
-            serde_json::to_writer_pretty(&mut w, agg)?;
+            serde_json::to_writer_pretty(w, agg)?;
         } else {
-            serde_json::to_writer(&mut w, agg)?;
+            serde_json::to_writer(w, agg)?;
         }
-        w.flush()?;
-    }
-    replace_file_atomic_backoff(&tmp, out)
-        .with_context(|| format!("publishing output file {}", out.display()))?;
-    Ok(())
+        Ok(())
+    })
+    .with_context(|| format!("publishing output file {}", out.display()))
 }
 
 fn write_grouped_tsv(out: &Path, rows: Vec<(String, String)>) -> Result<()> {
-    let tmp = out.with_extension("tsv.inprogress");
-    {
-        let f = create_with_backoff(&tmp, 16, 50)
-            .with_context(|| format!("creating output tempfile {}", tmp.display()))?;
-        let mut w = BufWriter::new(f);
+    write_text_file_atomic(out, |w| {
         for (key, value) in rows {
             writeln!(w, "{key}\t{value}")?;
         }
-        w.flush()?;
-    }
-    replace_file_atomic_backoff(&tmp, out)
-        .with_context(|| format!("publishing output file {}", out.display()))?;
-    Ok(())
+        Ok(())
+    })
+    .with_context(|| format!("publishing output file {}", out.display()))
 }
 
 pub(crate) fn run_first_seen(args: FirstSeenArgs) -> Result<()> {
     let etl = build_etl(&args.common)?;
+    let partial_reporter = etl.partial_read_reporter();
     let scan = plan!(etl, args.common, args.query);
     scan.build_first_seen_index_to_tsv(&args.out)?;
+    emit_partial_read_report(&partial_reporter)?;
     Ok(())
+}
+
+fn first_spool_record_keys(spool_parts: &[PathBuf]) -> Result<Option<(PathBuf, Vec<String>)>> {
+    for path in spool_parts {
+        let f = open_with_backoff(path, 16, 50)
+            .with_context(|| format!("opening spool part {}", path.display()))?;
+        let r = BufReader::new(f);
+        for (line_idx, line) in r.lines().enumerate() {
+            let line = line.with_context(|| {
+                format!(
+                    "reading spool part {} near line {}",
+                    path.display(),
+                    line_idx + 1
+                )
+            })?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let v: Value = serde_json::from_str(&line).with_context(|| {
+                format!(
+                    "parsing spool part {} line {} while diagnosing missing parent IDs",
+                    path.display(),
+                    line_idx + 1
+                )
+            })?;
+            let keys = match v {
+                Value::Object(map) => {
+                    let mut keys: Vec<String> = map.keys().cloned().collect();
+                    keys.sort();
+                    keys
+                }
+                other => vec![format!("<non-object:{}>", other_type_name(&other))],
+            };
+            return Ok(Some((path.clone(), keys)));
+        }
+    }
+    Ok(None)
+}
+
+fn other_type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+fn bail_empty_parent_ids(spool_parts: &[PathBuf]) -> Result<()> {
+    let observed = match first_spool_record_keys(spool_parts)? {
+        Some((path, keys)) => format!(
+            "first record in {} contained keys: [{}]",
+            path.display(),
+            keys.join(",")
+        ),
+        None => "the discovered spool parts contained no JSON records".to_string(),
+    };
+
+    anyhow::bail!(
+        "parents pipeline found no usable parent references in the spool: no `t1_`/`t3_` `parent_id` or `link_id` values were collected. This usually means the spool was produced with --whitelist/.whitelist_fields that omitted `parent_id` and `link_id`; {observed}. Re-run export/spool with --whitelist including body,parent_id,link_id (body is optional for matching but preserves the child comment text)."
+    );
 }
 
 pub(crate) fn run_parents(args: ParentsArgs) -> Result<()> {
@@ -553,14 +651,14 @@ pub(crate) fn run_parents(args: ParentsArgs) -> Result<()> {
         }
     }
 
-    fs::create_dir_all(&args.cache)
+    create_dir_all_with_backoff(&args.cache, 16, 50)
         .with_context(|| format!("creating cache dir {}", args.cache.display()))?;
-    fs::create_dir_all(&args.out)
+    create_dir_all_with_backoff(&args.out, 16, 50)
         .with_context(|| format!("creating output dir {}", args.out.display()))?;
-    fs::create_dir_all(&args.work_dir)
+    create_dir_all_with_backoff(&args.work_dir, 16, 50)
         .with_context(|| format!("creating work_dir {}", args.work_dir.display()))?;
     let lib_tmp = args.work_dir.join("lib_tmp");
-    fs::create_dir_all(&lib_tmp)
+    create_dir_all_with_backoff(&lib_tmp, 16, 50)
         .with_context(|| format!("creating work_dir {}", lib_tmp.display()))?;
 
     let build = |sources: Option<Sources>, range: Option<(YearMonth, YearMonth)>| -> RedditETL {
@@ -590,6 +688,10 @@ pub(crate) fn run_parents(args: ParentsArgs) -> Result<()> {
     };
 
     let ids = build(None, None).collect_parent_ids_from_jsonls(spool_parts.clone())?;
+    if ids.is_empty() {
+        return bail_empty_parent_ids(&spool_parts);
+    }
+
     let parents = build(Some(Sources::Both), Some((wstart, wend))).resolve_parent_maps(
         &ids,
         &args.cache,

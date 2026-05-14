@@ -2,11 +2,11 @@
 mod common;
 
 use common::*;
-use retl::{Aggregator, RedditETL};
+use retl::{AggregatePartialReadPolicy, Aggregator, RedditETL};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs::{self, File};
-use std::io::BufReader;
+use std::io::{BufReader, Write};
 
 /// A tiny aggregator: counts how many JSON objects were ingested overall.
 /// Demonstrates implementing `Aggregator` and running `aggregate_jsonls_parallel`.
@@ -70,7 +70,7 @@ fn aggregate_over_jsonl_inputs() {
     let final_out = base.join("agg_final.json");
     RedditETL::new()
         .progress(false)
-        .aggregate_jsonls_parallel::<RecCount>(parts, &shards_dir, &final_out, true, false)
+        .aggregate_jsonls_parallel::<RecCount>(parts, &shards_dir, &final_out, false)
         .unwrap();
 
     // Validate the final count matches the number of spooled rows.
@@ -93,15 +93,15 @@ fn aggregate_same_basename_inputs_get_distinct_shards() {
     fs::write(&b, "{\"id\":\"b1\"}\n").unwrap();
     let shards_dir = tmp.path().join("agg_shards");
 
-    let (agg, built, errors) = RedditETL::new()
+    let (agg, report) = RedditETL::new()
         .progress(false)
         .parallelism(2)
         .aggregate_jsonls_parallel_collect::<RecCount>(vec![a, b], &shards_dir)
         .unwrap();
 
     assert_eq!(agg.count, 3);
-    assert_eq!(built, 2);
-    assert_eq!(errors, 0);
+    assert_eq!(report.merged_shards, 2);
+    assert_eq!(report.problem_count(), 0);
 
     let mut shard_names: Vec<String> = fs::read_dir(&shards_dir)
         .unwrap()
@@ -121,14 +121,15 @@ fn aggregate_malformed_json_line_counts_shard_error() {
     fs::write(&bad, "{\"id\":\"ok\"}\nnot-json\n").unwrap();
     let shards_dir = tmp.path().join("agg_shards");
 
-    let (agg, built, errors) = RedditETL::new()
+    let (agg, report) = RedditETL::new()
         .progress(false)
-        .aggregate_jsonls_parallel_collect::<RecCount>(vec![bad], &shards_dir)
+        .aggregate_jsonls_parallel_collect::<RecCount>(vec![bad.clone()], &shards_dir)
         .unwrap();
 
     assert_eq!(agg.count, 0, "malformed shard should be dropped");
-    assert_eq!(built, 0);
-    assert_eq!(errors, 1);
+    assert_eq!(report.merged_shards, 0);
+    assert_eq!(report.fatal_count(), 1);
+    assert_eq!(report.fatal_inputs[0].input, bad);
     let shard_count = fs::read_dir(&shards_dir)
         .unwrap()
         .filter(|entry| {
@@ -144,7 +145,7 @@ fn aggregate_malformed_json_line_counts_shard_error() {
 }
 
 #[test]
-fn aggregate_clears_stale_shards_between_runs() {
+fn aggregate_ignores_stale_shards_between_runs() {
     let tmp = tempfile::tempdir().unwrap();
     let a = tmp.path().join("a.jsonl");
     let b = tmp.path().join("b.jsonl");
@@ -152,15 +153,15 @@ fn aggregate_clears_stale_shards_between_runs() {
     fs::write(&b, "{\"id\":\"b\"}\n").unwrap();
     let shards_dir = tmp.path().join("agg_shards");
 
-    let (first, built, errors) = RedditETL::new()
+    let (first, report) = RedditETL::new()
         .progress(false)
         .aggregate_jsonls_parallel_collect::<RecCount>(vec![a.clone(), b], &shards_dir)
         .unwrap();
     assert_eq!(first.count, 2);
-    assert_eq!(built, 2);
-    assert_eq!(errors, 0);
+    assert_eq!(report.merged_shards, 2);
+    assert_eq!(report.problem_count(), 0);
 
-    let (second, built, errors) = RedditETL::new()
+    let (second, report) = RedditETL::new()
         .progress(false)
         .aggregate_jsonls_parallel_collect::<RecCount>(vec![a], &shards_dir)
         .unwrap();
@@ -168,8 +169,63 @@ fn aggregate_clears_stale_shards_between_runs() {
         second.count, 1,
         "stale shard from first run leaked into second"
     );
-    assert_eq!(built, 1);
-    assert_eq!(errors, 0);
+    assert_eq!(report.merged_shards, 1);
+    assert_eq!(report.problem_count(), 0);
+}
+
+#[test]
+fn aggregate_partial_read_is_reported_and_skipped_by_default() {
+    let tmp = tempfile::tempdir().unwrap();
+    let partial = tmp.path().join("partial.jsonl");
+    fs::write(&partial, b"{\"id\":\"ok\"}\n{\"id\":\"").unwrap();
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&partial)
+        .unwrap()
+        .write_all(&[0xff, b'\n'])
+        .unwrap();
+    let shards_dir = tmp.path().join("agg_shards");
+
+    let (agg, report) = RedditETL::new()
+        .progress(false)
+        .aggregate_jsonls_parallel_collect::<RecCount>(vec![partial.clone()], &shards_dir)
+        .unwrap();
+
+    assert_eq!(agg.count, 0, "strict partial-read policy drops the input");
+    assert_eq!(report.merged_shards, 0);
+    assert_eq!(report.partial_count(), 1);
+    assert_eq!(report.partial_inputs[0].input, partial);
+}
+
+#[test]
+fn aggregate_partial_read_can_be_merged_by_explicit_policy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let partial = tmp.path().join("partial.jsonl");
+    fs::write(&partial, b"{\"id\":\"ok\"}\n{\"id\":\"").unwrap();
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&partial)
+        .unwrap()
+        .write_all(&[0xff, b'\n'])
+        .unwrap();
+
+    let (agg, report) = RedditETL::new()
+        .progress(false)
+        .aggregate_jsonls_parallel_collect_with_policy::<RecCount, _>(
+            vec![partial.clone()],
+            &tmp.path().join("agg_shards"),
+            RecCount::default,
+            AggregatePartialReadPolicy::MergePartial,
+        )
+        .unwrap();
+
+    assert_eq!(
+        agg.count, 1,
+        "explicit tolerant policy merges records read before the error"
+    );
+    assert_eq!(report.merged_shards, 1);
+    assert_eq!(report.partial_count(), 1);
+    assert_eq!(report.partial_inputs[0].input, partial);
 }
 
 #[test]
@@ -178,7 +234,7 @@ fn aggregate_honors_parallelism_one() {
     let input = tmp.path().join("input.jsonl");
     fs::write(&input, "{\"id\":\"a\"}\n{\"id\":\"b\"}\n").unwrap();
 
-    let (agg, built, errors) = RedditETL::new()
+    let (agg, report) = RedditETL::new()
         .progress(false)
         .parallelism(1)
         .aggregate_jsonls_parallel_collect::<ThreadCountAgg>(
@@ -187,7 +243,7 @@ fn aggregate_honors_parallelism_one() {
         )
         .unwrap();
 
-    assert_eq!(built, 1);
-    assert_eq!(errors, 0);
+    assert_eq!(report.merged_shards, 1);
+    assert_eq!(report.problem_count(), 0);
     assert_eq!(agg.max_threads, 1);
 }

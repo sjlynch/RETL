@@ -19,12 +19,14 @@
 //!      `file_concurrency` (default `1` to bound peak RAM on giant zstd
 //!      windows), `inflight_bytes` (default 256 MiB; cap on producer→consumer
 //!      backpressure), `inflight_groups` (bucketing channel depth),
-//!      `adaptive_mem` thresholds, `resume`, IO buffer sizes, `zst_level`.
+//!      `adaptive_mem` thresholds, `resume`, `allow_partial`, IO buffer
+//!      sizes, `zst_level`.
 //!    - [`YearMonth`] / `iter_year_months` — inclusive month range cursors.
 //!    - [`ScanPlan`] / [`QuerySpec`] — the query builder returned by
 //!      [`RedditETL::scan`], plus subreddit / author / regex / keyword / domain
-//!      / score filters. `ScanPlan::build` returns [`QueryBuildError`] for
-//!      contradictory or malformed query settings. `QuerySpec` exposes
+//!      / score / JSON-pointer predicate filters. `ScanPlan::build` returns
+//!      [`QueryBuildError`] for contradictory or malformed query settings.
+//!      `QuerySpec` exposes
 //!      `requires_full_parse()` to choose between the [`MinimalRecord`] fast-path
 //!      and a full `serde_json::Value` parse.
 //!
@@ -44,7 +46,8 @@
 //!    - [`for_each_line_cfg`] / [`quick_validate_zst`] / [`validate_zst_full`]
 //!      — zstd readers configured with `window_log_max(31)` so frames written
 //!      at the spec's max window size decode without "Frame requires too much
-//!      memory."
+//!      memory." Corpus scans are strict by default; opt into
+//!      `allow_partial` only when lossy skipped-file reporting is acceptable.
 //!
 //! 4. **Emit**
 //!    - [`stream_job`](crate::streaming::stream_job) drives the per-file
@@ -70,25 +73,31 @@
 //!      parents-pipeline.
 //!
 //! 6. **Publish atomically**
-//!    - Every output is written to `<dir>/_staging/<file>.inprogress`, then
+//!    - Every output is written to a unique
+//!      `<dir>/_staging/<file>.retl-<pid>-<nonce>.inprogress`, then
 //!      promoted to its final path via
 //!      [`replace_file_atomic_backoff`]. Library code never writes to a final
 //!      path directly. See [`crate::atomic_write`] for the staging contract.
 //!    - The optional resume manifest at `<out_dir>/_progress.json` (see
 //!      [`progress_manifest`](crate::progress_manifest)) records each
-//!      committed month so a crashed run can skip what already landed.
+//!      committed month so a crashed run can skip what already landed; months
+//!      skipped by `allow_partial` are intentionally left uncommitted.
 //!
 //! 7. **Verify**
 //!    - [`IntegrityMode::Quick`] / [`IntegrityMode::Full`] +
-//!      `RedditETL::check_corpus_integrity` validate `.zst` files.
+//!      `RedditETL::check_corpus_integrity` validate `.zst` files and return a
+//!      materialized failure list.
+//!    - [`RedditETL::check_corpus_integrity_with_failure_sink`] streams each
+//!      failure to a caller-provided callback during long runs.
 //!    - [`quick_validate_zst`] / [`validate_zst_full`] are the underlying
 //!      decoders, also re-exported for direct use.
 //!
 //! ## Cross-cutting helpers
 //!
-//! - [`open_with_backoff`] / [`create_with_backoff`] / [`remove_with_backoff`]
-//!   / [`replace_file_atomic_backoff`] — Windows-friendly retry/backoff over
-//!   transient sharing/AV errors.
+//! - [`open_with_backoff`] / [`create_with_backoff`] /
+//!   [`create_dir_all_with_backoff`] / [`read_dir_with_backoff`] /
+//!   [`remove_with_backoff`] / [`replace_file_atomic_backoff`] —
+//!   Windows-friendly retry/backoff over transient sharing/AV errors.
 //! - [`with_thread_pool`] — scoped Rayon pool (preferred over
 //!   `build_global`).
 //! - [`init_tracing_for_binary`] — *binary-only* tracing init; library code
@@ -139,14 +148,18 @@ mod json_whitelist;
 mod key_extractor;
 mod ndjson;
 
-pub use crate::config::{ConfigBuildError, ETLOptions, Sources};
+pub use crate::config::{
+    ConfigBuildError, ETLOptions, PartialReadReport, PartialReadReporter, SkippedFile, Sources,
+};
 pub use crate::date::YearMonth;
 pub use crate::pipeline::{RedditETL, ScanPlan};
 pub use crate::pipeline_exec::{DedupeKeySummary, ExportFormat};
-pub use crate::query::{QueryBuildError, QuerySpec};
+pub use crate::query::{JsonPointerPredicate, NumericComparison, QueryBuildError, QuerySpec};
 pub use crate::shard::UsernameStream;
 
-pub use crate::aggregate::Aggregator;
+pub use crate::aggregate::{
+    AggregateBuildReport, AggregateInputIssue, AggregatePartialReadPolicy, Aggregator,
+};
 pub use crate::parents::{ParentAttachStats, ParentIds, ParentMaps};
 
 #[doc(hidden)]
@@ -177,7 +190,8 @@ pub use crate::partition::PartitionWriters;
 
 //export robust file ops from util so binaries can import from crate root.
 pub use crate::util::{
-    create_with_backoff, open_with_backoff, remove_with_backoff, replace_file_atomic_backoff,
+    create_dir_all_with_backoff, create_new_with_backoff, create_with_backoff, open_with_backoff,
+    read_dir_with_backoff, remove_with_backoff, replace_file_atomic_backoff,
 };
 
 // Scoped rayon pool + opt-in tracing init for binaries.
@@ -232,6 +246,8 @@ pub use crate::zstd_jsonl::{parse_minimal, MinimalRecord};
 #[doc(hidden)]
 pub use crate::filters::matches_minimal;
 #[doc(hidden)]
-pub use crate::streaming::{apply_human_timestamps, rewrite_human_timestamps_bytes};
+pub use crate::streaming::{
+    apply_human_timestamps, project_whitelist_line_for_tests, rewrite_human_timestamps_bytes,
+};
 #[doc(hidden)]
 pub use crate::zstd_jsonl::for_each_line_cfg;

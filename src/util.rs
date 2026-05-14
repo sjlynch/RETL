@@ -45,7 +45,6 @@ pub fn default_bot_authors() -> Vec<String> {
 /// - ETL_EXCLUDE_AUTHORS_FILE: path to newline-separated file of names
 /// All entries are normalized (lowercase), then the list is sort+dedup.
 pub fn merge_extra_exclusions(target: &mut Vec<String>) {
-    use std::fs::File;
     use std::io::{BufRead, BufReader};
 
     if let Ok(s) = std::env::var("ETL_EXCLUDE_AUTHORS") {
@@ -59,7 +58,7 @@ pub fn merge_extra_exclusions(target: &mut Vec<String>) {
 
     if let Ok(path) = std::env::var("ETL_EXCLUDE_AUTHORS_FILE") {
         if !path.trim().is_empty() {
-            if let Ok(f) = File::open(&path) {
+            if let Ok(f) = open_with_backoff(std::path::Path::new(&path), 16, 50) {
                 let r = BufReader::new(f);
                 for line in r.lines().flatten() {
                     let n = normalize_str(&line);
@@ -193,14 +192,186 @@ where
     Err(last_err.unwrap_or_else(|| io::Error::new(io::ErrorKind::Other, "with_backoff: retries exhausted")))
 }
 
-/// Open a file with retries/backoff for transient errors.
-pub fn open_with_backoff(path: &Path, tries: usize, delay_ms: u64) -> io::Result<File> {
-    with_backoff(tries, delay_ms, || File::open(path))
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TestIoOp {
+    Open,
+    Create,
+    CreateDir,
+    CreateDirAll,
+    ReadDir,
 }
 
-/// Create a file with retries/backoff for transient errors.
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TestIoPathMatch {
+    Exact(PathBuf),
+    FileName(String),
+}
+
+#[cfg(test)]
+impl TestIoPathMatch {
+    fn matches(&self, path: &Path) -> bool {
+        match self {
+            Self::Exact(expected) => expected == path,
+            Self::FileName(expected) => path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name == expected),
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+struct TestIoFailure {
+    op: TestIoOp,
+    path_match: TestIoPathMatch,
+    remaining: usize,
+    raw_os_error: i32,
+}
+
+#[cfg(test)]
+static TEST_IO_FAILURES: std::sync::Mutex<Vec<TestIoFailure>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(crate) struct TestIoFailureGuard {
+    op: TestIoOp,
+    path_match: TestIoPathMatch,
+}
+
+#[cfg(test)]
+impl Drop for TestIoFailureGuard {
+    fn drop(&mut self) {
+        let mut failures = TEST_IO_FAILURES
+            .lock()
+            .expect("test I/O failure mutex poisoned");
+        failures.retain(|f| !(f.op == self.op && f.path_match == self.path_match));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn inject_retriable_io_errors_for_tests(
+    op: TestIoOp,
+    path: impl Into<PathBuf>,
+    failures: usize,
+) -> TestIoFailureGuard {
+    inject_retriable_io_errors_for_match_tests(op, TestIoPathMatch::Exact(path.into()), failures)
+}
+
+#[cfg(test)]
+pub(crate) fn inject_retriable_io_errors_for_file_name_tests(
+    op: TestIoOp,
+    file_name: impl Into<String>,
+    failures: usize,
+) -> TestIoFailureGuard {
+    inject_retriable_io_errors_for_match_tests(
+        op,
+        TestIoPathMatch::FileName(file_name.into()),
+        failures,
+    )
+}
+
+#[cfg(test)]
+fn inject_retriable_io_errors_for_match_tests(
+    op: TestIoOp,
+    path_match: TestIoPathMatch,
+    failures: usize,
+) -> TestIoFailureGuard {
+    let guard = TestIoFailureGuard {
+        op,
+        path_match: path_match.clone(),
+    };
+    TEST_IO_FAILURES
+        .lock()
+        .expect("test I/O failure mutex poisoned")
+        .push(TestIoFailure {
+            op,
+            path_match,
+            remaining: failures,
+            raw_os_error: WIN_ERR_SHARING_VIOLATION,
+        });
+    guard
+}
+
+#[cfg(test)]
+fn maybe_inject_retriable_io_error_for_tests(op: TestIoOp, path: &Path) -> io::Result<()> {
+    let mut failures = TEST_IO_FAILURES
+        .lock()
+        .expect("test I/O failure mutex poisoned");
+    if let Some(failure) = failures.iter_mut().find(|failure| {
+        failure.op == op && failure.remaining > 0 && failure.path_match.matches(path)
+    }) {
+        failure.remaining -= 1;
+        return Err(io::Error::from_raw_os_error(failure.raw_os_error));
+    }
+    Ok(())
+}
+
+/// Open a file with retries/backoff for transient errors.
+pub fn open_with_backoff(path: &Path, tries: usize, delay_ms: u64) -> io::Result<File> {
+    with_backoff(tries, delay_ms, || {
+        #[cfg(test)]
+        maybe_inject_retriable_io_error_for_tests(TestIoOp::Open, path)?;
+        File::open(path)
+    })
+}
+
+/// Create or truncate a file with retries/backoff for transient errors.
 pub fn create_with_backoff(path: &Path, tries: usize, delay_ms: u64) -> io::Result<File> {
-    with_backoff(tries, delay_ms, || File::create(path))
+    with_backoff(tries, delay_ms, || {
+        #[cfg(test)]
+        maybe_inject_retriable_io_error_for_tests(TestIoOp::Create, path)?;
+        File::create(path)
+    })
+}
+
+/// Create a single directory with retries/backoff for transient errors.
+pub(crate) fn create_dir_with_backoff(path: &Path, tries: usize, delay_ms: u64) -> io::Result<()> {
+    with_backoff(tries, delay_ms, || {
+        #[cfg(test)]
+        maybe_inject_retriable_io_error_for_tests(TestIoOp::CreateDir, path)?;
+        fs::create_dir(path)
+    })
+}
+
+/// Recursively create directories with retries/backoff for transient errors.
+pub fn create_dir_all_with_backoff(path: &Path, tries: usize, delay_ms: u64) -> io::Result<()> {
+    with_backoff(tries, delay_ms, || {
+        #[cfg(test)]
+        maybe_inject_retriable_io_error_for_tests(TestIoOp::CreateDirAll, path)?;
+        fs::create_dir_all(path)
+    })
+}
+
+/// Read a directory with retries/backoff for transient errors.
+///
+/// Entries are collected inside the retry loop so transient errors produced
+/// while iterating the `ReadDir` also retry the whole enumeration.
+pub fn read_dir_with_backoff(
+    path: &Path,
+    tries: usize,
+    delay_ms: u64,
+) -> io::Result<Vec<fs::DirEntry>> {
+    with_backoff(tries, delay_ms, || {
+        #[cfg(test)]
+        maybe_inject_retriable_io_error_for_tests(TestIoOp::ReadDir, path)?;
+        fs::read_dir(path)?.collect()
+    })
+}
+
+/// Create a brand-new file with retries/backoff for transient errors.
+///
+/// Unlike [`create_with_backoff`], this uses `create_new(true)` so an
+/// unexpected path collision returns `AlreadyExists` instead of truncating an
+/// existing staged file.
+pub fn create_new_with_backoff(path: &Path, tries: usize, delay_ms: u64) -> io::Result<File> {
+    with_backoff(tries, delay_ms, || {
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+    })
 }
 
 /// Remove a file with retries/backoff for transient errors.
@@ -277,5 +448,40 @@ pub fn replace_file_atomic_backoff(tmp: &Path, dest: &Path) -> Result<()> {
             remove_with_backoff(tmp, tries, delay_ms)?;
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn create_dir_all_with_backoff_retries_transient_errors() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("nested").join("leaf");
+        let _guard = inject_retriable_io_errors_for_tests(TestIoOp::CreateDirAll, &dir, 2);
+
+        create_dir_all_with_backoff(&dir, 3, 0).expect("create dir with retry");
+
+        assert!(
+            dir.is_dir(),
+            "directory should exist after retried create_dir_all"
+        );
+    }
+
+    #[test]
+    fn read_dir_with_backoff_retries_transient_errors() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let file = tmp.path().join("entry.txt");
+        fs::write(&file, b"x").expect("seed file");
+        let _guard = inject_retriable_io_errors_for_tests(TestIoOp::ReadDir, tmp.path(), 1);
+
+        let entries = read_dir_with_backoff(tmp.path(), 2, 0).expect("read_dir with retry");
+        let names: Vec<_> = entries
+            .into_iter()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(names, vec!["entry.txt"]);
     }
 }

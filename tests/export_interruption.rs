@@ -4,9 +4,8 @@
 //! `export_partitioned` writes compressed output through a staging path and
 //! atomically promotes it only after the source month streams successfully. If
 //! decoding aborts mid-stream (truncated tail, checksum failure, etc.), the
-//! destination month must remain absent even though the export wrapper returns
-//! `Ok` after warning/skipping the interrupted source. This keeps final output
-//! directories free of corrupt-by-omission `.zst` files.
+//! default strict export must fail and the destination month must remain absent.
+//! This keeps final output directories free of corrupt-by-omission `.zst` files.
 
 #[path = "common/mod.rs"]
 mod common;
@@ -25,9 +24,9 @@ fn interrupted_export_leaves_no_half_written_zst_at_destination() {
 
     let out_dir = base.join("export_interrupted");
 
-    // Run the export. We expect the call itself to return Ok (the streaming
-    // reader is documented to warn-and-skip), but no `.zst` should land at the
-    // destination because the export of THAT month was interrupted.
+    // Run the export. Strict mode is the default, so the decode error should
+    // bubble out, and no `.zst` should land at the destination because the
+    // export of THAT month was interrupted.
     let res = RedditETL::new()
         .base_dir(&base)
         .sources(Sources::Comments)
@@ -37,11 +36,9 @@ fn interrupted_export_leaves_no_half_written_zst_at_destination() {
         .subreddit("programming")
         .include_pseudo_users()
         .export_partitioned(&out_dir, ExportFormat::Zst);
-    assert!(
-        res.is_ok(),
-        "export_partitioned should not bubble decode errors: {:?}",
-        res.err()
-    );
+    let err = res.expect_err("export_partitioned must fail decode errors by default");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("zstd decode error"), "unexpected error: {msg}");
 
     // ---- The load-bearing assertion ---------------------------------------
     // No `.zst` at the FINAL destination directory tree.

@@ -3,14 +3,15 @@ use crate::atomic_write::{
 };
 use crate::date::YearMonth;
 use crate::filters::ym_from_epoch;
-use crate::json_utils::is_comment_record;
+use crate::json_utils::is_comment_record_for_parent_attach;
 use crate::mem::{available_memory_fraction, is_low_memory};
 use crate::parents_ids::{IdShards, SharedIdsetCache, WorkerShardCache};
 use crate::paths::{discover_all, plan_files_checked, FileJob, FileKind};
 use crate::pipeline::RedditETL;
 use crate::progress::{make_count_progress, make_progress_bar_labeled, total_compressed_size};
 use crate::util::{
-    create_with_backoff, remove_with_backoff, replace_file_atomic_backoff, with_thread_pool,
+    create_dir_all_with_backoff, create_with_backoff, open_with_backoff, read_dir_with_backoff,
+    remove_with_backoff, replace_file_atomic_backoff, with_thread_pool,
 };
 use crate::zstd_jsonl::{
     for_each_line_with_progress_cfg_no_throttle_status, malformed_json_error, parse_minimal,
@@ -20,7 +21,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
-use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -95,6 +95,62 @@ impl ParentAttachDiagnostics {
         self.records_with_parent_id += other.records_with_parent_id;
         self.records_with_link_id += other.records_with_link_id;
         self.comment_shaped_records += other.comment_shaped_records;
+    }
+}
+
+const ATTACH_INITIAL_DIAGNOSTIC_SAMPLE_RECORDS: u64 = 100;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ParentAttachInitialShape {
+    parsed_records: u64,
+    records_with_body: u64,
+    records_with_parent_id: u64,
+    records_with_link_id: u64,
+    records_with_body_and_parent_id: u64,
+    records_with_prefixed_parent_id: u64,
+}
+
+impl ParentAttachInitialShape {
+    fn observe(&mut self, v: &Value) {
+        let has_body = v.get("body").is_some();
+        let parent_id = v.get("parent_id").and_then(|x| x.as_str());
+        let has_parent_id = v.get("parent_id").is_some();
+        let has_link_id = v.get("link_id").is_some();
+
+        self.parsed_records += 1;
+        if has_body {
+            self.records_with_body += 1;
+        }
+        if has_parent_id {
+            self.records_with_parent_id += 1;
+        }
+        if has_link_id {
+            self.records_with_link_id += 1;
+        }
+        if has_body && has_parent_id {
+            self.records_with_body_and_parent_id += 1;
+        }
+        if parent_id
+            .map(|id| id.starts_with("t1_") || id.starts_with("t3_"))
+            .unwrap_or(false)
+        {
+            self.records_with_prefixed_parent_id += 1;
+        }
+    }
+
+    fn no_legacy_comment_shape(self) -> bool {
+        self.parsed_records > 0 && self.records_with_body_and_parent_id == 0
+    }
+
+    fn observed_shape(self) -> &'static str {
+        match (self.records_with_parent_id > 0, self.records_with_body > 0) {
+            (true, false) => "sample records had `parent_id` but no `body`",
+            (false, true) => "sample records had `body` but no `parent_id`",
+            (false, false) => "sample records had neither `body` nor `parent_id`",
+            (true, true) => {
+                "sample records mixed `body` and `parent_id`, but no single record had both"
+            }
+        }
     }
 }
 
@@ -207,6 +263,18 @@ impl ParentIds {
             t3_ids_sharded: Some(t3),
         }
     }
+    /// Return true when neither the comment (`t1_`) nor submission (`t3_`)
+    /// parent-id backing contains any IDs.
+    pub fn is_empty(&self) -> bool {
+        fn backing_empty(mem: Option<&AHashSet<String>>, sharded: Option<&IdShards>) -> bool {
+            mem.map_or(true, |ids| ids.is_empty())
+                && sharded.map_or(true, |shards| shards.total_ids == 0)
+        }
+
+        backing_empty(self.t1_ids_mem.as_ref(), self.t1_ids_sharded.as_ref())
+            && backing_empty(self.t3_ids_mem.as_ref(), self.t3_ids_sharded.as_ref())
+    }
+
     #[inline]
     pub fn contains_t1<'a>(
         &self,
@@ -331,7 +399,7 @@ fn build_id_shard_index(
             // sidecar binds this cache shard to the current ParentIds, source
             // corpus file, source kind/month, resolver format, and requested
             // resolver window; stale-but-parseable shards are rebuilt.
-            let valid_json = match File::open(&out) {
+            let valid_json = match open_with_backoff(&out, 16, 50) {
                 Ok(f) => match job.kind {
                     FileKind::Comment => {
                         serde_json::from_reader::<_, HashMap<String, String>>(BufReader::new(f))
@@ -461,13 +529,32 @@ fn build_id_shard_index(
     Ok((comment_shards.into_inner(), submission_shards.into_inner()))
 }
 
-fn attach_inprogress_path(staging_dir: &Path, final_dest: &Path) -> Result<PathBuf> {
+fn attach_inprogress_exists(staging_dir: &Path, final_dest: &Path) -> Result<bool> {
     let file_name = final_dest
         .file_name()
-        .ok_or_else(|| anyhow::anyhow!("final_dest has no file name: {}", final_dest.display()))?;
-    let mut staged = staging_dir.join(file_name);
-    staged.as_mut_os_string().push(INPROGRESS_EXT);
-    Ok(staged)
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "final_dest has no UTF-8 file name: {}",
+                final_dest.display()
+            )
+        })?;
+    if !staging_dir.exists() {
+        return Ok(false);
+    }
+    for entry in fs::read_dir(staging_dir)
+        .with_context(|| format!("read staging dir {}", staging_dir.display()))?
+    {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.starts_with(file_name) && name.ends_with(INPROGRESS_EXT) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn attach_fingerprint_path(final_dest: &Path) -> PathBuf {
@@ -680,7 +767,8 @@ fn fingerprint_empty_id_set(kind: &str) -> ParentIdSetFingerprint {
 }
 
 fn fingerprint_id_shard_file(path: &Path) -> Result<(u64, u64, u64)> {
-    let f = File::open(path).with_context(|| format!("open parent-id shard {}", path.display()))?;
+    let f = open_with_backoff(path, 16, 50)
+        .with_context(|| format!("open parent-id shard {}", path.display()))?;
     let r = BufReader::new(f);
     let mut count = 0u64;
     let mut sum = 0u64;
@@ -815,7 +903,7 @@ fn build_resolver_fingerprint(
 }
 
 fn resolver_fingerprint_matches(sidecar_path: &Path, expected: &ResolverFingerprint) -> bool {
-    match File::open(sidecar_path) {
+    match open_with_backoff(sidecar_path, 16, 50) {
         Ok(f) => match serde_json::from_reader::<_, ResolverFingerprint>(BufReader::new(f)) {
             Ok(actual) if &actual == expected => true,
             Ok(_) => {
@@ -848,7 +936,7 @@ fn write_resolver_fingerprint_atomic(
     let staged = PathBuf::from(staged);
 
     if let Some(parent) = sidecar_path.parent() {
-        fs::create_dir_all(parent)
+        create_dir_all_with_backoff(parent, 16, 50)
             .with_context(|| format!("create resolver sidecar parent {}", parent.display()))?;
     }
 
@@ -883,7 +971,7 @@ fn write_resolver_fingerprint_atomic(
 }
 
 fn attach_fingerprint_matches(sidecar_path: &Path, expected: &AttachFingerprint) -> bool {
-    match File::open(sidecar_path) {
+    match open_with_backoff(sidecar_path, 16, 50) {
         Ok(f) => match serde_json::from_reader::<_, AttachFingerprint>(BufReader::new(f)) {
             Ok(actual) if &actual == expected => true,
             Ok(_) => {
@@ -921,10 +1009,10 @@ fn write_attach_fingerprint_atomic(
     let mut staged = staging_dir.join(file_name);
     staged.as_mut_os_string().push(INPROGRESS_EXT);
 
-    fs::create_dir_all(staging_dir)
+    create_dir_all_with_backoff(staging_dir, 16, 50)
         .with_context(|| format!("create staging dir {}", staging_dir.display()))?;
     if let Some(parent) = sidecar_path.parent() {
-        fs::create_dir_all(parent)
+        create_dir_all_with_backoff(parent, 16, 50)
             .with_context(|| format!("create sidecar parent {}", parent.display()))?;
     }
 
@@ -959,7 +1047,7 @@ fn write_attach_fingerprint_atomic(
 }
 
 fn validate_jsonl_file(path: &Path) -> bool {
-    let Ok(f) = File::open(path) else {
+    let Ok(f) = open_with_backoff(path, 16, 50) else {
         return false;
     };
     let r = BufReader::new(f);
@@ -984,6 +1072,63 @@ fn looks_like_rc_spool_path(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn diagnose_initial_attach_shape(inputs: &[(usize, PathBuf)], read_buf: usize) -> Result<()> {
+    let Some((_, first_input)) = inputs.first() else {
+        return Ok(());
+    };
+
+    let f = open_with_backoff(first_input, 16, 50)
+        .with_context(|| format!("open initial parent attach input {}", first_input.display()))?;
+    let mut r = BufReader::with_capacity(read_buf, f);
+    let mut buf = String::with_capacity(64 * 1024);
+    let mut line_number = 0u64;
+    let mut shape = ParentAttachInitialShape::default();
+
+    while shape.parsed_records < ATTACH_INITIAL_DIAGNOSTIC_SAMPLE_RECORDS {
+        buf.clear();
+        let n = r.read_line(&mut buf).with_context(|| {
+            format!(
+                "read initial parent attach input {} near line {}",
+                first_input.display(),
+                line_number + 1
+            )
+        })?;
+        if n == 0 {
+            break;
+        }
+        line_number += 1;
+        let line = buf.trim_end_matches(|c| c == '\r' || c == '\n');
+        if line.trim().is_empty() {
+            continue;
+        }
+        let v: Value = serde_json::from_str(line).with_context(|| {
+            format!(
+                "malformed JSON in initial parent attach input {} at line {}",
+                first_input.display(),
+                line_number
+            )
+        })?;
+        shape.observe(&v);
+    }
+
+    if shape.no_legacy_comment_shape()
+        && (shape.records_with_parent_id > 0 || looks_like_rc_spool_path(first_input))
+    {
+        let observed_shape = shape.observed_shape();
+        tracing::error!(
+            path = %first_input.display(),
+            sampled_records = shape.parsed_records,
+            records_with_body = shape.records_with_body,
+            records_with_parent_id = shape.records_with_parent_id,
+            records_with_link_id = shape.records_with_link_id,
+            records_with_prefixed_parent_id = shape.records_with_prefixed_parent_id,
+            "parents attach initial sample found no records with both `body` and `parent_id` ({observed_shape}); using relaxed parent_id-based matching for records whose `parent_id` starts with `t1_`/`t3_`; if this spool was produced with --whitelist/.whitelist_fields, include body,parent_id,link_id to retain child comment text and parent-resolution context"
+        );
+    }
+
+    Ok(())
+}
+
 fn warn_if_no_comment_shaped_records(diagnostics: ParentAttachDiagnostics) {
     if diagnostics.files_scanned == 0
         || diagnostics.parsed_records == 0
@@ -1000,7 +1145,7 @@ fn warn_if_no_comment_shaped_records(diagnostics: ParentAttachDiagnostics) {
         records_with_body = diagnostics.records_with_body,
         records_with_parent_id = diagnostics.records_with_parent_id,
         records_with_link_id = diagnostics.records_with_link_id,
-        "parents attach found zero comment-shaped records in the spool; comment records must include `body` and `parent_id`, and parent resolution also requires `link_id`; if the spool was produced with --whitelist/.whitelist_fields, include body,parent_id,link_id or the output will be a no-op copy"
+        "parents attach found zero records with a usable `parent_id`; comment records must include a `parent_id` starting with `t1_` or `t3_`, and parent resolution also benefits from `link_id`; if the spool was produced with --whitelist/.whitelist_fields, include parent_id,link_id (and body if you need the child comment text) or the output will be a no-op copy"
     );
 }
 
@@ -1049,8 +1194,18 @@ impl RedditETL {
         with_thread_pool(self.opts.parallelism, || {
             let comments_out = cache_dir.join("comments");
             let submissions_out = cache_dir.join("submissions");
-            fs::create_dir_all(&comments_out)?;
-            fs::create_dir_all(&submissions_out)?;
+            create_dir_all_with_backoff(&comments_out, 16, 50).with_context(|| {
+                format!(
+                    "create comments parent cache dir {}",
+                    comments_out.display()
+                )
+            })?;
+            create_dir_all_with_backoff(&submissions_out, 16, 50).with_context(|| {
+                format!(
+                    "create submissions parent cache dir {}",
+                    submissions_out.display()
+                )
+            })?;
 
             let discovered = discover_all(&self.opts.comments_dir, &self.opts.submissions_dir);
             let files = plan_files_checked(
@@ -1111,10 +1266,14 @@ impl RedditETL {
 
             if eager_ok {
                 let load = |dir: &Path| -> Vec<PathBuf> {
-                    let mut v: Vec<PathBuf> = fs::read_dir(dir)
+                    let mut v: Vec<PathBuf> = read_dir_with_backoff(dir, 16, 50)
+                        .map_err(|e| {
+                            tracing::warn!(dir=%dir.display(), error=%e, "failed to eager-list parent cache shards");
+                            e
+                        })
                         .ok()
                         .into_iter()
-                        .flat_map(|it| it.filter_map(|e| e.ok().map(|e| e.path())))
+                        .flat_map(|entries| entries.into_iter().map(|e| e.path()))
                         .filter(|p| {
                             p.file_name()
                                 .and_then(|name| name.to_str())
@@ -1131,7 +1290,7 @@ impl RedditETL {
                 };
 
                 for p in load(&comments_out) {
-                    let f = File::open(&p)?;
+                    let f = open_with_backoff(&p, 16, 50)?;
                     let r = BufReader::new(f);
                     let m: HashMap<String, String> = serde_json::from_reader(r)?;
                     for (k, v) in m {
@@ -1142,7 +1301,7 @@ impl RedditETL {
                     }
                 }
                 for p in load(&submissions_out) {
-                    let f = File::open(&p)?;
+                    let f = open_with_backoff(&p, 16, 50)?;
                     let r = BufReader::new(f);
                     let m: HashMap<String, (String, String)> = serde_json::from_reader(r)?;
                     for (k, v) in m {
@@ -1183,7 +1342,9 @@ impl RedditETL {
         resume: bool,
     ) -> Result<(Vec<PathBuf>, ParentAttachStats)> {
         with_thread_pool(self.opts.parallelism, || {
-            fs::create_dir_all(out_dir)?;
+            create_dir_all_with_backoff(out_dir, 16, 50).with_context(|| {
+                format!("create parent attach output dir {}", out_dir.display())
+            })?;
             let staging_dir = ensure_staging_dir(out_dir)?;
             sweep_stale_inprogress(out_dir, true)?;
 
@@ -1207,6 +1368,7 @@ impl RedditETL {
             let resolution_range = attach_resolution_range(self.opts.start, self.opts.end);
 
             let indexed_inputs: Vec<(usize, PathBuf)> = inputs.into_iter().enumerate().collect();
+            diagnose_initial_attach_shape(&indexed_inputs, self.opts.read_buffer_bytes)?;
             let attached = std::sync::Mutex::new(vec![None; indexed_inputs.len()]);
 
             crate::concurrency::for_each_file_limited(
@@ -1215,7 +1377,7 @@ impl RedditETL {
                 |(idx, in_path)| -> Result<()> {
                     let name = in_path.file_name().unwrap().to_string_lossy().to_string();
                     let out_path = out_dir.join(name);
-                    let inprogress_path = attach_inprogress_path(&staging_dir, &out_path)?;
+                    let inprogress_exists = attach_inprogress_exists(&staging_dir, &out_path)?;
                     let sidecar_path = attach_fingerprint_path(&out_path);
                     let fingerprint = build_attach_fingerprint(
                         in_path,
@@ -1223,7 +1385,7 @@ impl RedditETL {
                         &resolution_range,
                     );
 
-                    if resume && out_path.exists() && !inprogress_path.exists() {
+                    if resume && out_path.exists() && !inprogress_exists {
                         if attach_fingerprint_matches(&sidecar_path, &fingerprint) {
                             if validate_jsonl_file(&out_path) {
                                 if let Some(pb) = &pb {
@@ -1261,7 +1423,7 @@ impl RedditETL {
                                 files_scanned: 1,
                                 ..Default::default()
                             };
-                            let f = File::open(in_path)?;
+                            let f = open_with_backoff(in_path, 16, 50)?;
                             let r = BufReader::new(f);
 
                             for (line_idx, line) in r.lines().enumerate() {
@@ -1302,7 +1464,7 @@ impl RedditETL {
                                     diagnostics.records_with_link_id += 1;
                                 }
 
-                                let is_comment = is_comment_record(&v);
+                                let is_comment = is_comment_record_for_parent_attach(&v);
                                 if is_comment {
                                     diagnostics.comment_shaped_records += 1;
                                     // Own-month is derived from the consuming record's
