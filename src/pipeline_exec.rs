@@ -19,14 +19,15 @@ use crate::query::QuerySpec;
 use crate::shard::{ShardedWriter, UsernameStream};
 use crate::stitch::{concat_tsvs, stitch_tmp_parts, stitch_tmp_parts_to_json_array};
 use crate::streaming::{
-    process_file_for_usernames_with_skip, stream_job, StreamJobResult, WhitelistMatchTracker,
+    process_file_for_usernames_with_skip, stream_job_with_partial_policy, StreamJobResult,
+    WhitelistMatchTracker,
 };
 use crate::util::{
     create_with_backoff, remove_dir_all_with_backoff, remove_with_backoff, with_thread_pool,
 };
 use crate::zstd_jsonl::{
-    for_each_line_cfg, for_each_line_with_progress_cfg, malformed_json_error, parse_minimal,
-    MinimalRecord,
+    for_each_line_with_opts_status, malformed_json_error, parse_minimal, LineStreamOpts,
+    MinimalRecord, PartialReadPolicy,
 };
 use anyhow::{anyhow, Context, Result};
 use indicatif::ProgressBar;
@@ -176,6 +177,8 @@ impl RedditETL {
                             &subreddit,
                             &shard_writer,
                             pb.clone(),
+                            self.opts.allow_partial,
+                            Some(&self.opts.partial_read_reporter),
                             move |_path, _err| {
                                 skip_count_per_call.fetch_add(1, Ordering::Relaxed);
                             },
@@ -490,6 +493,8 @@ impl ScanPlan {
                         whitelist_tracker: whitelist_tracker.as_deref(),
                         resume,
                         completed_keys: &completed_keys,
+                        allow_partial: plan.etl.opts.allow_partial,
+                        partial_reporter: Some(&plan.etl.opts.partial_read_reporter),
                     };
                     let outcome = process_month(job, &ctx)?;
 
@@ -634,6 +639,32 @@ impl ScanPlan {
             let staging_dir = ensure_staging_dir(out_base_dir)?;
             sweep_stale_inprogress(out_base_dir, true)?;
 
+            let resume = plan.etl.opts.resume;
+            let resume_fingerprint = build_resume_fingerprint(
+                &plan.etl,
+                &plan.query,
+                partitioned_resume_operation(format),
+            )?;
+            let (initial_months, completed_keys) = if resume {
+                load_and_validate_partitioned_manifest(out_base_dir, &resume_fingerprint, format)?
+            } else {
+                (HashMap::new(), HashSet::new())
+            };
+            let accumulator = if resume {
+                crate::progress_manifest::save(
+                    out_base_dir,
+                    &initial_months,
+                    Some(&resume_fingerprint),
+                )?;
+                Some(ManifestAccumulator::new(
+                    out_base_dir,
+                    initial_months,
+                    Some(resume_fingerprint.clone()),
+                ))
+            } else {
+                None
+            };
+
             let whitelist = plan.etl.opts.whitelist_fields.clone();
             let whitelist_tracker = whitelist
                 .as_ref()
@@ -658,20 +689,21 @@ impl ScanPlan {
                 &files,
                 plan.etl.opts.file_concurrency,
                 |job| -> Result<()> {
-                    let (prefix, out_dir) = match job.kind {
-                        FileKind::Comment => ("RC", &comments_dir),
-                        FileKind::Submission => ("RS", &submissions_dir),
-                    };
-                    let file_name = match format {
-                        ExportFormat::Jsonl => format!("{}_{}.jsonl", prefix, job.ym),
-                        ExportFormat::Zst => format!("{}_{}.zst", prefix, job.ym),
-                    };
-                    let out_path = out_dir.join(file_name);
+                    let key = export_part_key(job);
+                    let out_path = partitioned_output_path(out_base_dir, job, format);
+
+                    if resume && completed_keys.contains(&key) {
+                        if let Some(pb) = &pb {
+                            let sz = fs::metadata(&job.path).map(|m| m.len()).unwrap_or(0);
+                            pb.inc(sz);
+                        }
+                        return Ok(());
+                    }
 
                     let written_result = match format {
                         ExportFormat::Jsonl => {
                             write_jsonl_atomic(&staging_dir, &out_path, write_buf, |w| {
-                                let result = stream_job(
+                                let result = stream_job_with_partial_policy(
                                     job,
                                     w,
                                     targets_ref,
@@ -682,13 +714,15 @@ impl ScanPlan {
                                     read_buf,
                                     human_ts,
                                     whitelist_tracker.as_deref(),
+                                    plan.etl.opts.allow_partial,
+                                    Some(&plan.etl.opts.partial_read_reporter),
                                 )?;
                                 complete_stream_job(job, result)
                             })
                         }
                         ExportFormat::Zst => {
                             write_zst_atomic(&staging_dir, &out_path, zst_level, write_buf, |w| {
-                                let result = stream_job(
+                                let result = stream_job_with_partial_policy(
                                     job,
                                     w,
                                     targets_ref,
@@ -699,6 +733,8 @@ impl ScanPlan {
                                     read_buf,
                                     human_ts,
                                     whitelist_tracker.as_deref(),
+                                    plan.etl.opts.allow_partial,
+                                    Some(&plan.etl.opts.partial_read_reporter),
                                 )?;
                                 complete_stream_job(job, result)
                             })
@@ -707,7 +743,7 @@ impl ScanPlan {
 
                     let written = match written_result {
                         Ok(n) => n,
-                        Err(e) if is_partial_scan_error(&e) => {
+                        Err(e) if plan.etl.opts.allow_partial && is_partial_scan_error(&e) => {
                             tracing::warn!(path=%job.path.display(), error=%e, "Skipping partitioned export month after zstd decode error; staged output was discarded");
                             return Ok(());
                         }
@@ -715,7 +751,26 @@ impl ScanPlan {
                     };
 
                     if written == 0 {
-                        let _ = fs::remove_file(&out_path);
+                        if out_path.exists() {
+                            let _ = remove_with_backoff(&out_path, 8, 50);
+                        }
+                    }
+                    if let Some(acc) = &accumulator {
+                        let size = if written == 0 {
+                            0
+                        } else {
+                            fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0)
+                        };
+                        if let Err(e) = acc.commit(
+                            key,
+                            MonthEntry {
+                                size,
+                                lines: written,
+                                sha256: None,
+                            },
+                        ) {
+                            tracing::warn!(error=%e, "failed to update partitioned export progress manifest; continuing");
+                        }
                     }
                     Ok(())
                 },
@@ -854,6 +909,7 @@ fn extract_scratch_dir(
 /// resumable extract/spool operation. If it changes between `--resume` runs,
 /// stale month parts are discarded instead of being stitched into the new run.
 fn build_resume_fingerprint(etl: &RedditETL, query: &QuerySpec, operation: &str) -> Result<String> {
+    let zst_level = (operation == "partitioned-zst").then_some(etl.opts.zst_level);
     let input = serde_json::json!({
         "operation": operation,
         "corpus_paths": {
@@ -868,6 +924,7 @@ fn build_resume_fingerprint(etl: &RedditETL, query: &QuerySpec, operation: &str)
         "whitelist_fields": etl.opts.whitelist_fields.as_ref(),
         "strict_whitelist": etl.opts.strict_whitelist,
         "human_readable_timestamps": etl.opts.human_readable_timestamps,
+        "zst_level": zst_level,
         "query": {
             "subreddits": query.subreddits.as_ref(),
             "authors_in": query.authors_in.as_ref(),
@@ -935,6 +992,8 @@ struct MonthJobCtx<'a> {
     whitelist_tracker: Option<&'a WhitelistMatchTracker>,
     resume: bool,
     completed_keys: &'a HashSet<String>,
+    allow_partial: bool,
+    partial_reporter: Option<&'a crate::config::PartialReadReporter>,
 }
 
 /// Load `_progress.json`, validate it against the current fingerprint and each
@@ -1001,7 +1060,7 @@ fn process_month(job: &FileJob, ctx: &MonthJobCtx<'_>) -> Result<Option<MonthRes
     }
 
     let n = match write_jsonl_atomic(ctx.staging_dir, &out_path, ctx.write_buf, |w| {
-        let result = stream_job(
+        let result = stream_job_with_partial_policy(
             job,
             w,
             ctx.targets,
@@ -1012,11 +1071,13 @@ fn process_month(job: &FileJob, ctx: &MonthJobCtx<'_>) -> Result<Option<MonthRes
             ctx.read_buf,
             ctx.human_ts,
             ctx.whitelist_tracker,
+            ctx.allow_partial,
+            ctx.partial_reporter,
         )?;
         complete_stream_job(job, result)
     }) {
         Ok(n) => n,
-        Err(e) if is_partial_scan_error(&e) => {
+        Err(e) if ctx.allow_partial && is_partial_scan_error(&e) => {
             tracing::warn!(path=%job.path.display(), output=%out_path.display(), error=%e, "Skipping month after zstd decode error; staged spool output was discarded and resume will retry it");
             return Ok(None);
         }
@@ -1051,6 +1112,134 @@ fn export_part_key(job: &FileJob) -> String {
         FileKind::Submission => "RS",
     };
     crate::progress_manifest::month_key(prefix, job.ym)
+}
+
+fn partitioned_resume_operation(format: ExportFormat) -> &'static str {
+    match format {
+        ExportFormat::Jsonl => "partitioned-jsonl",
+        ExportFormat::Zst => "partitioned-zst",
+    }
+}
+
+fn partitioned_ext(format: ExportFormat) -> &'static str {
+    match format {
+        ExportFormat::Jsonl => "jsonl",
+        ExportFormat::Zst => "zst",
+    }
+}
+
+fn partitioned_output_path(out_base_dir: &Path, job: &FileJob, format: ExportFormat) -> PathBuf {
+    let (dir, prefix) = match job.kind {
+        FileKind::Comment => ("comments", "RC"),
+        FileKind::Submission => ("submissions", "RS"),
+    };
+    out_base_dir
+        .join(dir)
+        .join(format!("{}_{}.{}", prefix, job.ym, partitioned_ext(format)))
+}
+
+fn partitioned_output_path_for_key(
+    out_base_dir: &Path,
+    key: &str,
+    format: ExportFormat,
+) -> Option<PathBuf> {
+    let dir = if key.starts_with("RC_") {
+        "comments"
+    } else if key.starts_with("RS_") {
+        "submissions"
+    } else {
+        return None;
+    };
+    Some(
+        out_base_dir
+            .join(dir)
+            .join(format!("{}.{}", key, partitioned_ext(format))),
+    )
+}
+
+fn clear_partitioned_resume_outputs(out_base_dir: &Path, format: ExportFormat) -> Result<()> {
+    let suffix = format!(".{}", partitioned_ext(format));
+    remove_matching_files(&out_base_dir.join("comments"), |name| {
+        name.starts_with("RC_") && name.ends_with(&suffix)
+    })?;
+    remove_matching_files(&out_base_dir.join("submissions"), |name| {
+        name.starts_with("RS_") && name.ends_with(&suffix)
+    })?;
+    Ok(())
+}
+
+fn validate_partitioned_resume_output(
+    path: &Path,
+    format: ExportFormat,
+    expected: &MonthEntry,
+) -> Result<()> {
+    if expected.lines == 0 && !path.exists() {
+        return Ok(());
+    }
+    let meta = fs::metadata(path)
+        .with_context(|| format!("stat partitioned output {}", path.display()))?;
+    if meta.len() != expected.size {
+        anyhow::bail!(
+            "partitioned output size mismatch for {}: expected {}, got {}",
+            path.display(),
+            expected.size,
+            meta.len()
+        );
+    }
+    match format {
+        ExportFormat::Jsonl => {
+            let actual = validate_jsonl_part(path)?;
+            if actual.lines != expected.lines {
+                anyhow::bail!(
+                    "partitioned JSONL line-count mismatch for {}: expected {}, got {}",
+                    path.display(),
+                    expected.lines,
+                    actual.lines
+                );
+            }
+        }
+        ExportFormat::Zst => {
+            crate::zstd_jsonl::validate_zst_full(path)
+                .with_context(|| format!("validating partitioned zst {}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn load_and_validate_partitioned_manifest(
+    out_base_dir: &Path,
+    fingerprint: &str,
+    format: ExportFormat,
+) -> Result<(HashMap<String, MonthEntry>, HashSet<String>)> {
+    let manifest = crate::progress_manifest::load(out_base_dir);
+    if manifest.fingerprint.as_deref() != Some(fingerprint) && !manifest.months.is_empty() {
+        tracing::warn!(
+            path=%crate::progress_manifest::manifest_path(out_base_dir).display(),
+            stored=?manifest.fingerprint,
+            current=%fingerprint,
+            "partitioned resume manifest fingerprint does not match current query/config; discarding partitioned outputs"
+        );
+        clear_partitioned_resume_outputs(out_base_dir, format)?;
+        return Ok((HashMap::new(), HashSet::new()));
+    }
+
+    let mut keep: HashMap<String, MonthEntry> = HashMap::new();
+    for (key, entry) in manifest.months {
+        let Some(path) = partitioned_output_path_for_key(out_base_dir, &key, format) else {
+            tracing::info!(key=%key, "dropping unrecognized partitioned progress entry");
+            continue;
+        };
+        match validate_partitioned_resume_output(&path, format, &entry) {
+            Ok(()) => {
+                keep.insert(key, entry);
+            }
+            Err(e) => {
+                tracing::info!(key=%key, path=%path.display(), error=%e, "dropping stale partitioned progress entry; month will be re-run");
+            }
+        }
+    }
+    let completed_keys: HashSet<String> = keep.keys().cloned().collect();
+    Ok((keep, completed_keys))
 }
 
 fn export_part_path(tmp_dir: &Path, key: &str) -> PathBuf {
@@ -1226,7 +1415,7 @@ fn extract_common(
                 }
 
                 let lines = match write_jsonl_atomic(&staging_dir, &tmp_file, write_buf, |w| {
-                    let result = stream_job(
+                    let result = stream_job_with_partial_policy(
                         job,
                         w,
                         targets_ref,
@@ -1237,11 +1426,13 @@ fn extract_common(
                         read_buf,
                         human_ts,
                         whitelist_tracker.as_deref(),
+                        etl.opts.allow_partial,
+                        Some(&etl.opts.partial_read_reporter),
                     )?;
                     complete_stream_job(job, result)
                 }) {
                     Ok(lines) => lines,
-                    Err(e) if is_partial_scan_error(&e) => {
+                    Err(e) if etl.opts.allow_partial && is_partial_scan_error(&e) => {
                         tracing::warn!(path=%job.path.display(), part=%tmp_file.display(), error=%e, "Skipping extract month after zstd decode error; staged part was discarded and resume will retry it");
                         return Ok(());
                     }
@@ -1354,11 +1545,30 @@ where
                 on_record(&min, kind, line)?;
                 Ok(())
             };
-            if let Some(pb) = &pb {
-                for_each_line_with_progress_cfg(&job.path, read_buf, |delta| pb.inc(delta), line_cb)
+            let partial_read_policy = if etl.opts.allow_partial {
+                PartialReadPolicy::AllowPartial
             } else {
-                for_each_line_cfg(&job.path, read_buf, line_cb)
-            }
+                PartialReadPolicy::Strict
+            };
+            let mut progress_cb = pb.as_ref().map(|pb| move |delta| pb.inc(delta));
+            let mut skip_cb = |path: &Path, err: &anyhow::Error| {
+                etl.opts.partial_read_reporter.record(path, err);
+            };
+            for_each_line_with_opts_status(
+                &job.path,
+                LineStreamOpts {
+                    read_buf_bytes: Some(read_buf),
+                    progress: progress_cb.as_mut().map(|cb| cb as &mut dyn FnMut(u64)),
+                    on_skip: etl
+                        .opts
+                        .allow_partial
+                        .then_some(&mut skip_cb as &mut dyn FnMut(&Path, &anyhow::Error)),
+                    partial_read_policy,
+                    ..Default::default()
+                },
+                line_cb,
+            )?;
+            Ok(())
         },
     )?;
 

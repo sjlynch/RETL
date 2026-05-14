@@ -7,8 +7,8 @@ use crate::paths::FileJob;
 use crate::query::QuerySpec;
 use crate::shard::ShardedWriter;
 use crate::zstd_jsonl::{
-    for_each_line_cfg_status, for_each_line_cfg_with_skip, for_each_line_with_progress_cfg_status,
-    for_each_line_with_progress_cfg_with_skip, malformed_json_error, parse_minimal,
+    for_each_line_with_opts_status, malformed_json_error, parse_minimal, LineStreamOpts,
+    PartialReadPolicy,
 };
 use anyhow::{anyhow, Result};
 use indicatif::ProgressBar;
@@ -250,6 +250,8 @@ fn write_with_whitelist<W: Write + ?Sized>(
     tokenizer_buf: &mut String,
     human_timestamps: bool,
     written: &mut u64,
+    path: &std::path::Path,
+    line_number: u64,
 ) -> Result<bool> {
     // Preferred path: the streaming tokenizer copies raw value bytes verbatim
     // and never builds a `serde_json::Value`. If it rejects a structurally
@@ -271,7 +273,15 @@ fn write_with_whitelist<W: Write + ?Sized>(
         return Ok(emitted_empty_projection);
     }
 
-    write_via_value(writer, line, Some(fields), human_timestamps, written)
+    write_via_value(
+        writer,
+        line,
+        Some(fields),
+        human_timestamps,
+        written,
+        path,
+        line_number,
+    )
 }
 
 fn write_via_value<W: Write + ?Sized>(
@@ -280,8 +290,11 @@ fn write_via_value<W: Write + ?Sized>(
     whitelist: Option<&[String]>,
     human_timestamps: bool,
     written: &mut u64,
+    path: &std::path::Path,
+    line_number: u64,
 ) -> Result<bool> {
-    let val: Value = serde_json::from_str(line)?;
+    let val: Value =
+        serde_json::from_str(line).map_err(|e| malformed_json_error(path, line_number, e))?;
     let (mut out_val, emitted_empty_projection) = if let Some(fields) = whitelist {
         let mut obj = Map::new();
         if let Some(map) = val.as_object() {
@@ -307,6 +320,31 @@ fn write_via_value<W: Write + ?Sized>(
     Ok(emitted_empty_projection)
 }
 
+#[doc(hidden)]
+pub fn project_whitelist_line_for_tests(
+    line: &str,
+    fields: &[String],
+    path: &std::path::Path,
+    line_number: u64,
+) -> Result<String> {
+    let tokenizer = WhitelistTokenizer::new(fields.iter().map(|s| s.as_str()));
+    let mut tokenizer_buf = String::new();
+    let mut out = Vec::new();
+    let mut written = 0_u64;
+    write_with_whitelist(
+        &mut out,
+        line,
+        fields,
+        &tokenizer,
+        &mut tokenizer_buf,
+        false,
+        &mut written,
+        path,
+        line_number,
+    )?;
+    Ok(String::from_utf8(out)?.trim_end_matches('\n').to_string())
+}
+
 #[derive(Clone, Copy)]
 enum StreamWritePath<'a> {
     Raw,
@@ -326,6 +364,7 @@ pub struct StreamJobResult {
     pub complete: bool,
 }
 
+#[allow(dead_code)]
 pub fn stream_job<W: Write + ?Sized>(
     job: &FileJob,
     writer: &mut W,
@@ -337,6 +376,36 @@ pub fn stream_job<W: Write + ?Sized>(
     read_buf_bytes: usize,
     human_timestamps: bool,
     whitelist_tracker: Option<&WhitelistMatchTracker>,
+) -> Result<StreamJobResult> {
+    stream_job_with_partial_policy(
+        job,
+        writer,
+        targets,
+        query,
+        whitelist,
+        pb,
+        bounds,
+        read_buf_bytes,
+        human_timestamps,
+        whitelist_tracker,
+        false,
+        None,
+    )
+}
+
+pub(crate) fn stream_job_with_partial_policy<W: Write + ?Sized>(
+    job: &FileJob,
+    writer: &mut W,
+    targets: Option<&Vec<String>>,
+    query: &QuerySpec,
+    whitelist: &Option<Vec<String>>,
+    pb: Option<ProgressBar>,
+    bounds: Option<DateBounds>,
+    read_buf_bytes: usize,
+    human_timestamps: bool,
+    whitelist_tracker: Option<&WhitelistMatchTracker>,
+    allow_partial: bool,
+    partial_reporter: Option<&crate::config::PartialReadReporter>,
 ) -> Result<StreamJobResult> {
     let mut written: u64 = 0;
     let mut ts_buf = String::new();
@@ -394,6 +463,8 @@ pub fn stream_job<W: Write + ?Sized>(
                     &mut tok_buf,
                     human_timestamps,
                     &mut written,
+                    &job.path,
+                    line_number,
                 )?;
                 if let Some(tracker) = whitelist_tracker {
                     if let Err(e) = tracker.observe(emitted_empty_projection) {
@@ -405,16 +476,29 @@ pub fn stream_job<W: Write + ?Sized>(
         }
     };
 
-    let complete = if let Some(pb) = pb {
-        for_each_line_with_progress_cfg_status(
-            &job.path,
-            read_buf_bytes,
-            |delta| pb.inc(delta),
-            |s| on_line(s),
-        )?
+    let partial_read_policy = if allow_partial {
+        PartialReadPolicy::AllowPartial
     } else {
-        for_each_line_cfg_status(&job.path, read_buf_bytes, |s| on_line(s))?
+        PartialReadPolicy::Strict
     };
+    let mut progress_cb = pb.map(|pb| move |delta| pb.inc(delta));
+    let mut skip_cb = |path: &std::path::Path, err: &anyhow::Error| {
+        if let Some(reporter) = partial_reporter {
+            reporter.record(path, err);
+        }
+    };
+    let complete = for_each_line_with_opts_status(
+        &job.path,
+        LineStreamOpts {
+            read_buf_bytes: Some(read_buf_bytes),
+            progress: progress_cb.as_mut().map(|cb| cb as &mut dyn FnMut(u64)),
+            on_skip: allow_partial
+                .then_some(&mut skip_cb as &mut dyn FnMut(&std::path::Path, &anyhow::Error)),
+            partial_read_policy,
+            ..Default::default()
+        },
+        |s| on_line(s),
+    )?;
 
     if let Some(e) = whitelist_error {
         return Err(e);
@@ -423,19 +507,18 @@ pub fn stream_job<W: Write + ?Sized>(
     Ok(StreamJobResult { written, complete })
 }
 
-/// Process a single monthly file and shard usernames matching `subreddit`.
-///
-/// On decode error, the file is logged via `warn_decode_skip` and skipped (the
-/// outer `Result` stays `Ok`). The optional `on_skip(path, &error)` callback
-/// fires once per skipped file so callers can count, alert, or fail-fast — it
-/// does not change the swallow-by-default behavior; corrupt files never abort
-/// the job.
+/// Process a single monthly file and optionally tolerate zstd decode errors.
+/// In strict mode (the default policy for corpus scans) decode errors are
+/// returned. In `allow_partial` mode the file is logged, reported through
+/// `on_skip`, and skipped.
 pub fn process_file_for_usernames_with_skip(
     job: &FileJob,
     read_buf_bytes: usize,
     subreddit: &str,
     shard_writer: &ShardedWriter,
     pb: Option<ProgressBar>,
+    allow_partial: bool,
+    partial_reporter: Option<&crate::config::PartialReadReporter>,
     mut on_skip: impl FnMut(&std::path::Path, &anyhow::Error),
 ) -> Result<()> {
     let mut line_number: u64 = 0;
@@ -461,22 +544,30 @@ pub fn process_file_for_usernames_with_skip(
         Ok(())
     };
 
-    if let Some(pb) = pb {
-        for_each_line_with_progress_cfg_with_skip(
-            &job.path,
-            read_buf_bytes,
-            |p, e| on_skip(p, e),
-            |delta| pb.inc(delta),
-            |s| handle_line(s),
-        )?;
+    let partial_read_policy = if allow_partial {
+        PartialReadPolicy::AllowPartial
     } else {
-        for_each_line_cfg_with_skip(
-            &job.path,
-            read_buf_bytes,
-            |p, e| on_skip(p, e),
-            |s| handle_line(s),
-        )?;
-    }
+        PartialReadPolicy::Strict
+    };
+    let mut progress_cb = pb.map(|pb| move |delta| pb.inc(delta));
+    let mut skip_cb = |path: &std::path::Path, err: &anyhow::Error| {
+        if let Some(reporter) = partial_reporter {
+            reporter.record(path, err);
+        }
+        on_skip(path, err);
+    };
+    for_each_line_with_opts_status(
+        &job.path,
+        LineStreamOpts {
+            read_buf_bytes: Some(read_buf_bytes),
+            progress: progress_cb.as_mut().map(|cb| cb as &mut dyn FnMut(u64)),
+            on_skip: allow_partial
+                .then_some(&mut skip_cb as &mut dyn FnMut(&std::path::Path, &anyhow::Error)),
+            partial_read_policy,
+            ..Default::default()
+        },
+        |s| handle_line(s),
+    )?;
     Ok(())
 }
 
@@ -569,6 +660,8 @@ mod tests {
             &mut tokenizer_buf,
             false,
             &mut written,
+            std::path::Path::new("test.jsonl"),
+            1,
         )
         .unwrap();
         assert!(!non_empty, "sanity: first projection contains id");
@@ -586,6 +679,8 @@ mod tests {
             &mut tokenizer_buf,
             false,
             &mut written,
+            std::path::Path::new("test.jsonl"),
+            2,
         )
         .unwrap();
         assert!(
@@ -619,6 +714,8 @@ mod tests {
                 &mut tokenizer_buf,
                 false,
                 &mut written,
+                std::path::Path::new("test.jsonl"),
+                i + 1,
             )
             .unwrap();
             if let Err(e) = tracker.observe(empty) {

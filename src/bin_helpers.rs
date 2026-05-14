@@ -3,7 +3,7 @@
 //! couple of CLI-only path/I/O helpers.
 
 use anyhow::{Context, Result};
-use retl::{Aggregator, ConfigBuildError, RedditETL, Sources, YearMonth};
+use retl::{Aggregator, ConfigBuildError, PartialReadReporter, RedditETL, Sources, YearMonth};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -331,7 +331,8 @@ pub(crate) fn build_etl(common: &CommonOpts) -> Result<RedditETL> {
         .work_dir(&lib_tmp)
         .progress(!common.no_progress)
         .sources(Sources::from(common.source))
-        .date_range(common.start, common.end);
+        .date_range(common.start, common.end)
+        .allow_partial(common.allow_partial);
 
     if let Some(p) = common.parallelism {
         etl = etl.parallelism(p);
@@ -340,6 +341,15 @@ pub(crate) fn build_etl(common: &CommonOpts) -> Result<RedditETL> {
         etl = etl.file_concurrency(fc);
     }
     Ok(etl)
+}
+
+pub(crate) fn emit_partial_read_report(reporter: &PartialReadReporter) -> Result<()> {
+    let report = reporter.snapshot();
+    if report.skipped_file_count == 0 {
+        return Ok(());
+    }
+    eprintln!("{}", serde_json::to_string(&report)?);
+    Ok(())
 }
 
 /// Build a `ScanPlan` from `etl` with common CLI scan selections applied.

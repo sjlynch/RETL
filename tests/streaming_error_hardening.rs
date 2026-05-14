@@ -2,9 +2,11 @@
 mod common;
 
 use assert_cmd::Command;
-use common::{make_corpus_basic, write_zst_lines};
+use common::{make_corpus_basic, make_truncated_zst, read_jsonl_values, write_zst_lines};
 use predicates::prelude::*;
-use retl::{KeyExtractor, RedditETL, Sources, YearMonth};
+use retl::{
+    project_whitelist_line_for_tests, ExportFormat, KeyExtractor, RedditETL, Sources, YearMonth,
+};
 use serde_json::json;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -93,6 +95,48 @@ fn extract_to_jsonl_fails_on_malformed_json_line_without_publishing() {
 }
 
 #[test]
+fn whitelist_slow_path_malformed_json_reports_path_and_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("RC_2006-01.zst");
+    let fields = vec!["id".to_string()];
+
+    let projected =
+        project_whitelist_line_for_tests(r#"[{"id":"not-a-top-level-object"}]"#, &fields, &path, 1)
+            .expect("top-level non-object forces the Value slow path but is valid JSON");
+    assert_eq!(projected, "{}");
+
+    let err = project_whitelist_line_for_tests(r#"{"id":"bad","author":}"#, &fields, &path, 2)
+        .expect_err("malformed slow-path JSON must carry file/line context");
+    assert_malformed(err, &path, 2);
+}
+
+#[test]
+fn minimal_record_type_drift_in_unused_fields_does_not_drop_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.keep();
+    let rc = base.join("comments").join("RC_2006-01.zst");
+    let line = r#"{"id":"drift","author":"alice","subreddit":"programming","score":1.5,"created_utc":{"unexpected":true},"body":"kept"}"#;
+    write_zst_lines(&rc, &[line.to_string()]);
+    fs::create_dir_all(base.join("submissions")).unwrap();
+
+    let out_dir = base.join("partitioned");
+    RedditETL::new()
+        .base_dir(&base)
+        .sources(Sources::Comments)
+        .progress(false)
+        .scan()
+        .subreddit("programming")
+        .include_pseudo_users()
+        .export_partitioned(&out_dir, ExportFormat::Jsonl)
+        .expect("unused score/created_utc type drift must not drop valid JSON records");
+
+    let out = out_dir.join("comments").join("RC_2006-01.jsonl");
+    let values = read_jsonl_values(&out);
+    assert_eq!(values.len(), 1);
+    assert_eq!(values[0]["id"], "drift");
+}
+
+#[test]
 fn spool_fails_on_malformed_json_line_without_manifest_entry() {
     let (base, rc) = malformed_comment_corpus();
     let out_dir = base.join("spool");
@@ -117,6 +161,40 @@ fn spool_fails_on_malformed_json_line_without_manifest_entry() {
             "failed month was committed: {text}"
         );
     }
+}
+
+#[test]
+fn cli_allow_partial_count_reports_skipped_file_json() {
+    let base = tempfile::tempdir().unwrap().keep();
+    let rc = base.join("comments").join("RC_2006-03.zst");
+    make_truncated_zst(&rc, 500, 256);
+    fs::create_dir_all(base.join("submissions")).unwrap();
+
+    retl()
+        .arg("count")
+        .arg("--data-dir")
+        .arg(&base)
+        .arg("--work-dir")
+        .arg(base.join("work"))
+        .args([
+            "--source",
+            "rc",
+            "--start",
+            "2006-03",
+            "--end",
+            "2006-03",
+            "--subreddit",
+            "programming",
+            "--include-deleted",
+            "--no-progress",
+            "--allow-partial",
+        ])
+        .assert()
+        .success()
+        .stderr(
+            predicate::str::contains("skipped_file_count")
+                .and(predicate::str::contains("RC_2006-03.zst")),
+        );
 }
 
 #[test]

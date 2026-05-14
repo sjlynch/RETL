@@ -116,7 +116,7 @@ impl RedditETL {
         self.opts = self.opts.with_adaptive_mem(cfg);
         self
     }
-    /// Opt in to resumable extract/spool runs: when enabled, supported export
+    /// Opt in to resumable extract/export runs: when enabled, supported export
     /// paths read/write a `_progress.json` sidecar keyed by month and by a
     /// fingerprint of the current query/config, so changing filters invalidates
     /// stale parts instead of reusing them. Default false to preserve existing
@@ -124,6 +124,21 @@ impl RedditETL {
     pub fn resume(mut self, yes: bool) -> Self {
         self.opts = self.opts.with_resume(yes);
         self
+    }
+
+    /// Opt in to lossy scans/exports that skip corrupt zstd monthly files
+    /// instead of failing. Skipped paths are recorded in the shared
+    /// partial-read reporter; resume manifests never mark skipped months
+    /// complete.
+    pub fn allow_partial(mut self, yes: bool) -> Self {
+        self.opts = self.opts.with_allow_partial(yes);
+        self
+    }
+
+    /// Return a handle that snapshots tolerated partial zstd reads recorded by
+    /// this builder. Clone it before starting a consuming operation.
+    pub fn partial_read_reporter(&self) -> crate::config::PartialReadReporter {
+        self.opts.partial_read_reporter.clone()
     }
 
     // -------- Advanced: enter query mode --------
