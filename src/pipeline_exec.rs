@@ -156,6 +156,7 @@ fn warn_dedupe_key_drops(key: &KeyExtractor, summary: &DedupeKeySummary) {
 }
 
 fn dedupe_cfg_from_options(opts: &ETLOptions) -> DedupeCfg {
+    crate::config::warn_if_inflight_pair_pathological(opts.inflight_bytes, opts.inflight_groups);
     let mut cfg = DedupeCfg::from(opts);
     if cfg.inflight_bytes > 0 {
         let per_flush_mb = (cfg.inflight_bytes / 2 / (1024 * 1024)).max(1);

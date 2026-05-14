@@ -209,11 +209,14 @@ pub(crate) struct DedupeArgs {
     /// Output text file, one unique key per line. Use `-` for stdout.
     #[arg(long, short)]
     pub(crate) out: PathBuf,
-    /// Inflight bytes budget for bucketing/dedupe producer/consumer pairs.
+    /// Per-flush byte budget for bucketing/dedupe (`per_flush_cap = N / 2`).
     /// 0 disables the explicit cap and falls back to memory-fraction sampling.
+    /// NOTE: this is NOT the worst-case peak — see `--inflight-groups`.
     #[arg(long)]
     pub(crate) inflight_bytes: Option<usize>,
-    /// Bounded channel depth for bucketing producer/consumer pairs.
+    /// Bucketing channel depth (default 8). Worst-case bucketing peak is
+    /// `(1 + inflight_groups) * inflight_bytes / 2`, NOT `inflight_bytes`.
+    /// Set to 1 to match the declared `inflight_bytes` budget exactly.
     #[arg(long)]
     pub(crate) inflight_groups: Option<usize>,
     /// Error if any matched record does not contain the requested dedupe key.
@@ -250,11 +253,14 @@ pub(crate) struct ExportArgs {
     /// Convert `created_utc` to RFC3339 strings on export.
     #[arg(long)]
     pub(crate) human_timestamps: bool,
-    /// Inflight bytes budget for bucketing/dedupe producer/consumer pairs.
+    /// Per-flush byte budget for bucketing/dedupe (`per_flush_cap = N / 2`).
     /// 0 disables the explicit cap and falls back to memory-fraction sampling.
+    /// NOTE: this is NOT the worst-case peak — see `--inflight-groups`.
     #[arg(long)]
     pub(crate) inflight_bytes: Option<usize>,
-    /// Bounded channel depth for bucketing producer/consumer pairs.
+    /// Bucketing channel depth (default 8). Worst-case bucketing peak is
+    /// `(1 + inflight_groups) * inflight_bytes / 2`, NOT `inflight_bytes`.
+    /// Set to 1 to match the declared `inflight_bytes` budget exactly.
     #[arg(long)]
     pub(crate) inflight_groups: Option<usize>,
     /// Resume a prior export with the same query/config/corpus. `jsonl`/`json`
@@ -408,10 +414,13 @@ pub(crate) struct ParentsArgs {
     /// Disable progress bars.
     #[arg(long)]
     pub(crate) no_progress: bool,
-    /// Inflight bytes budget for bucketing/dedupe producer/consumer pairs.
+    /// Per-flush byte budget for bucketing/dedupe (`per_flush_cap = N / 2`).
+    /// NOTE: this is NOT the worst-case peak — see `--inflight-groups`.
     #[arg(long)]
     pub(crate) inflight_bytes: Option<usize>,
-    /// Bounded channel depth for bucketing producer/consumer pairs.
+    /// Bucketing channel depth (default 8). Worst-case bucketing peak is
+    /// `(1 + inflight_groups) * inflight_bytes / 2`, NOT `inflight_bytes`.
+    /// Set to 1 to match the declared `inflight_bytes` budget exactly.
     #[arg(long)]
     pub(crate) inflight_groups: Option<usize>,
 }
