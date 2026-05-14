@@ -1,3 +1,5 @@
+use crate::config::{clamp_shard_count, MAX_SHARDS};
+use crate::ndjson::{read_line_capped, DEFAULT_MAX_LINE_BYTES};
 use crate::parents::ParentIds;
 use crate::pipeline::RedditETL;
 use crate::progress::make_progress_bar_labeled;
@@ -13,7 +15,7 @@ use rayon::prelude::*;
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::io::{self, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -88,6 +90,7 @@ impl IdShardWriter {
         kind: &'static str,
         count: usize,
     ) -> Result<Self> {
+        let count = clamp_shard_count(count, "IdShardWriter::create");
         let dir = scratch_root.path().join(format!("{kind}_ids_shards"));
         create_dir_all_with_backoff(&dir, 16, 50)
             .with_context(|| format!("create parent-id shard dir {}", dir.display()))?;
@@ -214,16 +217,10 @@ fn dedup_one(input: &Path, output: &Path) -> Result<usize> {
 
     let mut buf = String::with_capacity(16 * 1024);
     loop {
-        buf.clear();
-        let n = r.read_line(&mut buf)?;
+        let n = read_line_capped(&mut r, &mut buf, DEFAULT_MAX_LINE_BYTES, input)
+            .with_context(|| format!("read parent-id shard {}", input.display()))?;
         if n == 0 {
             break;
-        }
-        if buf.ends_with('\n') {
-            buf.pop();
-            if buf.ends_with('\r') {
-                buf.pop();
-            }
         }
         if !buf.is_empty() {
             set.insert(buf.clone());
@@ -314,15 +311,17 @@ impl SharedIdsetCache {
         // don't serialize on the I/O.
         let f = open_with_backoff(path, 16, 50)
             .with_context(|| format!("open idset shard {}", path.display()))?;
-        let r = BufReader::new(f);
+        let mut r = BufReader::new(f);
         let mut set: AHashSet<String> = AHashSet::with_capacity(64_000);
-        for line in r.lines() {
-            let mut s = line.with_context(|| format!("read idset shard {}", path.display()))?;
-            if s.ends_with('\r') {
-                s.pop();
+        let mut s = String::with_capacity(16 * 1024);
+        loop {
+            let n = read_line_capped(&mut r, &mut s, DEFAULT_MAX_LINE_BYTES, path)
+                .with_context(|| format!("read idset shard {}", path.display()))?;
+            if n == 0 {
+                break;
             }
             if !s.is_empty() {
-                set.insert(s);
+                set.insert(s.clone());
             }
         }
         let arc = Arc::new(set);
@@ -359,7 +358,7 @@ impl RedditETL {
             let scratch_root = IdScratchRoot::create(&work_dir)?;
 
             // Fewer shards reduces disk thrash later; we keep a wider FIFO in memory.
-            let shard_count = 256usize;
+            let shard_count = MAX_SHARDS;
             let t1_writer = IdShardWriter::create(scratch_root.clone(), "t1", shard_count)?;
             let t3_writer = IdShardWriter::create(scratch_root, "t3", shard_count)?;
 
@@ -387,24 +386,18 @@ impl RedditETL {
                 let mut buf = String::with_capacity(64 * 1024);
                 let mut line_number = 0u64;
                 loop {
-                    buf.clear();
-                    let n = r.read_line(&mut buf).with_context(|| {
-                        format!(
-                            "read parent-id spool input {} near line {}",
-                            p.display(),
-                            line_number + 1
-                        )
-                    })?;
+                    let n = read_line_capped(&mut r, &mut buf, DEFAULT_MAX_LINE_BYTES, p)
+                        .with_context(|| {
+                            format!(
+                                "read parent-id spool input {} near line {}",
+                                p.display(),
+                                line_number + 1
+                            )
+                        })?;
                     if n == 0 {
                         break;
                     }
                     line_number += 1;
-                    if buf.ends_with('\n') {
-                        buf.pop();
-                        if buf.ends_with('\r') {
-                            buf.pop();
-                        }
-                    }
                     if buf.is_empty() {
                         if let Some(pb) = &pb {
                             pb.inc(n as u64);

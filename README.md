@@ -100,7 +100,7 @@ You can browse and download monthly dumps via Academic Torrents:
 https://academictorrents.com/browse.php?search=reddit
 
 Note on scale & performance:
-The monthly files become very large in later years. It’s normal for broader queries to run longer and consume significant I/O. RETL’s streaming design and throttling aim to keep resource use predictable; tune .file_concurrency(n), .parallelism(n), and .io_buffers(...) as appropriate for your hardware and dataset size.
+The monthly files become very large in later years. It’s normal for broader queries to run longer and consume significant I/O. RETL’s streaming design and throttling aim to keep resource use predictable; tune `.file_concurrency(n)`, `.parallelism(n)`, and `.io_buffers(...)` as appropriate for your hardware and dataset size. Oversized resource knobs are clamped with a warning rather than allowed to create unbounded threads, zstd decoders, or shard files.
 
 ## Install
 
@@ -158,7 +158,7 @@ and validation flags because it does not filter records by query:
 | `--domain <DOMAIN>` | Submission-domain allow-list. Repeatable; comments are dropped when this filter is active. |
 | `--json <PREDICATE>` | Full-record JSON Pointer predicate. Repeatable. Examples: `exists:/link_flair_text`, `/over_18=false`, `/is_self=true`, `/num_comments>=100`, `/link_flair_text~=^Question` (quote predicates containing `>` or `<` in shells). |
 | `--include-deleted` | Include pseudo-users (`[deleted]`, `[removed]`, and empty authors) that are filtered by default. |
-| `--parallelism <N>` / `--file-concurrency <N>` | Rayon threads / concurrent monthly files. |
+| `--parallelism <N>` / `--file-concurrency <N>` | Rayon threads / concurrent monthly files; oversized values are clamped to RETL's documented safety caps. |
 | `--no-progress` | Disable progress bars. |
 
 ### Pseudo-user filtering (default ON)
@@ -729,15 +729,21 @@ Suggested starting points for `.file_concurrency(n)` by total system RAM:
 | 16–31 GB | 2 |
 | 32–63 GB | 4 |
 | 64–127 GB | 8 |
-| ≥ 128 GB | 8–12, then measure |
+| ≥ 128 GB | 8 (the built-in maximum), then tune other bottlenecks |
 
 ### Tuning knobs
 
 - `.parallelism(n)` — Rayon worker threads. CPU-bound work (decompression,
-  parsing) scales with this up to physical core count.
+  parsing) scales with this up to physical core count. RETL clamps requests to
+  a conservative runtime limit (a small multiple of available CPUs, never above
+  `MAX_RAYON_THREADS = 256`) and logs a warning when it clamps.
 - `.file_concurrency(n)` — number of monthly files decoded in parallel. The
   per-file working set is large; raising this is the fastest way to use up
-  RAM.
+  RAM because every in-flight Reddit zstd frame can reserve a multi-GiB decode
+  window. RETL clamps this to `MAX_FILE_CONCURRENCY = 8`.
+- `.shard_count(n)` — number of open-all-writer scratch shards for username
+  and key/value reductions. RETL clamps this to `MAX_SHARDS = 256` so a typo
+  cannot open millions of files or allocate millions of writer buffers.
 - `.inflight_bytes(bytes)` — per-flush byte budget for the bucketing/dedupe
   producer (`per_flush_cap = inflight_bytes / 2`). On its own this caps one
   in-memory map; the bucketing channel adds more buffered groups on top

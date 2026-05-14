@@ -1,4 +1,4 @@
-//! Regression tests for the `max_line_bytes` guard on NDJSON line readers.
+//! Regression tests for the `max_line_bytes` guard on JSONL/text-shard readers.
 //!
 //! Pre-fix, `NdjsonReader::read_line` and the parents/extract validators
 //! delegated to `BufRead::read_line(&mut String)`, which grew its buffer
@@ -9,7 +9,10 @@
 use std::fs::File;
 use std::io::{BufReader, Write};
 
-use retl::{read_line_capped, NdjsonReader};
+use retl::{
+    build_runs_sorted, for_each_line_cfg, read_line_capped, DedupeCfg, KeyExtractor, NdjsonReader,
+    DEFAULT_MAX_LINE_BYTES,
+};
 
 /// Cap small enough to keep the test fast while still being larger than the
 /// payload required to demonstrate streaming reads work below the cap.
@@ -53,6 +56,68 @@ fn ndjson_reader_rejects_oversized_line() {
     assert!(
         msg.contains("oversized.ndjson"),
         "error message should name the offending path: {msg}"
+    );
+}
+
+#[test]
+fn zstd_reader_rejects_oversized_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("oversized.zst");
+
+    let f = File::create(&p).unwrap();
+    let mut enc = zstd::stream::write::Encoder::new(f, 1).unwrap();
+    enc.write_all(&vec![b'x'; DEFAULT_MAX_LINE_BYTES + 1])
+        .unwrap();
+    enc.write_all(b"\n").unwrap();
+    enc.finish().unwrap();
+
+    let err = for_each_line_cfg(&p, 8 * 1024, |_line| Ok(()))
+        .expect_err("oversized zstd JSONL line must error");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("max_line_bytes"),
+        "error message should mention the cap: {msg}"
+    );
+    assert!(
+        msg.contains("oversized.zst"),
+        "error message should name the offending path: {msg}"
+    );
+    let has_invalid_data = err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .map(|e| e.kind() == std::io::ErrorKind::InvalidData)
+            .unwrap_or(false)
+    });
+    assert!(
+        has_invalid_data,
+        "error chain should preserve io::ErrorKind::InvalidData: {msg}"
+    );
+}
+
+#[test]
+fn dedupe_build_runs_rejects_oversized_intermediate_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("oversized.ndjson");
+    let runs = dir.path().join("runs");
+
+    let mut f = File::create(&input).unwrap();
+    f.write_all(&vec![b'x'; DEFAULT_MAX_LINE_BYTES + 1])
+        .unwrap();
+    f.write_all(b"\n").unwrap();
+    drop(f);
+
+    let cfg = DedupeCfg {
+        read_buf_bytes: 8 * 1024,
+        write_buf_bytes: 8 * 1024,
+        ..Default::default()
+    };
+    let err = build_runs_sorted(&input, &runs, &KeyExtractor::author_lowercase_fast(), &cfg)
+        .expect_err("oversized dedupe intermediate line must error");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("max_line_bytes"), "unexpected error: {msg}");
+    assert!(
+        msg.contains("oversized.ndjson"),
+        "error should name the input path: {msg}"
     );
 }
 
@@ -113,7 +178,10 @@ fn read_line_capped_strips_crlf_and_lf() {
     assert!(read_line_capped(&mut r, &mut buf, SMALL_CAP, &p).unwrap() > 0);
     assert_eq!(buf, "three");
     // EOF.
-    assert_eq!(read_line_capped(&mut r, &mut buf, SMALL_CAP, &p).unwrap(), 0);
+    assert_eq!(
+        read_line_capped(&mut r, &mut buf, SMALL_CAP, &p).unwrap(),
+        0
+    );
 }
 
 #[test]

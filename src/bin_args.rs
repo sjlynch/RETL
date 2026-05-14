@@ -67,11 +67,11 @@ pub(crate) struct CommonOpts {
     #[arg(long, value_name = "YYYY-MM")]
     pub(crate) end: Option<YearMonth>,
 
-    /// Number of Rayon worker threads (defaults to the global pool).
+    /// Number of Rayon worker threads (defaults to the global pool; clamped to RETL's safe cap).
     #[arg(long)]
     pub(crate) parallelism: Option<usize>,
 
-    /// Number of monthly files processed concurrently.
+    /// Number of monthly files processed concurrently (clamped to protect zstd decoder memory).
     #[arg(long)]
     pub(crate) file_concurrency: Option<usize>,
 
@@ -334,7 +334,7 @@ pub(crate) enum IntegrityModeArg {
 
 #[derive(Args, Debug, Clone)]
 pub(crate) struct AggregateRuntimeOpts {
-    /// Number of Rayon worker threads (defaults to the global pool).
+    /// Number of Rayon worker threads (defaults to the global pool; clamped to RETL's safe cap).
     #[arg(long)]
     pub(crate) parallelism: Option<usize>,
 
@@ -405,10 +405,10 @@ pub(crate) struct ParentsArgs {
     /// Scratch directory for sharded writers and stitched intermediates.
     #[arg(long, default_value = "./etl_work")]
     pub(crate) work_dir: PathBuf,
-    /// Number of Rayon worker threads (defaults to the global pool).
+    /// Number of Rayon worker threads (defaults to the global pool; clamped to RETL's safe cap).
     #[arg(long)]
     pub(crate) parallelism: Option<usize>,
-    /// Number of monthly files processed concurrently.
+    /// Number of monthly files processed concurrently (clamped to protect zstd decoder memory).
     #[arg(long)]
     pub(crate) file_concurrency: Option<usize>,
     /// Disable progress bars.
@@ -434,4 +434,32 @@ pub(crate) struct FirstSeenArgs {
     /// Output TSV file: `<author>\t<earliest_created_utc>` per line.
     #[arg(long, short)]
     pub(crate) out: PathBuf,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn cli_accepts_huge_resource_flags_for_builder_clamp() {
+        let huge = usize::MAX.to_string();
+        let cli = Cli::try_parse_from([
+            "retl",
+            "scan",
+            "--parallelism",
+            huge.as_str(),
+            "--file-concurrency",
+            huge.as_str(),
+        ])
+        .expect("resource flag parsing should succeed; builders clamp later");
+
+        match cli.command {
+            Command::Scan(args) => {
+                assert_eq!(args.common.parallelism, Some(usize::MAX));
+                assert_eq!(args.common.file_concurrency, Some(usize::MAX));
+            }
+            other => panic!("expected scan command, got {other:?}"),
+        }
+    }
 }

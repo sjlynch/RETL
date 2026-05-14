@@ -1,3 +1,5 @@
+use crate::config::clamp_parallelism_threads;
+use crate::ndjson::{read_line_capped, DEFAULT_MAX_LINE_BYTES};
 use crate::query::normalize_str;
 use anyhow::{Context, Result};
 
@@ -45,7 +47,7 @@ pub fn default_bot_authors() -> Vec<String> {
 /// - ETL_EXCLUDE_AUTHORS_FILE: path to newline-separated file of names
 /// All entries are normalized (lowercase), then the list is sort+dedup.
 pub fn merge_extra_exclusions(target: &mut Vec<String>) {
-    use std::io::{BufRead, BufReader};
+    use std::io::BufReader;
 
     if let Ok(s) = std::env::var("ETL_EXCLUDE_AUTHORS") {
         for raw in s.split(|c: char| c == ',' || c == ';' || c.is_whitespace()) {
@@ -58,16 +60,34 @@ pub fn merge_extra_exclusions(target: &mut Vec<String>) {
 
     if let Ok(path) = std::env::var("ETL_EXCLUDE_AUTHORS_FILE") {
         if !path.trim().is_empty() {
-            if let Ok(f) = open_with_backoff(std::path::Path::new(&path), 16, 50) {
-                let r = BufReader::new(f);
-                for line in r.lines().flatten() {
-                    let n = normalize_str(&line);
-                    if !n.is_empty() {
-                        target.push(n);
+            let path_ref = std::path::Path::new(&path);
+            if let Ok(f) = open_with_backoff(path_ref, 16, 50) {
+                let mut r = BufReader::new(f);
+                let mut line = String::with_capacity(1024);
+                loop {
+                    match read_line_capped(&mut r, &mut line, DEFAULT_MAX_LINE_BYTES, path_ref) {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            let n = normalize_str(&line);
+                            if !n.is_empty() {
+                                target.push(n);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                path = %path_ref.display(),
+                                error = %e,
+                                "ETL_EXCLUDE_AUTHORS_FILE read failed; ignoring remaining entries"
+                            );
+                            break;
+                        }
                     }
                 }
             } else {
-                tracing::warn!("ETL_EXCLUDE_AUTHORS_FILE is set but cannot be opened: {}", path);
+                tracing::warn!(
+                    "ETL_EXCLUDE_AUTHORS_FILE is set but cannot be opened: {}",
+                    path
+                );
             }
         }
     }
@@ -83,7 +103,10 @@ pub fn merge_extra_exclusions(target: &mut Vec<String>) {
 // -------- NEW: scoped Rayon thread pool helper --------
 
 /// Run `f` inside a scoped Rayon thread pool sized to `n` threads. If `n` is
-/// `None` (or `Some(0)`), run on the global default pool.
+/// `None` (or `Some(0)`), run on the global default pool. Positive values are
+/// clamped through [`crate::config::max_parallelism_limit`]; if Rayon still
+/// rejects the pool, RETL logs a warning and safely falls back to the global
+/// pool instead of panicking.
 ///
 /// Prefer this over `rayon::ThreadPoolBuilder::build_global()`, which mutates
 /// process-wide state, only succeeds for the first caller, and prevents
@@ -95,11 +118,19 @@ where
 {
     match n {
         Some(k) if k > 0 => {
-            let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(k)
-                .build()
-                .expect("failed to build rayon thread pool");
-            pool.install(f)
+            let clamped = clamp_parallelism_threads(k, "with_thread_pool");
+            match rayon::ThreadPoolBuilder::new().num_threads(clamped).build() {
+                Ok(pool) => pool.install(f),
+                Err(e) => {
+                    tracing::warn!(
+                        requested = k,
+                        clamped,
+                        error = %e,
+                        "failed to build scoped Rayon thread pool; falling back to global pool"
+                    );
+                    f()
+                }
+            }
         }
         _ => f(),
     }

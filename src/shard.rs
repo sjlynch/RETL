@@ -1,5 +1,7 @@
 pub use crate::username_stream::UsernameStream;
 
+use crate::config::clamp_shard_count;
+use crate::ndjson::{read_line_capped, DEFAULT_MAX_LINE_BYTES};
 use crate::shard_common;
 use crate::util::{
     create_dir_all_with_backoff, create_with_backoff, open_with_backoff, unique_scratch_dir,
@@ -10,7 +12,7 @@ use parking_lot::Mutex;
 use rayon::prelude::*;
 use std::collections::HashSet;
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 /// Disk-backed sharded dedup writer: concurrent-safe.
@@ -24,7 +26,7 @@ pub struct ShardedWriter {
 
 impl ShardedWriter {
     pub fn create(work_dir: &Path, prefix: &str, count: usize) -> Result<Self> {
-        let count = count.max(1);
+        let count = clamp_shard_count(count, "ShardedWriter::create");
         let run_root = unique_scratch_dir(work_dir, prefix, "shards");
         let shards_dir = run_root.join("shards");
         create_dir_all_with_backoff(&shards_dir, 16, 50)
@@ -133,16 +135,10 @@ fn dedup_single_shard(input: &Path, output: &Path) -> Result<()> {
 
     let mut buf = String::with_capacity(8 * 1024);
     loop {
-        buf.clear();
-        let n = reader.read_line(&mut buf)?;
+        let n = read_line_capped(&mut reader, &mut buf, DEFAULT_MAX_LINE_BYTES, input)
+            .with_context(|| format!("read shard for dedup: {}", input.display()))?;
         if n == 0 {
             break;
-        }
-        if buf.ends_with('\n') {
-            let _ = buf.pop();
-            if buf.ends_with('\r') {
-                let _ = buf.pop();
-            }
         }
         if !buf.is_empty() {
             seen.insert(buf.clone());
@@ -184,5 +180,14 @@ mod tests {
             .read_to_string(&mut contents)
             .expect("read deduped shard");
         assert_eq!(contents, "alice\nbob\n");
+    }
+
+    #[test]
+    fn sharded_writer_clamps_huge_shard_count() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let writer = ShardedWriter::create(tmp.path(), "huge", usize::MAX)
+            .expect("huge shard count should be clamped before allocation");
+        assert_eq!(writer.count, crate::config::MAX_SHARDS);
+        assert_eq!(writer.shards.len(), crate::config::MAX_SHARDS);
     }
 }
