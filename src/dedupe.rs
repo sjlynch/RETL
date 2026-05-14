@@ -1,11 +1,11 @@
+use crate::atomic_write::{ensure_staging_dir, write_jsonl_atomic};
 use crate::config::ETLOptions;
 use crate::key_extractor::KeyExtractor;
 use crate::mem::{available_memory_fraction, is_low_memory, AdaptiveMemCfg};
 use crate::ndjson::{NdjsonReader, NdjsonWriter};
 use crate::progress::ProgressScope;
 use crate::util::{
-    create_dir_all_with_backoff, open_with_backoff, remove_with_backoff,
-    replace_file_atomic_backoff, smoothstep_memory_fraction,
+    create_dir_all_with_backoff, open_with_backoff, remove_with_backoff, smoothstep_memory_fraction,
 };
 use crate::zstd_jsonl::malformed_json_error;
 use anyhow::{Context, Result};
@@ -13,7 +13,7 @@ use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::fs;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
@@ -289,11 +289,22 @@ pub(crate) fn merge_runs_sorted_with_key_stats(
     mut merge_same_key: impl FnMut(&str, Vec<String>, &mut dyn std::io::Write) -> Result<()>,
     key_extractions_failed: Option<&AtomicU64>,
 ) -> Result<()> {
+    // Route through `<dest_parent>/_staging/<basename>.retl-<pid>-<nonce>.inprogress`
+    // so concurrent dedupe runs targeting different outputs in the same directory
+    // (e.g. `out/x.txt` and `out/x.json`) cannot collide on a shared sibling
+    // temp, and so crashed runs leave staged leftovers that `sweep_stale_inprogress`
+    // can recover.
+    let parent_dir = output
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let staging_dir = ensure_staging_dir(&parent_dir)
+        .with_context(|| format!("ensure staging dir under {}", parent_dir.display()))?;
+
     if runs.is_empty() {
-        // Nothing to write.
-        let tmp = output.with_extension("ndjson.inprogress");
-        let w = NdjsonWriter::create(&tmp, cfg.write_buf_bytes)?;
-        w.finish_atomic(output)?;
+        // Nothing to write — still publish an empty file atomically.
+        write_jsonl_atomic(&staging_dir, output, cfg.write_buf_bytes, |_w| Ok(()))?;
         return Ok(());
     }
 
@@ -380,83 +391,83 @@ pub(crate) fn merge_runs_sorted_with_key_stats(
         readers.push((BufReader::with_capacity(cfg.read_buf_bytes, f), 0, 0));
     }
 
-    let tmp_out = output.with_extension("ndjson.inprogress");
-    let out = crate::util::create_with_backoff(&tmp_out, 16, 50)
-        .with_context(|| format!("create {}", tmp_out.display()))?;
-    let mut out_buf = std::io::BufWriter::with_capacity(cfg.write_buf_bytes, out);
+    write_jsonl_atomic(
+        &staging_dir,
+        output,
+        cfg.write_buf_bytes,
+        |out_buf| -> Result<()> {
+            let mut heap = BinaryHeap::<HeapItem>::new();
 
-    let mut heap = BinaryHeap::<HeapItem>::new();
-
-    // Prime heap
-    for i in 0..readers.len() {
-        let (r, read_bytes, line_number) = &mut readers[i];
-        if let Some(item) = advance_reader(
-            r,
-            &runs[i],
-            i,
-            key,
-            read_bytes,
-            line_number,
-            &pb,
-            key_extractions_failed,
-        )? {
-            heap.push(item);
-        }
-    }
-
-    // Merge loop
-    while let Some(top) = heap.pop() {
-        let current_key = top.key.clone();
-
-        // Collect all lines for `current_key`
-        let mut group_lines: Vec<String> = Vec::with_capacity(16);
-        group_lines.push(top.line);
-
-        // Pull next from the run we just popped from
-        {
-            let (r, read_bytes, line_number) = &mut readers[top.run_idx];
-            if let Some(item) = advance_reader(
-                r,
-                &runs[top.run_idx],
-                top.run_idx,
-                key,
-                read_bytes,
-                line_number,
-                &pb,
-                key_extractions_failed,
-            )? {
-                heap.push(item);
+            // Prime heap
+            for i in 0..readers.len() {
+                let (r, read_bytes, line_number) = &mut readers[i];
+                if let Some(item) = advance_reader(
+                    r,
+                    &runs[i],
+                    i,
+                    key,
+                    read_bytes,
+                    line_number,
+                    &pb,
+                    key_extractions_failed,
+                )? {
+                    heap.push(item);
+                }
             }
-        }
 
-        // While heap top matches current key, accumulate and advance
-        while heap.peek().map(|h| h.key.as_str()) == Some(current_key.as_str()) {
-            let item = heap.pop().unwrap();
-            let run_idx = item.run_idx;
-            group_lines.push(item.line);
+            // Merge loop
+            while let Some(top) = heap.pop() {
+                let current_key = top.key.clone();
 
-            let (r, read_bytes, line_number) = &mut readers[run_idx];
-            if let Some(item) = advance_reader(
-                r,
-                &runs[run_idx],
-                run_idx,
-                key,
-                read_bytes,
-                line_number,
-                &pb,
-                key_extractions_failed,
-            )? {
-                heap.push(item);
+                // Collect all lines for `current_key`
+                let mut group_lines: Vec<String> = Vec::with_capacity(16);
+                group_lines.push(top.line);
+
+                // Pull next from the run we just popped from
+                {
+                    let (r, read_bytes, line_number) = &mut readers[top.run_idx];
+                    if let Some(item) = advance_reader(
+                        r,
+                        &runs[top.run_idx],
+                        top.run_idx,
+                        key,
+                        read_bytes,
+                        line_number,
+                        &pb,
+                        key_extractions_failed,
+                    )? {
+                        heap.push(item);
+                    }
+                }
+
+                // While heap top matches current key, accumulate and advance
+                while heap.peek().map(|h| h.key.as_str()) == Some(current_key.as_str()) {
+                    let item = heap.pop().unwrap();
+                    let run_idx = item.run_idx;
+                    group_lines.push(item.line);
+
+                    let (r, read_bytes, line_number) = &mut readers[run_idx];
+                    if let Some(item) = advance_reader(
+                        r,
+                        &runs[run_idx],
+                        run_idx,
+                        key,
+                        read_bytes,
+                        line_number,
+                        &pb,
+                        key_extractions_failed,
+                    )? {
+                        heap.push(item);
+                    }
+                }
+
+                // Delegate actual merging/encoding of the group to the caller
+                merge_same_key(&current_key, group_lines, out_buf)?;
             }
-        }
 
-        // Delegate actual merging/encoding of the group to the caller
-        merge_same_key(&current_key, group_lines, &mut out_buf)?;
-    }
-
-    out_buf.flush()?;
-    drop(out_buf);
-    replace_file_atomic_backoff(&tmp_out, output)?;
+            Ok(())
+        },
+    )?;
 
     // Cleanup run files (caller removes the runs directory)
     for p in runs {
