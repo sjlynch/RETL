@@ -6,8 +6,8 @@ use retl::{
     create_dir_all_with_backoff, create_new_with_backoff, discover_all, format_year_month_ranges,
     missing_month_diagnostics, open_with_backoff, plan_files, read_line_capped,
     remove_with_backoff, replace_file_atomic_backoff, total_compressed_size, AggregateBuildReport,
-    ExportFormat, FileKind, IntegrityMode, KeyExtractor, RedditETL, Sources, YearMonth,
-    DEFAULT_MAX_LINE_BYTES,
+    ExportFormat, FileKind, IntegrityMode, KeyExtractor, ParentPayloadSpec, RedditETL, Sources,
+    YearMonth, DEFAULT_MAX_LINE_BYTES,
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -669,10 +669,19 @@ pub(crate) fn run_parents(args: ParentsArgs) -> Result<()> {
     create_dir_all_with_backoff(&lib_tmp, 16, 50)
         .with_context(|| format!("creating work_dir {}", lib_tmp.display()))?;
 
+    let parent_payload_spec = if args.parent_full {
+        ParentPayloadSpec::full_record()
+    } else if args.parent_fields.is_empty() {
+        ParentPayloadSpec::default()
+    } else {
+        ParentPayloadSpec::from_fields(&args.parent_fields)
+    };
+
     let build = |sources: Option<Sources>, range: Option<(YearMonth, YearMonth)>| -> RedditETL {
         let mut etl = RedditETL::new()
             .base_dir(&args.data_dir)
             .work_dir(&lib_tmp)
+            .parent_payload_spec(parent_payload_spec.clone())
             .progress(!args.no_progress);
         if let Some(s) = sources {
             etl = etl.sources(s);

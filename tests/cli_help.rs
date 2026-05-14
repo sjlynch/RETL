@@ -44,6 +44,8 @@ fn parents_help_advertises_required_flags() {
         .and(contains("--cache"))
         .and(contains("--out"))
         .and(contains("--window-months"))
+        .and(contains("--parent-fields"))
+        .and(contains("--parent-full"))
         .and(contains("--resume"))
         .and(contains("--inflight-bytes"))
         .and(contains("--inflight-groups"));

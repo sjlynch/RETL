@@ -3,7 +3,9 @@
 //!   1. Spool monthly JSONL parts for the records you care about
 //!      (`scan().extract_spool_monthly`).
 //!   2. Collect the union of `parent_id` / `link_id` references the spooled
-//!      records point to (`collect_parent_ids_from_jsonls`).
+//!      records point to (`collect_parent_ids_from_jsonls`), or populate
+//!      `ParentIds` directly with `insert_prefixed` / `extend_prefixed` when
+//!      you already have IDs from SQL/Python.
 //!   3. Resolve those IDs against the corpus and cache the parent payloads
 //!      to disk (`resolve_parent_maps`).
 //!   4. Re-stream the spool, attaching a `"parent": {...}` payload to every
@@ -49,6 +51,12 @@ fn main() -> Result<()> {
         .progress(true)
         .collect_parent_ids_from_jsonls(spool_parts.clone())?;
 
+    // If you already have IDs, build the same resolver input directly instead:
+    // let mut ids = ParentIds::new();
+    // ids.extend_prefixed(["t1_comment_id", "t3_submission_id"]);
+    // ids.insert_t1("bare_comment_id");
+    // ids.insert_t3("bare_submission_id");
+
     // Step 3: resolve parent payloads from a slightly wider window so cross-month
     //         parents (a comment in 2006-02 referencing a submission from 2006-01)
     //         resolve.
@@ -59,6 +67,18 @@ fn main() -> Result<()> {
             Some(YearMonth::new(2006, 4)),
         )
         .progress(true)
+        // Optional: request additional top-level parent fields. Omit this line
+        // to keep the legacy body/title/selftext output shape, or use
+        // `.parent_full(true)` to attach the full parent JSON record.
+        .parent_fields([
+            "author",
+            "body",
+            "score",
+            "created_utc",
+            "subreddit",
+            "title",
+            "selftext",
+        ])
         .resolve_parent_maps(&ids, Path::new("parents_cache"), /*resume=*/ true)?;
 
     // Step 4: attach `"parent"` payloads back onto each spooled comment.

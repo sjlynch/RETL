@@ -399,6 +399,15 @@ pub(crate) struct ParentsArgs {
     /// scanning the corpus to resolve parent payloads.
     #[arg(long, default_value_t = 3)]
     pub(crate) window_months: u32,
+    /// Top-level parent fields to attach under `parent` (comma-separated,
+    /// repeatable). Defaults to body,title,selftext for backwards-compatible
+    /// output.
+    #[arg(long = "parent-fields", value_delimiter = ',', value_name = "FIELD")]
+    pub(crate) parent_fields: Vec<String>,
+    /// Attach the full source parent JSON record under `parent` (plus RETL's
+    /// `kind`/`id` metadata). Overrides `--parent-fields`.
+    #[arg(long = "parent-full")]
+    pub(crate) parent_full: bool,
     /// Path to corpus base dir (containing `comments/` and `submissions/`).
     #[arg(long, default_value = "./data")]
     pub(crate) data_dir: PathBuf,

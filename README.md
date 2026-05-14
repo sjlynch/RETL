@@ -646,6 +646,8 @@ let parents: ParentMaps = RedditETL::new()
     .base_dir("./data")
     .date_range(Some(YearMonth::new(2005, 10)), Some(YearMonth::new(2006, 4)))
     .progress(true)
+    // Optional: request more context than the legacy body/title/selftext payload.
+    .parent_fields(["author", "body", "score", "created_utc", "subreddit", "title", "selftext"])
     .resolve_parent_maps(&ids, Path::new("parents_cache"), resume)?;
 
 // Step 4: Attach parent payloads; resume skips outputs that already exist
@@ -655,9 +657,24 @@ let _out_paths = RedditETL::new()
     .attach_parents_jsonls_parallel(spool_parts, Path::new("spool_with_parents"), &parents, resume)?;
 ~~~
 
-Resolved comments receive a `"parent"` object containing either the parent comment’s body (`t1_...`) or the submission’s title/selftext (`t3_...`). If a referenced parent cannot be resolved from the cache/window, `retl` leaves the `"parent"` key absent rather than writing an empty object; the CLI reports resolved/unresolved totals and warns when more than 5% are unresolved.
+By default, resolved comments receive a `"parent"` object containing either the parent comment’s body (`t1_...`) or the submission’s title/selftext (`t3_...`). Use `.parent_fields([...])` or CLI `--parent-fields author,body,score,created_utc,subreddit,domain,url,title,selftext` to attach extra top-level parent fields; use `.parent_full(true)` / `--parent-full` to attach the full parent JSON record. `kind` and `id` are always included for resolved parents. If a referenced parent cannot be resolved from the cache/window, `retl` leaves the `"parent"` key absent rather than writing an empty object; the CLI reports resolved/unresolved totals and warns when more than 5% are unresolved.
 
-Note: extract/spool resume entries are fingerprinted by query/config. Parent-cache resume files are keyed by source/month and validated by parsing; regenerate the parent ID set when changing the upstream query.
+If you already have parent IDs from SQL/Python, build `ParentIds` directly instead of writing a fake spool:
+
+~~~rust
+let mut ids = ParentIds::new();
+ids.extend_prefixed(["t1_comment_id", "t3_submission_id"]); // validates prefixes, de-dupes
+ids.insert_t1("bare_comment_id");
+ids.insert_t3("bare_submission_id");
+
+let parents = RedditETL::new()
+    .base_dir("./data")
+    .date_range(Some(YearMonth::new(2005, 10)), Some(YearMonth::new(2006, 4)))
+    .parent_fields(["author", "body", "score", "created_utc", "subreddit", "title", "selftext"])
+    .resolve_parent_maps(&ids, Path::new("parents_cache"), true)?;
+~~~
+
+Note: extract/spool resume entries are fingerprinted by query/config. Parent-cache and attach resume sidecars include the parent ID set, selected parent fields, payload format, corpus file identity, and resolution window, so widening `--parent-fields` rebuilds stale narrow cache shards instead of reusing them.
 
 The `parents` CLI uses `--window-months 3` by default, scanning three extra months on each side of the spool range. Larger windows catch more old cross-month parents, but scan more corpus bytes and create/use more parent-cache shard files; smaller windows are faster and lighter but can leave more parents unresolved.
 
