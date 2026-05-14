@@ -41,13 +41,22 @@ impl fmt::Display for YearMonth {
 
 impl FromStr for YearMonth {
     type Err = String;
+    /// Parses a strict `YYYY-MM` (exactly 7 ASCII bytes, four-digit year, `-`,
+    /// two-digit month). Loose forms like `2024-1`, `2-1`, `24-01`, or
+    /// `02024-01` are rejected so `parse → Display` is bit-for-bit stable.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let parts: Vec<_> = s.split('-').collect();
-        if parts.len() != 2 {
+        let bytes = s.as_bytes();
+        if bytes.len() != 7 || bytes[4] != b'-' {
             return Err("expected YYYY-MM".into());
         }
-        let year: u16 = parts[0].parse().map_err(|_| "invalid year")?;
-        let month: u8 = parts[1].parse().map_err(|_| "invalid month")?;
+        if !bytes[..4].iter().all(u8::is_ascii_digit) {
+            return Err("invalid year".into());
+        }
+        if !bytes[5..].iter().all(u8::is_ascii_digit) {
+            return Err("invalid month".into());
+        }
+        let year: u16 = s[..4].parse().map_err(|_| "invalid year")?;
+        let month: u8 = s[5..].parse().map_err(|_| "invalid month")?;
         if !(1..=12).contains(&month) {
             return Err("month must be 01..12".into());
         }
