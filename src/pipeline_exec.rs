@@ -1,8 +1,11 @@
 use crate::atomic_write::{
     ensure_staging_dir, sweep_stale_inprogress, write_jsonl_atomic, write_zst_atomic,
 };
+use crate::config::ETLOptions;
 use crate::date::YearMonth;
-use crate::dedupe::{build_runs_sorted, merge_runs_sorted, DedupeCfg};
+use crate::dedupe::{
+    build_runs_sorted_with_key_stats, merge_runs_sorted_with_key_stats, DedupeCfg,
+};
 use crate::filters::{
     bounds_tuple, matches_full, matches_minimal, resolve_target_subs_from, within_bounds,
     ym_from_epoch, DateBounds,
@@ -45,6 +48,30 @@ pub enum ExportFormat {
     Zst,
 }
 
+/// Summary returned by [`ScanPlan::dedupe_keys_to_lines_with_stats`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DedupeKeySummary {
+    /// Records that matched the scan query before dedupe key extraction.
+    pub matched_records: u64,
+    /// Distinct keys written to the output.
+    pub unique_keys: u64,
+    /// Matched records for which [`KeyExtractor::key_from_line`] returned
+    /// `Ok(None)` (missing, null, or otherwise non-extractable key). These
+    /// records are omitted from the dedupe output.
+    pub key_extractions_failed: u64,
+}
+
+impl DedupeKeySummary {
+    /// Fraction of matched records omitted because no dedupe key was found.
+    pub fn key_drop_rate(&self) -> f64 {
+        if self.matched_records == 0 {
+            0.0
+        } else {
+            self.key_extractions_failed as f64 / self.matched_records as f64
+        }
+    }
+}
+
 /// Finalization choice for extract operations (internal).
 enum Finalize {
     Jsonl,
@@ -53,6 +80,7 @@ enum Finalize {
 
 const FILE_PREFIX_RC: &str = "part_RC";
 const FILE_PREFIX_RS: &str = "part_RS";
+const DEDUPE_KEY_DROP_WARN_RATE: f64 = 0.01;
 static EXTRACT_SCRATCH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
@@ -95,6 +123,44 @@ fn cleanup_scratch_dir(path: &Path, label: &str) {
     if let Err(e) = remove_dir_all_with_backoff(path, 8, 50) {
         tracing::warn!(path=%path.display(), error=%e, %label, "failed to remove scratch dir");
     }
+}
+
+fn dedupe_key_label(key: &KeyExtractor) -> String {
+    match key {
+        KeyExtractor::JsonPointer(ptr) => format!("json:{ptr}"),
+        KeyExtractor::AuthorLowerFast => "author".to_string(),
+        KeyExtractor::SubredditLowerFast => "subreddit".to_string(),
+        KeyExtractor::ByValue(_) => "<custom>".to_string(),
+    }
+}
+
+fn warn_dedupe_key_drops(key: &KeyExtractor, summary: &DedupeKeySummary) {
+    if summary.matched_records == 0 || summary.key_extractions_failed == 0 {
+        return;
+    }
+    let drop_rate = summary.key_drop_rate();
+    if drop_rate > DEDUPE_KEY_DROP_WARN_RATE {
+        let key_spec = dedupe_key_label(key);
+        tracing::warn!(
+            key = %key_spec,
+            matched_records = summary.matched_records,
+            key_extractions_failed = summary.key_extractions_failed,
+            drop_rate,
+            "dedupe dropped {} matching record(s) without an extractable key ({:.2}% of matches); use --strict-key to fail instead",
+            summary.key_extractions_failed,
+            drop_rate * 100.0,
+        );
+    }
+}
+
+fn dedupe_cfg_from_options(opts: &ETLOptions) -> DedupeCfg {
+    let mut cfg = DedupeCfg::from(opts);
+    if cfg.inflight_bytes > 0 {
+        let per_flush_mb = (cfg.inflight_bytes / 2 / (1024 * 1024)).max(1);
+        cfg.min_buf_mb = cfg.min_buf_mb.min(per_flush_mb);
+        cfg.max_buf_mb = cfg.max_buf_mb.min(per_flush_mb.max(cfg.min_buf_mb));
+    }
+    cfg
 }
 
 fn warn_dedupe_zero_keys(key: &KeyExtractor, input_records: u64) {
@@ -294,8 +360,22 @@ impl ScanPlan {
     /// engine (`build_runs_sorted` + `merge_runs_sorted`) with the supplied
     /// [`KeyExtractor`]. Built-in `author` and `subreddit` extractors keep the
     /// `MinimalRecord` fast path; `json:/pointer` extractors parse full JSON
-    /// only for key extraction.
+    /// only for key extraction. Matching records whose key extractor returns
+    /// `Ok(None)` are omitted from the output; use
+    /// [`ScanPlan::dedupe_keys_to_lines_with_stats`] to inspect that count.
     pub fn dedupe_keys_to_lines(self, key: &KeyExtractor, out_path: &Path) -> Result<u64> {
+        Ok(self
+            .dedupe_keys_to_lines_with_stats(key, out_path)?
+            .unique_keys)
+    }
+
+    /// Like [`ScanPlan::dedupe_keys_to_lines`], but returns matched-record,
+    /// unique-key, and missing-key counts for diagnostics.
+    pub fn dedupe_keys_to_lines_with_stats(
+        self,
+        key: &KeyExtractor,
+        out_path: &Path,
+    ) -> Result<DedupeKeySummary> {
         let plan = self.build()?;
         let parallelism = plan.etl.opts.parallelism;
         with_thread_pool(parallelism, || {
@@ -308,7 +388,7 @@ impl ScanPlan {
             fs::create_dir_all(&tmp_dir)
                 .with_context(|| format!("creating dedupe work dir {}", tmp_dir.display()))?;
 
-            let result = (|| -> Result<u64> {
+            let result = (|| -> Result<DedupeKeySummary> {
                 let input = tmp_dir.join("matched.ndjson");
                 let f = create_with_backoff(&input, 16, 50)
                     .with_context(|| format!("create {}", input.display()))?;
@@ -337,34 +417,64 @@ impl ScanPlan {
                     .map_err(|_| anyhow!("dedupe writer lock poisoned"))?
                     .flush()?;
 
-                let mut cfg = DedupeCfg {
-                    read_buf_bytes: plan.etl.opts.read_buffer_bytes,
-                    write_buf_bytes: plan.etl.opts.write_buffer_bytes,
-                    inflight_bytes: plan.etl.opts.inflight_bytes,
-                    ..DedupeCfg::default()
-                };
-                if cfg.inflight_bytes > 0 {
-                    let per_flush_mb = (cfg.inflight_bytes / 2 / (1024 * 1024)).max(1);
-                    cfg.min_buf_mb = cfg.min_buf_mb.min(per_flush_mb);
-                    cfg.max_buf_mb = cfg.max_buf_mb.min(per_flush_mb.max(cfg.min_buf_mb));
-                }
+                let key_extractions_failed = AtomicU64::new(0);
+                let cfg = dedupe_cfg_from_options(&plan.etl.opts);
 
                 let runs_dir = tmp_dir.join("runs");
-                let runs = build_runs_sorted(&input, &runs_dir, key, &cfg)?;
-                let mut unique_count = 0_u64;
-                merge_runs_sorted(&runs, out_path, key, &cfg, |current_key, _group, w| {
-                    w.write_all(current_key.as_bytes())?;
-                    w.write_all(b"\n")?;
-                    unique_count += 1;
-                    Ok(())
-                })?;
-
-                let matched_records = matched_records.load(Ordering::Relaxed);
-                if matched_records > 0 && unique_count == 0 {
-                    warn_dedupe_zero_keys(key, matched_records);
+                let runs = build_runs_sorted_with_key_stats(
+                    &input,
+                    &runs_dir,
+                    key,
+                    &cfg,
+                    Some(&key_extractions_failed),
+                )?;
+                let matched_total = matched_records.load(Ordering::Relaxed);
+                let failed_after_build = key_extractions_failed.load(Ordering::Relaxed);
+                if plan.etl.opts.strict_key && failed_after_build > 0 {
+                    let summary = DedupeKeySummary {
+                        matched_records: matched_total,
+                        unique_keys: 0,
+                        key_extractions_failed: failed_after_build,
+                    };
+                    if matched_total > 0 && runs.is_empty() {
+                        warn_dedupe_zero_keys(key, matched_total);
+                    }
+                    warn_dedupe_key_drops(key, &summary);
+                    anyhow::bail!(
+                        "--strict-key: {} of {} matching record(s) did not contain extractable key {}; aborting dedupe output",
+                        failed_after_build,
+                        matched_total,
+                        dedupe_key_label(key),
+                    );
                 }
 
-                Ok(unique_count)
+                let mut unique_count = 0_u64;
+                merge_runs_sorted_with_key_stats(
+                    &runs,
+                    out_path,
+                    key,
+                    &cfg,
+                    |current_key, _group, w| {
+                        w.write_all(current_key.as_bytes())?;
+                        w.write_all(b"\n")?;
+                        unique_count += 1;
+                        Ok(())
+                    },
+                    Some(&key_extractions_failed),
+                )?;
+
+                let key_extractions_failed = key_extractions_failed.load(Ordering::Relaxed);
+                let summary = DedupeKeySummary {
+                    matched_records: matched_total,
+                    unique_keys: unique_count,
+                    key_extractions_failed,
+                };
+                if matched_total > 0 && unique_count == 0 {
+                    warn_dedupe_zero_keys(key, matched_total);
+                }
+                warn_dedupe_key_drops(key, &summary);
+
+                Ok(summary)
             })();
 
             let _ = fs::remove_dir_all(&tmp_dir);

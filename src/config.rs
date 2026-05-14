@@ -45,6 +45,7 @@ pub struct ETLOptions {
     pub shard_count: usize,       // number of on-disk dedup shards
     pub whitelist_fields: Option<Vec<String>>,
     pub strict_whitelist: bool,       // fail instead of warn when whitelisted keys match nothing
+    pub strict_key: bool,             // fail dedupe when matching records lack the requested key
     pub parallelism: Option<usize>,   // Some(N) to set rayon threads, None to use default
     pub work_dir: Option<PathBuf>,    // if None, create in base_dir/.reddit_etl_work/
     pub file_concurrency: usize,      // limit number of monthly files processed concurrently
@@ -67,6 +68,12 @@ pub struct ETLOptions {
     /// growing in-memory hash maps to multi-GiB peaks driven by
     /// available_memory_fraction. Defaults to 256 MiB.
     pub inflight_bytes: usize,
+
+    /// Number of buffered groups allowed between bucketing producers and
+    /// consumers. Lower values reduce queued group memory at the cost of more
+    /// producer blocking; higher values can improve throughput when consumers
+    /// are bursty. Defaults to 8.
+    pub inflight_groups: usize,
 
     /// Adaptive-memory policy shared by bucketing/dedupe producers. Controls
     /// the free-memory fractions used to shrink/grow producer buffers and the
@@ -101,6 +108,7 @@ impl Default for ETLOptions {
             shard_count: 256,
             whitelist_fields: None,
             strict_whitelist: false,
+            strict_key: false,
             parallelism: None,
             work_dir: None,
             file_concurrency: 1, // safe default to prevent OOM on big .zst windows
@@ -115,6 +123,7 @@ impl Default for ETLOptions {
             zst_level: 7,
 
             inflight_bytes: 256 * 1024 * 1024,
+            inflight_groups: 8,
             adaptive_mem: AdaptiveMemCfg::default(),
             resume: false,
             build_error: None,
@@ -177,6 +186,10 @@ impl ETLOptions {
         self.strict_whitelist = yes;
         self
     }
+    pub fn with_strict_key(mut self, yes: bool) -> Self {
+        self.strict_key = yes;
+        self
+    }
     pub fn with_parallelism(mut self, threads: usize) -> Self {
         self.parallelism = Some(threads);
         self
@@ -232,6 +245,13 @@ impl ETLOptions {
     /// 0 disables the explicit cap and falls back to memory-fraction sampling.
     pub fn with_inflight_bytes(mut self, bytes: usize) -> Self {
         self.inflight_bytes = bytes;
+        self
+    }
+
+    /// Set the bounded-channel depth used by bucketing producer/consumer
+    /// pairs. Values below 1 are clamped to 1.
+    pub fn with_inflight_groups(mut self, groups: usize) -> Self {
+        self.inflight_groups = groups.max(1);
         self
     }
 

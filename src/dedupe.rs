@@ -3,7 +3,9 @@ use crate::key_extractor::KeyExtractor;
 use crate::mem::{available_memory_fraction, is_low_memory, AdaptiveMemCfg};
 use crate::ndjson::{NdjsonReader, NdjsonWriter};
 use crate::progress::ProgressScope;
-use crate::util::{open_with_backoff, remove_with_backoff, replace_file_atomic_backoff, smoothstep_memory_fraction};
+use crate::util::{
+    open_with_backoff, remove_with_backoff, replace_file_atomic_backoff, smoothstep_memory_fraction,
+};
 use crate::zstd_jsonl::malformed_json_error;
 use anyhow::{Context, Result};
 use std::cmp::Ordering;
@@ -12,12 +14,20 @@ use std::fs;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
 
 const MAP_INITIAL_CAPACITY: usize = 64_000;
 const BYTES_PER_MB: usize = 1024 * 1024;
 
 type RunMap = ahash::AHashMap<String, Vec<String>>;
+
+#[inline]
+fn note_key_extraction_failed(counter: Option<&AtomicU64>) {
+    if let Some(counter) = counter {
+        counter.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+}
 
 /// Configuration for the generic dedupe engine.
 #[derive(Clone, Debug)]
@@ -77,6 +87,16 @@ pub fn build_runs_sorted(
     key: &KeyExtractor,
     cfg: &DedupeCfg,
 ) -> Result<Vec<PathBuf>> {
+    build_runs_sorted_with_key_stats(input, runs_dir, key, cfg, None)
+}
+
+pub(crate) fn build_runs_sorted_with_key_stats(
+    input: &Path,
+    runs_dir: &Path,
+    key: &KeyExtractor,
+    cfg: &DedupeCfg,
+    key_extractions_failed: Option<&AtomicU64>,
+) -> Result<Vec<PathBuf>> {
     fs::create_dir_all(runs_dir)?;
 
     let total_in_bytes = fs::metadata(input).map(|m| m.len()).unwrap_or(0);
@@ -118,6 +138,7 @@ pub fn build_runs_sorted(
             tx.clone(),
             &pb,
             cfg.mem.clone(),
+            key_extractions_failed,
         );
 
         // Always close tx so the consumer drains and returns.
@@ -144,6 +165,7 @@ fn run_producer(
     tx: crossbeam_channel::Sender<(usize, RunMap)>,
     pb: &ProgressScope,
     adaptive_mem: AdaptiveMemCfg,
+    key_extractions_failed: Option<&AtomicU64>,
 ) -> Result<()> {
     let mut buf = String::with_capacity(64 * 1024);
     let mut buffered_bytes: usize = 0;
@@ -155,17 +177,24 @@ fn run_producer(
 
     loop {
         let n = rdr.read_line(&mut buf)?;
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         pb.inc_bytes(n as u64);
         line_number += 1;
 
-        if buf.is_empty() { continue; }
-        if let Some(k) = key
+        if buf.is_empty() {
+            continue;
+        }
+        match key
             .key_from_line(&buf)
             .map_err(|e| malformed_json_error(input_path, line_number, e))?
         {
-            map.entry(k).or_default().push(buf.clone());
-            buffered_bytes += buf.len() + 1;
+            Some(k) => {
+                map.entry(k).or_default().push(buf.clone());
+                buffered_bytes += buf.len() + 1;
+            }
+            None => note_key_extraction_failed(key_extractions_failed),
         }
 
         if last_eval.elapsed() >= Duration::from_millis(adaptive_mem.adapt_cooldown_ms) {
@@ -219,11 +248,7 @@ fn run_producer(
     Ok(())
 }
 
-fn write_run_sorted(
-    run_path: &Path,
-    buf_map: &mut RunMap,
-    write_buf: usize,
-) -> Result<()> {
+fn write_run_sorted(run_path: &Path, buf_map: &mut RunMap, write_buf: usize) -> Result<()> {
     let mut keys: Vec<String> = buf_map.keys().cloned().collect();
     keys.sort_unstable();
 
@@ -249,7 +274,18 @@ pub fn merge_runs_sorted(
     output: &Path,
     key: &KeyExtractor,
     cfg: &DedupeCfg,
+    merge_same_key: impl FnMut(&str, Vec<String>, &mut dyn std::io::Write) -> Result<()>,
+) -> Result<()> {
+    merge_runs_sorted_with_key_stats(runs, output, key, cfg, merge_same_key, None)
+}
+
+pub(crate) fn merge_runs_sorted_with_key_stats(
+    runs: &[PathBuf],
+    output: &Path,
+    key: &KeyExtractor,
+    cfg: &DedupeCfg,
     mut merge_same_key: impl FnMut(&str, Vec<String>, &mut dyn std::io::Write) -> Result<()>,
+    key_extractions_failed: Option<&AtomicU64>,
 ) -> Result<()> {
     if runs.is_empty() {
         // Nothing to write.
@@ -259,24 +295,42 @@ pub fn merge_runs_sorted(
         return Ok(());
     }
 
-    let total_merge_bytes: u64 = runs.iter().map(|p| fs::metadata(p).map(|m| m.len()).unwrap_or(0)).sum();
+    let total_merge_bytes: u64 = runs
+        .iter()
+        .map(|p| fs::metadata(p).map(|m| m.len()).unwrap_or(0))
+        .sum();
     let pb = ProgressScope::bytes("Dedupe: merge runs", total_merge_bytes);
 
     #[derive(Eq)]
-    struct HeapItem { key: String, run_idx: usize, line: String }
+    struct HeapItem {
+        key: String,
+        run_idx: usize,
+        line: String,
+    }
     impl Ord for HeapItem {
         fn cmp(&self, other: &Self) -> Ordering {
-            other.key.cmp(&self.key).then_with(|| other.run_idx.cmp(&self.run_idx))
+            other
+                .key
+                .cmp(&self.key)
+                .then_with(|| other.run_idx.cmp(&self.run_idx))
         }
     }
-    impl PartialOrd for HeapItem { fn partial_cmp(&self, o: &Self) -> Option<Ordering> { Some(self.cmp(o)) } }
-    impl PartialEq for HeapItem { fn eq(&self, o: &Self) -> bool { self.key == o.key && self.run_idx == o.run_idx } }
+    impl PartialOrd for HeapItem {
+        fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
+            Some(self.cmp(o))
+        }
+    }
+    impl PartialEq for HeapItem {
+        fn eq(&self, o: &Self) -> bool {
+            self.key == o.key && self.run_idx == o.run_idx
+        }
+    }
 
-    // Read one line from `reader`, strip CRLF, extract its key, and build a
-    // HeapItem for it. Returns `Ok(None)` at EOF or when the line has no
-    // extractable key (silently skipped, matching the original behaviour).
-    // `read_bytes` and `pb` are updated on every successful read so progress
-    // accounting stays consistent across the three call sites below.
+    // Read until `reader` yields a line with an extractable key, stripping
+    // CRLF and building a HeapItem for it. Returns `Ok(None)` only at EOF.
+    // Lines without a key are counted and skipped; `read_bytes` and `pb` are
+    // updated on every successful read so progress accounting stays
+    // consistent across the call sites below.
     fn advance_reader(
         reader: &mut BufReader<File>,
         run_path: &Path,
@@ -285,18 +339,37 @@ pub fn merge_runs_sorted(
         read_bytes: &mut u64,
         line_number: &mut u64,
         pb: &ProgressScope,
+        key_extractions_failed: Option<&AtomicU64>,
     ) -> Result<Option<HeapItem>> {
-        let mut s = String::new();
-        let n = reader.read_line(&mut s)?;
-        if n == 0 { return Ok(None); }
-        *read_bytes += n as u64;
-        *line_number += 1;
-        pb.inc_bytes(n as u64);
-        if s.ends_with('\n') { s.pop(); if s.ends_with('\r') { s.pop(); } }
-        Ok(key
-            .key_from_line(&s)
-            .map_err(|e| malformed_json_error(run_path, *line_number, e))?
-            .map(|k| HeapItem { key: k, run_idx, line: s }))
+        loop {
+            let mut s = String::new();
+            let n = reader.read_line(&mut s)?;
+            if n == 0 {
+                return Ok(None);
+            }
+            *read_bytes += n as u64;
+            *line_number += 1;
+            pb.inc_bytes(n as u64);
+            if s.ends_with('\n') {
+                s.pop();
+                if s.ends_with('\r') {
+                    s.pop();
+                }
+            }
+            match key
+                .key_from_line(&s)
+                .map_err(|e| malformed_json_error(run_path, *line_number, e))?
+            {
+                Some(k) => {
+                    return Ok(Some(HeapItem {
+                        key: k,
+                        run_idx,
+                        line: s,
+                    }))
+                }
+                None => note_key_extraction_failed(key_extractions_failed),
+            }
+        }
     }
 
     let mut readers: Vec<(BufReader<File>, u64, u64)> = Vec::with_capacity(runs.len()); // (reader, bytes_read, lines_read)
@@ -315,7 +388,16 @@ pub fn merge_runs_sorted(
     // Prime heap
     for i in 0..readers.len() {
         let (r, read_bytes, line_number) = &mut readers[i];
-        if let Some(item) = advance_reader(r, &runs[i], i, key, read_bytes, line_number, &pb)? {
+        if let Some(item) = advance_reader(
+            r,
+            &runs[i],
+            i,
+            key,
+            read_bytes,
+            line_number,
+            &pb,
+            key_extractions_failed,
+        )? {
             heap.push(item);
         }
     }
@@ -331,7 +413,16 @@ pub fn merge_runs_sorted(
         // Pull next from the run we just popped from
         {
             let (r, read_bytes, line_number) = &mut readers[top.run_idx];
-            if let Some(item) = advance_reader(r, &runs[top.run_idx], top.run_idx, key, read_bytes, line_number, &pb)? {
+            if let Some(item) = advance_reader(
+                r,
+                &runs[top.run_idx],
+                top.run_idx,
+                key,
+                read_bytes,
+                line_number,
+                &pb,
+                key_extractions_failed,
+            )? {
                 heap.push(item);
             }
         }
@@ -343,7 +434,16 @@ pub fn merge_runs_sorted(
             group_lines.push(item.line);
 
             let (r, read_bytes, line_number) = &mut readers[run_idx];
-            if let Some(item) = advance_reader(r, &runs[run_idx], run_idx, key, read_bytes, line_number, &pb)? {
+            if let Some(item) = advance_reader(
+                r,
+                &runs[run_idx],
+                run_idx,
+                key,
+                read_bytes,
+                line_number,
+                &pb,
+                key_extractions_failed,
+            )? {
                 heap.push(item);
             }
         }

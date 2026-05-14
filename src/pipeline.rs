@@ -61,6 +61,10 @@ impl RedditETL {
         self.opts = self.opts.with_strict_whitelist(yes);
         self
     }
+    pub fn strict_key(mut self, yes: bool) -> Self {
+        self.opts = self.opts.with_strict_key(yes);
+        self
+    }
     pub fn parallelism(mut self, threads: usize) -> Self {
         self.opts = self.opts.with_parallelism(threads);
         self
@@ -109,6 +113,12 @@ impl RedditETL {
     /// producer/consumer pairs. See `ETLOptions::inflight_bytes`.
     pub fn inflight_bytes(mut self, bytes: usize) -> Self {
         self.opts = self.opts.with_inflight_bytes(bytes);
+        self
+    }
+    /// Override the bounded-channel depth used by bucketing producer/consumer
+    /// pairs. See `ETLOptions::inflight_groups`.
+    pub fn inflight_groups(mut self, groups: usize) -> Self {
+        self.opts = self.opts.with_inflight_groups(groups);
         self
     }
     /// Override the adaptive-memory policy used by bucketing/dedupe producers.
@@ -355,6 +365,10 @@ impl ScanPlan {
     }
     pub fn strict_whitelist(mut self, yes: bool) -> Self {
         self.etl = self.etl.strict_whitelist(yes);
+        self
+    }
+    pub fn strict_key(mut self, yes: bool) -> Self {
+        self.etl = self.etl.strict_key(yes);
         self
     }
 }

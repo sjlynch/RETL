@@ -44,7 +44,9 @@ fn parents_help_advertises_required_flags() {
         .and(contains("--cache"))
         .and(contains("--out"))
         .and(contains("--window-months"))
-        .and(contains("--resume"));
+        .and(contains("--resume"))
+        .and(contains("--inflight-bytes"))
+        .and(contains("--inflight-groups"));
     assert.stdout(pred);
 }
 
@@ -62,7 +64,8 @@ fn export_help_advertises_export_only_flags() {
         .and(contains("--whitelist"))
         .and(contains("--strict-whitelist"))
         .and(contains("--human-timestamps"))
-        .and(contains("--inflight-bytes"));
+        .and(contains("--inflight-bytes"))
+        .and(contains("--inflight-groups"));
     assert.stdout(pred);
 }
 
@@ -72,6 +75,8 @@ fn dedupe_help_advertises_key_out_and_inflight() {
     let pred = contains("--key")
         .and(contains("--out"))
         .and(contains("--inflight-bytes"))
+        .and(contains("--inflight-groups"))
+        .and(contains("--strict-key"))
         .and(contains("json:/pointer"));
     assert.stdout(pred);
 }

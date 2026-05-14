@@ -18,8 +18,8 @@
 //!    - [`ETLOptions`] / [`Sources`] — base dirs, date range, parallelism,
 //!      `file_concurrency` (default `1` to bound peak RAM on giant zstd
 //!      windows), `inflight_bytes` (default 256 MiB; cap on producer→consumer
-//!      backpressure), `adaptive_mem` thresholds, `resume`, IO buffer sizes,
-//!      `zst_level`.
+//!      backpressure), `inflight_groups` (bucketing channel depth),
+//!      `adaptive_mem` thresholds, `resume`, IO buffer sizes, `zst_level`.
 //!    - [`YearMonth`] / `iter_year_months` — inclusive month range cursors.
 //!    - [`ScanPlan`] / [`QuerySpec`] — the query builder returned by
 //!      [`RedditETL::scan`], plus subreddit / author / regex / keyword / domain
@@ -142,7 +142,7 @@ mod ndjson;
 pub use crate::config::{ConfigBuildError, ETLOptions, Sources};
 pub use crate::date::YearMonth;
 pub use crate::pipeline::{RedditETL, ScanPlan};
-pub use crate::pipeline_exec::ExportFormat;
+pub use crate::pipeline_exec::{DedupeKeySummary, ExportFormat};
 pub use crate::query::{QueryBuildError, QuerySpec};
 pub use crate::shard::UsernameStream;
 

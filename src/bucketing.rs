@@ -58,6 +58,7 @@ impl From<&ETLOptions> for BucketingCfg {
         Self {
             mem: opts.adaptive_mem.clone(),
             inflight_bytes: opts.inflight_bytes,
+            inflight_groups: opts.inflight_groups,
             ..Self::default()
         }
     }

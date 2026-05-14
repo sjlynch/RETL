@@ -199,6 +199,12 @@ pub(crate) struct DedupeArgs {
     /// 0 disables the explicit cap and falls back to memory-fraction sampling.
     #[arg(long)]
     pub(crate) inflight_bytes: Option<usize>,
+    /// Bounded channel depth for bucketing producer/consumer pairs.
+    #[arg(long)]
+    pub(crate) inflight_groups: Option<usize>,
+    /// Error if any matched record does not contain the requested dedupe key.
+    #[arg(long)]
+    pub(crate) strict_key: bool,
 }
 
 #[derive(Args, Debug)]
@@ -234,6 +240,9 @@ pub(crate) struct ExportArgs {
     /// 0 disables the explicit cap and falls back to memory-fraction sampling.
     #[arg(long)]
     pub(crate) inflight_bytes: Option<usize>,
+    /// Bounded channel depth for bucketing producer/consumer pairs.
+    #[arg(long)]
+    pub(crate) inflight_groups: Option<usize>,
     /// Resume a prior export with the same query/config/corpus. `jsonl`/`json`
     /// reuse per-month `.part_*.jsonl` files and `_progress.json` in a namespaced
     /// scratch dir under `--work-dir`; `spool` reuses part files and
@@ -378,6 +387,9 @@ pub(crate) struct ParentsArgs {
     /// Inflight bytes budget for bucketing/dedupe producer/consumer pairs.
     #[arg(long)]
     pub(crate) inflight_bytes: Option<usize>,
+    /// Bounded channel depth for bucketing producer/consumer pairs.
+    #[arg(long)]
+    pub(crate) inflight_groups: Option<usize>,
 }
 
 #[derive(Args, Debug)]

@@ -222,6 +222,12 @@ retl dedupe --key subreddit --start 2021-01 --end 2021-12 --out subreddits.txt
 retl dedupe --source rc --key 'json:/parent_id' --start 2020-01 --end 2020-12 --out parent_ids.txt
 ~~~
 
+Records that match the query but do not contain the extracted key are omitted
+from the dedupe output (for example, `--key json:/parent_id --source both`
+drops submissions because they have no `parent_id`). The CLI prints a summary
+with the drop count and warns when more than 1% of matching records lack the
+key. Add `--strict-key` to make any missing key a hard error instead.
+
 ### `export` — extract filtered records
 
 Formats:
@@ -684,6 +690,11 @@ Suggested starting points for `.file_concurrency(n)` by total system RAM:
   RAM.
 - `.inflight_bytes(bytes)` — hard cap for producer→consumer backpressure in
   bucketing/dedupe. Lower it to reduce peaks; raise only after measuring RAM.
+  CLI subcommands that expose this as `--inflight-bytes` also accept
+  `--inflight-groups`.
+- `.inflight_groups(n)` — bounded-channel depth for bucketing group handoff
+  (default `8`). Lower it to queue fewer groups on memory-tight machines;
+  raise it only when the consumer is bursty and RAM headroom has been measured.
 - `.adaptive_mem(AdaptiveMemCfg { soft_low_frac, high_frac, adapt_cooldown_ms })`
   — cooperative buffer policy. `soft_low_frac` is the available-memory fraction
   below which RETL shrinks buffers and flushes sooner, `high_frac` is the

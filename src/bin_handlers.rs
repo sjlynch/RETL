@@ -207,17 +207,25 @@ pub(crate) fn run_dedupe(args: DedupeArgs) -> Result<()> {
     if let Some(b) = args.inflight_bytes {
         etl = etl.inflight_bytes(b);
     }
+    if let Some(g) = args.inflight_groups {
+        etl = etl.inflight_groups(g);
+    }
+    if args.strict_key {
+        etl = etl.strict_key(true);
+    }
     let work_dir = args.common.work_dir.clone();
     let scan = plan!(etl, args.common, args.query);
 
     if args.out == Path::new("-") {
         let tmp_path = stdout_dedupe_path(&work_dir);
         let _ = fs::remove_file(&tmp_path);
-        let result = scan.dedupe_keys_to_lines(&key, &tmp_path);
-        if let Err(e) = result {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(e);
-        }
+        let stats = match scan.dedupe_keys_to_lines_with_stats(&key, &tmp_path) {
+            Ok(stats) => stats,
+            Err(e) => {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(e);
+            }
+        };
         let copy_result = (|| -> Result<()> {
             let mut f = fs::File::open(&tmp_path)
                 .with_context(|| format!("opening dedupe tempfile {}", tmp_path.display()))?;
@@ -229,10 +237,22 @@ pub(crate) fn run_dedupe(args: DedupeArgs) -> Result<()> {
         })();
         let _ = fs::remove_file(&tmp_path);
         copy_result?;
+        print_dedupe_summary(&stats);
     } else {
-        scan.dedupe_keys_to_lines(&key, &args.out)?;
+        let stats = scan.dedupe_keys_to_lines_with_stats(&key, &args.out)?;
+        print_dedupe_summary(&stats);
     }
     Ok(())
+}
+
+fn print_dedupe_summary(stats: &retl::DedupeKeySummary) {
+    eprintln!(
+        "Deduped {} unique keys from {} matching records ({} dropped without key; {:.2}% drop rate)",
+        stats.unique_keys,
+        stats.matched_records,
+        stats.key_extractions_failed,
+        stats.key_drop_rate() * 100.0,
+    );
 }
 
 fn parse_dedupe_key(spec: &str) -> Result<KeyExtractor> {
@@ -286,6 +306,9 @@ pub(crate) fn run_export(args: ExportArgs) -> Result<()> {
     }
     if let Some(b) = args.inflight_bytes {
         etl = etl.inflight_bytes(b);
+    }
+    if let Some(g) = args.inflight_groups {
+        etl = etl.inflight_groups(g);
     }
     if let Some(level) = args.zst_level {
         etl = etl.zst_level(level);
@@ -559,6 +582,9 @@ pub(crate) fn run_parents(args: ParentsArgs) -> Result<()> {
         }
         if let Some(b) = args.inflight_bytes {
             etl = etl.inflight_bytes(b);
+        }
+        if let Some(g) = args.inflight_groups {
+            etl = etl.inflight_groups(g);
         }
         etl
     };
