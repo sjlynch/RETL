@@ -74,14 +74,20 @@ the canonical reader; prefer it over rolling your own `Decoder`.
 ## Backpressure invariants
 
 The bucketing/dedupe pipeline is producer→consumer with a bounded crossbeam
-channel between them (see `src/dedupe.rs`):
+channel between them. The channel capacity differs by stage:
 
-- Channel capacity is **1**; the producer fills one map while one map is in
-  flight to the writer.
+- **Dedupe** (`src/dedupe.rs::build_runs_sorted`): channel capacity is hard-
+  coded to **1**. Worst-case peak ≈ `2 * per_flush_cap = inflight_bytes`.
+- **Bucketing** (`src/bucketing.rs::process_bucket_streaming`): channel
+  capacity is `inflight_groups` (default 8). Worst-case peak ≈
+  `(1 + inflight_groups) * (inflight_bytes / 2)`. With the defaults this is
+  ≈ 1.125 GiB, **not** 256 MiB. The two knobs are **not** independent — use
+  `RedditETL::inflight_budget(bytes)` to set both together so the declared
+  budget matches the actual peak. `BucketingCfg::from(&ETLOptions)` emits a
+  one-shot `tracing::warn!` when a pair exceeds roughly 2× `inflight_bytes`.
 - `per_flush_cap = inflight_bytes / 2` — the producer flushes a map once
-  it reaches that byte budget. Peak in-memory footprint is bounded by
-  `2 * per_flush_cap = inflight_bytes`.
-- `inflight_bytes` defaults to **256 MiB** and is the primary RAM lever.
+  it reaches that byte budget.
+- `inflight_bytes` defaults to **256 MiB** and is the per-flush byte lever.
   Lower it for tight environments; do **not** unbound it.
 - `file_concurrency` defaults to **1** because each in-flight zstd frame
   can hold a multi-GiB decompression window. Bump it only when you've

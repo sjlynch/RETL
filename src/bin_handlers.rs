@@ -4,15 +4,16 @@
 use anyhow::{Context, Result};
 use retl::{
     create_dir_all_with_backoff, create_new_with_backoff, discover_all, format_year_month_ranges,
-    missing_month_diagnostics, open_with_backoff, plan_files, remove_with_backoff,
-    replace_file_atomic_backoff, total_compressed_size, AggregateBuildReport, ExportFormat,
-    FileKind, IntegrityMode, KeyExtractor, RedditETL, Sources, YearMonth,
+    missing_month_diagnostics, open_with_backoff, plan_files, read_line_capped,
+    remove_with_backoff, replace_file_atomic_backoff, total_compressed_size, AggregateBuildReport,
+    ExportFormat, FileKind, IntegrityMode, KeyExtractor, RedditETL, Sources, YearMonth,
+    DEFAULT_MAX_LINE_BYTES,
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
 #[cfg(test)]
 use std::fs;
-use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::io::{self, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -578,23 +579,30 @@ fn first_spool_record_keys(spool_parts: &[PathBuf]) -> Result<Option<(PathBuf, V
     for path in spool_parts {
         let f = open_with_backoff(path, 16, 50)
             .with_context(|| format!("opening spool part {}", path.display()))?;
-        let r = BufReader::new(f);
-        for (line_idx, line) in r.lines().enumerate() {
-            let line = line.with_context(|| {
-                format!(
-                    "reading spool part {} near line {}",
-                    path.display(),
-                    line_idx + 1
-                )
-            })?;
-            if line.trim().is_empty() {
+        let mut r = BufReader::new(f);
+        let mut buf = String::new();
+        let mut line_no = 0u64;
+        loop {
+            let n = read_line_capped(&mut r, &mut buf, DEFAULT_MAX_LINE_BYTES, path)
+                .with_context(|| {
+                    format!(
+                        "reading spool part {} near line {}",
+                        path.display(),
+                        line_no + 1
+                    )
+                })?;
+            if n == 0 {
+                break;
+            }
+            line_no += 1;
+            if buf.trim().is_empty() {
                 continue;
             }
-            let v: Value = serde_json::from_str(&line).with_context(|| {
+            let v: Value = serde_json::from_str(&buf).with_context(|| {
                 format!(
                     "parsing spool part {} line {} while diagnosing missing parent IDs",
                     path.display(),
-                    line_idx + 1
+                    line_no
                 )
             })?;
             let keys = match v {

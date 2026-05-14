@@ -57,6 +57,10 @@ impl Default for BucketingCfg {
 
 impl From<&ETLOptions> for BucketingCfg {
     fn from(opts: &ETLOptions) -> Self {
+        crate::config::warn_if_inflight_pair_pathological(
+            opts.inflight_bytes,
+            opts.inflight_groups,
+        );
         Self {
             mem: opts.adaptive_mem.clone(),
             inflight_bytes: opts.inflight_bytes,

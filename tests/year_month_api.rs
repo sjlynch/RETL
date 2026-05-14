@@ -94,6 +94,27 @@ fn fromstr_rejects_non_numeric_components() {
 }
 
 #[test]
+fn fromstr_rejects_non_canonical_widths() {
+    // Single-digit month, single-digit year, two-digit year, padded year — all
+    // happen to round-trip to a different shape under Display, so we reject
+    // them outright instead of silently rewriting the operator's input.
+    assert!(YearMonth::from_str("2024-1").is_err(), "single-digit month must be rejected");
+    assert!(YearMonth::from_str("2-1").is_err(), "single-digit year+month must be rejected");
+    assert!(YearMonth::from_str("24-01").is_err(), "two-digit year must be rejected");
+    assert!(YearMonth::from_str("02024-01").is_err(), "five-digit padded year must be rejected");
+    assert!(YearMonth::from_str("2024-001").is_err(), "three-digit month must be rejected");
+}
+
+#[test]
+fn fromstr_round_trip_is_bit_stable_for_canonical_form() {
+    // `parse → Display` must be the identity on canonical input. Regression
+    // guard for the lax parser that silently rewrote `"2-1"` → `"0002-01"`.
+    let s = "2024-01";
+    let ym: YearMonth = s.parse().expect("canonical form parses");
+    assert_eq!(format!("{}", ym), s);
+}
+
+#[test]
 fn ord_compares_year_then_month() {
     let a = YearMonth::new(2005, 12);
     let b = YearMonth::new(2006, 1);

@@ -138,7 +138,15 @@ impl IdShardWriter {
         } = self;
         drop(writers);
 
-        let out_dir = base_dir.parent().unwrap().join(format!("{kind}_ids_dedup"));
+        let out_dir = base_dir
+            .parent()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "parent-id scratch base_dir has no parent: {}",
+                    base_dir.display()
+                )
+            })?
+            .join(format!("{kind}_ids_dedup"));
         create_dir_all_with_backoff(&out_dir, 16, 50)
             .with_context(|| format!("create parent-id dedup dir {}", out_dir.display()))?;
 
@@ -148,12 +156,13 @@ impl IdShardWriter {
         let shard_counts: Vec<usize> = tmp_paths
             .par_iter()
             .map(|p| -> Result<usize> {
-                let out = out_dir.join(
-                    p.file_name()
-                        .unwrap()
-                        .to_string_lossy()
-                        .replace(".tmp", ".txt"),
-                );
+                let file_name = p.file_name().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "parent-id shard scratch path has no file name: {}",
+                        p.display()
+                    )
+                })?;
+                let out = out_dir.join(file_name.to_string_lossy().replace(".tmp", ".txt"));
                 dedup_one(p, &out)
             })
             .collect::<Result<Vec<_>>>()?;

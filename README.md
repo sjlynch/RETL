@@ -738,13 +738,32 @@ Suggested starting points for `.file_concurrency(n)` by total system RAM:
 - `.file_concurrency(n)` — number of monthly files decoded in parallel. The
   per-file working set is large; raising this is the fastest way to use up
   RAM.
-- `.inflight_bytes(bytes)` — hard cap for producer→consumer backpressure in
-  bucketing/dedupe. Lower it to reduce peaks; raise only after measuring RAM.
-  CLI subcommands that expose this as `--inflight-bytes` also accept
-  `--inflight-groups`.
+- `.inflight_bytes(bytes)` — per-flush byte budget for the bucketing/dedupe
+  producer (`per_flush_cap = inflight_bytes / 2`). On its own this caps one
+  in-memory map; the bucketing channel adds more buffered groups on top
+  (see below). CLI subcommands expose this as `--inflight-bytes`.
 - `.inflight_groups(n)` — bounded-channel depth for bucketing group handoff
-  (default `8`). Lower it to queue fewer groups on memory-tight machines;
-  raise it only when the consumer is bursty and RAM headroom has been measured.
+  (default `8`). The dedupe stage hard-codes channel capacity to 1, so this
+  only affects bucketing. Lower it to queue fewer groups; raise only when
+  the consumer is bursty and you have measured RAM headroom.
+- `.inflight_budget(bytes)` — helper that sets `inflight_bytes = bytes` and
+  `inflight_groups = 1`, so the worst-case bucketing peak is bounded by the
+  declared value. Prefer this when the budget you pass should be the actual
+  RAM ceiling.
+
+> **These two knobs are not independent.** The bucketing worst-case peak is
+>
+> ```text
+> peak ≈ (1 + inflight_groups) * (inflight_bytes / 2)
+> ```
+>
+> With the defaults (`inflight_bytes = 256 MiB`, `inflight_groups = 8`) the
+> bucketing peak is ≈ 1.125 GiB, not 256 MiB. The dedupe stage pins channel
+> capacity to 1, so its peak is ≈ `inflight_bytes`. `retl` emits a one-shot
+> `tracing::warn!` (visible when `RETL_LOG`/`RUST_LOG` is enabled) if the
+> configured pair would exceed roughly 2× the declared `inflight_bytes`.
+> Use `.inflight_budget(bytes)` to set both together, or lower
+> `--inflight-groups` if you need the declared budget to be the ceiling.
 - `.adaptive_mem(AdaptiveMemCfg { soft_low_frac, high_frac, adapt_cooldown_ms })`
   — cooperative buffer policy. `soft_low_frac` is the available-memory fraction
   below which RETL shrinks buffers and flushes sooner, `high_frac` is the
