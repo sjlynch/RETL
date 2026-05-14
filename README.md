@@ -337,22 +337,23 @@ next to `--out`). `aggregate` does not scan the RC/RS corpus and does not
 accept corpus selectors such as `--data-dir`, `--start`, or `--subreddit`; run
 `retl export --format spool ...` first if you need to filter the corpus. Its
 runtime flags are limited to `--parallelism`, `--no-progress`, and
-`--shards-dir`. With no `--by`, the CLI keeps the original built-in
-record-count fallback and writes a JSON aggregate state:
+`--shards-dir`. Use `--spool DIR` to discover `part_RC_YYYY-MM.jsonl` /
+`part_RS_YYYY-MM.jsonl` spool parts chronologically (cross-platform and
+recommended); explicit JSONL file paths are still accepted for advanced use,
+but cannot be combined with `--spool`. With no `--by`, the CLI keeps the
+original built-in record-count fallback and writes a JSON aggregate state:
 
 ~~~sh
-retl aggregate \
-  --out agg.json --pretty \
-  ./spool/part_RC_2006-01.jsonl ./spool/part_RS_2006-01.jsonl
+retl aggregate --spool ./spool --out agg.json --pretty
 ~~~
 
 Built-in grouped rollups write two-column TSV:
 
 ~~~sh
-retl aggregate --by subreddit --out counts.tsv ./spool/*.jsonl
-retl aggregate --by month --out months.tsv ./spool/*.jsonl
-retl aggregate --by author --top 100 --out top_authors.tsv ./spool/*.jsonl
-retl aggregate --by 'json:/subreddit' --metric 'sum:/score' --out scores.tsv ./spool/*.jsonl
+retl aggregate --spool ./spool --by subreddit --out counts.tsv
+retl aggregate --spool ./spool --by month --out months.tsv
+retl aggregate --spool ./spool --by author --top 100 --out top_authors.tsv
+retl aggregate --spool ./spool --by 'json:/subreddit' --metric 'sum:/score' --out scores.tsv
 ~~~
 
 `--pretty` field-indents the final JSON when `--by` is omitted, matching

@@ -146,9 +146,10 @@ fn integrity_help_advertises_modes_and_sample() {
 }
 
 #[test]
-fn aggregate_help_requires_inputs_out_and_runtime_flags_only() {
+fn aggregate_help_advertises_spool_inputs_out_and_runtime_flags_only() {
     let assert = retl().args(["aggregate", "--help"]).assert().success();
     let pred = contains("INPUTS")
+        .and(contains("--spool"))
         .and(contains("--out"))
         .and(contains("--by"))
         .and(contains("--metric"))

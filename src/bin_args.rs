@@ -347,8 +347,12 @@ pub(crate) struct AggregateRuntimeOpts {
 pub(crate) struct AggregateArgs {
     #[command(flatten)]
     pub(crate) runtime: AggregateRuntimeOpts,
-    /// JSONL input files to aggregate.
-    #[arg(required = true, num_args = 1..)]
+    /// Spool directory containing `part_RC_YYYY-MM.jsonl` /
+    /// `part_RS_YYYY-MM.jsonl` files to aggregate.
+    #[arg(long)]
+    pub(crate) spool: Option<PathBuf>,
+    /// JSONL input files to aggregate. Omit when using `--spool`.
+    #[arg(num_args = 1.., value_name = "INPUTS")]
     pub(crate) inputs: Vec<PathBuf>,
     /// Output path. Without `--by`, writes JSON record-count state; with `--by`, writes TSV.
     #[arg(long, short)]
