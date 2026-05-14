@@ -172,7 +172,10 @@ pub use crate::progress::{
 };
 
 // Expose memory helpers for adaptive throttling from the binary.
-pub use crate::mem::{available_memory_fraction, is_low_memory, maybe_throttle_low_memory};
+pub use crate::mem::{
+    available_memory_fraction, is_low_memory, maybe_throttle_low_memory, sysinfo_ok,
+    FALLBACK_FRAC_ENV,
+};
 
 // Test-only injection point so integration tests can drive the cooperative
 // throttles in dedupe/bucketing/zstd_jsonl. Strictly gated; production
