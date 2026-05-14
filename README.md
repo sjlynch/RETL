@@ -317,12 +317,17 @@ retl count --mode author --subreddit programming --start 2006-01 --end 2006-04 -
 ### `integrity` — validate `.zst` monthly files
 
 ~~~sh
-# Quick: decode at most 64 KiB per file
+# Quick: decode the first 64 KiB (decompressed) per file
 retl integrity --mode quick --sample-bytes 65536 --source rc --start 2006-02 --end 2006-02
 
 # Full: decode every byte (validates trailing checksum)
 retl integrity --mode full --source both --start 2006-01 --end 2006-04
 ~~~
+
+Quick mode validates only the first `--sample-bytes` decompressed bytes of each
+file. `--sample-bytes` must be positive (default: 65536); very small samples
+(for example, below 4096 bytes) only cover a tiny prefix and emit a warning. Use
+`--mode full` for complete payload/trailer validation.
 
 Bad files print one `path<TAB>error` line per failure on stdout as soon as
 they are discovered, and the process exits with status `2`. Pass `--collect`
@@ -663,7 +668,9 @@ The `parents` CLI uses `--window-months 3` by default, scanning three extra mont
 
 ### Integrity Checks
 
-Quick sampling (fast) and full decode (slow but thorough):
+Quick sampling validates only the first positive `sample_bytes` decompressed
+bytes per file (fast, prefix-only); full decode validates the complete stream
+(slow but thorough):
 
 ~~~rust
 use retl::{IntegrityMode, RedditETL, Sources, YearMonth};

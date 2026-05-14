@@ -12,9 +12,18 @@ use zstd::stream::read::Decoder;
 
 /// Prevents "Frame requires too much memory" on large Reddit dumps.
 const ZSTD_WINDOW_LOG_MAX: u32 = 31;
+const ZERO_SAMPLE_BYTES_ERROR: &str =
+    "--sample-bytes must be > 0; use --mode full for complete validation";
 
 /// QUICK check: attempt to decode up to `max_decompressed_bytes` and stop.
+///
+/// `max_decompressed_bytes` must be positive. Use [`validate_zst_full`] when
+/// you need to validate the complete frame payload and trailer/checksum.
 pub fn quick_validate_zst(path: &Path, max_decompressed_bytes: u64) -> Result<()> {
+    if max_decompressed_bytes == 0 {
+        anyhow::bail!(ZERO_SAMPLE_BYTES_ERROR);
+    }
+
     let file = open_with_backoff(path, 16, 50)?;
     let mut decoder = Decoder::new(file)?;
     decoder.window_log_max(ZSTD_WINDOW_LOG_MAX)?;
@@ -44,10 +53,20 @@ pub fn validate_zst_full(path: &Path) -> Result<()> {
 #[derive(Clone, Copy, Debug)]
 pub enum IntegrityMode {
     /// Decode only the first `sample_bytes` (decompressed) per file.
-    /// Fast and catches early corruption; cannot detect late/trailing corruption.
+    ///
+    /// `sample_bytes` must be positive. Quick mode is fast and catches early
+    /// corruption; it cannot detect late/trailing corruption beyond the sampled
+    /// prefix.
     Quick { sample_bytes: u64 },
     /// Decode entire stream; slowest but most thorough (validates checksums).
     Full,
+}
+
+fn validate_integrity_mode(mode: IntegrityMode) -> Result<()> {
+    if let IntegrityMode::Quick { sample_bytes: 0 } = mode {
+        anyhow::bail!(ZERO_SAMPLE_BYTES_ERROR);
+    }
+    Ok(())
 }
 
 fn validate_integrity_job(job: &FileJob, mode: IntegrityMode) -> Result<()> {
@@ -70,6 +89,8 @@ where
     F: Fn(&Path, &str) -> Result<()> + Send + Sync,
     V: Fn(&FileJob, IntegrityMode) -> Result<()> + Send + Sync,
 {
+    validate_integrity_mode(mode)?;
+
     let label = match mode {
         IntegrityMode::Quick { .. } => "Integrity (quick)",
         IntegrityMode::Full => "Integrity (full)",
@@ -142,8 +163,9 @@ impl RedditETL {
     /// - Set `.sources()` (Comments / Submissions / Both) and `.date_range()` on the builder
     ///   before calling this.
     /// - Progress displays one tick per file (not per byte) to avoid noisy output.
-    /// - Use `IntegrityMode::Quick { sample_bytes }` for a fast, best-effort pass, or
-    ///   `IntegrityMode::Full` to validate the entire stream.
+    /// - Use `IntegrityMode::Quick { sample_bytes }` with a positive sample size for
+    ///   a fast, best-effort prefix pass, or `IntegrityMode::Full` to validate the
+    ///   entire stream.
     /// - Parallelism is controlled by `.parallelism(n)`, while `.file_concurrency(n)`
     ///   bounds the number of zstd decoders in flight.
     ///
@@ -168,6 +190,8 @@ impl RedditETL {
     where
         F: Fn(&Path, &str) -> Result<()> + Send + Sync,
     {
+        validate_integrity_mode(mode)?;
+
         let discovered = discover_all(&self.opts.comments_dir, &self.opts.submissions_dir);
         let files = plan_files_checked(
             &discovered,

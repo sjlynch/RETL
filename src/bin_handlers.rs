@@ -27,6 +27,7 @@ use crate::bin_helpers::{
 };
 
 const CLI_TEXT_WRITE_BUF_BYTES: usize = 64 * 1024;
+const QUICK_SAMPLE_WARN_BELOW_BYTES: u64 = 4096;
 static CLI_STAGE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn output_parent(path: &Path) -> &Path {
@@ -427,6 +428,14 @@ pub(crate) fn run_integrity(args: IntegrityArgs) -> Result<()> {
         },
         IntegrityModeArg::Full => IntegrityMode::Full,
     };
+    if let IntegrityMode::Quick { sample_bytes } = mode {
+        if sample_bytes > 0 && sample_bytes < QUICK_SAMPLE_WARN_BELOW_BYTES {
+            eprintln!(
+                "WARNING: quick integrity mode validates only a decompressed prefix sample \
+                 ({sample_bytes} byte(s)); use --mode full for complete validation"
+            );
+        }
+    }
     let bad = if args.collect {
         etl.check_corpus_integrity(mode)?
     } else {

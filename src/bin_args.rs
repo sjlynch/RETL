@@ -8,6 +8,20 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use retl::{Sources, YearMonth};
 use std::path::PathBuf;
 
+const SAMPLE_BYTES_ZERO_ERROR: &str =
+    "--sample-bytes must be > 0; use --mode full for complete validation";
+
+fn parse_positive_sample_bytes(raw: &str) -> Result<u64, String> {
+    let bytes = raw
+        .parse::<u64>()
+        .map_err(|e| format!("invalid byte count: {e}"))?;
+    if bytes == 0 {
+        Err(SAMPLE_BYTES_ZERO_ERROR.to_string())
+    } else {
+        Ok(bytes)
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "retl",
@@ -315,8 +329,9 @@ pub(crate) struct IntegrityArgs {
     /// Validation mode.
     #[arg(long, value_enum, default_value_t = IntegrityModeArg::Quick)]
     pub(crate) mode: IntegrityModeArg,
-    /// Bytes (decompressed) to sample per file in quick mode.
-    #[arg(long, default_value_t = 64 * 1024)]
+    /// Bytes (decompressed) to sample per file in quick mode. Must be positive;
+    /// values below 4096 only validate a tiny prefix and emit a warning.
+    #[arg(long, default_value_t = 64 * 1024, value_parser = parse_positive_sample_bytes)]
     pub(crate) sample_bytes: u64,
     /// Collect failures and print them only after all files finish.
     ///
