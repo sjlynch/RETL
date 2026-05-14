@@ -55,7 +55,7 @@ fn writers_with_same_stem_use_distinct_staged_files() {
         .filter_map(|e| e.ok())
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .filter(|name| {
-            name.starts_with("shared_part_0000.ndjson") && name.ends_with(".inprogress")
+            name.starts_with("shared_part_000000.ndjson") && name.ends_with(".inprogress")
         })
         .collect();
     assert_eq!(
@@ -148,7 +148,7 @@ fn finalize_returns_paths_in_partition_index_order() {
     let parts = pw.finalize().unwrap();
     assert_eq!(parts.len(), 8);
     for (i, p) in parts.iter().enumerate() {
-        let want = format!("ordered_part_{:04}.ndjson", i);
+        let want = format!("ordered_part_{:06}.ndjson", i);
         assert_eq!(
             p.file_name().unwrap().to_string_lossy(),
             want,

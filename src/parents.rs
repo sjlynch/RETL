@@ -498,28 +498,27 @@ fn build_id_shard_index(
             ));
         }
 
-        // Atomic write: serialize to a sibling .tmp first, fsync the data
-        // path via BufWriter::flush, then atomically replace the dest.
-        // Prevents readers from observing torn / half-written shard JSON
-        // after a crash mid-write.
-        let tmp = out.with_extension("json.tmp");
-        let write_res = (|| -> Result<()> {
-            let f = create_with_backoff(&tmp, 16, 50)
-                .with_context(|| format!("create tmp {}", tmp.display()))?;
-            let mut w = BufWriter::new(f);
+        // Atomic write: stage under `<out_dir>/_staging/<basename>.retl-<pid>-<nonce>.inprogress`,
+        // serialize the shard map into the staged file, flush, then atomically
+        // replace the dest. Routing through `_staging/` keeps concurrent shard
+        // writers from colliding on a shared sibling temp and lets a
+        // subsequent run's sweep recover crash leftovers — see
+        // `sweep_stale_inprogress` in `resolve_parent_maps`.
+        let out_parent = out
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let shard_staging = ensure_staging_dir(&out_parent)
+            .with_context(|| format!("ensure staging dir under {}", out_parent.display()))?;
+        write_jsonl_atomic(&shard_staging, &out, write_buf, |w| -> Result<()> {
             match job.kind {
-                FileKind::Comment => serde_json::to_writer(&mut w, &out_map_c)?,
-                FileKind::Submission => serde_json::to_writer(&mut w, &out_map_s)?,
+                FileKind::Comment => serde_json::to_writer(w, &out_map_c)?,
+                FileKind::Submission => serde_json::to_writer(w, &out_map_s)?,
             }
-            w.flush()?;
-            replace_file_atomic_backoff(&tmp, &out)?;
             Ok(())
-        })();
-
-        if let Err(e) = write_res {
-            let _ = remove_with_backoff(&tmp, 8, 50);
-            return Err(e).with_context(|| format!("write parent shard {}", out.display()));
-        }
+        })
+        .with_context(|| format!("write parent shard {}", out.display()))?;
 
         write_resolver_fingerprint_atomic(&sidecar_path, &fingerprint, write_buf)?;
         record_shard(out.clone());
@@ -1212,6 +1211,13 @@ impl RedditETL {
                 )
             })?;
 
+            // Sweep crash leftovers under `<cache>/_staging/`: shard writers
+            // stage there now (see `build_id_shard_index`), and any file owned
+            // by a no-longer-running PID is a partial flush from a prior
+            // crashed run that should not be promoted.
+            sweep_stale_inprogress(&comments_out, true)?;
+            sweep_stale_inprogress(&submissions_out, true)?;
+
             let discovered = discover_all(&self.opts.comments_dir, &self.opts.submissions_dir);
             let files = plan_files_checked(
                 &discovered,
@@ -1380,7 +1386,16 @@ impl RedditETL {
                 &indexed_inputs,
                 self.opts.file_concurrency,
                 |(idx, in_path)| -> Result<()> {
-                    let name = in_path.file_name().unwrap().to_string_lossy().to_string();
+                    let name = in_path
+                        .file_name()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "attach_parents input path has no file name: {}",
+                                in_path.display()
+                            )
+                        })?
+                        .to_string_lossy()
+                        .to_string();
                     let out_path = out_dir.join(name);
                     let inprogress_exists = attach_inprogress_exists(&staging_dir, &out_path)?;
                     let sidecar_path = attach_fingerprint_path(&out_path);
@@ -1602,5 +1617,36 @@ impl RedditETL {
             warn_if_no_comment_shaped_records(diagnostics);
             Ok((out_paths, stats))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::RedditETL;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    #[test]
+    fn attach_parents_with_no_file_name_input_returns_err() {
+        let etl = RedditETL::new();
+        let out_dir = tempfile::tempdir().expect("create out dir");
+        let parents = ParentMaps {
+            comments: HashMap::new(),
+            submissions: HashMap::new(),
+            comment_shards: None,
+            submission_shards: None,
+        };
+
+        // `..` has no `file_name()` per `Path::file_name` semantics. The function
+        // should surface a clean `Err` (from whichever guard fires first) rather
+        // than panicking inside the rayon worker.
+        let inputs = vec![PathBuf::from("..")];
+        let result =
+            etl.attach_parents_jsonls_parallel_with_stats(inputs, out_dir.path(), &parents, false);
+        assert!(
+            result.is_err(),
+            "expected Err for input path with no file_name(), got Ok"
+        );
     }
 }

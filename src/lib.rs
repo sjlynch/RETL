@@ -172,7 +172,10 @@ pub use crate::progress::{
 };
 
 // Expose memory helpers for adaptive throttling from the binary.
-pub use crate::mem::{available_memory_fraction, is_low_memory, maybe_throttle_low_memory};
+pub use crate::mem::{
+    available_memory_fraction, is_low_memory, maybe_throttle_low_memory, sysinfo_ok,
+    FALLBACK_FRAC_ENV,
+};
 
 // Test-only injection point so integration tests can drive the cooperative
 // throttles in dedupe/bucketing/zstd_jsonl. Strictly gated; production
@@ -186,7 +189,7 @@ pub use crate::integrity::IntegrityMode;
 pub use crate::zstd_jsonl::{quick_validate_zst, validate_zst_full};
 
 //export partition writers (lambda-capable)
-pub use crate::partition::PartitionWriters;
+pub use crate::partition::{PartitionWriters, MAX_PARTITIONS};
 
 //export robust file ops from util so binaries can import from crate root.
 pub use crate::util::{

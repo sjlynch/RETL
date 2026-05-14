@@ -9,13 +9,34 @@ use std::path::{Path, PathBuf};
 use crate::atomic_write::{ensure_staging_dir, unique_inprogress_path};
 use crate::util::{create_dir_all_with_backoff, create_new_with_backoff, replace_file_atomic_backoff};
 
+/// Upper bound on the number of partitions a single `PartitionWriters` will
+/// open at once. Each partition owns a live `BufWriter<File>` for the lifetime
+/// of the writer, so an unbounded `parts` value can exhaust the process
+/// file-descriptor limit (Windows stdio ~512, Linux soft `ulimit -n` ~1024)
+/// and pin a `parts * write_buf` block of RAM before any data lands.
+///
+/// `PartitionWriters::new` silently clamps `parts` to this value. Callers
+/// that want to dynamic-cap their own configuration can compare against this
+/// constant directly.
+pub const MAX_PARTITIONS: usize = 10_000;
+
 /// Partitioned writers that route each user aggregate to a stable partition file.
 /// Writes are user-keyed: the same `user` always goes to the same partition.
 /// You provide the bytes to write via a lambda (closure) that gets a `&mut dyn Write`.
 ///
 /// File layout:
-///   `<dir>/_staging/<stem>_part_XXXX.ndjson.retl-<pid>-<nonce>.inprogress`
-///   `<dir>/<stem>_part_XXXX.ndjson` (final, after finalize())
+///   `<dir>/_staging/<stem>_part_XXXXXX.ndjson.retl-<pid>-<nonce>.inprogress`
+///   `<dir>/<stem>_part_XXXXXX.ndjson` (final, after finalize())
+///
+/// The part number is zero-padded to 6 digits so that final paths sort
+/// lexicographically for any supported partition count.
+///
+/// Bounds on `parts`:
+///  - `parts` is clamped to `1` on the low end (a zero partition count
+///    collapses to a single output file).
+///  - `parts` is clamped to [`MAX_PARTITIONS`] on the high end so a
+///    misconfigured caller cannot exhaust the process file-descriptor limit
+///    or commit hundreds of GiB of writer buffers up front.
 ///
 /// Notes:
 ///  - You are responsible for writing line terminators (`\n`) inside the lambda.
@@ -34,8 +55,21 @@ pub struct PartitionWriters {
 impl PartitionWriters {
     /// Create `parts` writers under `dir` with the given file `stem`.
     /// Writes go into a staging directory and are atomically promoted on `finalize()`.
+    ///
+    /// `parts` is clamped to the inclusive range `[1, MAX_PARTITIONS]`; a
+    /// value above [`MAX_PARTITIONS`] is reduced to that ceiling (with a
+    /// `tracing::warn!`) rather than allowed to exhaust file descriptors
+    /// or writer-buffer RAM.
     pub fn new(dir: &Path, stem: &str, parts: usize, write_buf: usize) -> Result<Self> {
-        let parts = parts.max(1);
+        let requested = parts;
+        let parts = parts.max(1).min(MAX_PARTITIONS);
+        if requested > MAX_PARTITIONS {
+            tracing::warn!(
+                requested = requested,
+                max = MAX_PARTITIONS,
+                "PartitionWriters: clamping parts to MAX_PARTITIONS to bound file-descriptor and buffer use"
+            );
+        }
         create_dir_all_with_backoff(dir, 16, 50)
             .with_context(|| format!("create partition dir {}", dir.display()))?;
         let staging = ensure_staging_dir(dir)?;
@@ -45,7 +79,7 @@ impl PartitionWriters {
         let mut final_paths = Vec::with_capacity(parts);
 
         for i in 0..parts {
-            let final_p = dir.join(format!("{}_part_{:04}.ndjson", stem, i));
+            let final_p = dir.join(format!("{}_part_{:06}.ndjson", stem, i));
             let tmp = unique_inprogress_path(&staging, &final_p)?;
             let f = create_new_with_backoff(&tmp, 16, 50)
                 .with_context(|| format!("create {}", tmp.display()))?;
