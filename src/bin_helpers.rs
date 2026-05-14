@@ -3,7 +3,10 @@
 //! couple of CLI-only path/I/O helpers.
 
 use anyhow::{Context, Result};
-use retl::{Aggregator, ConfigBuildError, RedditETL, Sources, YearMonth};
+use retl::{
+    Aggregator, ConfigBuildError, JsonPointerPredicate, NumericComparison, PartialReadReporter,
+    RedditETL, Sources, YearMonth,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -160,27 +163,36 @@ impl GroupMetricAgg {
     }
 
     pub(crate) fn rows(&self, top: Option<usize>) -> Vec<(String, String)> {
+        self.rows_with_scientific(top, false)
+    }
+
+    pub(crate) fn rows_with_scientific(
+        &self,
+        top: Option<usize>,
+        scientific: bool,
+    ) -> Vec<(String, String)> {
+        let number_format = NumberFormat::from_scientific(scientific);
         let mut rows: Vec<(String, String, f64)> = self
             .groups
             .iter()
             .filter_map(|(key, state)| {
                 let (display, sort_value) = match self.metric.kind {
                     MetricKind::Count => (state.count.to_string(), state.count as f64),
-                    MetricKind::Sum => (format_number(state.sum), state.sum),
+                    MetricKind::Sum => (format_number(state.sum, number_format), state.sum),
                     MetricKind::Avg => {
                         if state.count == 0 {
                             return None;
                         }
                         let avg = state.sum / state.count as f64;
-                        (format_number(avg), avg)
+                        (format_number(avg, number_format), avg)
                     }
                     MetricKind::Min => {
                         let n = state.min?;
-                        (format_number(n), n)
+                        (format_number(n, number_format), n)
                     }
                     MetricKind::Max => {
                         let n = state.max?;
-                        (format_number(n), n)
+                        (format_number(n, number_format), n)
                     }
                 };
                 Some((key.clone(), display, sort_value))
@@ -310,6 +322,43 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn format_number_integer_scores_use_plain_decimal() {
+        let rendered = format_number(1_000_000_000_000_000.0, NumberFormat::Decimal);
+        assert_eq!(rendered, "1000000000000000");
+        assert!(!rendered.contains('e') && !rendered.contains('E'));
+    }
+
+    #[test]
+    fn format_number_average_uses_stable_decimal() {
+        let rendered = format_number(2.5, NumberFormat::Decimal);
+        assert_eq!(rendered, "2.5");
+        assert!(!rendered.contains('e') && !rendered.contains('E'));
+    }
+
+    #[test]
+    fn value_to_month_rejects_invalid_string_months() {
+        assert_eq!(string_to_month("2024-00-01T00:00:00Z"), None);
+        assert_eq!(string_to_month("2024-13-01T00:00:00Z"), None);
+        assert_eq!(string_to_month("2024-99-01T00:00:00Z"), None);
+    }
+
+    #[test]
+    fn value_to_month_accepts_valid_string_month_prefixes() {
+        for month in [
+            "01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12",
+        ] {
+            assert_eq!(
+                string_to_month(&format!("2024-{month}-01T00:00:00Z")),
+                Some(format!("2024-{month}"))
+            );
+        }
+    }
+
+    fn string_to_month(s: &str) -> Option<String> {
+        value_to_month(&Value::String(s.to_string()))
+    }
 }
 
 fn value_to_month(v: &Value) -> Option<String> {
@@ -322,10 +371,15 @@ fn value_to_month(v: &Value) -> Option<String> {
 }
 
 fn looks_like_year_month_prefix(s: &str) -> bool {
-    s.len() >= 7
+    if !(s.len() >= 7
         && s.as_bytes()[4] == b'-'
         && s.as_bytes()[0..4].iter().all(u8::is_ascii_digit)
-        && s.as_bytes()[5..7].iter().all(u8::is_ascii_digit)
+        && s.as_bytes()[5..7].iter().all(u8::is_ascii_digit))
+    {
+        return false;
+    }
+
+    matches!(s[5..7].parse::<u8>(), Ok(1..=12))
 }
 
 fn unix_seconds_to_month(secs: i64) -> Option<String> {
@@ -333,8 +387,62 @@ fn unix_seconds_to_month(secs: i64) -> Option<String> {
     Some(format!("{:04}-{:02}", dt.year(), u8::from(dt.month())))
 }
 
-fn format_number(n: f64) -> String {
-    n.to_string()
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NumberFormat {
+    Decimal,
+    Scientific,
+}
+
+impl NumberFormat {
+    fn from_scientific(scientific: bool) -> Self {
+        if scientific {
+            Self::Scientific
+        } else {
+            Self::Decimal
+        }
+    }
+}
+
+fn format_number(n: f64, format: NumberFormat) -> String {
+    if format == NumberFormat::Scientific || !n.is_finite() {
+        return n.to_string();
+    }
+
+    // All integers that fit in f64's exact integer range should be rendered as
+    // plain decimal digits. This keeps score sums (which originate as integer
+    // JSON numbers) friendly to awk/pandas/spreadsheets up to 1e15+.
+    const MAX_EXACT_INTEGER: f64 = 9_007_199_254_740_992.0; // 2^53
+    if n.fract() == 0.0 && n.abs() < MAX_EXACT_INTEGER {
+        return normalize_negative_zero(format!("{n:.0}"));
+    }
+
+    // For non-integers, use a stable fixed-precision decimal representation
+    // and trim cosmetic zeroes. This avoids f64::to_string's scientific
+    // notation for typical aggregate averages/min/max values while keeping the
+    // TSV compact enough for quick inspection.
+    let s = format!("{n:.6}");
+    let s = trim_decimal_zeros(s);
+    normalize_negative_zero(s)
+}
+
+fn trim_decimal_zeros(mut s: String) -> String {
+    if let Some(dot) = s.find('.') {
+        while s.ends_with('0') {
+            s.pop();
+        }
+        if s.len() == dot + 1 {
+            s.pop();
+        }
+    }
+    s
+}
+
+fn normalize_negative_zero(s: String) -> String {
+    if s == "-0" {
+        "0".to_string()
+    } else {
+        s
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -350,6 +458,144 @@ pub(crate) fn ensure_dirs(common: &CommonOpts) -> Result<PathBuf> {
     Ok(lib_tmp)
 }
 
+pub(crate) fn parse_json_predicate(raw: &str) -> Result<JsonPointerPredicate> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        anyhow::bail!("bad --json predicate: predicate is empty");
+    }
+
+    if let Some(pointer) = raw.strip_prefix("exists:") {
+        validate_cli_json_pointer(pointer, raw)?;
+        return Ok(JsonPointerPredicate::exists(pointer.to_string()));
+    }
+
+    let (pointer, op, value) = split_json_predicate(raw)?;
+    validate_cli_json_pointer(pointer, raw)?;
+
+    match op {
+        "=" => Ok(JsonPointerPredicate::equals(
+            pointer.to_string(),
+            parse_json_scalar(value, raw, op)?,
+        )),
+        "!=" => Ok(JsonPointerPredicate::not_equals(
+            pointer.to_string(),
+            parse_json_scalar(value, raw, op)?,
+        )),
+        ">" | ">=" | "<" | "<=" => {
+            let number = value.parse::<f64>().map_err(|_| {
+                anyhow::anyhow!(
+                    "bad --json predicate {raw:?}: value {value:?} is not a number for operator {op:?}"
+                )
+            })?;
+            if !number.is_finite() {
+                anyhow::bail!(
+                    "bad --json predicate {raw:?}: value {value:?} is not finite for operator {op:?}"
+                );
+            }
+            let cmp = match op {
+                ">" => NumericComparison::GreaterThan,
+                ">=" => NumericComparison::GreaterThanOrEqual,
+                "<" => NumericComparison::LessThan,
+                "<=" => NumericComparison::LessThanOrEqual,
+                _ => unreachable!(),
+            };
+            Ok(JsonPointerPredicate::number(
+                pointer.to_string(),
+                cmp,
+                number,
+            ))
+        }
+        "~=" => {
+            if value.is_empty() {
+                anyhow::bail!(
+                    "bad --json predicate {raw:?}: value is empty for regex operator {op:?}"
+                );
+            }
+            Ok(JsonPointerPredicate::regex(
+                pointer.to_string(),
+                value.to_string(),
+            ))
+        }
+        _ => unreachable!("split_json_predicate only returns supported operators"),
+    }
+}
+
+fn split_json_predicate(raw: &str) -> Result<(&str, &'static str, &str)> {
+    let mut best: Option<(usize, &'static str)> = None;
+    for op in ["~=", ">=", "<=", "!=", "=", ">", "<"] {
+        if let Some(idx) = raw.find(op) {
+            let replace = best
+                .map(|(best_idx, best_op)| {
+                    idx < best_idx || (idx == best_idx && op.len() > best_op.len())
+                })
+                .unwrap_or(true);
+            if replace {
+                best = Some((idx, op));
+            }
+        }
+    }
+
+    if let Some((idx, op)) = best {
+        let pointer = &raw[..idx];
+        let value = &raw[idx + op.len()..];
+        if pointer.is_empty() {
+            anyhow::bail!("bad --json predicate {raw:?}: pointer is empty before operator {op:?}");
+        }
+        if value.is_empty() {
+            anyhow::bail!("bad --json predicate {raw:?}: value is empty for operator {op:?}");
+        }
+        return Ok((pointer, op, value));
+    }
+
+    anyhow::bail!(
+        "bad --json predicate {raw:?}: missing or unsupported operator; expected exists:/path, /path=value, /path!=value, /path>value, /path>=value, /path<value, /path<=value, or /path~=REGEX"
+    )
+}
+
+fn validate_cli_json_pointer(pointer: &str, raw: &str) -> Result<()> {
+    if !pointer.starts_with('/') {
+        anyhow::bail!("bad --json predicate {raw:?}: pointer {pointer:?} must start with '/'");
+    }
+    let mut chars = pointer.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '~' {
+            match chars.next() {
+                Some('0') | Some('1') => {}
+                other => anyhow::bail!(
+                    "bad --json predicate {raw:?}: pointer {pointer:?} has invalid escape near '~{:?}'; use '~0' for '~' and '~1' for '/'",
+                    other
+                ),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_json_scalar(raw_value: &str, raw_predicate: &str, op: &str) -> Result<Value> {
+    match serde_json::from_str::<Value>(raw_value) {
+        Ok(value) if matches!(
+            value,
+            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_)
+        ) => Ok(value),
+        Ok(value) => anyhow::bail!(
+            "bad --json predicate {raw_predicate:?}: value {raw_value:?} for operator {op:?} must be a JSON scalar, not {}",
+            value_type_name(&value)
+        ),
+        Err(_) => Ok(Value::String(raw_value.to_string())),
+    }
+}
+
+fn value_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
 pub(crate) fn build_etl(common: &CommonOpts) -> Result<RedditETL> {
     if let (Some(start), Some(end)) = (common.start, common.end) {
         if start > end {
@@ -362,7 +608,8 @@ pub(crate) fn build_etl(common: &CommonOpts) -> Result<RedditETL> {
         .work_dir(&lib_tmp)
         .progress(!common.no_progress)
         .sources(Sources::from(common.source))
-        .date_range(common.start, common.end);
+        .date_range(common.start, common.end)
+        .allow_partial(common.allow_partial);
 
     if let Some(p) = common.parallelism {
         etl = etl.parallelism(p);
@@ -371,6 +618,15 @@ pub(crate) fn build_etl(common: &CommonOpts) -> Result<RedditETL> {
         etl = etl.file_concurrency(fc);
     }
     Ok(etl)
+}
+
+pub(crate) fn emit_partial_read_report(reporter: &PartialReadReporter) -> Result<()> {
+    let report = reporter.snapshot();
+    if report.skipped_file_count == 0 {
+        return Ok(());
+    }
+    eprintln!("{}", serde_json::to_string(&report)?);
+    Ok(())
 }
 
 /// Build a `ScanPlan` from `etl` with common CLI scan selections applied.
@@ -410,6 +666,9 @@ macro_rules! plan {
         }
         if !query.domains.is_empty() {
             scan = scan.domains_in(query.domains.iter().map(String::as_str));
+        }
+        for json_predicate in &query.json_predicates {
+            scan = scan.json_predicate($crate::bin_helpers::parse_json_predicate(json_predicate)?);
         }
         if common.include_deleted {
             scan = scan.include_pseudo_users();

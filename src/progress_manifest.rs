@@ -135,8 +135,9 @@ impl ManifestAccumulator {
     ///
     /// The in-memory insert, snapshot construction, staged write, and atomic
     /// rename all happen under the same mutex. That serializes concurrent
-    /// workers with `file_concurrency > 1`, preventing lost updates and staged
-    /// `_progress.json.inprogress` collisions.
+    /// workers with `file_concurrency > 1`, preventing lost updates. The
+    /// atomic writer also gives each staged `_progress.json` rewrite a unique
+    /// `.inprogress` path so concurrent attempts cannot truncate each other.
     pub fn commit(&self, key: String, entry: MonthEntry) -> Result<()> {
         let mut guard = self.months.lock();
         guard.insert(key, entry);

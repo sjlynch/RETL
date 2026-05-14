@@ -59,6 +59,10 @@ fn extract_to_json_array_pretty_parses_back_as_vec_and_has_indentation() {
 
     let s = fs::read_to_string(&out).unwrap();
     assert!(s.contains('\n'), "pretty form should have line breaks");
+    assert!(
+        s.contains("\n  {") && s.contains("\n    \"id\""),
+        "pretty form should field-indent array records"
+    );
     let arr: Vec<Value> = serde_json::from_str(&s).expect("pretty array parses");
     assert_eq!(arr.len(), 5);
     // Same content as compact, just formatted differently.
@@ -91,5 +95,8 @@ fn extract_to_json_array_errors_when_no_input_files_exist() {
         .unwrap_err();
 
     assert!(err.downcast_ref::<PlanningError>().is_some());
-    assert!(!out.exists(), "no empty JSON array should be published without candidate input files");
+    assert!(
+        !out.exists(),
+        "no empty JSON array should be published without candidate input files"
+    );
 }

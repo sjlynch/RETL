@@ -47,6 +47,25 @@ fn ascii_ci_contains_http(haystack: &[u8]) -> bool {
     haystack.windows(4).any(ascii_ci_is_http_prefix)
 }
 
+#[inline]
+fn keyword_field_matches(q: &QuerySpec, ac: &aho_corasick::AhoCorasick, text: &str) -> bool {
+    if q.keywords_all_ascii() && text.is_ascii() {
+        return ac.is_match(text.as_bytes());
+    }
+
+    // First try the raw bytes: this preserves the zero-allocation path for
+    // already-lowercase Unicode text and for ASCII folds inside non-ASCII text.
+    if ac.is_match(text.as_bytes()) {
+        return true;
+    }
+
+    // Unicode-aware fallback. Keyword inputs are stored lowercased in
+    // QuerySpec::normalize(); lowercase the haystack only when either the
+    // keyword set or the text field leaves the all-ASCII fast path.
+    let lower = text.to_lowercase();
+    ac.is_match(lower.as_bytes())
+}
+
 /// Decide using only fields in MinimalRecord (fast path).
 /// If `targets_opt` is None, accept any subreddit (still rejects missing subreddit).
 pub fn matches_minimal(
@@ -112,21 +131,23 @@ pub fn matches_minimal(
         }
     }
 
-    // keywords_any: run the pre-built ASCII-case-insensitive automaton over each
-    // text field's raw bytes — no per-record allocation or to_lowercase pass.
+    // keywords_any: all-ASCII keywords + all-ASCII haystacks stay on the
+    // pre-built Aho-Corasick raw-byte path. Non-ASCII keywords/text get a
+    // lowercase fallback so the documented case-insensitive behavior covers
+    // Unicode (e.g. `café` matching `CAFÉ`).
     if let Some(ac) = q.keywords_automaton() {
         let matched = min
             .body
             .as_deref()
-            .map_or(false, |s| ac.is_match(s.as_bytes()))
+            .map_or(false, |s| keyword_field_matches(q, ac, s))
             || min
                 .selftext
                 .as_deref()
-                .map_or(false, |s| ac.is_match(s.as_bytes()))
+                .map_or(false, |s| keyword_field_matches(q, ac, s))
             || min
                 .title
                 .as_deref()
-                .map_or(false, |s| ac.is_match(s.as_bytes()));
+                .map_or(false, |s| keyword_field_matches(q, ac, s));
         if !matched {
             return false;
         }
@@ -156,7 +177,7 @@ pub fn matches_minimal(
     true
 }
 
-/// Full-parse checks (kept for back-compat; not used when domain is on fast path).
+/// Full-parse checks for arbitrary JSON-pointer predicates.
 pub fn matches_full(val: &Value, kind: FileKind, q: &QuerySpec) -> bool {
     if let Some(ref domains) = q.domains_in {
         if let FileKind::Submission = kind {
@@ -169,7 +190,10 @@ pub fn matches_full(val: &Value, kind: FileKind, q: &QuerySpec) -> bool {
             return false;
         }
     }
-    true
+
+    q.json_predicates
+        .iter()
+        .all(|predicate| predicate.matches(val))
 }
 
 /// Resolve target subreddits from both the deprecated ETL single-subreddit

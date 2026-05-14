@@ -4,6 +4,8 @@
 //!   files at the destination (one per partition) and removes the staging
 //!   `.inprogress` files.
 //! - finalize promotes outputs in stable, sorted order by part index.
+//! - two live writers with the same stem use distinct staged files instead of
+//!   truncating each other's `.inprogress` path.
 //! - flush_all can be called repeatedly without breaking the writer.
 //! - parts=0 is clamped to 1 (per the doc comment in
 //!   `PartitionWriters::new(... parts.max(1) ...)`).
@@ -39,6 +41,57 @@ fn finalize_without_writes_emits_empty_per_partition_files() {
         leftovers.is_empty(),
         "expected no .inprogress in staging after finalize, got: {:?}",
         leftovers.iter().map(|e| e.path()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn writers_with_same_stem_use_distinct_staged_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = PartitionWriters::new(dir.path(), "shared", 1, 64 * 1024).unwrap();
+    let second = PartitionWriters::new(dir.path(), "shared", 1, 64 * 1024).unwrap();
+
+    let staged: Vec<_> = fs::read_dir(dir.path().join("_staging"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| {
+            name.starts_with("shared_part_0000.ndjson") && name.ends_with(".inprogress")
+        })
+        .collect();
+    assert_eq!(
+        staged.len(),
+        2,
+        "same-stem writers must not share one temp path: {staged:?}"
+    );
+
+    first
+        .write_with("alice", |w| {
+            w.write_all(b"first\n")?;
+            Ok(())
+        })
+        .unwrap();
+    second
+        .write_with("alice", |w| {
+            w.write_all(b"second\n")?;
+            Ok(())
+        })
+        .unwrap();
+    let first_paths = first.finalize().unwrap();
+    let second_paths = second.finalize().unwrap();
+    assert_eq!(
+        first_paths, second_paths,
+        "same stem still publishes the same final path"
+    );
+    assert_eq!(fs::read_to_string(&second_paths[0]).unwrap(), "second\n");
+
+    let leftovers: Vec<_> = fs::read_dir(dir.path().join("_staging"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".inprogress"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "staged files should be cleaned up after finalize: {leftovers:?}"
     );
 }
 

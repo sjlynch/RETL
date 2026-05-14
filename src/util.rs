@@ -198,9 +198,23 @@ pub fn open_with_backoff(path: &Path, tries: usize, delay_ms: u64) -> io::Result
     with_backoff(tries, delay_ms, || File::open(path))
 }
 
-/// Create a file with retries/backoff for transient errors.
+/// Create or truncate a file with retries/backoff for transient errors.
 pub fn create_with_backoff(path: &Path, tries: usize, delay_ms: u64) -> io::Result<File> {
     with_backoff(tries, delay_ms, || File::create(path))
+}
+
+/// Create a brand-new file with retries/backoff for transient errors.
+///
+/// Unlike [`create_with_backoff`], this uses `create_new(true)` so an
+/// unexpected path collision returns `AlreadyExists` instead of truncating an
+/// existing staged file.
+pub fn create_new_with_backoff(path: &Path, tries: usize, delay_ms: u64) -> io::Result<File> {
+    with_backoff(tries, delay_ms, || {
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+    })
 }
 
 /// Remove a file with retries/backoff for transient errors.
