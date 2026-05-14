@@ -167,6 +167,11 @@ fn jsonl_part_paths(tmp_dir: &Path) -> Result<Vec<PathBuf>> {
             paths.push(path);
         }
     }
+    // Sort by full PathBuf so stitched JSONL/JSON output is byte-stable across
+    // runs and filesystems — `read_dir` order is implementation-defined (NTFS
+    // typically alphabetical, ext4 hash-based, resume runs may change insertion
+    // order). Matches the sort in `concat_tsvs` below.
+    paths.sort();
     Ok(paths)
 }
 
@@ -249,6 +254,53 @@ mod tests {
         // Round-trip through serde to confirm it parses as an array of two objects.
         let v: serde_json::Value = serde_json::from_str(&got).unwrap();
         assert_eq!(v.as_array().map(|a| a.len()), Some(2));
+    }
+
+    /// Regression: stitched JSONL/JSON output must be byte-stable regardless of
+    /// the order `read_dir` returns the per-month temp parts. NTFS typically
+    /// returns entries alphabetically, ext4 returns them hash-ordered, and
+    /// resume runs change insertion order — all three must produce identical
+    /// stitched output. Mirrors the sort already done by `concat_tsvs`.
+    #[test]
+    fn stitch_output_is_sorted_independent_of_insertion_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmp_dir = dir.path().join("parts");
+        fs::create_dir_all(&tmp_dir).unwrap();
+
+        // Deliberately create parts in non-sorted order. On ext4 (hash-based
+        // readdir) this also makes `read_dir` return them in a non-sorted
+        // order; on NTFS (alphabetical readdir) the sort is a no-op but the
+        // assertion still pins the contract.
+        for (name, payload) in [
+            ("RC_2020-03.jsonl.part", b"{\"m\":\"2020-03\"}\n" as &[u8]),
+            ("RS_2020-01.jsonl.part", b"{\"m\":\"2020-01-rs\"}\n"),
+            ("RC_2020-01.jsonl.part", b"{\"m\":\"2020-01\"}\n"),
+            ("RC_2020-02.jsonl.part", b"{\"m\":\"2020-02\"}\n"),
+        ] {
+            let mut f = fs::File::create(tmp_dir.join(name)).unwrap();
+            f.write_all(payload).unwrap();
+        }
+
+        // JSONL stitch: records appear in sorted-by-filename order.
+        let jsonl_out = dir.path().join("out.jsonl");
+        stitch_tmp_parts(&tmp_dir, &jsonl_out, 64 * 1024).unwrap();
+        let got = fs::read_to_string(&jsonl_out).unwrap();
+        assert_eq!(
+            got,
+            "{\"m\":\"2020-01\"}\n{\"m\":\"2020-02\"}\n{\"m\":\"2020-03\"}\n{\"m\":\"2020-01-rs\"}\n",
+            "stitched JSONL must follow PathBuf sort order \
+             (RC_2020-01, RC_2020-02, RC_2020-03, RS_2020-01), not readdir order"
+        );
+
+        // Compact JSON array: same ordering invariant.
+        let json_out = dir.path().join("out.json");
+        stitch_tmp_parts_to_json_array(&tmp_dir, &json_out, false, 64 * 1024).unwrap();
+        let got = fs::read_to_string(&json_out).unwrap();
+        assert_eq!(
+            got,
+            "[{\"m\":\"2020-01\"},{\"m\":\"2020-02\"},{\"m\":\"2020-03\"},{\"m\":\"2020-01-rs\"}]",
+            "stitched JSON array must follow PathBuf sort order"
+        );
     }
 
     /// Pretty mode: field-indented array elements, matching CLI --pretty docs.

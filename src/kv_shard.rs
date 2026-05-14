@@ -70,20 +70,40 @@ impl ShardedKVWriter {
         Ok(())
     }
 
+    /// Reduce all shards by summing per-key values.
+    ///
+    /// **Overflow contract:** per-key totals are accumulated as `i64` using
+    /// [`i64::checked_add`]. On overflow the running total saturates to
+    /// [`i64::MAX`] (positive addend) or [`i64::MIN`] (negative addend) and
+    /// a single `tracing::warn!` is emitted per affected shard — further
+    /// overflows in the same shard are suppressed to avoid log spam. Callers
+    /// that need strict overflow detection should partition input so per-key
+    /// totals stay within `i64`, or post-process the warning log.
     pub fn reduce_sum(self, prefix: &str) -> Result<Vec<PathBuf>> {
         let (outs, _scratch_root) = self.reduce_sum_with_scratch(prefix)?;
         Ok(outs)
     }
 
+    /// Like [`reduce_sum`](Self::reduce_sum) but also returns the scratch
+    /// directory root so the caller can clean it up.
+    ///
+    /// See [`reduce_sum`](Self::reduce_sum) for the overflow contract.
     pub fn reduce_sum_with_scratch(self, prefix: &str) -> Result<(Vec<PathBuf>, PathBuf)> {
         self.reduce(prefix, Reducer::Sum, "kv_sum")
     }
 
+    /// Reduce all shards by keeping the minimum value seen per key.
+    ///
+    /// Every observed `i64` (including [`i64::MAX`]) is a legal value: keys
+    /// that never appear in input never appear in output, and a key whose
+    /// only observation is [`i64::MAX`] reduces to [`i64::MAX`].
     pub fn reduce_min(self, prefix: &str) -> Result<Vec<PathBuf>> {
         let (outs, _scratch_root) = self.reduce_min_with_scratch(prefix)?;
         Ok(outs)
     }
 
+    /// Like [`reduce_min`](Self::reduce_min) but also returns the scratch
+    /// directory root so the caller can clean it up.
     pub fn reduce_min_with_scratch(self, prefix: &str) -> Result<(Vec<PathBuf>, PathBuf)> {
         self.reduce(prefix, Reducer::Min, "kv_min")
     }
@@ -135,12 +155,19 @@ impl ShardedKVWriter {
 
 #[derive(Clone, Copy)]
 enum Reducer {
+    /// Per-key sum with saturating overflow. See [`ShardedKVWriter::reduce_sum`]
+    /// for the public contract: `checked_add` saturates to `i64::{MAX,MIN}` and
+    /// emits a one-time `tracing::warn!` per affected shard.
     Sum,
+    /// Per-key minimum. Sentinel-free: the first observation seeds the entry,
+    /// so any `i64` (including `i64::MAX`) is a legal observed value and keys
+    /// never observed never appear in output.
     Min,
 }
 
 fn reduce_shard(input: &Path, output: &Path, reducer: Reducer) -> Result<()> {
     let mut acc: HashMap<String, i64> = HashMap::with_capacity(64_000);
+    let mut sum_overflow_warned = false;
     let r = BufReader::new(
         open_with_backoff(input, 16, 50).with_context(|| format!("open {}", input.display()))?,
     );
@@ -165,12 +192,41 @@ fn reduce_shard(input: &Path, output: &Path, reducer: Reducer) -> Result<()> {
             )
         })?;
         match reducer {
-            Reducer::Sum => *acc.entry(k.to_string()).or_insert(0) += val,
-            Reducer::Min => {
-                let e = acc.entry(k.to_string()).or_insert(i64::MAX);
-                if val < *e {
-                    *e = val;
+            Reducer::Sum => {
+                let e = acc.entry(k.to_string()).or_insert(0i64);
+                match e.checked_add(val) {
+                    Some(s) => *e = s,
+                    None => {
+                        // Saturate to keep the run going; emit one warning per
+                        // shard so the user sees the overflow without log spam.
+                        let saturated = if val >= 0 { i64::MAX } else { i64::MIN };
+                        if !sum_overflow_warned {
+                            tracing::warn!(
+                                path = %input.display(),
+                                line = line_no,
+                                key = %k,
+                                accumulator = *e,
+                                value = val,
+                                saturated_to = saturated,
+                                "kv_shard Sum overflow: saturating; further overflows in this shard suppressed"
+                            );
+                            sum_overflow_warned = true;
+                        }
+                        *e = saturated;
+                    }
                 }
+            }
+            Reducer::Min => {
+                // Sentinel-free: seed with the first observed value so `i64::MAX`
+                // is a legal observation and 'never seen' is unambiguous (the
+                // key simply never enters the map).
+                acc.entry(k.to_string())
+                    .and_modify(|cur| {
+                        if val < *cur {
+                            *cur = val;
+                        }
+                    })
+                    .or_insert(val);
             }
         }
     }
@@ -231,5 +287,102 @@ mod tests {
             msg.contains("malformed K-V shard line") && msg.contains("value is not an i64"),
             "unexpected error: {msg}"
         );
+    }
+
+    fn read_kv_tsv(path: &Path) -> HashMap<String, i64> {
+        let mut out = HashMap::new();
+        let r = BufReader::new(File::open(path).expect("open output"));
+        for line in r.lines() {
+            let line = line.expect("read line");
+            if line.is_empty() {
+                continue;
+            }
+            let (k, v) = line.split_once('\t').expect("tab");
+            out.insert(k.to_string(), v.parse::<i64>().expect("i64"));
+        }
+        out
+    }
+
+    #[test]
+    fn reduce_shard_sum_saturates_on_positive_overflow() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let input = tmp.path().join("kv_0000.tmp");
+        let output = tmp.path().join("kv_0000.tsv");
+
+        let mut f = std::fs::File::create(&input).expect("create input");
+        writeln!(f, "alice\t{}", i64::MAX).expect("write");
+        writeln!(f, "alice\t1").expect("write");
+        writeln!(f, "alice\t1000").expect("write");
+        writeln!(f, "bob\t42").expect("write");
+        drop(f);
+
+        reduce_shard(&input, &output, Reducer::Sum).expect("sum should saturate, not panic");
+        let rows = read_kv_tsv(&output);
+        assert_eq!(rows.get("alice").copied(), Some(i64::MAX));
+        assert_eq!(rows.get("bob").copied(), Some(42));
+    }
+
+    #[test]
+    fn reduce_shard_sum_saturates_on_negative_overflow() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let input = tmp.path().join("kv_0000.tmp");
+        let output = tmp.path().join("kv_0000.tsv");
+
+        let mut f = std::fs::File::create(&input).expect("create input");
+        writeln!(f, "alice\t{}", i64::MIN).expect("write");
+        writeln!(f, "alice\t-1").expect("write");
+        drop(f);
+
+        reduce_shard(&input, &output, Reducer::Sum).expect("sum should saturate, not panic");
+        let rows = read_kv_tsv(&output);
+        assert_eq!(rows.get("alice").copied(), Some(i64::MIN));
+    }
+
+    #[test]
+    fn reduce_shard_min_accepts_i64_max_as_legal_value() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let input = tmp.path().join("kv_0000.tmp");
+        let output = tmp.path().join("kv_0000.tsv");
+
+        let mut f = std::fs::File::create(&input).expect("create input");
+        // `lonely_max` is only ever observed as i64::MAX — must round-trip.
+        writeln!(f, "lonely_max\t{}", i64::MAX).expect("write");
+        // `pair_max` is seen twice as i64::MAX — still MAX, no sentinel collision.
+        writeln!(f, "pair_max\t{}", i64::MAX).expect("write");
+        writeln!(f, "pair_max\t{}", i64::MAX).expect("write");
+        // `mixed` proves the min still wins when there is a smaller value.
+        writeln!(f, "mixed\t{}", i64::MAX).expect("write");
+        writeln!(f, "mixed\t5").expect("write");
+        writeln!(f, "mixed\t{}", i64::MAX).expect("write");
+        drop(f);
+
+        reduce_shard(&input, &output, Reducer::Min).expect("min should succeed");
+        let rows = read_kv_tsv(&output);
+        assert_eq!(rows.get("lonely_max").copied(), Some(i64::MAX));
+        assert_eq!(rows.get("pair_max").copied(), Some(i64::MAX));
+        assert_eq!(rows.get("mixed").copied(), Some(5));
+        // 'never seen' is unambiguous: keys that never appeared are absent.
+        assert!(!rows.contains_key("ghost"));
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn reduce_shard_min_picks_smallest_value() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let input = tmp.path().join("kv_0000.tmp");
+        let output = tmp.path().join("kv_0000.tsv");
+
+        let mut f = std::fs::File::create(&input).expect("create input");
+        writeln!(f, "a\t30").expect("write");
+        writeln!(f, "a\t10").expect("write");
+        writeln!(f, "a\t20").expect("write");
+        writeln!(f, "b\t-5").expect("write");
+        writeln!(f, "b\t-100").expect("write");
+        drop(f);
+
+        reduce_shard(&input, &output, Reducer::Min).expect("min should succeed");
+        let rows = read_kv_tsv(&output);
+        assert_eq!(rows.get("a").copied(), Some(10));
+        assert_eq!(rows.get("b").copied(), Some(-100));
     }
 }
