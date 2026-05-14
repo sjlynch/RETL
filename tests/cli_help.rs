@@ -97,6 +97,7 @@ fn scan_help_advertises_common_flags() {
         .and(contains("--max-score"))
         .and(contains("--contains-url"))
         .and(contains("--domain"))
+        .and(contains("--json"))
         .and(contains("--include-deleted"))
         .and(contains("--whitelist").not())
         .and(contains("--strict-whitelist").not())

@@ -11,6 +11,77 @@ fn retl() -> Command {
 }
 
 #[test]
+fn cli_unfiltered_undated_export_warns_before_scan() {
+    let base = make_corpus_basic();
+    let cwd = tempfile::tempdir().unwrap();
+    let out_jsonl = cwd.path().join("everything.jsonl");
+
+    retl()
+        .arg("export")
+        .arg("--data-dir")
+        .arg(&base)
+        .args(["--format", "jsonl", "--no-progress", "--out"])
+        .arg(&out_jsonl)
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("running an unfiltered, undated query over the full corpus")
+                .and(predicate::str::contains("files"))
+                .and(predicate::str::contains("compressed_bytes")),
+        );
+}
+
+#[test]
+fn cli_filtered_export_does_not_warn_full_corpus() {
+    let base = make_corpus_basic();
+    let cwd = tempfile::tempdir().unwrap();
+    let out_jsonl = cwd.path().join("filtered.jsonl");
+
+    retl()
+        .arg("export")
+        .arg("--data-dir")
+        .arg(&base)
+        .args([
+            "--subreddit",
+            "programming",
+            "--format",
+            "jsonl",
+            "--no-progress",
+            "--out",
+        ])
+        .arg(&out_jsonl)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("unfiltered, undated query").not());
+}
+
+#[test]
+fn cli_json_pointer_filter_suppresses_full_corpus_warning() {
+    let base = make_corpus_basic();
+    let cwd = tempfile::tempdir().unwrap();
+    let out_jsonl = cwd.path().join("json_filtered.jsonl");
+
+    retl()
+        .arg("export")
+        .arg("--data-dir")
+        .arg(&base)
+        .args([
+            "--source",
+            "rs",
+            "--json",
+            "/over_18=false",
+            "--format",
+            "jsonl",
+            "--no-progress",
+            "--out",
+        ])
+        .arg(&out_jsonl)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("unfiltered, undated query").not());
+}
+
+#[test]
 fn cli_keyword_score_url_filters_export_and_count() {
     let base = make_corpus_basic();
     let cwd = tempfile::tempdir().unwrap();

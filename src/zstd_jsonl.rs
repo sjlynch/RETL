@@ -30,31 +30,63 @@ const THROTTLE_SAMPLE_MASK: u32 = 0xFFFF;
 /// Default `BufReader` capacity when callers do not specify one.
 const DEFAULT_READ_BUF_BYTES: usize = 16 * 1024;
 
+fn de_opt_string_lossy<'de, D>(deserializer: D) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|v| match v {
+        serde_json::Value::String(s) => Some(s),
+        _ => None,
+    }))
+}
+
+fn de_opt_i64_lossy<'de, D>(deserializer: D) -> std::result::Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|v| v.as_i64()))
+}
+
 /// Minimal line-level schema for fast filtering.
 /// Extra fields are ignored by serde.
 /// NOTE: includes `score` to enable fast numeric filters.
 /// Includes `selftext`, `body`, `title`, `url`, and `parent_id` so keyword/URL
 /// filtering works without a full parse. Includes `domain` (submissions) and
-/// `id` (both kinds).
+/// `id` (both kinds). Optional fields are lossy: unexpected JSON types become
+/// `None` instead of making the entire hot-path parse fail, so schema drift in
+/// unused fields does not silently drop otherwise valid records.
 #[derive(Debug, Deserialize)]
 pub struct MinimalRecord {
+    #[serde(default, deserialize_with = "de_opt_string_lossy")]
     pub subreddit: Option<String>,
+    #[serde(default, deserialize_with = "de_opt_string_lossy")]
     pub author: Option<String>,
+    #[serde(default, deserialize_with = "de_opt_i64_lossy")]
     pub created_utc: Option<i64>,
+    #[serde(default, deserialize_with = "de_opt_i64_lossy")]
     pub score: Option<i64>,
 
     // ID of the record (present on both RC and RS)
+    #[serde(default, deserialize_with = "de_opt_string_lossy")]
     pub id: Option<String>,
 
     // Optional textual / metadata fields (only present when applicable):
+    #[serde(default, deserialize_with = "de_opt_string_lossy")]
     pub selftext: Option<String>, // submissions
-    pub body: Option<String>,     // comments
-    pub title: Option<String>,    // submissions
-    pub url: Option<String>,      // submissions (outbound URL on link posts)
+    #[serde(default, deserialize_with = "de_opt_string_lossy")]
+    pub body: Option<String>, // comments
+    #[serde(default, deserialize_with = "de_opt_string_lossy")]
+    pub title: Option<String>, // submissions
+    #[serde(default, deserialize_with = "de_opt_string_lossy")]
+    pub url: Option<String>, // submissions (outbound URL on link posts)
 
     #[allow(dead_code)]
+    #[serde(default, deserialize_with = "de_opt_string_lossy")]
     pub parent_id: Option<String>, // comments
 
+    #[serde(default, deserialize_with = "de_opt_string_lossy")]
     pub domain: Option<String>, // submissions (used by domains_in)
 }
 
@@ -105,13 +137,31 @@ pub fn malformed_json_error(
     )
 }
 
+pub fn zstd_decode_error(path: &Path, source: impl std::fmt::Display) -> anyhow::Error {
+    anyhow!(
+        "zstd decode error while streaming {}: {}",
+        path.display(),
+        source
+    )
+}
+
 // ----------------------------- Streaming ----------------------------------
+
+/// Policy for zstd decode errors that occur after a file has been opened.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PartialReadPolicy {
+    /// Decode errors are fatal. This is the default for corpus scans/exports.
+    Strict,
+    /// Decode errors are logged and reported through `on_skip`, and the file
+    /// is treated as incomplete (`Ok(false)` from status APIs).
+    AllowPartial,
+}
 
 /// Options for [`for_each_line_with_opts`].
 ///
-/// Every field has a sensible default (`None`/`true`); callers fill in only
-/// the knobs they actually use. Lifetime `'a` ties the trait-object callbacks
-/// to the caller's stack.
+/// Every field has a sensible default (`None`/`true`/strict); callers fill in
+/// only the knobs they actually use. Lifetime `'a` ties the trait-object
+/// callbacks to the caller's stack.
 pub struct LineStreamOpts<'a> {
     /// `BufReader` capacity in bytes. `None` → [`DEFAULT_READ_BUF_BYTES`].
     pub read_buf_bytes: Option<usize>,
@@ -119,10 +169,14 @@ pub struct LineStreamOpts<'a> {
     /// line, plus a final flush at EOF. On a decode error the file's full
     /// length is reported so progress bars stay monotonic.
     pub progress: Option<&'a mut dyn FnMut(u64)>,
-    /// If `Some`, called once when the file is skipped due to a decode error.
-    /// The error is also logged via tracing/stderr; the outer call still
-    /// returns `Ok(())`.
+    /// If `Some`, called once when the file is skipped due to a decode error
+    /// in [`PartialReadPolicy::AllowPartial`] mode. The error is also logged
+    /// via tracing/stderr; strict mode returns the error instead.
     pub on_skip: Option<&'a mut dyn FnMut(&Path, &anyhow::Error)>,
+    /// Strict by default. Set to [`PartialReadPolicy::AllowPartial`] only when
+    /// the caller is deliberately accepting lossy results and records skipped
+    /// paths somewhere machine-readable.
+    pub partial_read_policy: PartialReadPolicy,
     /// Sample [`maybe_throttle_low_memory`] every
     /// [`THROTTLE_SAMPLE_MASK`]+1 lines. Set `false` for stages that briefly
     /// allocate a lot (e.g., parent-cache builds) where the backoff would
@@ -136,6 +190,7 @@ impl<'a> Default for LineStreamOpts<'a> {
             read_buf_bytes: None,
             progress: None,
             on_skip: None,
+            partial_read_policy: PartialReadPolicy::Strict,
             throttle: true,
         }
     }
@@ -146,10 +201,11 @@ impl<'a> Default for LineStreamOpts<'a> {
 ///
 /// We request `window_log_max(ZSTD_WINDOW_LOG_MAX)` up front to avoid
 /// "Frame requires too much memory" on very large frames. If decoding
-/// still fails (e.g., checksum/corruption), we log a single warning,
+/// still fails (e.g., checksum/corruption), strict mode returns a contextual
+/// error. In [`PartialReadPolicy::AllowPartial`] mode we log a single warning,
 /// invoke `opts.on_skip` (if set), advance progress to the file's size
-/// (if a progress callback is set), and report the skipped/partial read to
-/// callers that need resume correctness.
+/// (if a progress callback is set), and return `Ok(false)` so callers can keep
+/// resume manifests from marking the month complete.
 pub fn for_each_line_with_opts_status(
     path: &Path,
     opts: LineStreamOpts<'_>,
@@ -159,6 +215,7 @@ pub fn for_each_line_with_opts_status(
         read_buf_bytes,
         mut progress,
         mut on_skip,
+        partial_read_policy,
         throttle,
     } = opts;
     let result = for_each_line_attempt(
@@ -172,24 +229,31 @@ pub fn for_each_line_with_opts_status(
         Ok(()) => Ok(true),
         Err(LineStreamAttemptError::Open(e)) => Err(e),
         Err(LineStreamAttemptError::Decode(e)) => {
-            warn_decode_skip(path, &e);
-            if let Some(cb) = on_skip.as_deref_mut() {
-                cb(path, &e);
-            }
-            // Keep progress bars monotonic on skip.
-            if let Some(cb) = progress.as_deref_mut() {
-                if let Ok(meta) = fs::metadata(path) {
-                    cb(meta.len());
+            let e = zstd_decode_error(path, e);
+            match partial_read_policy {
+                PartialReadPolicy::Strict => Err(e),
+                PartialReadPolicy::AllowPartial => {
+                    warn_decode_skip(path, &e);
+                    if let Some(cb) = on_skip.as_deref_mut() {
+                        cb(path, &e);
+                    }
+                    // Keep progress bars monotonic on skip.
+                    if let Some(cb) = progress.as_deref_mut() {
+                        if let Ok(meta) = fs::metadata(path) {
+                            cb(meta.len());
+                        }
+                    }
+                    Ok(false)
                 }
             }
-            Ok(false)
         }
         Err(LineStreamAttemptError::Callback(e)) => Err(e),
     }
 }
 
-/// Back-compat wrapper for callers that tolerate corrupt zstd inputs by
-/// warning and continuing.
+/// Wrapper for callers that do not need the complete/incomplete boolean.
+/// Decode-error behavior is controlled by [`LineStreamOpts::partial_read_policy`]
+/// and is strict by default.
 pub fn for_each_line_with_opts(
     path: &Path,
     opts: LineStreamOpts<'_>,
@@ -219,6 +283,7 @@ pub fn for_each_line_cfg(
 
 /// Like [`for_each_line_cfg`] but returns `Ok(false)` when a zstd decode error
 /// was tolerated after zero or more lines had already been delivered.
+#[allow(dead_code)]
 pub fn for_each_line_cfg_status(
     path: &Path,
     read_buf_bytes: usize,
@@ -228,13 +293,16 @@ pub fn for_each_line_cfg_status(
         path,
         LineStreamOpts {
             read_buf_bytes: Some(read_buf_bytes),
+            partial_read_policy: PartialReadPolicy::AllowPartial,
             ..Default::default()
         },
         on_line,
     )
 }
 
-/// Like [`for_each_line_cfg`] but reports skip events to the caller.
+/// Like [`for_each_line_cfg`] but reports skip events to the caller and
+/// deliberately allows corrupt zstd files to be skipped.
+#[allow(dead_code)]
 pub fn for_each_line_cfg_with_skip(
     path: &Path,
     read_buf_bytes: usize,
@@ -246,6 +314,7 @@ pub fn for_each_line_cfg_with_skip(
         LineStreamOpts {
             read_buf_bytes: Some(read_buf_bytes),
             on_skip: Some(&mut on_skip),
+            partial_read_policy: PartialReadPolicy::AllowPartial,
             ..Default::default()
         },
         on_line,
@@ -255,8 +324,9 @@ pub fn for_each_line_cfg_with_skip(
 /// Like [`for_each_line_cfg`] but additionally calls
 /// `on_progress(delta_bytes_read)` after each line and at EOF.
 ///
-/// On corruption, advances progress by the file's size before returning
-/// `Ok(())` so progress bars stay monotonic.
+/// In strict mode, corruption is returned as an error. Use the status/with-skip
+/// variants or [`LineStreamOpts::partial_read_policy`] to opt into lossy skips.
+#[allow(dead_code)]
 pub fn for_each_line_with_progress_cfg(
     path: &Path,
     read_buf_bytes: usize,
@@ -276,6 +346,7 @@ pub fn for_each_line_with_progress_cfg(
 
 /// Like [`for_each_line_with_progress_cfg`] but returns `Ok(false)` when a
 /// zstd decode error was tolerated.
+#[allow(dead_code)]
 pub fn for_each_line_with_progress_cfg_status(
     path: &Path,
     read_buf_bytes: usize,
@@ -287,6 +358,7 @@ pub fn for_each_line_with_progress_cfg_status(
         LineStreamOpts {
             read_buf_bytes: Some(read_buf_bytes),
             progress: Some(&mut on_progress),
+            partial_read_policy: PartialReadPolicy::AllowPartial,
             ..Default::default()
         },
         on_line,
@@ -330,6 +402,7 @@ pub fn for_each_line_with_progress_cfg_no_throttle_status(
             read_buf_bytes: Some(read_buf_bytes),
             progress: Some(&mut on_progress),
             throttle: false,
+            partial_read_policy: PartialReadPolicy::AllowPartial,
             ..Default::default()
         },
         on_line,
@@ -337,6 +410,7 @@ pub fn for_each_line_with_progress_cfg_no_throttle_status(
 }
 
 /// Like [`for_each_line_with_progress_cfg`] but reports skip events to the caller.
+#[allow(dead_code)]
 pub fn for_each_line_with_progress_cfg_with_skip(
     path: &Path,
     read_buf_bytes: usize,
@@ -350,6 +424,7 @@ pub fn for_each_line_with_progress_cfg_with_skip(
             read_buf_bytes: Some(read_buf_bytes),
             progress: Some(&mut on_progress),
             on_skip: Some(&mut on_skip),
+            partial_read_policy: PartialReadPolicy::AllowPartial,
             ..Default::default()
         },
         on_line,
@@ -480,10 +555,11 @@ mod tests {
 
     /// Bit-flipping a byte mid-stream in a checksum-bearing zstd file must:
     ///   - cause `validate_zst_full` (Full integrity) to return an error
-    ///   - cause `for_each_line_cfg` (the normal scanning path) to log a
-    ///     warning and return Ok (skip the file, don't abort the run)
+    ///   - cause `for_each_line_cfg` (the normal strict scanning path) to
+    ///     return an error with path context
+    ///   - cause explicit tolerant/status APIs to report the file incomplete
     #[test]
-    fn bit_flipped_frame_fails_full_but_scan_skips() {
+    fn bit_flipped_frame_fails_full_strict_scan_errors_and_tolerant_scan_skips() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("flipped.zst");
 
@@ -520,21 +596,27 @@ mod tests {
             "validate_zst_full must reject a bit-flipped frame"
         );
 
-        // The normal scan path must skip gracefully (warn + continue), not bubble.
+        // The normal scan path is strict by default and must not silently
+        // return partial results.
         let mut lines_seen = 0usize;
-        let res = for_each_line_cfg(&path, 16 * 1024, |_line| {
+        let err = for_each_line_cfg(&path, 16 * 1024, |_line| {
             lines_seen += 1;
             Ok(())
-        });
+        })
+        .expect_err("for_each_line_cfg must fail corrupt zstd files by default");
+        let msg = err.to_string();
+        assert!(msg.contains("zstd decode error"), "unexpected error: {msg}");
         assert!(
-            res.is_ok(),
-            "for_each_line_cfg should skip a corrupt file gracefully, got {:?}",
-            res
+            msg.contains(&path.display().to_string()),
+            "unexpected error: {msg}"
         );
 
         let status = for_each_line_cfg_status(&path, 16 * 1024, |_line| Ok(()))
             .expect("status API should not bubble corrupt-frame decode errors");
-        assert!(!status, "status API must report the corrupt file as incomplete");
+        assert!(
+            !status,
+            "status API must report the corrupt file as incomplete"
+        );
 
         // The *_with_skip variant must also skip gracefully AND surface the
         // skip event to the caller via `on_skip`. The path passed to the
