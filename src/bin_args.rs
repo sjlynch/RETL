@@ -90,6 +90,12 @@ pub(crate) struct CommonOpts {
     /// Include pseudo-users that are excluded by default: [deleted], [removed], and empty authors.
     #[arg(long = "include-deleted", alias = "include-pseudo-users")]
     pub(crate) include_deleted: bool,
+
+    /// Allow corrupt/truncated zstd monthly files to be skipped instead of
+    /// failing the scan/export. Skipped paths are reported as JSON on stderr;
+    /// resumable exports leave those months uncommitted so a later run retries.
+    #[arg(long)]
+    pub(crate) allow_partial: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -244,11 +250,10 @@ pub(crate) struct ExportArgs {
     pub(crate) inflight_bytes: Option<usize>,
     /// Resume a prior export with the same query/config/corpus. `jsonl`/`json`
     /// reuse per-month `.part_*.jsonl` files and `_progress.json` in a namespaced
-    /// scratch dir under `--work-dir`; `spool` reuses part files and
-    /// `_progress.json` in `--out`. Changing filters, corpus paths, sources,
-    /// date range, whitelist, or timestamp formatting invalidates the checkpoint
-    /// and rebuilds the parts. `zst` and `partitioned-jsonl` exports are not
-    /// currently resumable.
+    /// scratch dir under `--work-dir`; `spool`, `zst`, and `partitioned-jsonl`
+    /// use `_progress.json` under `--out`. Changing filters, corpus paths,
+    /// sources, date range, whitelist, timestamp formatting, or (for ZST)
+    /// zst level invalidates the checkpoint and rebuilds the parts.
     #[arg(long)]
     pub(crate) resume: bool,
 }

@@ -1,7 +1,7 @@
 //! T11: late/trailing zst corruption (truncated tail).
 //!
-//! These tests exercise the documented split between integrity modes and the
-//! "warn-and-skip" behaviour of normal scans:
+//! These tests exercise the documented split between integrity modes, strict
+//! default scans, and explicit `allow_partial` lossy scans:
 //!
 //! - `IntegrityMode::Full` decodes the whole stream, so it MUST report a tail
 //!   truncation. (After #T5 lands `include_checksum` verification this also
@@ -11,9 +11,10 @@
 //!   decompressed bytes; with a healthy prefix, Quick MUST MISS the corruption.
 //!   This test locks in that documented limitation so we don't accidentally
 //!   "fix" Quick to do a Full scan and silently regress its perf contract.
-//! - A normal scan over a corrupt month must NOT crash. The streaming reader
-//!   is expected to log a warning and skip the file, returning a (partial)
-//!   result rather than aborting the run.
+//! - A normal scan over a corrupt month is strict by default and must fail
+//!   instead of returning a plausible partial result. `allow_partial(true)`
+//!   preserves the old skip behavior while surfacing skipped paths through a
+//!   machine-readable reporter.
 
 #[path = "common/mod.rs"]
 mod common;
@@ -81,16 +82,12 @@ fn quick_integrity_misses_tail_truncation() {
 }
 
 #[test]
-fn normal_scan_warns_and_skips_truncated_month_without_crashing() {
+fn normal_scan_errors_on_truncated_month_by_default() {
     let base = make_corpus_basic();
     let path = base.join("comments").join("RC_2006-03.zst");
     make_truncated_zst(&path, FIXTURE_RECORDS, TRUNCATE_BYTES);
 
-    // A normal scan that touches the corrupt month must NOT crash. The
-    // streaming reader is expected to log a warning and skip the file. The
-    // count we get back may be partial (records read before the truncation
-    // boundary) — what matters is that `count_by_month` returns Ok.
-    let counts = RedditETL::new()
+    let err = RedditETL::new()
         .base_dir(&base)
         .sources(Sources::Comments)
         .date_range(Some(YearMonth::new(2006, 3)), Some(YearMonth::new(2006, 3)))
@@ -99,19 +96,50 @@ fn normal_scan_warns_and_skips_truncated_month_without_crashing() {
         .subreddit("programming")
         .include_pseudo_users()
         .count_by_month()
-        .expect(
-            "scan over a truncated month must not error out — \
-                 the streaming reader is supposed to warn and skip",
-        );
+        .expect_err("strict scans must fail truncated zstd months by default");
 
-    // The map may be empty (file failed before any record was decoded) or
-    // contain a partial count for 2006-03; either is acceptable. The
-    // load-bearing assertion is that we got here without panicking.
+    let msg = format!("{err:#}");
+    assert!(msg.contains("zstd decode error"), "unexpected error: {msg}");
+    assert!(
+        msg.contains(&path.display().to_string()),
+        "unexpected error: {msg}"
+    );
+}
+
+#[test]
+fn allow_partial_scan_skips_truncated_month_and_reports_path() {
+    let base = make_corpus_basic();
+    let path = base.join("comments").join("RC_2006-03.zst");
+    make_truncated_zst(&path, FIXTURE_RECORDS, TRUNCATE_BYTES);
+
+    let etl = RedditETL::new()
+        .base_dir(&base)
+        .sources(Sources::Comments)
+        .date_range(Some(YearMonth::new(2006, 3)), Some(YearMonth::new(2006, 3)))
+        .progress(false)
+        .allow_partial(true);
+    let reporter = etl.partial_read_reporter();
+
+    let counts = etl
+        .scan()
+        .subreddit("programming")
+        .include_pseudo_users()
+        .count_by_month()
+        .expect("allow_partial preserves explicit lossy skip behavior");
+
     let partial = counts.get(&YearMonth::new(2006, 3)).copied().unwrap_or(0);
     assert!(
         partial < FIXTURE_RECORDS as u64,
         "expected a partial count from the truncated month, got {} (full count would be {})",
         partial,
         FIXTURE_RECORDS
+    );
+
+    let report = reporter.snapshot();
+    assert_eq!(report.skipped_file_count, 1, "{report:?}");
+    assert_eq!(report.skipped_files[0].path, path);
+    assert!(
+        report.skipped_files[0].error.contains("zstd decode error"),
+        "{report:?}"
     );
 }
