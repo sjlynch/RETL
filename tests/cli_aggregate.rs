@@ -4,6 +4,7 @@ use serde_json::json;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
+use std::process::{Command as StdCommand, Stdio};
 
 fn retl() -> Command {
     Command::cargo_bin("retl").expect("retl binary should be built")
@@ -135,6 +136,37 @@ fn aggregate_json_pointer_sum_and_month_grouping() {
 }
 
 #[test]
+fn aggregate_sum_large_integer_metric_uses_plain_decimal_tsv() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("input.jsonl");
+    let out = dir.path().join("scores.tsv");
+    write_jsonl(
+        &input,
+        &[
+            json!({"subreddit":"rust", "score":500_000_000_000_000_i64}),
+            json!({"subreddit":"rust", "score":500_000_000_000_000_i64}),
+        ],
+    );
+
+    retl()
+        .args([
+            "aggregate",
+            "--no-progress",
+            "--by",
+            "subreddit",
+            "--metric",
+            "sum:/score",
+            "--out",
+            out.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    assert_eq!(read_lines(&out), vec!["rust\t1000000000000000"]);
+}
+
+#[test]
 fn aggregate_fails_when_all_inputs_fail() {
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("counts.json");
@@ -179,15 +211,201 @@ fn aggregate_fails_when_all_inputs_are_malformed() {
         ])
         .assert()
         .failure()
-        .stdout(predicate::str::contains("malformed JSON").and(predicate::str::contains("line 1")))
-        .stderr(predicate::str::contains(
-            "aggregate failed: 1 of 1 input(s) failed",
-        ));
+        .stderr(
+            predicate::str::contains("bad.jsonl")
+                .and(predicate::str::contains("malformed JSON"))
+                .and(predicate::str::contains("line 1"))
+                .and(predicate::str::contains(
+                    "aggregate failed: 1 of 1 input(s) failed",
+                )),
+        );
 
     assert!(
         !out.exists(),
         "total malformed input should not publish an empty aggregate"
     );
+}
+
+#[test]
+fn aggregate_reports_each_failed_input_by_filename() {
+    let dir = tempfile::tempdir().unwrap();
+    let good_a = dir.path().join("good-a.jsonl");
+    let good_b = dir.path().join("good-b.jsonl");
+    let bad = dir.path().join("bad-input.jsonl");
+    let out = dir.path().join("counts.json");
+    write_jsonl(&good_a, &[json!({"id":"a"})]);
+    write_jsonl(&good_b, &[json!({"id":"b"})]);
+    fs::write(&bad, "not-json\n").unwrap();
+
+    retl()
+        .args([
+            "aggregate",
+            "--no-progress",
+            "--out",
+            out.to_str().unwrap(),
+            good_a.to_str().unwrap(),
+            bad.to_str().unwrap(),
+            good_b.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stderr(
+            predicate::str::contains("Aggregate input(s) failed during shard build")
+                .and(predicate::str::contains("bad-input.jsonl"))
+                .and(predicate::str::contains("malformed JSON"))
+                .and(predicate::str::contains(
+                    "1 input(s) failed during shard build",
+                )),
+        );
+
+    let aggregate: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&out).unwrap()).unwrap();
+    assert_eq!(aggregate["count"].as_u64(), Some(2));
+}
+
+#[test]
+fn aggregate_reports_partial_read_and_does_not_merge_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let good = dir.path().join("good.jsonl");
+    let partial = dir.path().join("partial.jsonl");
+    let out = dir.path().join("counts.json");
+    write_jsonl(&good, &[json!({"id":"good"})]);
+    fs::write(&partial, b"{\"id\":\"partial-before-error\"}\n{\"id\":\"").unwrap();
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&partial)
+        .unwrap()
+        .write_all(&[0xff, b'\n'])
+        .unwrap();
+
+    retl()
+        .args([
+            "aggregate",
+            "--no-progress",
+            "--out",
+            out.to_str().unwrap(),
+            good.to_str().unwrap(),
+            partial.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stderr(
+            predicate::str::contains("Aggregate input(s) skipped after partial read")
+                .and(predicate::str::contains("partial.jsonl"))
+                .and(predicate::str::contains(
+                    "1 input(s) skipped after partial read",
+                )),
+        );
+
+    let aggregate: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&out).unwrap()).unwrap();
+    assert_eq!(aggregate["count"].as_u64(), Some(1));
+}
+
+#[test]
+fn aggregate_creates_output_parent_and_uses_staging_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("input.jsonl");
+    let out = dir.path().join("nested").join("counts.json");
+    write_jsonl(&input, &[json!({"id":"a"})]);
+
+    retl()
+        .args([
+            "aggregate",
+            "--no-progress",
+            "--out",
+            out.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    assert!(out.exists());
+    assert!(out.parent().unwrap().join("_staging").is_dir());
+    assert!(
+        !out.with_extension("json.inprogress").exists(),
+        "aggregate must not stage next to the final output"
+    );
+}
+
+#[test]
+fn aggregate_concurrent_same_output_does_not_corrupt_staging_or_final() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("input.jsonl");
+    let out = dir.path().join("counts.json");
+    let rows: Vec<_> = (0..2_000).map(|i| json!({"id": i})).collect();
+    write_jsonl(&input, &rows);
+
+    let exe = assert_cmd::cargo::cargo_bin("retl");
+    let args = [
+        "aggregate",
+        "--no-progress",
+        "--parallelism",
+        "1",
+        "--out",
+        out.to_str().unwrap(),
+        input.to_str().unwrap(),
+    ];
+    let first = StdCommand::new(&exe)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let second = StdCommand::new(&exe)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let first_out = first.wait_with_output().unwrap();
+    let second_out = second.wait_with_output().unwrap();
+
+    assert!(
+        first_out.status.success(),
+        "first aggregate failed: {}",
+        String::from_utf8_lossy(&first_out.stderr)
+    );
+    assert!(
+        second_out.status.success(),
+        "second aggregate failed: {}",
+        String::from_utf8_lossy(&second_out.stderr)
+    );
+
+    let aggregate: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&out).unwrap()).unwrap();
+    assert_eq!(aggregate["count"].as_u64(), Some(rows.len() as u64));
+    let staging = out.parent().unwrap().join("_staging");
+    let leftovers: Vec<_> = fs::read_dir(&staging)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".inprogress"))
+        .collect();
+    assert!(leftovers.is_empty(), "leftover staged files: {leftovers:?}");
+}
+
+#[test]
+fn aggregate_pretty_field_indents_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("input.jsonl");
+    let out = dir.path().join("counts.json");
+    write_jsonl(&input, &[json!({"id":"a"})]);
+
+    retl()
+        .args([
+            "aggregate",
+            "--no-progress",
+            "--pretty",
+            "--out",
+            out.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let s = fs::read_to_string(&out).unwrap();
+    assert!(s.contains("\n  \"count\": 1\n"), "got: {s}");
 }
 
 #[test]

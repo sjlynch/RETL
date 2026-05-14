@@ -70,7 +70,8 @@
 //!      parents-pipeline.
 //!
 //! 6. **Publish atomically**
-//!    - Every output is written to `<dir>/_staging/<file>.inprogress`, then
+//!    - Every output is written to a unique
+//!      `<dir>/_staging/<file>.retl-<pid>-<nonce>.inprogress`, then
 //!      promoted to its final path via
 //!      [`replace_file_atomic_backoff`]. Library code never writes to a final
 //!      path directly. See [`crate::atomic_write`] for the staging contract.
@@ -146,7 +147,9 @@ pub use crate::pipeline_exec::ExportFormat;
 pub use crate::query::{QueryBuildError, QuerySpec};
 pub use crate::shard::UsernameStream;
 
-pub use crate::aggregate::Aggregator;
+pub use crate::aggregate::{
+    AggregateBuildReport, AggregateInputIssue, AggregatePartialReadPolicy, Aggregator,
+};
 pub use crate::parents::{ParentAttachStats, ParentIds, ParentMaps};
 
 #[doc(hidden)]
@@ -177,7 +180,8 @@ pub use crate::partition::PartitionWriters;
 
 //export robust file ops from util so binaries can import from crate root.
 pub use crate::util::{
-    create_with_backoff, open_with_backoff, remove_with_backoff, replace_file_atomic_backoff,
+    create_new_with_backoff, create_with_backoff, open_with_backoff, remove_with_backoff,
+    replace_file_atomic_backoff,
 };
 
 // Scoped rayon pool + opt-in tracing init for binaries.

@@ -391,10 +391,10 @@ impl ScanPlan {
     ///   - comments → `part_RC_YYYY-MM.jsonl`
     ///   - submissions → `part_RS_YYYY-MM.jsonl`
     ///
-    /// Each month is staged as `<out_dir>/_staging/<file>.inprogress` then
-    /// atomically renamed onto the final path so a crashed run never publishes
-    /// a partial file. On entry, leftover `*.inprogress` files from a prior
-    /// crashed run are swept.
+    /// Each month is staged as a unique `<out_dir>/_staging/<file>.*.inprogress`
+    /// then atomically renamed onto the final path so a crashed run never
+    /// publishes a partial file. On entry, leftover `*.inprogress` files from
+    /// a prior crashed run are swept only when their owner PID is no longer live.
     ///
     /// Returns `(vector_of_paths, total_records_written)`.
     pub fn extract_spool_monthly(self, out_dir: &Path) -> Result<(Vec<PathBuf>, u64)> {
@@ -613,10 +613,11 @@ impl ScanPlan {
     /// Export corpus back to partitioned JSONL or ZST by month/kinds with query filters.
     /// This lives on ScanPlan (advanced query mode).
     ///
-    /// Each output is staged as `<out_base_dir>/_staging/<file>.inprogress`,
-    /// finalized (zstd frame closed with checksum, or buffer flushed) and
-    /// atomically renamed onto its final path. Stale `*.inprogress` from a
-    /// crashed prior run are swept on entry.
+    /// Each output is staged as a unique
+    /// `<out_base_dir>/_staging/<file>.*.inprogress`, finalized (zstd frame
+    /// closed with checksum, or buffer flushed) and atomically renamed onto its
+    /// final path. Stale `*.inprogress` from a crashed prior run are swept on
+    /// entry only when their owner PID is no longer live.
     pub fn export_partitioned(self, out_base_dir: &Path, format: ExportFormat) -> Result<()> {
         let plan = self.build()?;
         log_pseudo_user_filter(&plan.query);

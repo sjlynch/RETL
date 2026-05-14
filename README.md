@@ -227,7 +227,8 @@ retl dedupe --source rc --key 'json:/parent_id' --start 2020-01 --end 2020-12 --
 Formats:
 
 * `--format jsonl` → single stitched `.jsonl` file (default).
-* `--format json`  → single `.json` file containing a JSON array (`--pretty` for pretty-print).
+* `--format json`  → single `.json` file containing a JSON array (`--pretty`
+  field-indents records, matching `aggregate --pretty`).
 * `--format spool` → per-source per-month files (`part_RC_YYYY-MM.jsonl`, `part_RS_YYYY-MM.jsonl`) under the directory passed to `--out`. Use this for the parents-pipeline workflow.
 * `--format zst` → corpus-style partitioned `.zst` output under `<out>/comments/RC_YYYY-MM.zst` and `<out>/submissions/RS_YYYY-MM.zst`.
 * `--format partitioned-jsonl` → the same corpus-style directory layout, but as uncompressed `.jsonl` files.
@@ -333,8 +334,21 @@ retl aggregate --by author --top 100 --out top_authors.tsv ./spool/*.jsonl
 retl aggregate --by 'json:/subreddit' --metric 'sum:/score' --out scores.tsv ./spool/*.jsonl
 ~~~
 
+`--pretty` field-indents the final JSON when `--by` is omitted, matching
+`export --format json --pretty`. Grouped TSV metrics render integer-valued
+numbers as plain decimal strings by default (for example large `sum:/score`
+values do not use scientific notation); pass `--scientific` to opt back into
+Rust's default `f64` formatting.
+
 `--metric` defaults to `count` and also supports `avg:/pointer`,
 `min:/pointer`, and `max:/pointer` for numeric JSON-pointer values.
+
+Partial-read policy: if a JSONL input hits a mid-file read error, `aggregate`
+reports that path on stderr, drops that partial shard from the merged result,
+and continues with other inputs. Inputs that fail to open, contain malformed
+JSON, or fail shard publishing are reported separately as fatal build failures.
+If every input fails or is partial, the CLI exits non-zero and publishes no
+final output.
 
 ---
 
@@ -694,8 +708,8 @@ Suggested starting points for `.file_concurrency(n)` by total system RAM:
   is fine for SSD-backed local storage; increase to 1–4 MiB on networked
   filesystems.
 - `.work_dir(path)` — scratch directory for intermediate shards and
-  `.inprogress` files. Point this at fast local storage if the corpus lives
-  on a network share.
+  uniquely named `.inprogress` files. Point this at fast local storage if the
+  corpus lives on a network share.
 - `.progress(true)` and `.progress_label("...")` — render an `indicatif`
   progress bar.
 

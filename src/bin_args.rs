@@ -214,7 +214,7 @@ pub(crate) struct ExportArgs {
     /// directory for `spool`/`zst`/`partitioned-jsonl`.
     #[arg(long, short)]
     pub(crate) out: PathBuf,
-    /// Pretty-print the JSON array (only with `--format json`).
+    /// Field-indent the JSON array (only with `--format json`).
     #[arg(long)]
     pub(crate) pretty: bool,
     /// zstd compression level for `.zst` outputs. Clamped to 1..=22 by the library.
@@ -322,7 +322,7 @@ pub(crate) struct AggregateArgs {
     /// Directory used for per-input aggregate shards (default: alongside `--out`).
     #[arg(long)]
     pub(crate) shards_dir: Option<PathBuf>,
-    /// Pretty-print the final JSON (only used when `--by` is omitted).
+    /// Field-indent the final JSON (only used when `--by` is omitted).
     #[arg(long)]
     pub(crate) pretty: bool,
     /// Built-in group key: `subreddit`, `month`, `author`, or `json:/pointer`.
@@ -335,6 +335,11 @@ pub(crate) struct AggregateArgs {
     /// Keep only the top N groups by metric value (ties sort by key).
     #[arg(long)]
     pub(crate) top: Option<usize>,
+    /// Render grouped numeric TSV metrics with Rust's default f64 formatting
+    /// (scientific notation when chosen by the formatter). By default RETL
+    /// emits decimal strings for spreadsheet- and awk-friendly TSV.
+    #[arg(long)]
+    pub(crate) scientific: bool,
 }
 
 #[derive(Args, Debug)]

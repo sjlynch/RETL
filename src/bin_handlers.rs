@@ -3,9 +3,10 @@
 
 use anyhow::{Context, Result};
 use retl::{
-    create_with_backoff, discover_all, format_year_month_ranges, missing_month_diagnostics,
+    create_new_with_backoff, discover_all, format_year_month_ranges, missing_month_diagnostics,
     plan_files, remove_with_backoff, replace_file_atomic_backoff, total_compressed_size,
-    ExportFormat, FileKind, IntegrityMode, KeyExtractor, RedditETL, Sources, YearMonth,
+    AggregateBuildReport, ExportFormat, FileKind, IntegrityMode, KeyExtractor, RedditETL, Sources,
+    YearMonth,
 };
 use std::collections::BTreeMap;
 use std::fs;
@@ -48,7 +49,7 @@ where
     staged_name.push(format!(".{}.{}.inprogress", std::process::id(), counter));
     let staged = staging_dir.join(staged_name);
 
-    let file = create_with_backoff(&staged, 16, 50)
+    let file = create_new_with_backoff(&staged, 16, 50)
         .with_context(|| format!("creating staged output {}", staged.display()))?;
     let mut w = BufWriter::with_capacity(CLI_TEXT_WRITE_BUF_BYTES, file);
 
@@ -431,17 +432,24 @@ pub(crate) fn run_aggregate(args: AggregateArgs) -> Result<()> {
         let group_by = GroupBySpec::parse(&by)?;
         let metric = MetricSpec::parse(args.metric.as_deref())?;
         let top = args.top;
-        let (agg, built, errors) = etl
-            .aggregate_jsonls_parallel_collect_with::<GroupMetricAgg, _>(
-                args.inputs,
-                &shards_dir,
-                || GroupMetricAgg::new(group_by.clone(), metric.clone()),
-            )?;
-        ensure_aggregate_inputs_succeeded(input_count, built, errors)?;
-        write_grouped_tsv(&args.out, agg.rows(top))?;
+        let (agg, report) = etl.aggregate_jsonls_parallel_collect_with::<GroupMetricAgg, _>(
+            args.inputs,
+            &shards_dir,
+            || GroupMetricAgg::new(group_by.clone(), metric.clone()),
+        )?;
+        report_aggregate_input_issues(&report);
+        ensure_aggregate_inputs_succeeded(input_count, &report)?;
+        let rows = if args.scientific {
+            agg.rows_with_scientific(top, true)
+        } else {
+            agg.rows(top)
+        };
+        write_grouped_tsv(&args.out, rows)?;
         eprintln!(
-            "Aggregated {} shard(s) to TSV; {} input(s) failed during shard build",
-            built, errors
+            "Aggregated {} shard(s) to TSV; {} input(s) failed during shard build; {} input(s) skipped after partial read",
+            report.merged_shards,
+            report.fatal_count(),
+            report.partial_count()
         );
     } else {
         if args.metric.is_some() {
@@ -450,63 +458,70 @@ pub(crate) fn run_aggregate(args: AggregateArgs) -> Result<()> {
         if args.top.is_some() {
             anyhow::bail!("--top requires --by");
         }
-        let (agg, built, errors) =
+        let (agg, report) =
             etl.aggregate_jsonls_parallel_collect::<RecCount>(args.inputs, &shards_dir)?;
-        ensure_aggregate_inputs_succeeded(input_count, built, errors)?;
+        report_aggregate_input_issues(&report);
+        ensure_aggregate_inputs_succeeded(input_count, &report)?;
         write_rec_count_json(&args.out, &agg, args.pretty)?;
         eprintln!(
-            "Aggregated {} shard(s); {} input(s) failed during shard build",
-            built, errors
+            "Aggregated {} shard(s); {} input(s) failed during shard build; {} input(s) skipped after partial read",
+            report.merged_shards,
+            report.fatal_count(),
+            report.partial_count()
         );
     }
     Ok(())
 }
 
+fn report_aggregate_input_issues(report: &AggregateBuildReport) {
+    if !report.fatal_inputs.is_empty() {
+        eprintln!("Aggregate input(s) failed during shard build:");
+        for issue in &report.fatal_inputs {
+            eprintln!("  {}\t{}", issue.input.display(), issue.error);
+        }
+    }
+    if !report.partial_inputs.is_empty() {
+        eprintln!("Aggregate input(s) skipped after partial read:");
+        for issue in &report.partial_inputs {
+            eprintln!("  {}\t{}", issue.input.display(), issue.error);
+        }
+    }
+}
+
 fn ensure_aggregate_inputs_succeeded(
     input_count: usize,
-    built: usize,
-    errors: usize,
+    report: &AggregateBuildReport,
 ) -> Result<()> {
-    if input_count > 0 && (errors == input_count || built == 0) {
+    let errors = report.problem_count();
+    if input_count > 0 && (errors == input_count || report.merged_shards == 0) {
         anyhow::bail!(
-            "aggregate failed: {errors} of {input_count} input(s) failed during shard build; {built} shard(s) merged"
+            "aggregate failed: {errors} of {input_count} input(s) failed or were partial; {} shard(s) merged",
+            report.merged_shards
         );
     }
     Ok(())
 }
 
 fn write_rec_count_json(out: &Path, agg: &RecCount, pretty: bool) -> Result<()> {
-    let tmp = out.with_extension("json.inprogress");
-    {
-        let f = create_with_backoff(&tmp, 16, 50)
-            .with_context(|| format!("creating output tempfile {}", tmp.display()))?;
-        let mut w = BufWriter::new(f);
+    write_text_file_atomic(out, |w| {
         if pretty {
-            serde_json::to_writer_pretty(&mut w, agg)?;
+            serde_json::to_writer_pretty(w, agg)?;
         } else {
-            serde_json::to_writer(&mut w, agg)?;
+            serde_json::to_writer(w, agg)?;
         }
-        w.flush()?;
-    }
-    replace_file_atomic_backoff(&tmp, out)
-        .with_context(|| format!("publishing output file {}", out.display()))?;
-    Ok(())
+        Ok(())
+    })
+    .with_context(|| format!("publishing output file {}", out.display()))
 }
 
 fn write_grouped_tsv(out: &Path, rows: Vec<(String, String)>) -> Result<()> {
-    let tmp = out.with_extension("tsv.inprogress");
-    {
-        let f = create_with_backoff(&tmp, 16, 50)
-            .with_context(|| format!("creating output tempfile {}", tmp.display()))?;
-        let mut w = BufWriter::new(f);
+    write_text_file_atomic(out, |w| {
         for (key, value) in rows {
             writeln!(w, "{key}\t{value}")?;
         }
-        w.flush()?;
-    }
-    replace_file_atomic_backoff(&tmp, out)
-        .with_context(|| format!("publishing output file {}", out.display()))?;
-    Ok(())
+        Ok(())
+    })
+    .with_context(|| format!("publishing output file {}", out.display()))
 }
 
 pub(crate) fn run_first_seen(args: FirstSeenArgs) -> Result<()> {

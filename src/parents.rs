@@ -461,13 +461,32 @@ fn build_id_shard_index(
     Ok((comment_shards.into_inner(), submission_shards.into_inner()))
 }
 
-fn attach_inprogress_path(staging_dir: &Path, final_dest: &Path) -> Result<PathBuf> {
+fn attach_inprogress_exists(staging_dir: &Path, final_dest: &Path) -> Result<bool> {
     let file_name = final_dest
         .file_name()
-        .ok_or_else(|| anyhow::anyhow!("final_dest has no file name: {}", final_dest.display()))?;
-    let mut staged = staging_dir.join(file_name);
-    staged.as_mut_os_string().push(INPROGRESS_EXT);
-    Ok(staged)
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "final_dest has no UTF-8 file name: {}",
+                final_dest.display()
+            )
+        })?;
+    if !staging_dir.exists() {
+        return Ok(false);
+    }
+    for entry in fs::read_dir(staging_dir)
+        .with_context(|| format!("read staging dir {}", staging_dir.display()))?
+    {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.starts_with(file_name) && name.ends_with(INPROGRESS_EXT) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn attach_fingerprint_path(final_dest: &Path) -> PathBuf {
@@ -1215,7 +1234,7 @@ impl RedditETL {
                 |(idx, in_path)| -> Result<()> {
                     let name = in_path.file_name().unwrap().to_string_lossy().to_string();
                     let out_path = out_dir.join(name);
-                    let inprogress_path = attach_inprogress_path(&staging_dir, &out_path)?;
+                    let inprogress_exists = attach_inprogress_exists(&staging_dir, &out_path)?;
                     let sidecar_path = attach_fingerprint_path(&out_path);
                     let fingerprint = build_attach_fingerprint(
                         in_path,
@@ -1223,7 +1242,7 @@ impl RedditETL {
                         &resolution_range,
                     );
 
-                    if resume && out_path.exists() && !inprogress_path.exists() {
+                    if resume && out_path.exists() && !inprogress_exists {
                         if attach_fingerprint_matches(&sidecar_path, &fingerprint) {
                             if validate_jsonl_file(&out_path) {
                                 if let Some(pb) = &pb {

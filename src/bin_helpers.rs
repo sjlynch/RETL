@@ -160,27 +160,36 @@ impl GroupMetricAgg {
     }
 
     pub(crate) fn rows(&self, top: Option<usize>) -> Vec<(String, String)> {
+        self.rows_with_scientific(top, false)
+    }
+
+    pub(crate) fn rows_with_scientific(
+        &self,
+        top: Option<usize>,
+        scientific: bool,
+    ) -> Vec<(String, String)> {
+        let number_format = NumberFormat::from_scientific(scientific);
         let mut rows: Vec<(String, String, f64)> = self
             .groups
             .iter()
             .filter_map(|(key, state)| {
                 let (display, sort_value) = match self.metric.kind {
                     MetricKind::Count => (state.count.to_string(), state.count as f64),
-                    MetricKind::Sum => (format_number(state.sum), state.sum),
+                    MetricKind::Sum => (format_number(state.sum, number_format), state.sum),
                     MetricKind::Avg => {
                         if state.count == 0 {
                             return None;
                         }
                         let avg = state.sum / state.count as f64;
-                        (format_number(avg), avg)
+                        (format_number(avg, number_format), avg)
                     }
                     MetricKind::Min => {
                         let n = state.min?;
-                        (format_number(n), n)
+                        (format_number(n, number_format), n)
                     }
                     MetricKind::Max => {
                         let n = state.max?;
-                        (format_number(n), n)
+                        (format_number(n, number_format), n)
                     }
                 };
                 Some((key.clone(), display, sort_value))
@@ -279,6 +288,20 @@ mod tests {
         let right = GroupMetricAgg::new(GroupBySpec::Author, MetricSpec::default());
         left.merge(right);
     }
+
+    #[test]
+    fn format_number_integer_scores_use_plain_decimal() {
+        let rendered = format_number(1_000_000_000_000_000.0, NumberFormat::Decimal);
+        assert_eq!(rendered, "1000000000000000");
+        assert!(!rendered.contains('e') && !rendered.contains('E'));
+    }
+
+    #[test]
+    fn format_number_average_uses_stable_decimal() {
+        let rendered = format_number(2.5, NumberFormat::Decimal);
+        assert_eq!(rendered, "2.5");
+        assert!(!rendered.contains('e') && !rendered.contains('E'));
+    }
 }
 
 fn value_to_month(v: &Value) -> Option<String> {
@@ -302,8 +325,62 @@ fn unix_seconds_to_month(secs: i64) -> Option<String> {
     Some(format!("{:04}-{:02}", dt.year(), u8::from(dt.month())))
 }
 
-fn format_number(n: f64) -> String {
-    n.to_string()
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NumberFormat {
+    Decimal,
+    Scientific,
+}
+
+impl NumberFormat {
+    fn from_scientific(scientific: bool) -> Self {
+        if scientific {
+            Self::Scientific
+        } else {
+            Self::Decimal
+        }
+    }
+}
+
+fn format_number(n: f64, format: NumberFormat) -> String {
+    if format == NumberFormat::Scientific || !n.is_finite() {
+        return n.to_string();
+    }
+
+    // All integers that fit in f64's exact integer range should be rendered as
+    // plain decimal digits. This keeps score sums (which originate as integer
+    // JSON numbers) friendly to awk/pandas/spreadsheets up to 1e15+.
+    const MAX_EXACT_INTEGER: f64 = 9_007_199_254_740_992.0; // 2^53
+    if n.fract() == 0.0 && n.abs() < MAX_EXACT_INTEGER {
+        return normalize_negative_zero(format!("{n:.0}"));
+    }
+
+    // For non-integers, use a stable fixed-precision decimal representation
+    // and trim cosmetic zeroes. This avoids f64::to_string's scientific
+    // notation for typical aggregate averages/min/max values while keeping the
+    // TSV compact enough for quick inspection.
+    let s = format!("{n:.6}");
+    let s = trim_decimal_zeros(s);
+    normalize_negative_zero(s)
+}
+
+fn trim_decimal_zeros(mut s: String) -> String {
+    if let Some(dot) = s.find('.') {
+        while s.ends_with('0') {
+            s.pop();
+        }
+        if s.len() == dot + 1 {
+            s.pop();
+        }
+    }
+    s
+}
+
+fn normalize_negative_zero(s: String) -> String {
+    if s == "-0" {
+        "0".to_string()
+    } else {
+        s
+    }
 }
 
 // -----------------------------------------------------------------------------
