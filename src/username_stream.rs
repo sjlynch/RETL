@@ -1,4 +1,4 @@
-use crate::util::remove_dir_all_with_backoff;
+use crate::util::{open_with_backoff, remove_dir_all_with_backoff};
 use anyhow::Result;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -66,7 +66,7 @@ impl UsernameStream {
         }
         let path = self.files[self.current_idx].clone();
         self.current_idx += 1;
-        match File::open(&path) {
+        match open_with_backoff(&path, 16, 50) {
             Ok(f) => {
                 self.reader = Some(BufReader::new(f));
                 self.current_file_errors = 0;

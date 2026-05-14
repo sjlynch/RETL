@@ -1,13 +1,15 @@
 pub use crate::username_stream::UsernameStream;
 
 use crate::shard_common;
-use crate::util::unique_scratch_dir;
+use crate::util::{
+    create_dir_all_with_backoff, create_with_backoff, open_with_backoff, unique_scratch_dir,
+};
 use ahash::RandomState;
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
 use rayon::prelude::*;
 use std::collections::HashSet;
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
@@ -25,12 +27,14 @@ impl ShardedWriter {
         let count = count.max(1);
         let run_root = unique_scratch_dir(work_dir, prefix, "shards");
         let shards_dir = run_root.join("shards");
-        fs::create_dir_all(&shards_dir)?;
+        create_dir_all_with_backoff(&shards_dir, 16, 50)
+            .with_context(|| format!("create shard scratch dir {}", shards_dir.display()))?;
 
         let mut shards = Vec::with_capacity(count);
         for i in 0..count {
             let path = shards_dir.join(format!("shard_{:04}.tmp", i));
-            let file = File::create(path)?;
+            let file = create_with_backoff(&path, 16, 50)
+                .with_context(|| format!("create shard scratch {}", path.display()))?;
             shards.push(Mutex::new(BufWriter::new(file)));
         }
 
@@ -90,7 +94,8 @@ impl ShardedWriter {
         drop(shards); // ensure writers are closed
 
         let dedup_dir = run_root.join(format!("{prefix}_dedup"));
-        fs::create_dir_all(&dedup_dir)?;
+        create_dir_all_with_backoff(&dedup_dir, 16, 50)
+            .with_context(|| format!("create dedup scratch dir {}", dedup_dir.display()))?;
 
         let shard_paths: Vec<PathBuf> = (0..count)
             .map(|i| base_dir.join(format!("shard_{:04}.tmp", i)))
@@ -116,11 +121,11 @@ impl ShardedWriter {
 }
 
 fn dedup_single_shard(input: &Path, output: &Path) -> Result<()> {
-    let in_file =
-        File::open(input).with_context(|| format!("open shard for dedup: {}", input.display()))?;
+    let in_file = open_with_backoff(input, 16, 50)
+        .with_context(|| format!("open shard for dedup: {}", input.display()))?;
     let mut reader = BufReader::new(in_file);
 
-    let out_file = File::create(output)
+    let out_file = create_with_backoff(output, 16, 50)
         .with_context(|| format!("create dedup output: {}", output.display()))?;
     let mut writer = BufWriter::new(out_file);
 
@@ -152,4 +157,32 @@ fn dedup_single_shard(input: &Path, output: &Path) -> Result<()> {
     }
     writer.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::util::{inject_retriable_io_errors_for_file_name_tests, TestIoOp};
+    use std::io::Read;
+
+    #[test]
+    fn sharded_writer_retries_transient_create_on_shard_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _guard =
+            inject_retriable_io_errors_for_file_name_tests(TestIoOp::Create, "shard_0000.tmp", 1);
+
+        let writer = ShardedWriter::create(tmp.path(), "retry", 1).expect("create sharded writer");
+        writer.write("alice").expect("write key");
+        writer.write("alice").expect("write duplicate key");
+        writer.write("bob").expect("write key");
+        let (deduped, _scratch_root) = writer.dedup_with_scratch("out").expect("dedup shards");
+
+        assert_eq!(deduped.len(), 1);
+        let mut contents = String::new();
+        open_with_backoff(&deduped[0], 2, 0)
+            .expect("open deduped shard")
+            .read_to_string(&mut contents)
+            .expect("read deduped shard");
+        assert_eq!(contents, "alice\nbob\n");
+    }
 }

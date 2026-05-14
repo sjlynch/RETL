@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 use ahash::RandomState;
 use std::collections::HashMap;
-use std::fs;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -14,7 +13,10 @@ use std::sync::{atomic::{AtomicUsize, Ordering as AtomicOrdering}, Arc};
 use crate::config::ETLOptions;
 use crate::key_extractor::KeyExtractor;
 use crate::mem::{available_memory_fraction, is_low_memory, AdaptiveMemCfg};
-use crate::util::{open_with_backoff, smoothstep_memory_fraction};
+use crate::util::{
+    create_dir_all_with_backoff, create_with_backoff, open_with_backoff,
+    smoothstep_memory_fraction,
+};
 use crate::zstd_jsonl::malformed_json_error;
 
 /// Adaptive streaming configuration used during micro-bucket processing.
@@ -92,14 +94,16 @@ fn route_lines_to_shards(
     use std::fs::File;
     use std::io::{BufReader, BufWriter};
 
-    fs::create_dir_all(out_dir)?;
+    create_dir_all_with_backoff(out_dir, 16, 50)
+        .with_context(|| format!("create shard output dir {}", out_dir.display()))?;
 
     let shard_count = shards.max(1);
     let mut writers: Vec<Mutex<BufWriter<File>>> = Vec::with_capacity(shard_count);
     let mut paths: Vec<PathBuf> = Vec::with_capacity(shard_count);
     for i in 0..shard_count {
         let p = out_dir.join(format!("{}_{:04}.jsonl", file_prefix, i));
-        let f = std::fs::File::create(&p).with_context(|| format!("create {}", p.display()))?;
+        let f = create_with_backoff(&p, 16, 50)
+            .with_context(|| format!("create {}", p.display()))?;
         writers.push(Mutex::new(BufWriter::new(f)));
         paths.push(p);
     }

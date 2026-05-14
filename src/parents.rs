@@ -10,7 +10,8 @@ use crate::paths::{discover_all, plan_files_checked, FileJob, FileKind};
 use crate::pipeline::RedditETL;
 use crate::progress::{make_count_progress, make_progress_bar_labeled, total_compressed_size};
 use crate::util::{
-    create_with_backoff, remove_with_backoff, replace_file_atomic_backoff, with_thread_pool,
+    create_dir_all_with_backoff, create_with_backoff, open_with_backoff, read_dir_with_backoff,
+    remove_with_backoff, replace_file_atomic_backoff, with_thread_pool,
 };
 use crate::zstd_jsonl::{
     for_each_line_with_progress_cfg_no_throttle_status, malformed_json_error, parse_minimal,
@@ -20,7 +21,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
-use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -331,7 +331,7 @@ fn build_id_shard_index(
             // sidecar binds this cache shard to the current ParentIds, source
             // corpus file, source kind/month, resolver format, and requested
             // resolver window; stale-but-parseable shards are rebuilt.
-            let valid_json = match File::open(&out) {
+            let valid_json = match open_with_backoff(&out, 16, 50) {
                 Ok(f) => match job.kind {
                     FileKind::Comment => {
                         serde_json::from_reader::<_, HashMap<String, String>>(BufReader::new(f))
@@ -680,7 +680,8 @@ fn fingerprint_empty_id_set(kind: &str) -> ParentIdSetFingerprint {
 }
 
 fn fingerprint_id_shard_file(path: &Path) -> Result<(u64, u64, u64)> {
-    let f = File::open(path).with_context(|| format!("open parent-id shard {}", path.display()))?;
+    let f = open_with_backoff(path, 16, 50)
+        .with_context(|| format!("open parent-id shard {}", path.display()))?;
     let r = BufReader::new(f);
     let mut count = 0u64;
     let mut sum = 0u64;
@@ -815,7 +816,7 @@ fn build_resolver_fingerprint(
 }
 
 fn resolver_fingerprint_matches(sidecar_path: &Path, expected: &ResolverFingerprint) -> bool {
-    match File::open(sidecar_path) {
+    match open_with_backoff(sidecar_path, 16, 50) {
         Ok(f) => match serde_json::from_reader::<_, ResolverFingerprint>(BufReader::new(f)) {
             Ok(actual) if &actual == expected => true,
             Ok(_) => {
@@ -848,7 +849,7 @@ fn write_resolver_fingerprint_atomic(
     let staged = PathBuf::from(staged);
 
     if let Some(parent) = sidecar_path.parent() {
-        fs::create_dir_all(parent)
+        create_dir_all_with_backoff(parent, 16, 50)
             .with_context(|| format!("create resolver sidecar parent {}", parent.display()))?;
     }
 
@@ -883,7 +884,7 @@ fn write_resolver_fingerprint_atomic(
 }
 
 fn attach_fingerprint_matches(sidecar_path: &Path, expected: &AttachFingerprint) -> bool {
-    match File::open(sidecar_path) {
+    match open_with_backoff(sidecar_path, 16, 50) {
         Ok(f) => match serde_json::from_reader::<_, AttachFingerprint>(BufReader::new(f)) {
             Ok(actual) if &actual == expected => true,
             Ok(_) => {
@@ -921,10 +922,10 @@ fn write_attach_fingerprint_atomic(
     let mut staged = staging_dir.join(file_name);
     staged.as_mut_os_string().push(INPROGRESS_EXT);
 
-    fs::create_dir_all(staging_dir)
+    create_dir_all_with_backoff(staging_dir, 16, 50)
         .with_context(|| format!("create staging dir {}", staging_dir.display()))?;
     if let Some(parent) = sidecar_path.parent() {
-        fs::create_dir_all(parent)
+        create_dir_all_with_backoff(parent, 16, 50)
             .with_context(|| format!("create sidecar parent {}", parent.display()))?;
     }
 
@@ -959,7 +960,7 @@ fn write_attach_fingerprint_atomic(
 }
 
 fn validate_jsonl_file(path: &Path) -> bool {
-    let Ok(f) = File::open(path) else {
+    let Ok(f) = open_with_backoff(path, 16, 50) else {
         return false;
     };
     let r = BufReader::new(f);
@@ -1049,8 +1050,18 @@ impl RedditETL {
         with_thread_pool(self.opts.parallelism, || {
             let comments_out = cache_dir.join("comments");
             let submissions_out = cache_dir.join("submissions");
-            fs::create_dir_all(&comments_out)?;
-            fs::create_dir_all(&submissions_out)?;
+            create_dir_all_with_backoff(&comments_out, 16, 50).with_context(|| {
+                format!(
+                    "create comments parent cache dir {}",
+                    comments_out.display()
+                )
+            })?;
+            create_dir_all_with_backoff(&submissions_out, 16, 50).with_context(|| {
+                format!(
+                    "create submissions parent cache dir {}",
+                    submissions_out.display()
+                )
+            })?;
 
             let discovered = discover_all(&self.opts.comments_dir, &self.opts.submissions_dir);
             let files = plan_files_checked(
@@ -1111,10 +1122,14 @@ impl RedditETL {
 
             if eager_ok {
                 let load = |dir: &Path| -> Vec<PathBuf> {
-                    let mut v: Vec<PathBuf> = fs::read_dir(dir)
+                    let mut v: Vec<PathBuf> = read_dir_with_backoff(dir, 16, 50)
+                        .map_err(|e| {
+                            tracing::warn!(dir=%dir.display(), error=%e, "failed to eager-list parent cache shards");
+                            e
+                        })
                         .ok()
                         .into_iter()
-                        .flat_map(|it| it.filter_map(|e| e.ok().map(|e| e.path())))
+                        .flat_map(|entries| entries.into_iter().map(|e| e.path()))
                         .filter(|p| {
                             p.file_name()
                                 .and_then(|name| name.to_str())
@@ -1131,7 +1146,7 @@ impl RedditETL {
                 };
 
                 for p in load(&comments_out) {
-                    let f = File::open(&p)?;
+                    let f = open_with_backoff(&p, 16, 50)?;
                     let r = BufReader::new(f);
                     let m: HashMap<String, String> = serde_json::from_reader(r)?;
                     for (k, v) in m {
@@ -1142,7 +1157,7 @@ impl RedditETL {
                     }
                 }
                 for p in load(&submissions_out) {
-                    let f = File::open(&p)?;
+                    let f = open_with_backoff(&p, 16, 50)?;
                     let r = BufReader::new(f);
                     let m: HashMap<String, (String, String)> = serde_json::from_reader(r)?;
                     for (k, v) in m {
@@ -1183,7 +1198,9 @@ impl RedditETL {
         resume: bool,
     ) -> Result<(Vec<PathBuf>, ParentAttachStats)> {
         with_thread_pool(self.opts.parallelism, || {
-            fs::create_dir_all(out_dir)?;
+            create_dir_all_with_backoff(out_dir, 16, 50).with_context(|| {
+                format!("create parent attach output dir {}", out_dir.display())
+            })?;
             let staging_dir = ensure_staging_dir(out_dir)?;
             sweep_stale_inprogress(out_dir, true)?;
 
@@ -1261,7 +1278,7 @@ impl RedditETL {
                                 files_scanned: 1,
                                 ..Default::default()
                             };
-                            let f = File::open(in_path)?;
+                            let f = open_with_backoff(in_path, 16, 50)?;
                             let r = BufReader::new(f);
 
                             for (line_idx, line) in r.lines().enumerate() {

@@ -3,11 +3,13 @@
 
 use anyhow::{Context, Result};
 use retl::{
-    create_with_backoff, discover_all, format_year_month_ranges, missing_month_diagnostics,
-    plan_files, remove_with_backoff, replace_file_atomic_backoff, total_compressed_size,
-    ExportFormat, FileKind, IntegrityMode, KeyExtractor, RedditETL, Sources, YearMonth,
+    create_dir_all_with_backoff, create_with_backoff, discover_all, format_year_month_ranges,
+    missing_month_diagnostics, open_with_backoff, plan_files, remove_with_backoff,
+    replace_file_atomic_backoff, total_compressed_size, ExportFormat, FileKind, IntegrityMode,
+    KeyExtractor, RedditETL, Sources, YearMonth,
 };
 use std::collections::BTreeMap;
+#[cfg(test)]
 use std::fs;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -37,7 +39,7 @@ where
 {
     let parent = output_parent(final_path);
     let staging_dir = parent.join("_staging");
-    fs::create_dir_all(&staging_dir)
+    create_dir_all_with_backoff(&staging_dir, 16, 50)
         .with_context(|| format!("creating staging dir {}", staging_dir.display()))?;
 
     let file_name = final_path
@@ -69,7 +71,7 @@ where
     drop(w);
 
     let parent = output_parent(final_path);
-    fs::create_dir_all(parent)
+    create_dir_all_with_backoff(parent, 16, 50)
         .with_context(|| format!("creating output parent {}", parent.display()))?;
 
     if let Err(e) = replace_file_atomic_backoff(&staged, final_path) {
@@ -212,14 +214,14 @@ pub(crate) fn run_dedupe(args: DedupeArgs) -> Result<()> {
 
     if args.out == Path::new("-") {
         let tmp_path = stdout_dedupe_path(&work_dir);
-        let _ = fs::remove_file(&tmp_path);
+        let _ = remove_with_backoff(&tmp_path, 8, 50);
         let result = scan.dedupe_keys_to_lines(&key, &tmp_path);
         if let Err(e) = result {
-            let _ = fs::remove_file(&tmp_path);
+            let _ = remove_with_backoff(&tmp_path, 8, 50);
             return Err(e);
         }
         let copy_result = (|| -> Result<()> {
-            let mut f = fs::File::open(&tmp_path)
+            let mut f = open_with_backoff(&tmp_path, 16, 50)
                 .with_context(|| format!("opening dedupe tempfile {}", tmp_path.display()))?;
             let stdout = io::stdout();
             let mut w = stdout.lock();
@@ -227,7 +229,7 @@ pub(crate) fn run_dedupe(args: DedupeArgs) -> Result<()> {
             w.flush()?;
             Ok(())
         })();
-        let _ = fs::remove_file(&tmp_path);
+        let _ = remove_with_backoff(&tmp_path, 8, 50);
         copy_result?;
     } else {
         scan.dedupe_keys_to_lines(&key, &args.out)?;
@@ -319,7 +321,7 @@ pub(crate) fn run_export(args: ExportArgs) -> Result<()> {
             if to_stdout {
                 anyhow::bail!("--out - is not valid for --format spool (it expects a directory)");
             }
-            fs::create_dir_all(&args.out)
+            create_dir_all_with_backoff(&args.out, 16, 50)
                 .with_context(|| format!("creating spool dir {}", args.out.display()))?;
             let (parts, n) = scan.extract_spool_monthly(&args.out)?;
             eprintln!("Spooled {} records across {} part files", n, parts.len());
@@ -423,7 +425,7 @@ pub(crate) fn run_aggregate(args: AggregateArgs) -> Result<()> {
             .unwrap_or_else(|| std::path::Path::new("."))
             .join("agg_shards")
     });
-    fs::create_dir_all(&shards_dir)
+    create_dir_all_with_backoff(&shards_dir, 16, 50)
         .with_context(|| format!("creating shards_dir {}", shards_dir.display()))?;
 
     let input_count = args.inputs.len();
@@ -530,14 +532,14 @@ pub(crate) fn run_parents(args: ParentsArgs) -> Result<()> {
         }
     }
 
-    fs::create_dir_all(&args.cache)
+    create_dir_all_with_backoff(&args.cache, 16, 50)
         .with_context(|| format!("creating cache dir {}", args.cache.display()))?;
-    fs::create_dir_all(&args.out)
+    create_dir_all_with_backoff(&args.out, 16, 50)
         .with_context(|| format!("creating output dir {}", args.out.display()))?;
-    fs::create_dir_all(&args.work_dir)
+    create_dir_all_with_backoff(&args.work_dir, 16, 50)
         .with_context(|| format!("creating work_dir {}", args.work_dir.display()))?;
     let lib_tmp = args.work_dir.join("lib_tmp");
-    fs::create_dir_all(&lib_tmp)
+    create_dir_all_with_backoff(&lib_tmp, 16, 50)
         .with_context(|| format!("creating work_dir {}", lib_tmp.display()))?;
 
     let build = |sources: Option<Sources>, range: Option<(YearMonth, YearMonth)>| -> RedditETL {

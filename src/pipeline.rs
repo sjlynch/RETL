@@ -2,10 +2,9 @@ use crate::config::{ETLOptions, Sources};
 use crate::date::YearMonth;
 use crate::mem::AdaptiveMemCfg;
 use crate::query::{normalize_str, QueryBuildError, QuerySpec};
-use crate::util::{default_bot_authors, merge_extra_exclusions};
+use crate::util::{create_dir_all_with_backoff, default_bot_authors, merge_extra_exclusions};
 use anyhow::Result;
 use regex::Regex;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone)]
@@ -144,7 +143,7 @@ impl RedditETL {
             .work_dir
             .clone()
             .unwrap_or_else(|| self.opts.base_dir.join(".reddit_etl_work"));
-        fs::create_dir_all(&dir)?;
+        create_dir_all_with_backoff(&dir, 16, 50)?;
         Ok(dir)
     }
 }
@@ -362,4 +361,24 @@ impl ScanPlan {
 #[inline]
 fn lowercase_str(s: &str) -> String {
     s.to_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::util::{inject_retriable_io_errors_for_tests, TestIoOp};
+
+    #[test]
+    fn ensure_work_dir_retries_transient_create_dir_all() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let work_dir = tmp.path().join("work");
+        let _guard =
+            inject_retriable_io_errors_for_tests(TestIoOp::CreateDirAll, &work_dir, 1);
+
+        let etl = RedditETL::new().work_dir(&work_dir);
+        let created = etl.ensure_work_dir().expect("ensure work dir");
+
+        assert_eq!(created, work_dir);
+        assert!(created.is_dir());
+    }
 }

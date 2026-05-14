@@ -8,8 +8,8 @@
 //! is atomic on Windows and POSIX.
 
 use crate::atomic_write::write_jsonl_atomic;
+use crate::util::{open_with_backoff, read_dir_with_backoff};
 use anyhow::Result;
-use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
@@ -34,7 +34,7 @@ pub fn stitch_tmp_parts(tmp_dir: &Path, out_path: &Path, write_buf: usize) -> Re
     let parts = list_tmp_parts(tmp_dir)?;
     write_atomic(out_path, write_buf, |out| {
         for path in &parts {
-            let mut r = BufReader::new(std::fs::File::open(path)?);
+            let mut r = BufReader::new(open_with_backoff(path, 16, 50)?);
             std::io::copy(&mut r, out)?;
         }
         Ok(())
@@ -73,7 +73,7 @@ pub fn stitch_tmp_parts_to_json_array(
 
         let mut buf = String::with_capacity(STITCH_BUF_BYTES);
         for path in &parts {
-            let mut r = BufReader::new(std::fs::File::open(path)?);
+            let mut r = BufReader::new(open_with_backoff(path, 16, 50)?);
             loop {
                 buf.clear();
                 let n = r.read_line(&mut buf)?;
@@ -116,7 +116,7 @@ fn stitch_tmp_parts_to_json_array_pretty(
 
         let mut buf = String::with_capacity(STITCH_BUF_BYTES);
         for path in &parts {
-            let mut r = BufReader::new(std::fs::File::open(path)?);
+            let mut r = BufReader::new(open_with_backoff(path, 16, 50)?);
             loop {
                 buf.clear();
                 let n = r.read_line(&mut buf)?;
@@ -148,11 +148,16 @@ fn stitch_tmp_parts_to_json_array_pretty(
 
 fn jsonl_part_paths(tmp_dir: &Path) -> Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
-    for entry in fs::read_dir(tmp_dir)? {
-        let path = entry?.path();
-        if !path.is_file() { continue; }
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue; };
-        if name.ends_with(".jsonl.part") || (name.starts_with(".part_") && name.ends_with(".jsonl")) {
+    for entry in read_dir_with_backoff(tmp_dir, 16, 50)? {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if name.ends_with(".jsonl.part") || (name.starts_with(".part_") && name.ends_with(".jsonl"))
+        {
             paths.push(path);
         }
     }
@@ -164,7 +169,7 @@ pub fn concat_tsvs(parts: &Vec<PathBuf>, out_path: &Path, write_buf: usize) -> R
     paths.sort();
     write_atomic(out_path, write_buf, |out| {
         for p in paths {
-            let mut r = BufReader::new(std::fs::File::open(&p)?);
+            let mut r = BufReader::new(open_with_backoff(&p, 16, 50)?);
             std::io::copy(&mut r, out)?;
         }
         Ok(())
@@ -174,6 +179,7 @@ pub fn concat_tsvs(parts: &Vec<PathBuf>, out_path: &Path, write_buf: usize) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     /// A temp part containing invalid UTF-8 must cause stitching to return
     /// `Err` instead of silently truncating the JSON array. Regression test

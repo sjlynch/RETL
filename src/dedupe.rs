@@ -3,7 +3,10 @@ use crate::key_extractor::KeyExtractor;
 use crate::mem::{available_memory_fraction, is_low_memory, AdaptiveMemCfg};
 use crate::ndjson::{NdjsonReader, NdjsonWriter};
 use crate::progress::ProgressScope;
-use crate::util::{open_with_backoff, remove_with_backoff, replace_file_atomic_backoff, smoothstep_memory_fraction};
+use crate::util::{
+    create_dir_all_with_backoff, open_with_backoff, remove_with_backoff,
+    replace_file_atomic_backoff, smoothstep_memory_fraction,
+};
 use crate::zstd_jsonl::malformed_json_error;
 use anyhow::{Context, Result};
 use std::cmp::Ordering;
@@ -77,7 +80,8 @@ pub fn build_runs_sorted(
     key: &KeyExtractor,
     cfg: &DedupeCfg,
 ) -> Result<Vec<PathBuf>> {
-    fs::create_dir_all(runs_dir)?;
+    create_dir_all_with_backoff(runs_dir, 16, 50)
+        .with_context(|| format!("create runs dir {}", runs_dir.display()))?;
 
     let total_in_bytes = fs::metadata(input).map(|m| m.len()).unwrap_or(0);
     let pb = ProgressScope::bytes("Dedupe: build runs", total_in_bytes);

@@ -5,7 +5,8 @@ use crate::ndjson::for_each_jsonl_line_cfg;
 use crate::pipeline::RedditETL;
 use crate::progress::make_count_progress;
 use crate::util::{
-    create_with_backoff, remove_with_backoff, replace_file_atomic_backoff, with_thread_pool,
+    create_dir_all_with_backoff, create_with_backoff, open_with_backoff, read_dir_with_backoff,
+    remove_with_backoff, replace_file_atomic_backoff, with_thread_pool,
 };
 use anyhow::Result;
 use indicatif::ProgressBar;
@@ -13,8 +14,6 @@ use rayon::prelude::*;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
-use std::fs;
-use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -67,8 +66,7 @@ fn clear_aggregate_artifacts(shards_dir: &Path) -> Result<()> {
         return Ok(());
     }
 
-    for entry in fs::read_dir(shards_dir)? {
-        let entry = entry?;
+    for entry in read_dir_with_backoff(shards_dir, 16, 50)? {
         if !entry.file_type()?.is_file() {
             continue;
         }
@@ -81,7 +79,7 @@ fn clear_aggregate_artifacts(shards_dir: &Path) -> Result<()> {
 }
 
 fn load_shard<A: Aggregator>(shard: &Path) -> Result<A> {
-    let f = File::open(shard)?;
+    let f = open_with_backoff(shard, 16, 50)?;
     let r = BufReader::new(f);
     let part: A = serde_json::from_reader(r)?;
     Ok(part)
@@ -305,7 +303,7 @@ impl RedditETL {
         F: Fn() -> A + Send + Sync,
     {
         clear_aggregate_artifacts(shards_dir)?;
-        fs::create_dir_all(shards_dir)?;
+        create_dir_all_with_backoff(shards_dir, 16, 50)?;
 
         let shard_paths = shard_names_for_inputs(shards_dir, &inputs);
 

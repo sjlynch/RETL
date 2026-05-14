@@ -1,12 +1,12 @@
 use ahash::RandomState;
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
-use std::fs::{self, File};
+use std::fs::File;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use crate::util::{create_with_backoff, replace_file_atomic_backoff};
+use crate::util::{create_dir_all_with_backoff, create_with_backoff, replace_file_atomic_backoff};
 
 /// Partitioned writers that route each user aggregate to a stable partition file.
 /// Writes are user-keyed: the same `user` always goes to the same partition.
@@ -36,8 +36,10 @@ impl PartitionWriters {
     pub fn new(dir: &Path, stem: &str, parts: usize, write_buf: usize) -> Result<Self> {
         let parts = parts.max(1);
         let staging = dir.join("_staging");
-        fs::create_dir_all(&staging)?;
-        fs::create_dir_all(dir)?;
+        create_dir_all_with_backoff(&staging, 16, 50)
+            .with_context(|| format!("create staging dir {}", staging.display()))?;
+        create_dir_all_with_backoff(dir, 16, 50)
+            .with_context(|| format!("create partition dir {}", dir.display()))?;
 
         let mut writers = Vec::with_capacity(parts);
         let mut tmp_paths = Vec::with_capacity(parts);
@@ -61,7 +63,12 @@ impl PartitionWriters {
             0x0bad_f00d_c0de_cafe,
         );
 
-        Ok(Self { writers, tmp_paths, final_paths, state })
+        Ok(Self {
+            writers,
+            tmp_paths,
+            final_paths,
+            state,
+        })
     }
 
     #[inline]

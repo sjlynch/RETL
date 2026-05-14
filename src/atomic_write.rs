@@ -7,12 +7,15 @@
 //! unreadable file at the published path.
 
 use anyhow::{Context, Result};
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use zstd::stream::write::Encoder as ZstdEncoder;
 
-use crate::util::{create_with_backoff, remove_with_backoff, replace_file_atomic_backoff};
+use crate::util::{
+    create_dir_all_with_backoff, create_with_backoff, read_dir_with_backoff, remove_with_backoff,
+    replace_file_atomic_backoff,
+};
 
 /// Directory used to stage `*.inprogress` files under an output root.
 pub const STAGING_DIR_NAME: &str = "_staging";
@@ -25,7 +28,7 @@ pub(crate) const INPROGRESS_EXT: &str = ".inprogress";
 /// Build the staging directory path for a given output root, creating it.
 pub fn ensure_staging_dir(out_root: &Path) -> Result<PathBuf> {
     let dir = out_root.join(STAGING_DIR_NAME);
-    fs::create_dir_all(&dir)
+    create_dir_all_with_backoff(&dir, 16, 50)
         .with_context(|| format!("create staging dir {}", dir.display()))?;
     Ok(dir)
 }
@@ -41,14 +44,9 @@ pub fn sweep_stale_inprogress(out_root: &Path, delete: bool) -> Result<usize> {
         return Ok(0);
     }
     let mut count = 0usize;
-    for entry in fs::read_dir(&dir).with_context(|| format!("read_dir {}", dir.display()))? {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(e) => {
-                tracing::warn!(dir=%dir.display(), error=%e, "skipping unreadable staging entry");
-                continue;
-            }
-        };
+    for entry in read_dir_with_backoff(&dir, 16, 50)
+        .with_context(|| format!("read_dir {}", dir.display()))?
+    {
         let path = entry.path();
         let is_inprogress = path
             .file_name()
@@ -99,7 +97,7 @@ where
     let mut staged = staging_dir.join(file_name);
     staged.as_mut_os_string().push(INPROGRESS_EXT);
 
-    fs::create_dir_all(staging_dir)
+    create_dir_all_with_backoff(staging_dir, 16, 50)
         .with_context(|| format!("create staging dir {}", staging_dir.display()))?;
 
     let file = create_with_backoff(&staged, 16, 50)
@@ -121,7 +119,7 @@ where
     drop(writer); // release file handle before atomic rename (Windows)
 
     if let Some(parent) = final_dest.parent() {
-        fs::create_dir_all(parent)
+        create_dir_all_with_backoff(parent, 16, 50)
             .with_context(|| format!("create dest parent {}", parent.display()))?;
     }
     replace_file_atomic_backoff(&staged, final_dest)?;

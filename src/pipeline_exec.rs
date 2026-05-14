@@ -22,7 +22,8 @@ use crate::streaming::{
     process_file_for_usernames_with_skip, stream_job, StreamJobResult, WhitelistMatchTracker,
 };
 use crate::util::{
-    create_with_backoff, remove_dir_all_with_backoff, remove_with_backoff, with_thread_pool,
+    create_dir_all_with_backoff, create_with_backoff, open_with_backoff, read_dir_with_backoff,
+    remove_dir_all_with_backoff, remove_with_backoff, with_thread_pool,
 };
 use crate::zstd_jsonl::{
     for_each_line_cfg, for_each_line_with_progress_cfg, malformed_json_error, parse_minimal,
@@ -305,7 +306,7 @@ impl ScanPlan {
                 .map(|d| d.as_nanos())
                 .unwrap_or(0);
             let tmp_dir = work_dir.join(format!("dedupe_{}_{}", std::process::id(), unique));
-            fs::create_dir_all(&tmp_dir)
+            create_dir_all_with_backoff(&tmp_dir, 16, 50)
                 .with_context(|| format!("creating dedupe work dir {}", tmp_dir.display()))?;
 
             let result = (|| -> Result<u64> {
@@ -367,7 +368,7 @@ impl ScanPlan {
                 Ok(unique_count)
             })();
 
-            let _ = fs::remove_dir_all(&tmp_dir);
+            let _ = remove_dir_all_with_backoff(&tmp_dir, 8, 50);
             result
         })
     }
@@ -404,7 +405,8 @@ impl ScanPlan {
         let parallelism = plan.etl.opts.parallelism;
 
         with_thread_pool(parallelism, || {
-            fs::create_dir_all(out_dir)?;
+            create_dir_all_with_backoff(out_dir, 16, 50)
+                .with_context(|| format!("creating spool dir {}", out_dir.display()))?;
             let staging_dir = ensure_staging_dir(out_dir)?;
             sweep_stale_inprogress(out_dir, true)?;
 
@@ -629,8 +631,15 @@ impl ScanPlan {
 
             let comments_dir = out_base_dir.join("comments");
             let submissions_dir = out_base_dir.join("submissions");
-            fs::create_dir_all(&comments_dir)?;
-            fs::create_dir_all(&submissions_dir)?;
+            create_dir_all_with_backoff(&comments_dir, 16, 50).with_context(|| {
+                format!("creating comments export dir {}", comments_dir.display())
+            })?;
+            create_dir_all_with_backoff(&submissions_dir, 16, 50).with_context(|| {
+                format!(
+                    "creating submissions export dir {}",
+                    submissions_dir.display()
+                )
+            })?;
             let staging_dir = ensure_staging_dir(out_base_dir)?;
             sweep_stale_inprogress(out_base_dir, true)?;
 
@@ -715,7 +724,7 @@ impl ScanPlan {
                     };
 
                     if written == 0 {
-                        let _ = fs::remove_file(&out_path);
+                        let _ = remove_with_backoff(&out_path, 8, 50);
                     }
                     Ok(())
                 },
@@ -891,8 +900,9 @@ fn remove_matching_files(dir: &Path, mut should_remove: impl FnMut(&str) -> bool
     if !dir.exists() {
         return Ok(());
     }
-    for entry in fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))? {
-        let entry = entry?;
+    let entries = read_dir_with_backoff(dir, 16, 50)
+        .with_context(|| format!("read_dir {}", dir.display()))?;
+    for entry in entries {
         let path = entry.path();
         if !path.is_file() {
             continue;
@@ -1089,7 +1099,7 @@ fn load_and_validate_export_manifest(
 }
 
 fn validate_jsonl_part(path: &Path) -> Result<MonthEntry> {
-    let file = fs::File::open(path)
+    let file = open_with_backoff(path, 16, 50)
         .with_context(|| format!("opening extract resume part {}", path.display()))?;
     let mut reader = BufReader::new(file);
     let mut buf = String::new();
@@ -1147,7 +1157,8 @@ fn extract_common(
             resume,
             resume_fingerprint.as_deref(),
         )?;
-        fs::create_dir_all(&tmp_dir)?;
+        create_dir_all_with_backoff(&tmp_dir, 16, 50)
+            .with_context(|| format!("creating extract work dir {}", tmp_dir.display()))?;
         let staging_dir = ensure_staging_dir(&tmp_dir)?;
         sweep_stale_inprogress(&tmp_dir, true)?;
 
@@ -1220,7 +1231,7 @@ fn extract_common(
                         }
                         Err(e) => {
                             tracing::info!(path=%tmp_file.display(), error=%e, "resume part failed validation; rebuilding");
-                            let _ = fs::remove_file(&tmp_file);
+                            let _ = remove_with_backoff(&tmp_file, 8, 50);
                         }
                     }
                 }
@@ -1274,7 +1285,7 @@ fn extract_common(
             }
         }
         if !resume {
-            if let Err(e) = fs::remove_dir_all(&tmp_dir) {
+            if let Err(e) = remove_dir_all_with_backoff(&tmp_dir, 8, 50) {
                 tracing::warn!(path=%tmp_dir.display(), error=%e, "failed to remove extract scratch dir");
             }
         }

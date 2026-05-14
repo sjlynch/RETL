@@ -86,9 +86,10 @@
 //!
 //! ## Cross-cutting helpers
 //!
-//! - [`open_with_backoff`] / [`create_with_backoff`] / [`remove_with_backoff`]
-//!   / [`replace_file_atomic_backoff`] — Windows-friendly retry/backoff over
-//!   transient sharing/AV errors.
+//! - [`open_with_backoff`] / [`create_with_backoff`] /
+//!   [`create_dir_all_with_backoff`] / [`read_dir_with_backoff`] /
+//!   [`remove_with_backoff`] / [`replace_file_atomic_backoff`] —
+//!   Windows-friendly retry/backoff over transient sharing/AV errors.
 //! - [`with_thread_pool`] — scoped Rayon pool (preferred over
 //!   `build_global`).
 //! - [`init_tracing_for_binary`] — *binary-only* tracing init; library code
@@ -177,7 +178,8 @@ pub use crate::partition::PartitionWriters;
 
 //export robust file ops from util so binaries can import from crate root.
 pub use crate::util::{
-    create_with_backoff, open_with_backoff, remove_with_backoff, replace_file_atomic_backoff,
+    create_dir_all_with_backoff, create_with_backoff, open_with_backoff, read_dir_with_backoff,
+    remove_with_backoff, replace_file_atomic_backoff,
 };
 
 // Scoped rayon pool + opt-in tracing init for binaries.

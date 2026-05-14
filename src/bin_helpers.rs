@@ -3,11 +3,13 @@
 //! couple of CLI-only path/I/O helpers.
 
 use anyhow::{Context, Result};
-use retl::{Aggregator, ConfigBuildError, RedditETL, Sources, YearMonth};
+use retl::{
+    create_dir_all_with_backoff, open_with_backoff, read_dir_with_backoff, remove_with_backoff,
+    Aggregator, ConfigBuildError, RedditETL, Sources, YearMonth,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
@@ -311,10 +313,10 @@ fn format_number(n: f64) -> String {
 // -----------------------------------------------------------------------------
 
 pub(crate) fn ensure_dirs(common: &CommonOpts) -> Result<PathBuf> {
-    fs::create_dir_all(&common.work_dir)
+    create_dir_all_with_backoff(&common.work_dir, 16, 50)
         .with_context(|| format!("creating work_dir {}", common.work_dir.display()))?;
     let lib_tmp = common.work_dir.join("lib_tmp");
-    fs::create_dir_all(&lib_tmp)
+    create_dir_all_with_backoff(&lib_tmp, 16, 50)
         .with_context(|| format!("creating work_dir {}", lib_tmp.display()))?;
     Ok(lib_tmp)
 }
@@ -402,7 +404,7 @@ pub(crate) fn stream_path_output_to_stdout(
     write_output: impl FnOnce(&Path) -> Result<()>,
 ) -> Result<()> {
     let lib_tmp = work_dir.join("lib_tmp");
-    fs::create_dir_all(&lib_tmp)
+    create_dir_all_with_backoff(&lib_tmp, 16, 50)
         .with_context(|| format!("creating work_dir {}", lib_tmp.display()))?;
     let tmp_path = lib_tmp.join(format!(
         "retl_{}_{}_{}",
@@ -410,17 +412,17 @@ pub(crate) fn stream_path_output_to_stdout(
         std::process::id(),
         file_stem
     ));
-    let _ = fs::remove_file(&tmp_path);
+    let _ = remove_with_backoff(&tmp_path, 8, 50);
 
     let result = write_output(&tmp_path);
 
     if let Err(e) = result {
-        let _ = fs::remove_file(&tmp_path);
+        let _ = remove_with_backoff(&tmp_path, 8, 50);
         return Err(e);
     }
 
     let copy_result = (|| -> Result<()> {
-        let mut f = fs::File::open(&tmp_path)
+        let mut f = open_with_backoff(&tmp_path, 16, 50)
             .with_context(|| format!("opening {temp_prefix} tempfile {}", tmp_path.display()))?;
         let stdout = io::stdout();
         let mut w = stdout.lock();
@@ -430,7 +432,7 @@ pub(crate) fn stream_path_output_to_stdout(
         Ok(())
     })();
 
-    let _ = fs::remove_file(&tmp_path);
+    let _ = remove_with_backoff(&tmp_path, 8, 50);
     copy_result
 }
 
@@ -447,11 +449,10 @@ pub(crate) fn stream_extract_to_stdout(
 /// Discover spool parts in `dir`, parsing `part_RC_YYYY-MM.jsonl` and
 /// `part_RS_YYYY-MM.jsonl` filenames. Returns `(sorted_paths, min, max)`.
 pub(crate) fn discover_spool_parts(dir: &Path) -> Result<(Vec<PathBuf>, YearMonth, YearMonth)> {
-    let entries =
-        fs::read_dir(dir).with_context(|| format!("reading spool dir {}", dir.display()))?;
+    let entries = read_dir_with_backoff(dir, 16, 50)
+        .with_context(|| format!("reading spool dir {}", dir.display()))?;
     let mut parts: Vec<(YearMonth, PathBuf)> = Vec::new();
     for e in entries {
-        let e = e?;
         let name = e.file_name().to_string_lossy().into_owned();
         let stem = name
             .strip_prefix("part_RC_")
