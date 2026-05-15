@@ -231,15 +231,21 @@ pub struct ETLOptions {
     /// minimum cooldown between target recomputations.
     pub adaptive_mem: AdaptiveMemCfg,
 
-    /// Opt-in: when true, supported extract/export operations read/write a
-    /// `_progress.json`-style sidecar and skip months already committed by a
-    /// prior run. Default false to preserve current behavior.
+    /// Opt-in: when true, supported extract/export and analytics operations
+    /// read/write a `_progress.json`-style sidecar and skip months already
+    /// committed by a prior run. Default false to preserve current behavior.
     pub resume: bool,
 
     /// Parent payload fields attached by the parents pipeline. Defaults to the
     /// legacy output shape (`body` for comments, `title`/`selftext` for
     /// submissions).
     pub parent_payload_spec: ParentPayloadSpec,
+
+    /// Emit user-facing provenance manifests next to file/directory outputs.
+    /// Enabled by default; disable via [`ETLOptions::with_run_manifest`] or the
+    /// CLI's `--no-manifest` when absolute local paths are too sensitive for a
+    /// sidecar artifact.
+    pub emit_manifest: bool,
 
     /// Opt-in lossy mode for corrupt zstd inputs. The default (`false`) treats
     /// zstd decode errors as fatal so scans/exports cannot silently return
@@ -290,6 +296,7 @@ impl Default for ETLOptions {
             adaptive_mem: AdaptiveMemCfg::default(),
             resume: false,
             parent_payload_spec: ParentPayloadSpec::default(),
+            emit_manifest: true,
             allow_partial: false,
             partial_read_reporter: PartialReadReporter::default(),
             build_error: None,
@@ -463,11 +470,18 @@ impl ETLOptions {
         self
     }
 
-    /// Opt in to resumable extract/export runs (`extract_to_jsonl`,
-    /// `extract_to_json`, `extract_spool_monthly`, `export_partitioned`, and
-    /// parents helpers).
+    /// Opt in to resumable extract/export and analytics runs (`scan`/usernames,
+    /// dedupe, count, first-seen, `extract_to_jsonl`, `extract_to_json`,
+    /// `extract_spool_monthly`, `export_partitioned`, and parents helpers).
     pub fn with_resume(mut self, yes: bool) -> Self {
         self.resume = yes;
+        self
+    }
+
+    /// Enable or disable user-facing provenance manifest sidecars next to
+    /// file/directory outputs. Enabled by default.
+    pub fn with_run_manifest(mut self, yes: bool) -> Self {
+        self.emit_manifest = yes;
         self
     }
 

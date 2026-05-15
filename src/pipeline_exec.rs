@@ -19,6 +19,10 @@ use crate::pipeline::{RedditETL, ScanPlan};
 use crate::progress::{make_progress_bar_labeled, total_compressed_size};
 use crate::progress_manifest::{ManifestAccumulator, MonthEntry};
 use crate::query::QuerySpec;
+use crate::run_manifest::{
+    corpus_snapshot_from_etl, etl_options_value, maybe_write_run_manifest, scan_query_value,
+    ManifestDestination, RunManifestInput, RunManifestStart,
+};
 use crate::shard::{ShardedWriter, UsernameStream};
 use crate::stitch::{concat_tsvs, stitch_tmp_parts, stitch_tmp_parts_to_json_array};
 use crate::streaming::{
@@ -35,6 +39,7 @@ use crate::zstd_jsonl::{
 };
 use anyhow::{anyhow, Context, Result};
 use indicatif::ProgressBar;
+use rayon::prelude::*;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
@@ -43,6 +48,7 @@ use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Export format for partitioned corpus-style outputs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -125,6 +131,7 @@ enum Finalize {
 
 const FILE_PREFIX_RC: &str = "part_RC";
 const FILE_PREFIX_RS: &str = "part_RS";
+const ANALYTICS_CHECKPOINT_OPERATION: &str = "analytics-matched-jsonl-v1";
 const DEDUPE_KEY_DROP_WARN_RATE: f64 = 0.01;
 static EXTRACT_SCRATCH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -263,7 +270,7 @@ impl RedditETL {
 
         with_thread_pool(parallelism, || {
             let work_dir = self.ensure_work_dir()?;
-            let files = plan_pipeline_files(&self)?;
+            let files = plan_pipeline_files(&self, None)?;
             tracing::info!("Planned {} files for processing.", files.len());
 
             let shard_writer =
@@ -344,22 +351,45 @@ impl ScanPlan {
             let scratch_root = shard_writer.scratch_root().to_path_buf();
 
             let result = (|| -> Result<UsernameStream> {
-                scan_records(
-                    &plan.etl,
-                    &plan.query,
-                    /*show_progress=*/ true,
-                    plan.limit,
-                    |min, _kind, _line| {
-                        if let Some(a) = min.author.as_deref() {
-                            let a = a.trim();
-                            if a.is_empty() {
-                                return Ok(());
+                if plan.etl.opts.resume {
+                    let checkpoint = materialize_scan_checkpoint(
+                        &plan.etl,
+                        &plan.query,
+                        /*show_progress=*/ true,
+                        plan.limit,
+                    )?;
+                    for_each_checkpoint_record(
+                        &checkpoint.parts,
+                        plan.etl.opts.read_buffer_bytes,
+                        |min, _line| {
+                            if let Some(a) = min.author.as_deref() {
+                                let a = a.trim();
+                                if a.is_empty() {
+                                    return Ok(());
+                                }
+                                shard_writer.write(a)?;
                             }
-                            shard_writer.write(a)?;
-                        }
-                        Ok(())
-                    },
-                )?;
+                            Ok(())
+                        },
+                    )?;
+                } else {
+                    scan_records(
+                        &plan.etl,
+                        &plan.query,
+                        /*show_progress=*/ true,
+                        plan.limit,
+                        |min, _kind, _line| {
+                            if let Some(a) = min.author.as_deref() {
+                                let a = a.trim();
+                                if a.is_empty() {
+                                    return Ok(());
+                                }
+                                shard_writer.write(a)?;
+                            }
+                            Ok(())
+                        },
+                    )?;
+                }
 
                 let (deduped, scratch_root) = shard_writer.dedup_with_scratch("usernames_q")?;
                 UsernameStream::from_deduped_files_with_cleanup(deduped, vec![scratch_root])
@@ -411,6 +441,8 @@ impl ScanPlan {
             "extract_jsonl_q_tmp",
             out_path,
             Finalize::Jsonl,
+            "jsonl",
+            "scan.extract_to_jsonl",
             plan.limit,
         )
     }
@@ -441,6 +473,8 @@ impl ScanPlan {
         let plan = self.build()?;
         let parallelism = plan.etl.opts.parallelism;
         with_thread_pool(parallelism, || {
+            let manifest_start = RunManifestStart::now();
+            let files = plan_pipeline_files(&plan.etl, Some(&plan.query))?;
             let work_dir = plan.etl.ensure_work_dir()?;
             let unique = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -452,33 +486,49 @@ impl ScanPlan {
 
             let result = (|| -> Result<DedupeKeySummary> {
                 let input = tmp_dir.join("matched.ndjson");
-                let f = create_with_backoff(&input, 16, 50)
-                    .with_context(|| format!("create {}", input.display()))?;
-                let writer = Mutex::new(BufWriter::with_capacity(
-                    plan.etl.opts.write_buffer_bytes,
-                    f,
-                ));
-                let matched_records = AtomicU64::new(0);
+                let matched_total = if plan.etl.opts.resume {
+                    let checkpoint = materialize_scan_checkpoint(
+                        &plan.etl,
+                        &plan.query,
+                        /*show_progress=*/ true,
+                        plan.limit,
+                    )?;
+                    copy_checkpoint_parts_to_jsonl(
+                        &checkpoint.parts,
+                        &input,
+                        plan.etl.opts.write_buffer_bytes,
+                    )?;
+                    checkpoint.matched_records
+                } else {
+                    let f = create_with_backoff(&input, 16, 50)
+                        .with_context(|| format!("create {}", input.display()))?;
+                    let writer = Mutex::new(BufWriter::with_capacity(
+                        plan.etl.opts.write_buffer_bytes,
+                        f,
+                    ));
+                    let matched_records = AtomicU64::new(0);
 
-                scan_records(
-                    &plan.etl,
-                    &plan.query,
-                    /*show_progress=*/ true,
-                    plan.limit,
-                    |_min, _kind, line| {
-                        matched_records.fetch_add(1, Ordering::Relaxed);
-                        let mut w = writer
-                            .lock()
-                            .map_err(|_| anyhow!("dedupe writer lock poisoned"))?;
-                        w.write_all(line.as_bytes())?;
-                        w.write_all(b"\n")?;
-                        Ok(())
-                    },
-                )?;
-                writer
-                    .into_inner()
-                    .map_err(|_| anyhow!("dedupe writer lock poisoned"))?
-                    .flush()?;
+                    scan_records(
+                        &plan.etl,
+                        &plan.query,
+                        /*show_progress=*/ true,
+                        plan.limit,
+                        |_min, _kind, line| {
+                            matched_records.fetch_add(1, Ordering::Relaxed);
+                            let mut w = writer
+                                .lock()
+                                .map_err(|_| anyhow!("dedupe writer lock poisoned"))?;
+                            w.write_all(line.as_bytes())?;
+                            w.write_all(b"\n")?;
+                            Ok(())
+                        },
+                    )?;
+                    writer
+                        .into_inner()
+                        .map_err(|_| anyhow!("dedupe writer lock poisoned"))?
+                        .flush()?;
+                    matched_records.load(Ordering::Relaxed)
+                };
 
                 let key_extractions_failed = AtomicU64::new(0);
                 let cfg = dedupe_cfg_from_options(&plan.etl.opts);
@@ -491,7 +541,6 @@ impl ScanPlan {
                     &cfg,
                     Some(&key_extractions_failed),
                 )?;
-                let matched_total = matched_records.load(Ordering::Relaxed);
                 let failed_after_build = key_extractions_failed.load(Ordering::Relaxed);
                 if plan.etl.opts.strict_key && failed_after_build > 0 {
                     let summary = DedupeKeySummary {
@@ -537,6 +586,29 @@ impl ScanPlan {
                 }
                 warn_dedupe_key_drops(key, &summary);
 
+                let manifest = scan_manifest_input(
+                    manifest_start,
+                    "scan.dedupe_keys_to_lines",
+                    "text-lines",
+                    &plan.etl,
+                    &plan.query,
+                    &files,
+                    plan.limit,
+                    manifest_counts(&[
+                        ("matched_records", summary.matched_records),
+                        ("unique_keys", summary.unique_keys),
+                        ("key_extractions_failed", summary.key_extractions_failed),
+                    ]),
+                    None,
+                    None,
+                    serde_json::json!({ "dedupe_key": dedupe_key_label(key) }),
+                );
+                maybe_write_run_manifest(
+                    plan.etl.opts.emit_manifest,
+                    manifest,
+                    ManifestDestination::File(out_path.to_path_buf()),
+                )?;
+
                 Ok(summary)
             })();
 
@@ -556,6 +628,8 @@ impl ScanPlan {
             "extract_json_q_tmp",
             out_path,
             Finalize::JsonArray { pretty },
+            "json",
+            "scan.extract_to_json",
             plan.limit,
         )
     }
@@ -602,6 +676,16 @@ impl ScanPlan {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
+        if self.etl.opts.human_readable_timestamps {
+            anyhow::bail!(
+                "--human-timestamps is not supported for CSV/TSV export; use --format jsonl/json/spool/zst/partitioned-jsonl or omit the flag"
+            );
+        }
+        if self.etl.opts.resume {
+            anyhow::bail!(
+                "--resume is not supported for CSV/TSV export; use --format jsonl/json/spool/zst/partitioned-jsonl or omit the flag"
+            );
+        }
         let fields = normalize_tabular_fields(fields)?;
         let mut scan = self;
         scan.etl.opts.whitelist_fields = Some(fields.clone());
@@ -638,6 +722,7 @@ impl ScanPlan {
         let parallelism = plan.etl.opts.parallelism;
 
         with_thread_pool(parallelism, || {
+            let manifest_start = RunManifestStart::now();
             create_dir_all_with_backoff(out_dir, 16, 50)
                 .with_context(|| format!("creating spool dir {}", out_dir.display()))?;
             let staging_dir = ensure_staging_dir(out_dir)?;
@@ -645,20 +730,25 @@ impl ScanPlan {
 
             let targets =
                 resolve_target_subs_from(&plan.etl.opts.subreddit, &plan.query.subreddits);
-            let files = plan_pipeline_files(&plan.etl)?;
+            let files = plan_pipeline_files(&plan.etl, Some(&plan.query))?;
             warn_if_unfiltered_undated_query(&plan.etl, &plan.query, &files);
+            let planned_keys = planned_job_keys(&files);
 
             let resume = plan.etl.opts.resume;
             let resume_fingerprint =
-                build_resume_fingerprint(&plan.etl, &plan.query, "spool", plan.limit)?;
+                build_resume_fingerprint(&plan.etl, &plan.query, "spool", plan.limit, &files)?;
             // Resume manifest: load on entry, validate each entry against the
             // current query/config fingerprint and the file actually on disk,
             // then snapshot surviving keys before any worker mutates the accumulator.
             let (initial_months, completed_keys) = if resume {
-                load_and_validate_manifest(out_dir, &resume_fingerprint)?
+                load_and_validate_manifest(out_dir, &resume_fingerprint, &planned_keys)?
             } else {
+                clear_spool_resume_parts(out_dir)?;
                 (HashMap::new(), HashSet::new())
             };
+            if resume {
+                prune_spool_outputs_except(out_dir, &completed_keys)?;
+            }
 
             let total_bytes = total_compressed_size(&files);
             let pb = if plan.etl.opts.progress {
@@ -683,6 +773,7 @@ impl ScanPlan {
             }
 
             let resumed_lines = committed_line_count(&initial_months);
+            let total_output_lines = AtomicU64::new(resumed_lines);
 
             // Persist the (pruned) manifest before any work, so a crash mid-
             // prune cannot resurrect entries we already know are stale.
@@ -702,9 +793,12 @@ impl ScanPlan {
             };
 
             let whitelist = plan.etl.opts.whitelist_fields.clone();
-            let whitelist_tracker = whitelist
-                .as_ref()
-                .map(|_| Arc::new(WhitelistMatchTracker::new(plan.etl.opts.strict_whitelist)));
+            let whitelist_tracker = whitelist.as_ref().map(|fields| {
+                Arc::new(WhitelistMatchTracker::new(
+                    plan.etl.opts.strict_whitelist,
+                    fields.iter().cloned(),
+                ))
+            });
             let record_limit = record_limit_from_with_claimed(plan.limit, resumed_lines);
             let targets_ref = targets.as_ref();
             let bounds = bounds_tuple(plan.etl.opts.start, plan.etl.opts.end);
@@ -738,6 +832,7 @@ impl ScanPlan {
 
                     if let Some(month) = outcome {
                         total_written.fetch_add(month.lines, Ordering::Relaxed);
+                        total_output_lines.fetch_add(month.lines, Ordering::Relaxed);
                         parts.lock().unwrap().push(month.out_path.clone());
                         if let Some(acc) = &accumulator {
                             commit_entry_to_manifest(acc, month).context(
@@ -749,6 +844,9 @@ impl ScanPlan {
                 },
             )?;
 
+            if let Some(tracker) = &whitelist_tracker {
+                tracker.finalize()?;
+            }
             if let Some(pb) = pb {
                 pb.finish_with_message("done");
             }
@@ -757,6 +855,34 @@ impl ScanPlan {
             let mut list = parts.into_inner().unwrap();
             list.sort();
             list.dedup();
+            let manifest = scan_manifest_input(
+                manifest_start,
+                "scan.extract_spool_monthly",
+                "spool-jsonl-directory",
+                &plan.etl,
+                &plan.query,
+                &files,
+                plan.limit,
+                manifest_counts(&[
+                    (
+                        "records_written",
+                        total_output_lines.load(Ordering::Relaxed),
+                    ),
+                    ("part_files", list.len() as u64),
+                    (
+                        "records_written_this_run",
+                        total_written.load(Ordering::Relaxed),
+                    ),
+                ]),
+                Some(resume_fingerprint.clone()),
+                resume.then(|| crate::progress_manifest::manifest_path(out_dir)),
+                serde_json::json!({}),
+            );
+            maybe_write_run_manifest(
+                plan.etl.opts.emit_manifest,
+                manifest,
+                ManifestDestination::Directory(out_dir.to_path_buf()),
+            )?;
             Ok((list, total_written.load(Ordering::Relaxed)))
         })
     }
@@ -767,19 +893,39 @@ impl ScanPlan {
         let parallelism = plan.etl.opts.parallelism;
         with_thread_pool(parallelism, || {
             let total = Mutex::new(BTreeMap::<YearMonth, u64>::new());
-            scan_records(
-                &plan.etl,
-                &plan.query,
-                /*show_progress=*/ false,
-                plan.limit,
-                |min, _kind, _line| {
-                    if let Some(ts) = min.created_utc {
-                        let ym = ym_from_epoch(ts);
-                        *total.lock().unwrap().entry(ym).or_insert(0) += 1;
-                    }
-                    Ok(())
-                },
-            )?;
+            if plan.etl.opts.resume {
+                let checkpoint = materialize_scan_checkpoint(
+                    &plan.etl,
+                    &plan.query,
+                    /*show_progress=*/ false,
+                    plan.limit,
+                )?;
+                for_each_checkpoint_record(
+                    &checkpoint.parts,
+                    plan.etl.opts.read_buffer_bytes,
+                    |min, _line| {
+                        if let Some(ts) = min.created_utc {
+                            let ym = ym_from_epoch(ts);
+                            *total.lock().unwrap().entry(ym).or_insert(0) += 1;
+                        }
+                        Ok(())
+                    },
+                )?;
+            } else {
+                scan_records(
+                    &plan.etl,
+                    &plan.query,
+                    /*show_progress=*/ false,
+                    plan.limit,
+                    |min, _kind, _line| {
+                        if let Some(ts) = min.created_utc {
+                            let ym = ym_from_epoch(ts);
+                            *total.lock().unwrap().entry(ym).or_insert(0) += 1;
+                        }
+                        Ok(())
+                    },
+                )?;
+            }
             Ok(total.into_inner().unwrap())
         })
     }
@@ -789,31 +935,81 @@ impl ScanPlan {
         log_pseudo_user_filter(&plan.query);
         let parallelism = plan.etl.opts.parallelism;
         with_thread_pool(parallelism, || {
+            let manifest_start = RunManifestStart::now();
+            let files = plan_pipeline_files(&plan.etl, Some(&plan.query))?;
             let work_dir = plan.etl.ensure_work_dir()?;
             let kv =
                 ShardedKVWriter::create(&work_dir, "author_counts", plan.etl.opts.shard_count)?;
             let scratch_root = kv.scratch_root().to_path_buf();
 
             let result = (|| -> Result<()> {
-                scan_records(
-                    &plan.etl,
-                    &plan.query,
-                    /*show_progress=*/ false,
-                    plan.limit,
-                    |min, _kind, _line| {
-                        if let Some(a) = min.author.as_deref() {
-                            let a = a.trim();
-                            if a.is_empty() {
-                                return Ok(());
+                let matched_records = AtomicU64::new(0);
+                if plan.etl.opts.resume {
+                    let checkpoint = materialize_scan_checkpoint(
+                        &plan.etl,
+                        &plan.query,
+                        /*show_progress=*/ false,
+                        plan.limit,
+                    )?;
+                    for_each_checkpoint_record(
+                        &checkpoint.parts,
+                        plan.etl.opts.read_buffer_bytes,
+                        |min, _line| {
+                            if let Some(a) = min.author.as_deref() {
+                                let a = a.trim();
+                                if a.is_empty() {
+                                    return Ok(());
+                                }
+                                matched_records.fetch_add(1, Ordering::Relaxed);
+                                kv.write_kv(a, 1)?;
                             }
-                            kv.write_kv(a, 1)?;
-                        }
-                        Ok(())
-                    },
-                )?;
+                            Ok(())
+                        },
+                    )?;
+                } else {
+                    scan_records(
+                        &plan.etl,
+                        &plan.query,
+                        /*show_progress=*/ false,
+                        plan.limit,
+                        |min, _kind, _line| {
+                            if let Some(a) = min.author.as_deref() {
+                                let a = a.trim();
+                                if a.is_empty() {
+                                    return Ok(());
+                                }
+                                matched_records.fetch_add(1, Ordering::Relaxed);
+                                kv.write_kv(a, 1)?;
+                            }
+                            Ok(())
+                        },
+                    )?;
+                }
 
                 let (shards, _scratch_root) = kv.reduce_sum_with_scratch("author_counts")?;
                 concat_tsvs(&shards, out_path, plan.etl.opts.write_buffer_bytes)?;
+                let output_rows = count_text_lines(out_path)?;
+                let manifest = scan_manifest_input(
+                    manifest_start,
+                    "scan.author_counts_to_tsv",
+                    "tsv",
+                    &plan.etl,
+                    &plan.query,
+                    &files,
+                    plan.limit,
+                    manifest_counts(&[
+                        ("matched_records", matched_records.load(Ordering::Relaxed)),
+                        ("output_rows", output_rows),
+                    ]),
+                    None,
+                    None,
+                    serde_json::json!({}),
+                );
+                maybe_write_run_manifest(
+                    plan.etl.opts.emit_manifest,
+                    manifest,
+                    ManifestDestination::File(out_path.to_path_buf()),
+                )?;
                 Ok(())
             })();
             cleanup_scratch_dir(&scratch_root, "author_counts");
@@ -826,30 +1022,80 @@ impl ScanPlan {
         log_pseudo_user_filter(&plan.query);
         let parallelism = plan.etl.opts.parallelism;
         with_thread_pool(parallelism, || {
+            let manifest_start = RunManifestStart::now();
+            let files = plan_pipeline_files(&plan.etl, Some(&plan.query))?;
             let work_dir = plan.etl.ensure_work_dir()?;
             let kv = ShardedKVWriter::create(&work_dir, "first_seen", plan.etl.opts.shard_count)?;
             let scratch_root = kv.scratch_root().to_path_buf();
 
             let result = (|| -> Result<()> {
-                scan_records(
-                    &plan.etl,
-                    &plan.query,
-                    /*show_progress=*/ false,
-                    plan.limit,
-                    |min, _kind, _line| {
-                        if let (Some(a), Some(ts)) = (min.author.as_deref(), min.created_utc) {
-                            let a = a.trim();
-                            if a.is_empty() {
-                                return Ok(());
+                let matched_records = AtomicU64::new(0);
+                if plan.etl.opts.resume {
+                    let checkpoint = materialize_scan_checkpoint(
+                        &plan.etl,
+                        &plan.query,
+                        /*show_progress=*/ false,
+                        plan.limit,
+                    )?;
+                    for_each_checkpoint_record(
+                        &checkpoint.parts,
+                        plan.etl.opts.read_buffer_bytes,
+                        |min, _line| {
+                            if let (Some(a), Some(ts)) = (min.author.as_deref(), min.created_utc) {
+                                let a = a.trim();
+                                if a.is_empty() {
+                                    return Ok(());
+                                }
+                                matched_records.fetch_add(1, Ordering::Relaxed);
+                                kv.write_kv(a, ts)?;
                             }
-                            kv.write_kv(a, ts)?;
-                        }
-                        Ok(())
-                    },
-                )?;
+                            Ok(())
+                        },
+                    )?;
+                } else {
+                    scan_records(
+                        &plan.etl,
+                        &plan.query,
+                        /*show_progress=*/ false,
+                        plan.limit,
+                        |min, _kind, _line| {
+                            if let (Some(a), Some(ts)) = (min.author.as_deref(), min.created_utc) {
+                                let a = a.trim();
+                                if a.is_empty() {
+                                    return Ok(());
+                                }
+                                matched_records.fetch_add(1, Ordering::Relaxed);
+                                kv.write_kv(a, ts)?;
+                            }
+                            Ok(())
+                        },
+                    )?;
+                }
 
                 let (shards, _scratch_root) = kv.reduce_min_with_scratch("first_seen")?;
                 concat_tsvs(&shards, out_path, plan.etl.opts.write_buffer_bytes)?;
+                let output_rows = count_text_lines(out_path)?;
+                let manifest = scan_manifest_input(
+                    manifest_start,
+                    "scan.build_first_seen_index_to_tsv",
+                    "tsv",
+                    &plan.etl,
+                    &plan.query,
+                    &files,
+                    plan.limit,
+                    manifest_counts(&[
+                        ("matched_records", matched_records.load(Ordering::Relaxed)),
+                        ("output_rows", output_rows),
+                    ]),
+                    None,
+                    None,
+                    serde_json::json!({}),
+                );
+                maybe_write_run_manifest(
+                    plan.etl.opts.emit_manifest,
+                    manifest,
+                    ManifestDestination::File(out_path.to_path_buf()),
+                )?;
                 Ok(())
             })();
             cleanup_scratch_dir(&scratch_root, "first_seen");
@@ -873,7 +1119,8 @@ impl ScanPlan {
         let parallelism = plan.etl.opts.parallelism;
 
         with_thread_pool(parallelism, || {
-            let files = plan_pipeline_files(&plan.etl)?;
+            let manifest_start = RunManifestStart::now();
+            let files = plan_pipeline_files(&plan.etl, Some(&plan.query))?;
             warn_if_unfiltered_undated_query(&plan.etl, &plan.query, &files);
 
             let comments_dir = out_base_dir.join("comments");
@@ -890,19 +1137,32 @@ impl ScanPlan {
             let staging_dir = ensure_staging_dir(out_base_dir)?;
             sweep_stale_inprogress(out_base_dir, true)?;
 
+            let planned_keys = planned_job_keys(&files);
             let resume = plan.etl.opts.resume;
             let resume_fingerprint = build_resume_fingerprint(
                 &plan.etl,
                 &plan.query,
                 partitioned_resume_operation(format),
                 plan.limit,
+                &files,
             )?;
             let (initial_months, completed_keys) = if resume {
-                load_and_validate_partitioned_manifest(out_base_dir, &resume_fingerprint, format)?
+                load_and_validate_partitioned_manifest(
+                    out_base_dir,
+                    &resume_fingerprint,
+                    format,
+                    &planned_keys,
+                )?
             } else {
+                clear_partitioned_resume_outputs(out_base_dir, format)?;
                 (HashMap::new(), HashSet::new())
             };
+            if resume {
+                prune_partitioned_outputs_except(out_base_dir, format, &completed_keys)?;
+            }
             let resumed_lines = committed_line_count(&initial_months);
+            let output_records = AtomicU64::new(resumed_lines);
+            let output_files = AtomicU64::new(completed_keys.len() as u64);
             let accumulator = if resume {
                 crate::progress_manifest::save(
                     out_base_dir,
@@ -919,9 +1179,12 @@ impl ScanPlan {
             };
 
             let whitelist = plan.etl.opts.whitelist_fields.clone();
-            let whitelist_tracker = whitelist
-                .as_ref()
-                .map(|_| Arc::new(WhitelistMatchTracker::new(plan.etl.opts.strict_whitelist)));
+            let whitelist_tracker = whitelist.as_ref().map(|fields| {
+                Arc::new(WhitelistMatchTracker::new(
+                    plan.etl.opts.strict_whitelist,
+                    fields.iter().cloned(),
+                ))
+            });
             let record_limit = record_limit_from_with_claimed(plan.limit, resumed_lines);
             let targets_ref = targets.as_ref();
             let bounds = bounds_tuple(plan.etl.opts.start, plan.etl.opts.end);
@@ -1013,8 +1276,11 @@ impl ScanPlan {
                         Err(e) => return Err(e),
                     };
 
+                    output_records.fetch_add(written, Ordering::Relaxed);
                     if written == 0 {
                         let _ = remove_with_backoff(&out_path, 8, 50);
+                    } else {
+                        output_files.fetch_add(1, Ordering::Relaxed);
                     }
                     if let Some(acc) = &accumulator {
                         let size = if written == 0 {
@@ -1038,10 +1304,37 @@ impl ScanPlan {
                 },
             )?;
 
+            if let Some(tracker) = &whitelist_tracker {
+                tracker.finalize()?;
+            }
             if let Some(pb) = pb {
                 pb.finish_with_message("done");
             }
             ensure_resume_manifest_durable(accumulator.as_ref(), "partitioned export")?;
+            let manifest = scan_manifest_input(
+                manifest_start,
+                "scan.export_partitioned",
+                partitioned_resume_operation(format),
+                &plan.etl,
+                &plan.query,
+                &files,
+                plan.limit,
+                manifest_counts(&[
+                    ("records_written", output_records.load(Ordering::Relaxed)),
+                    ("partition_files", output_files.load(Ordering::Relaxed)),
+                ]),
+                Some(resume_fingerprint.clone()),
+                resume.then(|| crate::progress_manifest::manifest_path(out_base_dir)),
+                serde_json::json!({
+                    "partition_format": partitioned_ext(format),
+                    "zst_level": (format == ExportFormat::Zst).then_some(plan.etl.opts.zst_level),
+                }),
+            );
+            maybe_write_run_manifest(
+                plan.etl.opts.emit_manifest,
+                manifest,
+                ManifestDestination::Directory(out_base_dir.to_path_buf()),
+            )?;
             Ok(())
         })
     }
@@ -1066,7 +1359,31 @@ struct MonthResult {
     lines: u64,
 }
 
-fn plan_pipeline_files(etl: &RedditETL) -> Result<Vec<FileJob>> {
+struct ScanCheckpoint {
+    parts: Vec<PathBuf>,
+    matched_records: u64,
+}
+
+fn effective_plan_range(
+    etl: &RedditETL,
+    query: Option<&QuerySpec>,
+) -> (Option<YearMonth>, Option<YearMonth>) {
+    let mut start = etl.opts.start;
+    let mut end = etl.opts.end;
+
+    if let Some(bounds) = query.map(|q| q.timestamp_bounds) {
+        if start.is_none() {
+            start = bounds.derived_start_month();
+        }
+        if end.is_none() {
+            end = bounds.derived_end_month();
+        }
+    }
+
+    (start, end)
+}
+
+fn plan_pipeline_files(etl: &RedditETL, query: Option<&QuerySpec>) -> Result<Vec<FileJob>> {
     if let Some(err) = etl.opts.build_error.clone() {
         return Err(err.into());
     }
@@ -1075,15 +1392,16 @@ fn plan_pipeline_files(etl: &RedditETL) -> Result<Vec<FileJob>> {
         &etl.opts.submissions_dir,
         etl.opts.sources,
     )?;
+    let (start, end) = effective_plan_range(etl, query);
     let jobs = plan_files_checked(
         &discovered,
         &etl.opts.comments_dir,
         &etl.opts.submissions_dir,
         etl.opts.sources,
-        etl.opts.start,
-        etl.opts.end,
+        start,
+        end,
     )?;
-    log_missing_month_warnings(&discovered, etl.opts.sources, etl.opts.start, etl.opts.end);
+    log_missing_month_warnings(&discovered, etl.opts.sources, start, end);
     Ok(jobs)
 }
 
@@ -1103,6 +1421,41 @@ fn warn_if_unfiltered_undated_query(etl: &RedditETL, query: &QuerySpec, files: &
         compressed_bytes = compressed_bytes,
         "running an unfiltered, undated query over the full corpus (files={file_count}, compressed_bytes={compressed_bytes}); pass --subreddit and/or --start/--end to narrow the scope"
     );
+}
+
+fn manifest_counts(entries: &[(&str, u64)]) -> BTreeMap<String, u64> {
+    entries
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), *value))
+        .collect()
+}
+
+fn scan_manifest_input(
+    start: RunManifestStart,
+    operation: &str,
+    format: &str,
+    etl: &RedditETL,
+    query: &QuerySpec,
+    files: &[FileJob],
+    limit: Option<u64>,
+    counts: BTreeMap<String, u64>,
+    checkpoint_fingerprint: Option<String>,
+    checkpoint_path: Option<PathBuf>,
+    extra_options: Value,
+) -> RunManifestInput {
+    let mut input = RunManifestInput::new(operation);
+    input.start = start;
+    input.api_operation = Some(operation.to_string());
+    input.query = scan_query_value(query, limit);
+    input.options = etl_options_value(&etl.opts, limit, extra_options);
+    input.corpus = corpus_snapshot_from_etl(&etl.opts, files);
+    input.output_format = format.to_string();
+    input.counts = counts;
+    input.partial_read = etl.opts.partial_read_reporter.snapshot();
+    input.resume_enabled = etl.opts.resume;
+    input.checkpoint_fingerprint = checkpoint_fingerprint;
+    input.checkpoint_path = checkpoint_path;
+    input
 }
 
 fn validate_export_whitelist(etl: &RedditETL) -> Result<()> {
@@ -1163,6 +1516,49 @@ fn stable_hash_component(bytes: &[u8]) -> String {
     stable_fnv1a_hex(bytes).replace(':', "_")
 }
 
+fn system_time_parts(t: SystemTime) -> (i64, u32) {
+    match t.duration_since(UNIX_EPOCH) {
+        Ok(d) => (
+            i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
+            d.subsec_nanos(),
+        ),
+        Err(e) => {
+            let d = e.duration();
+            (
+                -i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
+                d.subsec_nanos(),
+            )
+        }
+    }
+}
+
+fn corpus_file_fingerprints(files: &[FileJob]) -> Result<Vec<Value>> {
+    let mut out = Vec::with_capacity(files.len());
+    for job in files {
+        let metadata = fs::metadata(&job.path)
+            .with_context(|| format!("stat corpus input {}", job.path.display()))?;
+        let modified = metadata.modified().ok().map(system_time_parts);
+        let (modified_unix_secs, modified_nanos) = match modified {
+            Some((secs, nanos)) => (Some(secs), Some(nanos)),
+            None => (None, None),
+        };
+        let prefix = match job.kind {
+            FileKind::Comment => "RC",
+            FileKind::Submission => "RS",
+        };
+        out.push(serde_json::json!({
+            "key": crate::progress_manifest::month_key(prefix, job.ym),
+            "kind": format!("{:?}", job.kind),
+            "month": job.ym.to_string(),
+            "path": path_for_fingerprint(&job.path)?,
+            "len": metadata.len(),
+            "modified_unix_secs": modified_unix_secs,
+            "modified_nanos": modified_nanos,
+        }));
+    }
+    Ok(out)
+}
+
 fn extract_scratch_dir(
     work_dir: &Path,
     tmp_dir_name: &str,
@@ -1190,14 +1586,16 @@ fn extract_scratch_dir(
     Ok(work_dir.join(name))
 }
 
-/// Fingerprint every query/config knob that can change the bytes written by a
-/// resumable extract/spool operation. If it changes between `--resume` runs,
-/// stale month parts are discarded instead of being stitched into the new run.
+/// Fingerprint every query/config knob and selected corpus file identity that
+/// can change the records written by a resumable operation. If it changes
+/// between `--resume` runs, stale month parts are discarded instead of being
+/// stitched or reduced into the new run.
 fn build_resume_fingerprint(
     etl: &RedditETL,
     query: &QuerySpec,
     operation: &str,
     limit: Option<u64>,
+    files: &[FileJob],
 ) -> Result<String> {
     let zst_level = (operation == "partitioned-zst").then_some(etl.opts.zst_level);
     let input = serde_json::json!({
@@ -1207,6 +1605,7 @@ fn build_resume_fingerprint(
             "comments_dir": path_for_fingerprint(&etl.opts.comments_dir)?,
             "submissions_dir": path_for_fingerprint(&etl.opts.submissions_dir)?,
         },
+        "corpus_files": corpus_file_fingerprints(files)?,
         "sources": format!("{:?}", etl.opts.sources),
         "start": opt_ym_string(etl.opts.start),
         "end": opt_ym_string(etl.opts.end),
@@ -1218,6 +1617,9 @@ fn build_resume_fingerprint(
         "limit": limit,
         "query": {
             "subreddits": query.subreddits.as_ref(),
+            "ids_in": query.ids_in.as_ref(),
+            "comment_ids_in": query.comment_ids_in.as_ref(),
+            "submission_ids_in": query.submission_ids_in.as_ref(),
             "authors_in": query.authors_in.as_ref(),
             "authors_out": query.authors_out.as_ref(),
             "exclude_common_bots": query.exclude_common_bots,
@@ -1225,9 +1627,18 @@ fn build_resume_fingerprint(
             "author_regex_pattern": query.author_regex_pattern.as_ref(),
             "min_score": query.min_score,
             "max_score": query.max_score,
+            "timestamp_bounds": {
+                "created_utc_gte": query.timestamp_bounds.created_utc_gte,
+                "created_utc_lt": query.timestamp_bounds.created_utc_lt,
+            },
             "keywords_any": query.keywords_any.as_ref(),
+            "keywords_all": query.keywords_all.as_ref(),
+            "keywords_exclude": query.keywords_exclude.as_ref(),
+            "text_regex": query.text_regex.as_ref().map(|re| re.as_str()),
+            "text_regex_pattern": query.text_regex_pattern.as_ref(),
             "domains_in": query.domains_in.as_ref(),
             "contains_url": query.contains_url,
+            "no_url": query.no_url,
             "json_predicates": query.json_predicates_fingerprint(),
             "filter_pseudo_users": query.filter_pseudo_users,
         }
@@ -1251,17 +1662,38 @@ fn remove_matching_files(dir: &Path, mut should_remove: impl FnMut(&str) -> bool
             continue;
         };
         if should_remove(name) {
-            if let Err(e) = remove_with_backoff(&path, 8, 50) {
-                tracing::warn!(path=%path.display(), error=%e, "failed to remove stale resume part");
-            }
+            remove_with_backoff(&path, 8, 50)
+                .with_context(|| format!("remove stale RETL-owned output {}", path.display()))?;
         }
     }
     Ok(())
 }
 
+fn planned_job_keys(files: &[FileJob]) -> HashSet<String> {
+    files.iter().map(export_part_key).collect()
+}
+
+fn spool_key_from_part_name(name: &str) -> Option<String> {
+    let (prefix, key_prefix) = if name.starts_with("part_RC_") {
+        ("part_RC_", "RC")
+    } else if name.starts_with("part_RS_") {
+        ("part_RS_", "RS")
+    } else {
+        return None;
+    };
+    let ym = name.strip_prefix(prefix)?.strip_suffix(".jsonl")?;
+    ym.parse::<YearMonth>().ok()?;
+    Some(format!("{key_prefix}_{ym}"))
+}
+
 fn clear_spool_resume_parts(out_dir: &Path) -> Result<()> {
-    remove_matching_files(out_dir, |name| {
-        (name.starts_with("part_RC_") || name.starts_with("part_RS_")) && name.ends_with(".jsonl")
+    remove_matching_files(out_dir, |name| spool_key_from_part_name(name).is_some())
+}
+
+fn prune_spool_outputs_except(out_dir: &Path, keep_keys: &HashSet<String>) -> Result<()> {
+    remove_matching_files(out_dir, |name| match spool_key_from_part_name(name) {
+        Some(key) => !keep_keys.contains(&key),
+        None => false,
     })
 }
 
@@ -1296,6 +1728,7 @@ struct MonthJobCtx<'a> {
 fn load_and_validate_manifest(
     out_dir: &Path,
     fingerprint: &str,
+    planned_keys: &HashSet<String>,
 ) -> Result<(HashMap<String, MonthEntry>, HashSet<String>)> {
     let manifest = crate::progress_manifest::load(out_dir);
     if manifest.fingerprint.as_deref() != Some(fingerprint) && !manifest.months.is_empty() {
@@ -1310,6 +1743,10 @@ fn load_and_validate_manifest(
     }
     let mut keep: HashMap<String, MonthEntry> = HashMap::new();
     for (k, v) in manifest.months {
+        if !planned_keys.contains(&k) {
+            tracing::info!(key=%k, "dropping progress manifest entry outside current spool plan");
+            continue;
+        }
         let final_name = format!("part_{}.jsonl", k);
         let final_path = out_dir.join(&final_name);
         match fs::metadata(&final_path) {
@@ -1468,13 +1905,44 @@ fn partitioned_output_path_for_key(
     )
 }
 
-fn clear_partitioned_resume_outputs(out_base_dir: &Path, format: ExportFormat) -> Result<()> {
+fn partitioned_key_from_output_name(
+    name: &str,
+    key_prefix: &str,
+    format: ExportFormat,
+) -> Option<String> {
+    let prefix = format!("{key_prefix}_");
     let suffix = format!(".{}", partitioned_ext(format));
+    let ym = name.strip_prefix(&prefix)?.strip_suffix(&suffix)?;
+    ym.parse::<YearMonth>().ok()?;
+    Some(format!("{key_prefix}_{ym}"))
+}
+
+fn clear_partitioned_resume_outputs(out_base_dir: &Path, format: ExportFormat) -> Result<()> {
     remove_matching_files(&out_base_dir.join("comments"), |name| {
-        name.starts_with("RC_") && name.ends_with(&suffix)
+        partitioned_key_from_output_name(name, "RC", format).is_some()
     })?;
     remove_matching_files(&out_base_dir.join("submissions"), |name| {
-        name.starts_with("RS_") && name.ends_with(&suffix)
+        partitioned_key_from_output_name(name, "RS", format).is_some()
+    })?;
+    Ok(())
+}
+
+fn prune_partitioned_outputs_except(
+    out_base_dir: &Path,
+    format: ExportFormat,
+    keep_keys: &HashSet<String>,
+) -> Result<()> {
+    remove_matching_files(&out_base_dir.join("comments"), |name| {
+        match partitioned_key_from_output_name(name, "RC", format) {
+            Some(key) => !keep_keys.contains(&key),
+            None => false,
+        }
+    })?;
+    remove_matching_files(&out_base_dir.join("submissions"), |name| {
+        match partitioned_key_from_output_name(name, "RS", format) {
+            Some(key) => !keep_keys.contains(&key),
+            None => false,
+        }
     })?;
     Ok(())
 }
@@ -1521,6 +1989,7 @@ fn load_and_validate_partitioned_manifest(
     out_base_dir: &Path,
     fingerprint: &str,
     format: ExportFormat,
+    planned_keys: &HashSet<String>,
 ) -> Result<(HashMap<String, MonthEntry>, HashSet<String>)> {
     let manifest = crate::progress_manifest::load(out_base_dir);
     if manifest.fingerprint.as_deref() != Some(fingerprint) && !manifest.months.is_empty() {
@@ -1536,6 +2005,10 @@ fn load_and_validate_partitioned_manifest(
 
     let mut keep: HashMap<String, MonthEntry> = HashMap::new();
     for (key, entry) in manifest.months {
+        if !planned_keys.contains(&key) {
+            tracing::info!(key=%key, "dropping partitioned progress entry outside current plan");
+            continue;
+        }
         let Some(path) = partitioned_output_path_for_key(out_base_dir, &key, format) else {
             tracing::info!(key=%key, "dropping unrecognized partitioned progress entry");
             continue;
@@ -1619,6 +2092,247 @@ fn validate_jsonl_part(path: &Path) -> Result<MonthEntry> {
     })
 }
 
+fn count_text_lines(path: &Path) -> Result<u64> {
+    let file = open_with_backoff(path, 16, 50)
+        .with_context(|| format!("opening output to count lines {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut buf = String::new();
+    let mut lines = 0_u64;
+    loop {
+        let n = crate::ndjson::read_line_capped(
+            &mut reader,
+            &mut buf,
+            crate::ndjson::DEFAULT_MAX_LINE_BYTES,
+            path,
+        )?;
+        if n == 0 {
+            break;
+        }
+        if !buf.is_empty() {
+            lines += 1;
+        }
+    }
+    Ok(lines)
+}
+
+fn checkpoint_part_path(dir: &Path, key: &str) -> PathBuf {
+    dir.join(format!("part_{}.jsonl", key))
+}
+
+fn scan_checkpoint_dir(work_dir: &Path, fingerprint: &str) -> PathBuf {
+    work_dir
+        .join("scan_checkpoints")
+        .join(stable_hash_component(fingerprint.as_bytes()))
+}
+
+fn load_and_validate_scan_checkpoint_manifest(
+    dir: &Path,
+    fingerprint: &str,
+) -> Result<(HashMap<String, MonthEntry>, HashSet<String>)> {
+    let manifest = crate::progress_manifest::load(dir);
+    if manifest.fingerprint.as_deref() != Some(fingerprint) && !manifest.months.is_empty() {
+        tracing::warn!(
+            path=%crate::progress_manifest::manifest_path(dir).display(),
+            stored=?manifest.fingerprint,
+            current=%fingerprint,
+            "scan checkpoint fingerprint does not match current query/config/corpus; discarding cached month parts"
+        );
+        clear_spool_resume_parts(dir)?;
+        return Ok((HashMap::new(), HashSet::new()));
+    }
+
+    let mut keep = HashMap::<String, MonthEntry>::new();
+    for (key, expected) in manifest.months {
+        let part_path = checkpoint_part_path(dir, &key);
+        match validate_jsonl_part(&part_path) {
+            Ok(actual) if actual.size == expected.size && actual.lines == expected.lines => {
+                keep.insert(key, actual);
+            }
+            Ok(actual) => {
+                tracing::info!(
+                    key=%key,
+                    path=%part_path.display(),
+                    expected_size=expected.size,
+                    actual_size=actual.size,
+                    expected_lines=expected.lines,
+                    actual_lines=actual.lines,
+                    "dropping stale scan checkpoint entry; month will be rebuilt"
+                );
+                let _ = remove_with_backoff(&part_path, 8, 50);
+            }
+            Err(e) => {
+                tracing::info!(
+                    key=%key,
+                    path=%part_path.display(),
+                    error=%e,
+                    "dropping invalid scan checkpoint entry; month will be rebuilt"
+                );
+                let _ = remove_with_backoff(&part_path, 8, 50);
+            }
+        }
+    }
+    let completed_keys = keep.keys().cloned().collect();
+    Ok((keep, completed_keys))
+}
+
+fn materialize_scan_checkpoint(
+    etl: &RedditETL,
+    query: &QuerySpec,
+    show_progress: bool,
+    limit: Option<u64>,
+) -> Result<ScanCheckpoint> {
+    let files = plan_pipeline_files(etl, Some(query))?;
+    warn_if_unfiltered_undated_query(etl, query, &files);
+
+    let work_dir = etl.ensure_work_dir()?;
+    let fingerprint =
+        build_resume_fingerprint(etl, query, ANALYTICS_CHECKPOINT_OPERATION, limit, &files)?;
+    let checkpoint_dir = scan_checkpoint_dir(&work_dir, &fingerprint);
+    create_dir_all_with_backoff(&checkpoint_dir, 16, 50)
+        .with_context(|| format!("creating scan checkpoint dir {}", checkpoint_dir.display()))?;
+    let staging_dir = ensure_staging_dir(&checkpoint_dir)?;
+    sweep_stale_inprogress(&checkpoint_dir, true)?;
+
+    let (initial_months, completed_keys) =
+        load_and_validate_scan_checkpoint_manifest(&checkpoint_dir, &fingerprint)?;
+    crate::progress_manifest::save(&checkpoint_dir, &initial_months, Some(&fingerprint))?;
+    let resumed_lines = committed_line_count(&initial_months);
+    let accumulator =
+        ManifestAccumulator::new(&checkpoint_dir, initial_months, Some(fingerprint.clone()));
+
+    let total_bytes = total_compressed_size(&files);
+    let pb = if show_progress && etl.opts.progress {
+        Some(make_progress_bar_labeled(
+            total_bytes,
+            etl.opts.progress_label.as_deref(),
+        ))
+    } else {
+        None
+    };
+
+    let parts = Mutex::new(Vec::<PathBuf>::new());
+    {
+        let mut guard = parts.lock().unwrap();
+        for key in &completed_keys {
+            guard.push(checkpoint_part_path(&checkpoint_dir, key));
+        }
+    }
+
+    let total_written = AtomicU64::new(0);
+    let targets = resolve_target_subs_from(&etl.opts.subreddit, &query.subreddits);
+    let targets_ref = targets.as_ref();
+    let bounds = bounds_tuple(etl.opts.start, etl.opts.end);
+    let read_buf = etl.opts.read_buffer_bytes;
+    let write_buf = etl.opts.write_buffer_bytes;
+    let record_limit = record_limit_from_with_claimed(limit, resumed_lines);
+    let no_whitelist: Option<Vec<String>> = None;
+
+    crate::concurrency::for_each_file_limited(
+        &files,
+        etl.opts.file_concurrency,
+        |job| -> Result<()> {
+            let ctx = MonthJobCtx {
+                out_dir: &checkpoint_dir,
+                staging_dir: &staging_dir,
+                targets: targets_ref,
+                query,
+                whitelist: &no_whitelist,
+                pb: pb.as_ref(),
+                bounds,
+                read_buf,
+                write_buf,
+                human_ts: false,
+                whitelist_tracker: None,
+                record_limit: record_limit.as_deref(),
+                resume: true,
+                completed_keys: &completed_keys,
+                allow_partial: etl.opts.allow_partial,
+                partial_reporter: Some(&etl.opts.partial_read_reporter),
+            };
+            let outcome = process_month(job, &ctx)?;
+            if let Some(month) = outcome {
+                total_written.fetch_add(month.lines, Ordering::Relaxed);
+                parts.lock().unwrap().push(month.out_path.clone());
+                commit_entry_to_manifest(&accumulator, month).context(
+                    "failed to durably update scan checkpoint progress manifest after publishing month part",
+                )?;
+            }
+            Ok(())
+        },
+    )?;
+
+    if let Some(pb) = pb {
+        pb.finish_with_message("done");
+    }
+    ensure_resume_manifest_durable(Some(&accumulator), "scan checkpoint")?;
+
+    let mut parts = parts.into_inner().unwrap();
+    parts.sort();
+    parts.dedup();
+    Ok(ScanCheckpoint {
+        parts,
+        matched_records: resumed_lines + total_written.load(Ordering::Relaxed),
+    })
+}
+
+fn for_each_checkpoint_record<F>(parts: &[PathBuf], read_buf: usize, on_record: F) -> Result<()>
+where
+    F: Sync + Send + Fn(&MinimalRecord, &str) -> Result<()>,
+{
+    parts.par_iter().try_for_each(|path| -> Result<()> {
+        let file = open_with_backoff(path, 16, 50)
+            .with_context(|| format!("opening scan checkpoint part {}", path.display()))?;
+        let mut reader = BufReader::with_capacity(read_buf.max(8 * 1024), file);
+        let mut buf = String::new();
+        let mut line_number = 0_u64;
+        loop {
+            let n = crate::ndjson::read_line_capped(
+                &mut reader,
+                &mut buf,
+                crate::ndjson::DEFAULT_MAX_LINE_BYTES,
+                path,
+            )
+            .with_context(|| {
+                format!(
+                    "reading scan checkpoint part {} near line {}",
+                    path.display(),
+                    line_number + 1
+                )
+            })?;
+            if n == 0 {
+                break;
+            }
+            if buf.is_empty() {
+                continue;
+            }
+            line_number += 1;
+            let min =
+                parse_minimal(&buf).map_err(|e| malformed_json_error(path, line_number, e))?;
+            on_record(&min, &buf)?;
+        }
+        Ok(())
+    })
+}
+
+fn copy_checkpoint_parts_to_jsonl(
+    parts: &[PathBuf],
+    out_path: &Path,
+    write_buf: usize,
+) -> Result<()> {
+    let file = create_with_backoff(out_path, 16, 50)
+        .with_context(|| format!("creating matched checkpoint copy {}", out_path.display()))?;
+    let mut writer = BufWriter::with_capacity(write_buf.max(8 * 1024), file);
+    for part in parts {
+        let file = open_with_backoff(part, 16, 50)
+            .with_context(|| format!("opening scan checkpoint part {}", part.display()))?;
+        let mut reader = BufReader::new(file);
+        std::io::copy(&mut reader, &mut writer)
+            .with_context(|| format!("copying scan checkpoint part {}", part.display()))?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
 fn normalize_tabular_fields<I, S>(fields: I) -> Result<Vec<String>>
 where
     I: IntoIterator<Item = S>,
@@ -1661,6 +2375,84 @@ fn tabular_part_paths(tmp_dir: &Path, format: TabularFormat) -> Result<Vec<PathB
     }
     paths.sort();
     Ok(paths)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TabularFieldSelector {
+    TopLevel(String),
+    JsonPointer(String),
+    Dotted(Vec<String>),
+}
+
+impl TabularFieldSelector {
+    fn parse(raw: &str) -> Result<Self> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            anyhow::bail!("CSV/TSV field names must not be empty");
+        }
+        if let Some(pointer) = trimmed.strip_prefix("json:") {
+            validate_tabular_json_pointer(pointer)?;
+            return Ok(Self::JsonPointer(pointer.to_string()));
+        }
+        if trimmed.starts_with('/') {
+            validate_tabular_json_pointer(trimmed)?;
+            return Ok(Self::JsonPointer(trimmed.to_string()));
+        }
+        if trimmed.contains('.') {
+            let parts: Vec<String> = trimmed
+                .split('.')
+                .map(str::trim)
+                .map(str::to_string)
+                .collect();
+            if parts.iter().any(String::is_empty) {
+                anyhow::bail!(
+                    "bad dotted tabular field {trimmed:?}: path segments must not be empty; use JSON Pointer syntax for unusual keys"
+                );
+            }
+            return Ok(Self::Dotted(parts));
+        }
+        Ok(Self::TopLevel(trimmed.to_string()))
+    }
+
+    fn value<'a>(&self, record: &'a Value) -> Option<&'a Value> {
+        match self {
+            Self::TopLevel(key) => record.as_object().and_then(|map| map.get(key)),
+            Self::JsonPointer(pointer) => record.pointer(pointer),
+            Self::Dotted(parts) => {
+                let mut cur = record;
+                for part in parts {
+                    cur = cur.as_object()?.get(part)?;
+                }
+                Some(cur)
+            }
+        }
+    }
+}
+
+fn parse_tabular_field_selectors(fields: &[String]) -> Result<Vec<TabularFieldSelector>> {
+    fields
+        .iter()
+        .map(|field| TabularFieldSelector::parse(field))
+        .collect()
+}
+
+fn validate_tabular_json_pointer(pointer: &str) -> Result<()> {
+    if !pointer.starts_with('/') {
+        anyhow::bail!("JSON Pointer tabular fields must start with '/': {pointer:?}");
+    }
+    let mut chars = pointer.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '~' {
+            match chars.next() {
+                Some('0') | Some('1') => {}
+                other => anyhow::bail!(
+                    "bad JSON Pointer tabular field {pointer:?}: invalid escape near '~{:?}'; use '~0' for '~' and '~1' for '/'",
+                    other
+                ),
+            }
+        }
+    }
+    Ok(())
 }
 
 fn write_csv_cell<W: Write + ?Sized>(out: &mut W, cell: &str) -> Result<()> {
@@ -1715,13 +2507,20 @@ fn write_tabular_row<W: Write + ?Sized>(
         }
         TabularFormat::Tsv => {
             for (field, cell) in fields.iter().zip(cells.iter()) {
-                if cell.contains('\t') {
+                if let Some(ch) = cell.chars().find(|ch| matches!(ch, '\t' | '\n' | '\r')) {
+                    let desc = match ch {
+                        '\t' => "tab",
+                        '\n' => "line feed",
+                        '\r' => "carriage return",
+                        _ => unreachable!(),
+                    };
                     tracing::warn!(
                         field,
-                        "refusing to emit TSV value containing a literal tab; use --format csv for robust escaping"
+                        character = desc,
+                        "refusing to emit TSV value containing a tab or line break; use --format csv for robust escaping"
                     );
                     anyhow::bail!(
-                        "TSV export cannot represent a literal tab in field {field:?}; use --format csv"
+                        "TSV export cannot represent a {desc} in field {field:?}; use --format csv"
                     );
                 }
             }
@@ -1737,18 +2536,20 @@ fn write_tabular_row<W: Write + ?Sized>(
     Ok(())
 }
 
-fn tabular_cells_from_value(value: &Value, fields: &[String]) -> Result<(Vec<String>, bool)> {
-    let map = value.as_object();
-    let mut matched_any = false;
-    let mut cells = Vec::with_capacity(fields.len());
-    for field in fields {
-        let field_value = map.and_then(|map| map.get(field));
+fn tabular_cells_from_value(
+    value: &Value,
+    selectors: &[TabularFieldSelector],
+) -> Result<(Vec<String>, Vec<usize>)> {
+    let mut matched_indices = Vec::new();
+    let mut cells = Vec::with_capacity(selectors.len());
+    for (idx, selector) in selectors.iter().enumerate() {
+        let field_value = selector.value(value);
         if field_value.is_some() {
-            matched_any = true;
+            matched_indices.push(idx);
         }
         cells.push(value_to_tabular_cell(field_value)?);
     }
-    Ok((cells, matched_any))
+    Ok((cells, matched_indices))
 }
 
 fn write_tabular_header<W: Write + ?Sized>(
@@ -1789,6 +2590,7 @@ fn stream_tabular_job<W: Write + ?Sized>(
     targets: Option<&Vec<String>>,
     query: &QuerySpec,
     fields: &[String],
+    selectors: &[TabularFieldSelector],
     format: TabularFormat,
     pb: Option<ProgressBar>,
     bounds: Option<DateBounds>,
@@ -1809,7 +2611,7 @@ fn stream_tabular_job<W: Write + ?Sized>(
                 Err(e) => return Err(malformed_json_error(&job.path, line_number, e)),
             },
         };
-        if !matches_minimal(&min, targets, query) || !within_bounds(&min, bounds) {
+        if !matches_minimal(&min, targets, query, job.kind) || !within_bounds(&min, bounds) {
             return Ok(());
         }
         if query.requires_full_parse() {
@@ -1822,12 +2624,19 @@ fn stream_tabular_job<W: Write + ?Sized>(
         claim_record_or_stop(record_limit)?;
         let val: Value = serde_json::from_str(line)
             .map_err(|e| malformed_json_error(&job.path, line_number, e))?;
-        let (cells, matched_any) = tabular_cells_from_value(&val, fields)?;
-        write_tabular_row(writer, fields, &cells, format)?;
+        let (cells, matched_indices) = tabular_cells_from_value(&val, selectors)?;
+        write_tabular_row(writer, fields, &cells, format).with_context(|| {
+            format!(
+                "writing {} row for {} line {}",
+                format.label(),
+                job.path.display(),
+                line_number
+            )
+        })?;
         written += 1;
         if let Some(tracker) = whitelist_tracker {
             tracker.observe(crate::streaming::WhitelistEmission {
-                emitted_empty_projection: !matched_any,
+                matched_fields: &matched_indices,
                 used_slow_path: false,
             })?;
         }
@@ -1861,9 +2670,6 @@ fn stream_tabular_job<W: Write + ?Sized>(
         Err(e) if is_record_limit_reached(&e) => true,
         Err(e) => return Err(e),
     };
-    if let Some(tracker) = whitelist_tracker {
-        tracker.finalize()?;
-    }
     Ok(StreamJobResult { written, complete })
 }
 
@@ -1880,7 +2686,8 @@ fn extract_tabular_common(
 ) -> Result<()> {
     let parallelism = etl.opts.parallelism;
     with_thread_pool(parallelism, || {
-        let files = plan_pipeline_files(etl)?;
+        let manifest_start = RunManifestStart::now();
+        let files = plan_pipeline_files(etl, Some(query))?;
         warn_if_unfiltered_undated_query(etl, query, &files);
 
         let work_dir = etl.ensure_work_dir()?;
@@ -1895,8 +2702,10 @@ fn extract_tabular_common(
         let staging_dir = ensure_staging_dir(&tmp_dir)?;
         sweep_stale_inprogress(&tmp_dir, true)?;
 
+        let selectors = parse_tabular_field_selectors(fields)?;
         let whitelist_tracker = Some(Arc::new(WhitelistMatchTracker::new(
             etl.opts.strict_whitelist,
+            fields.iter().cloned(),
         )));
         let record_limit = record_limit_from(limit);
         let total_bytes = total_compressed_size(&files);
@@ -1912,6 +2721,7 @@ fn extract_tabular_common(
         let bounds = bounds_tuple(etl.opts.start, etl.opts.end);
         let read_buf = etl.opts.read_buffer_bytes;
         let write_buf = etl.opts.write_buffer_bytes;
+        let output_records = AtomicU64::new(0);
 
         crate::concurrency::for_each_file_limited(
             &files,
@@ -1932,6 +2742,7 @@ fn extract_tabular_common(
                         targets,
                         query,
                         fields,
+                        &selectors,
                         format,
                         pb.clone(),
                         bounds,
@@ -1950,6 +2761,7 @@ fn extract_tabular_common(
                     }
                     Err(e) => return Err(e),
                 };
+                output_records.fetch_add(lines, Ordering::Relaxed);
                 if lines == 0 {
                     let _ = remove_with_backoff(&tmp_file, 8, 50);
                 }
@@ -1957,14 +2769,150 @@ fn extract_tabular_common(
             },
         )?;
 
+        if let Some(tracker) = &whitelist_tracker {
+            tracker.finalize()?;
+        }
         if let Some(pb) = pb {
             pb.finish_with_message("done");
         }
         stitch_tabular_parts(&tmp_dir, out_path, fields, opts, format, write_buf)?;
+        let manifest = scan_manifest_input(
+            manifest_start,
+            &format!("scan.extract_to_{}", format.label()),
+            format.label(),
+            etl,
+            query,
+            &files,
+            limit,
+            manifest_counts(&[("records_written", output_records.load(Ordering::Relaxed))]),
+            None,
+            None,
+            serde_json::json!({
+                "tabular_fields": fields,
+                "header": opts.header,
+            }),
+        );
+        maybe_write_run_manifest(
+            etl.opts.emit_manifest,
+            manifest,
+            ManifestDestination::File(out_path.to_path_buf()),
+        )?;
         if let Err(e) = remove_dir_all_with_backoff(&tmp_dir, 8, 50) {
             tracing::warn!(path=%tmp_dir.display(), error=%e, "failed to remove tabular extract scratch dir");
         }
         Ok(())
+    })
+}
+
+/// Convert existing plain JSONL files (including RETL spool/parent-enriched
+/// parts) into a single CSV file using top-level, dotted, or JSON Pointer
+/// field selectors. Missing fields render as empty cells.
+pub fn convert_jsonl_to_csv<I, P, J, S>(
+    inputs: I,
+    out_path: &Path,
+    fields: J,
+    opts: TabularExportOptions,
+) -> Result<u64>
+where
+    I: IntoIterator<Item = P>,
+    P: AsRef<Path>,
+    J: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    convert_jsonl_to_tabular(inputs, out_path, fields, opts, TabularFormat::Csv)
+}
+
+/// Convert existing plain JSONL files (including RETL spool/parent-enriched
+/// parts) into a single TSV file using top-level, dotted, or JSON Pointer
+/// field selectors. Values containing tabs or line breaks are rejected; use
+/// CSV for arbitrary Reddit text fields.
+pub fn convert_jsonl_to_tsv<I, P, J, S>(
+    inputs: I,
+    out_path: &Path,
+    fields: J,
+    opts: TabularExportOptions,
+) -> Result<u64>
+where
+    I: IntoIterator<Item = P>,
+    P: AsRef<Path>,
+    J: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    convert_jsonl_to_tabular(inputs, out_path, fields, opts, TabularFormat::Tsv)
+}
+
+fn convert_jsonl_to_tabular<I, P, J, S>(
+    inputs: I,
+    out_path: &Path,
+    fields: J,
+    opts: TabularExportOptions,
+    format: TabularFormat,
+) -> Result<u64>
+where
+    I: IntoIterator<Item = P>,
+    P: AsRef<Path>,
+    J: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let input_paths: Vec<PathBuf> = inputs
+        .into_iter()
+        .map(|path| path.as_ref().to_path_buf())
+        .collect();
+    if input_paths.is_empty() {
+        anyhow::bail!("convert requires at least one JSONL input file");
+    }
+    let fields = normalize_tabular_fields(fields)?;
+    let selectors = parse_tabular_field_selectors(&fields)?;
+    let parent = out_path.parent().unwrap_or_else(|| Path::new("."));
+    let staging_dir = ensure_staging_dir(parent)?;
+    write_jsonl_atomic(&staging_dir, out_path, 64 * 1024, |out| {
+        let mut written = 0_u64;
+        if opts.header {
+            write_tabular_header(out, &fields, format)?;
+        }
+        for path in &input_paths {
+            let file = open_with_backoff(path, 16, 50)
+                .with_context(|| format!("opening JSONL input {}", path.display()))?;
+            let mut reader = BufReader::with_capacity(256 * 1024, file);
+            let mut line = String::with_capacity(16 * 1024);
+            let mut line_number = 0_u64;
+            loop {
+                let n = crate::ndjson::read_line_capped(
+                    &mut reader,
+                    &mut line,
+                    crate::ndjson::DEFAULT_MAX_LINE_BYTES,
+                    path,
+                )
+                .with_context(|| {
+                    format!(
+                        "reading JSONL input {} near line {}",
+                        path.display(),
+                        line_number + 1
+                    )
+                })?;
+                if n == 0 {
+                    break;
+                }
+                line_number += 1;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let value: Value = serde_json::from_str(&line).with_context(|| {
+                    format!("malformed JSON in {} line {}", path.display(), line_number)
+                })?;
+                let (cells, _matched_indices) = tabular_cells_from_value(&value, &selectors)?;
+                write_tabular_row(out, &fields, &cells, format).with_context(|| {
+                    format!(
+                        "writing {} row for {} line {}",
+                        format.label(),
+                        path.display(),
+                        line_number
+                    )
+                })?;
+                written += 1;
+            }
+        }
+        Ok(written)
     })
 }
 
@@ -1979,18 +2927,23 @@ fn extract_common(
     tmp_dir_name: &str,
     out_path: &Path,
     finalize: Finalize,
+    output_format: &str,
+    operation: &str,
     limit: Option<u64>,
 ) -> Result<()> {
     validate_export_whitelist(etl)?;
     let parallelism = etl.opts.parallelism;
     with_thread_pool(parallelism, || {
-        let files = plan_pipeline_files(etl)?;
+        let manifest_start = RunManifestStart::now();
+        let files = plan_pipeline_files(etl, Some(query))?;
         warn_if_unfiltered_undated_query(etl, query, &files);
 
         let work_dir = etl.ensure_work_dir()?;
         let resume = etl.opts.resume;
         let resume_fingerprint = if resume {
-            Some(build_resume_fingerprint(etl, query, "extract", limit)?)
+            Some(build_resume_fingerprint(
+                etl, query, "extract", limit, &files,
+            )?)
         } else {
             None
         };
@@ -2013,6 +2966,7 @@ fn extract_common(
                 (HashMap::new(), HashSet::new())
             };
         let resumed_lines = committed_line_count(&initial_months);
+        let output_records = AtomicU64::new(resumed_lines);
         let accumulator = if let Some(fingerprint) = resume_fingerprint.as_ref() {
             crate::progress_manifest::save(&tmp_dir, &initial_months, Some(fingerprint))?;
             Some(ManifestAccumulator::new(
@@ -2025,9 +2979,12 @@ fn extract_common(
         };
 
         let whitelist = etl.opts.whitelist_fields.clone();
-        let whitelist_tracker = whitelist
-            .as_ref()
-            .map(|_| Arc::new(WhitelistMatchTracker::new(etl.opts.strict_whitelist)));
+        let whitelist_tracker = whitelist.as_ref().map(|fields| {
+            Arc::new(WhitelistMatchTracker::new(
+                etl.opts.strict_whitelist,
+                fields.iter().cloned(),
+            ))
+        });
         let record_limit = record_limit_from_with_claimed(limit, resumed_lines);
 
         let total_bytes = total_compressed_size(&files);
@@ -2071,6 +3028,7 @@ fn extract_common(
                 if resume && tmp_file.exists() {
                     match validate_jsonl_part(&tmp_file) {
                         Ok(entry) => {
+                            output_records.fetch_add(entry.lines, Ordering::Relaxed);
                             if let Some(acc) = &accumulator {
                                 acc.commit(key.clone(), entry).with_context(|| {
                                     format!(
@@ -2117,6 +3075,7 @@ fn extract_common(
                     Err(e) => return Err(e),
                 };
 
+                output_records.fetch_add(lines, Ordering::Relaxed);
                 if let Some(acc) = &accumulator {
                     let size = fs::metadata(&tmp_file).map(|m| m.len()).unwrap_or(0);
                     let entry = MonthEntry {
@@ -2132,6 +3091,9 @@ fn extract_common(
             },
         )?;
 
+        if let Some(tracker) = &whitelist_tracker {
+            tracker.finalize()?;
+        }
         if let Some(pb) = pb {
             pb.finish_with_message("done");
         }
@@ -2143,6 +3105,24 @@ fn extract_common(
                 stitch_tmp_parts_to_json_array(&tmp_dir, out_path, pretty, write_buf)?
             }
         }
+        let manifest = scan_manifest_input(
+            manifest_start,
+            operation,
+            output_format,
+            etl,
+            query,
+            &files,
+            limit,
+            manifest_counts(&[("records_written", output_records.load(Ordering::Relaxed))]),
+            resume_fingerprint.clone(),
+            resume.then(|| crate::progress_manifest::manifest_path(&tmp_dir)),
+            serde_json::json!({}),
+        );
+        maybe_write_run_manifest(
+            etl.opts.emit_manifest,
+            manifest,
+            ManifestDestination::File(out_path.to_path_buf()),
+        )?;
         if !resume {
             if let Err(e) = remove_dir_all_with_backoff(&tmp_dir, 8, 50) {
                 tracing::warn!(path=%tmp_dir.display(), error=%e, "failed to remove extract scratch dir");
@@ -2186,7 +3166,7 @@ where
         return Ok(());
     }
 
-    let files = plan_pipeline_files(etl)?;
+    let files = plan_pipeline_files(etl, Some(query))?;
     warn_if_unfiltered_undated_query(etl, query, &files);
 
     let pb = if show_progress && etl.opts.progress {
@@ -2220,7 +3200,7 @@ where
                         Err(e) => return Err(malformed_json_error(&job.path, line_number, e)),
                     },
                 };
-                if !matches_minimal(&min, targets_ref, query) {
+                if !matches_minimal(&min, targets_ref, query, kind) {
                     return Ok(());
                 }
                 if !within_bounds(&min, bounds) {
@@ -2277,9 +3257,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{build_resume_fingerprint, extract_scratch_dir, ExportFormat};
+    use super::*;
     use crate::progress_manifest::testing::fail_saves_after_attempts_for_tests;
-    use crate::{RedditETL, ScanPlan, Sources, YearMonth};
+    use crate::{KeyExtractor, RedditETL, ScanPlan, Sources, YearMonth};
     use serde_json::{json, Value};
     use std::fs::{self, File};
     use std::io::Write;
@@ -2324,6 +3304,258 @@ mod tests {
 
     fn manifest_json(out_dir: &Path) -> Value {
         serde_json::from_slice(&fs::read(out_dir.join("_progress.json")).unwrap()).unwrap()
+    }
+
+    fn comment_line(id: &str, author: &str, created_utc: i64) -> String {
+        json!({
+            "id": id,
+            "author": author,
+            "subreddit": "programming",
+            "created_utc": created_utc,
+            "score": 1,
+            "body": "hello",
+            "parent_id": "t3_s1",
+            "link_id": "t3_s1",
+        })
+        .to_string()
+    }
+
+    fn make_two_month_comment_corpus() -> PathBuf {
+        let base = tempfile::tempdir().unwrap().keep();
+        write_zst_lines(
+            &base.join("comments").join("RC_2006-01.zst"),
+            &[comment_line("jan_real", "jan_real", 1_136_073_600)],
+        );
+        write_zst_lines(
+            &base.join("comments").join("RC_2006-02.zst"),
+            &[comment_line("feb_real", "feb_real", 1_138_752_000)],
+        );
+        fs::create_dir_all(base.join("submissions")).unwrap();
+        base
+    }
+
+    fn two_month_scan(base: &Path, work_dir: &Path) -> ScanPlan {
+        RedditETL::new()
+            .base_dir(base)
+            .work_dir(work_dir)
+            .sources(Sources::Comments)
+            .date_range(Some(YearMonth::new(2006, 1)), Some(YearMonth::new(2006, 2)))
+            .progress(false)
+            .resume(true)
+            .scan()
+            .subreddit("programming")
+    }
+
+    fn seed_scan_checkpoint_part(
+        plan: &ScanPlan,
+        key: &str,
+        contents: &str,
+        lines: u64,
+    ) -> PathBuf {
+        let files = plan_pipeline_files(&plan.etl, Some(&plan.query)).unwrap();
+        let fingerprint = build_resume_fingerprint(
+            &plan.etl,
+            &plan.query,
+            ANALYTICS_CHECKPOINT_OPERATION,
+            plan.limit,
+            &files,
+        )
+        .unwrap();
+        let work_dir = plan.etl.ensure_work_dir().unwrap();
+        let checkpoint_dir = scan_checkpoint_dir(&work_dir, &fingerprint);
+        fs::create_dir_all(&checkpoint_dir).unwrap();
+        let part = checkpoint_part_path(&checkpoint_dir, key);
+        fs::write(&part, contents).unwrap();
+        let mut months = std::collections::HashMap::new();
+        months.insert(
+            key.to_string(),
+            MonthEntry {
+                size: fs::metadata(&part).unwrap().len(),
+                lines,
+                sha256: None,
+            },
+        );
+        crate::progress_manifest::save(&checkpoint_dir, &months, Some(&fingerprint)).unwrap();
+        checkpoint_dir
+    }
+
+    fn read_tsv_i64(path: &Path) -> std::collections::HashMap<String, i64> {
+        fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .filter_map(|line| {
+                let (key, value) = line.split_once('\t')?;
+                Some((key.to_string(), value.parse::<i64>().unwrap()))
+            })
+            .collect()
+    }
+
+    fn spool_fingerprint_for(plan: ScanPlan) -> String {
+        let plan = plan.build().unwrap();
+        let files = plan_pipeline_files(&plan.etl, Some(&plan.query)).unwrap();
+        build_resume_fingerprint(&plan.etl, &plan.query, "spool", plan.limit, &files).unwrap()
+    }
+
+    #[test]
+    fn dedupe_resume_reuses_checkpointed_month_and_scans_missing_month() {
+        let base = make_two_month_comment_corpus();
+        let work = base.join("work_dedupe_resume");
+        let checkpoint_line = format!(
+            "{}\n",
+            comment_line("checkpoint_jan", "checkpoint_only", 1_136_073_600)
+        );
+        let plan = two_month_scan(&base, &work).build().unwrap();
+        seed_scan_checkpoint_part(&plan, "RC_2006-01", &checkpoint_line, 1);
+
+        let out = base.join("dedupe_resume.txt");
+        let stats = two_month_scan(&base, &work)
+            .dedupe_keys_to_lines_with_stats(&KeyExtractor::author_lowercase_fast(), &out)
+            .unwrap();
+
+        let got: Vec<String> = fs::read_to_string(&out)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(got, vec!["checkpoint_only", "feb_real"]);
+        assert_eq!(stats.matched_records, 2);
+    }
+
+    #[test]
+    fn count_author_resume_reuses_checkpointed_month_and_scans_missing_month() {
+        let base = make_two_month_comment_corpus();
+        let work = base.join("work_count_resume");
+        let checkpoint_contents = format!(
+            "{}\n{}\n",
+            comment_line("checkpoint_a", "checkpoint_only", 1_136_073_600),
+            comment_line("checkpoint_b", "checkpoint_only", 1_136_073_601)
+        );
+        let plan = two_month_scan(&base, &work).build().unwrap();
+        seed_scan_checkpoint_part(&plan, "RC_2006-01", &checkpoint_contents, 2);
+
+        let out = base.join("count_resume.tsv");
+        two_month_scan(&base, &work)
+            .author_counts_to_tsv(&out)
+            .unwrap();
+
+        let got = read_tsv_i64(&out);
+        assert_eq!(got.get("checkpoint_only").copied(), Some(2));
+        assert_eq!(got.get("feb_real").copied(), Some(1));
+        assert!(!got.contains_key("jan_real"));
+    }
+
+    #[test]
+    fn first_seen_resume_reuses_checkpointed_month_and_scans_missing_month() {
+        let base = make_two_month_comment_corpus();
+        let work = base.join("work_first_seen_resume");
+        let checkpoint_contents = format!(
+            "{}\n{}\n",
+            comment_line("checkpoint_late", "checkpoint_only", 1_136_073_650),
+            comment_line("checkpoint_early", "checkpoint_only", 1_136_073_610)
+        );
+        let plan = two_month_scan(&base, &work).build().unwrap();
+        seed_scan_checkpoint_part(&plan, "RC_2006-01", &checkpoint_contents, 2);
+
+        let out = base.join("first_seen_resume.tsv");
+        two_month_scan(&base, &work)
+            .build_first_seen_index_to_tsv(&out)
+            .unwrap();
+
+        let got = read_tsv_i64(&out);
+        assert_eq!(got.get("checkpoint_only").copied(), Some(1_136_073_610));
+        assert_eq!(got.get("feb_real").copied(), Some(1_138_752_000));
+        assert!(!got.contains_key("jan_real"));
+    }
+
+    #[test]
+    fn resume_rebuilds_invalid_checkpoint_part() {
+        let base = make_two_month_comment_corpus();
+        let work = base.join("work_invalid_checkpoint");
+        let plan = two_month_scan(&base, &work).build().unwrap();
+        let checkpoint_dir = seed_scan_checkpoint_part(&plan, "RC_2006-01", "{not json\n", 1);
+
+        let out = base.join("count_rebuilt.tsv");
+        two_month_scan(&base, &work)
+            .author_counts_to_tsv(&out)
+            .unwrap();
+
+        let got = read_tsv_i64(&out);
+        assert_eq!(got.get("jan_real").copied(), Some(1));
+        assert_eq!(got.get("feb_real").copied(), Some(1));
+        assert!(!got.contains_key("checkpoint_only"));
+        let manifest = manifest_json(&checkpoint_dir);
+        assert!(manifest["months"]
+            .as_object()
+            .unwrap()
+            .contains_key("RC_2006-01"));
+    }
+
+    #[test]
+    fn resume_fingerprint_includes_new_text_and_url_filters() {
+        let base = make_one_comment_corpus();
+        let base_fp = spool_fingerprint_for(one_month_scan(&base));
+
+        let keyword_all_fp = spool_fingerprint_for(one_month_scan(&base).keywords_all(["hello"]));
+        let exclude_keyword_fp =
+            spool_fingerprint_for(one_month_scan(&base).exclude_keywords(["spam"]));
+        let text_regex_fp = spool_fingerprint_for(one_month_scan(&base).text_regex("hello"));
+        let no_url_fp = spool_fingerprint_for(one_month_scan(&base).no_url());
+
+        assert_ne!(base_fp, keyword_all_fp);
+        assert_ne!(base_fp, exclude_keyword_fp);
+        assert_ne!(base_fp, text_regex_fp);
+        assert_ne!(base_fp, no_url_fp);
+    }
+
+    #[test]
+    fn resume_fingerprint_changes_when_timestamp_bounds_change() {
+        let base = make_one_comment_corpus();
+        let plan_a = RedditETL::new()
+            .base_dir(&base)
+            .sources(Sources::Comments)
+            .progress(false)
+            .scan()
+            .created_utc_gte(1_136_073_600)
+            .created_utc_lt(1_136_160_000)
+            .build()
+            .unwrap();
+        let plan_b = RedditETL::new()
+            .base_dir(&base)
+            .sources(Sources::Comments)
+            .progress(false)
+            .scan()
+            .created_utc_gte(1_136_073_601)
+            .created_utc_lt(1_136_160_000)
+            .build()
+            .unwrap();
+
+        let files_a = plan_pipeline_files(&plan_a.etl, Some(&plan_a.query)).unwrap();
+        let files_b = plan_pipeline_files(&plan_b.etl, Some(&plan_b.query)).unwrap();
+        let fp_a =
+            build_resume_fingerprint(&plan_a.etl, &plan_a.query, "extract", plan_a.limit, &files_a)
+                .expect("fingerprint a");
+        let fp_b =
+            build_resume_fingerprint(&plan_b.etl, &plan_b.query, "extract", plan_b.limit, &files_b)
+                .expect("fingerprint b");
+        assert_ne!(fp_a, fp_b);
+    }
+
+    #[test]
+    fn resume_fingerprint_changes_when_record_id_filter_changes() {
+        let base = make_one_comment_corpus();
+        let plan_c1 = one_month_scan(&base).ids(["c1"]).build().unwrap();
+        let plan_c2 = one_month_scan(&base).ids(["c2"]).build().unwrap();
+
+        let files_c1 = plan_pipeline_files(&plan_c1.etl, Some(&plan_c1.query)).unwrap();
+        let files_c2 = plan_pipeline_files(&plan_c2.etl, Some(&plan_c2.query)).unwrap();
+        let fp_c1 =
+            build_resume_fingerprint(&plan_c1.etl, &plan_c1.query, "spool", plan_c1.limit, &files_c1)
+                .unwrap();
+        let fp_c2 =
+            build_resume_fingerprint(&plan_c2.etl, &plan_c2.query, "spool", plan_c2.limit, &files_c2)
+                .unwrap();
+
+        assert_ne!(fp_c1, fp_c2);
     }
 
     #[test]
@@ -2406,6 +3638,49 @@ mod tests {
     }
 
     #[test]
+    fn resume_fingerprint_includes_record_limit() {
+        let base = make_one_comment_corpus();
+        let no_limit_plan = one_month_scan(&base).build().unwrap();
+        let limit_one_plan = one_month_scan(&base).limit(1).build().unwrap();
+        let limit_two_plan = one_month_scan(&base).limit(2).build().unwrap();
+
+        let no_limit_files =
+            plan_pipeline_files(&no_limit_plan.etl, Some(&no_limit_plan.query)).unwrap();
+        let limit_one_files =
+            plan_pipeline_files(&limit_one_plan.etl, Some(&limit_one_plan.query)).unwrap();
+        let limit_two_files =
+            plan_pipeline_files(&limit_two_plan.etl, Some(&limit_two_plan.query)).unwrap();
+
+        let no_limit = build_resume_fingerprint(
+            &no_limit_plan.etl,
+            &no_limit_plan.query,
+            "extract",
+            no_limit_plan.limit,
+            &no_limit_files,
+        )
+        .unwrap();
+        let limit_one = build_resume_fingerprint(
+            &limit_one_plan.etl,
+            &limit_one_plan.query,
+            "extract",
+            limit_one_plan.limit,
+            &limit_one_files,
+        )
+        .unwrap();
+        let limit_two = build_resume_fingerprint(
+            &limit_two_plan.etl,
+            &limit_two_plan.query,
+            "extract",
+            limit_two_plan.limit,
+            &limit_two_files,
+        )
+        .unwrap();
+
+        assert_ne!(no_limit, limit_one);
+        assert_ne!(limit_one, limit_two);
+    }
+
+    #[test]
     fn extract_resume_commit_failure_after_temp_part_publish_returns_error_and_next_run_stitches() {
         let base = make_one_comment_corpus();
         let work_dir = base.join("work_manifest_failure");
@@ -2422,7 +3697,10 @@ mod tests {
             .subreddit("programming")
             .build()
             .unwrap();
-        let fingerprint = build_resume_fingerprint(&plan.etl, &plan.query, "extract", None).unwrap();
+        let files = plan_pipeline_files(&plan.etl, Some(&plan.query)).unwrap();
+        let fingerprint =
+            build_resume_fingerprint(&plan.etl, &plan.query, "extract", plan.limit, &files)
+                .unwrap();
         let tmp_dir = extract_scratch_dir(
             &work_dir,
             "extract_jsonl_q_tmp",
