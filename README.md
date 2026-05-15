@@ -160,6 +160,7 @@ and validation flags because it does not filter records by query:
 | `--include-deleted` | Include pseudo-users (`[deleted]`, `[removed]`, and empty authors) that are filtered by default. |
 | `--parallelism <N>` / `--file-concurrency <N>` | Rayon threads / concurrent monthly files; oversized values are clamped to RETL's documented safety caps. |
 | `--no-progress` | Disable progress bars. |
+| `--resume` | For `scan`, `dedupe`, `export`, `count`, and `first-seen`, reuse validated per-month checkpoints instead of restarting a long run from month one. `integrity`, `aggregate`, and `sample` are intentionally non-resumable. |
 
 ### Pseudo-user filtering (default ON)
 
@@ -233,6 +234,10 @@ retl scan \
   --out usernames.txt
 ~~~
 
+Add `--resume` to persist per-source per-month matched-record checkpoints under
+`--work-dir/scan_checkpoints/`; a later run with the same query/config/corpus
+skips completed months and rebuilds missing, stale, or partial checkpoint parts.
+
 ### `dedupe` — emit unique keys
 
 Walks the corpus, applies the query selection, and writes one distinct key per
@@ -261,7 +266,10 @@ Records that match the query but do not contain the extracted key are omitted
 from the dedupe output (for example, `--key json:/parent_id --source both`
 drops submissions because they have no `parent_id`). The CLI prints a summary
 with the drop count and warns when more than 1% of matching records lack the
-key. Add `--strict-key` to make any missing key a hard error instead.
+key. Add `--strict-key` to make any missing key a hard error instead. With
+`--resume`, the expensive corpus scan is checkpointed per month under
+`--work-dir/scan_checkpoints/`; final key sorting/deduplication still reruns so
+changing `--key` can reuse the same matched-record checkpoints.
 
 ### `export` — extract filtered records
 
@@ -276,9 +284,16 @@ Formats:
 * `--format zst` → corpus-style partitioned `.zst` output under `<out>/comments/RC_YYYY-MM.zst` and `<out>/submissions/RS_YYYY-MM.zst`.
 * `--format partitioned-jsonl` → the same corpus-style directory layout, but as uncompressed `.jsonl` files.
 
-Export-only modifiers include `--whitelist a,b,c`, `--strict-whitelist`, `--human-timestamps`, `--limit N`, `--zst-level <N>`, and `--resume`. With `--resume`, `jsonl`/`json` exports checkpoint per-month `.part_*.jsonl` files under `--work-dir`; `spool`, `zst`, and `partitioned-jsonl` use `_progress.json` under `--out`. The checkpoint includes a fingerprint of the query and output-affecting config; changing filters, sources, date range, whitelist fields, `--limit`, `--human-timestamps`, or (for ZST) `--zst-level` discards stale parts instead of mixing results from different runs. Partitioned ZST resume validates completed `.zst` outputs with a full decode before skipping them.
+Export modifiers include `--whitelist a,b,c`, `--strict-whitelist`, `--human-timestamps`, `--limit N`, `--zst-level <N>`, and `--resume`. With `--resume`, `jsonl`/`json` exports checkpoint per-month `.part_*.jsonl` files under `--work-dir`; `spool`, `zst`, and `partitioned-jsonl` use `_progress.json` under `--out`. The checkpoint includes a fingerprint of the query, output-affecting config, selected corpus paths, and selected monthly file identities; changing filters, sources, date range, corpus files, whitelist fields, `--limit`, `--human-timestamps`, or (for ZST) `--zst-level` discards stale parts instead of mixing results from different runs. Partitioned ZST resume validates completed `.zst` outputs with a full decode before skipping them.
 
 Corpus scans and exports are strict by default: zstd decode errors fail the command instead of returning plausible partial results. Pass `--allow-partial` to preserve the explicit lossy mode; skipped file counts and paths are emitted as a JSON object on stderr, and skipped months are not committed to resume manifests.
+
+Resumable analytics (`scan`, `dedupe`, `count`, and `first-seen`) use a shared
+matched-record checkpoint format under `--work-dir/scan_checkpoints/<fingerprint>/`.
+Each part is `part_RC_YYYY-MM.jsonl` or `part_RS_YYYY-MM.jsonl` plus a
+`_progress.json` entry. On resume, RETL checks the query/config/corpus
+fingerprint and validates each JSONL part's size and line count; mismatches,
+malformed JSON, and uncommitted partial months are rebuilt.
 
 ~~~sh
 # JSONL with a field whitelist and human timestamps
@@ -348,7 +363,24 @@ retl count --start 2016-01 --end 2016-12 --subreddit worldnews
 
 # Author-level counts
 retl count --mode author --subreddit programming --start 2006-01 --end 2006-04 --out authors.tsv
+
+# Resume an interrupted author-count scan
+retl count --mode author --resume --subreddit programming --start 2006-01 --end 2006-04 --out authors.tsv
 ~~~
+
+Both modes support `--resume` and reuse the same matched-record checkpoints as
+`scan`/`dedupe` when the fingerprint still matches.
+
+### `first-seen` — earliest timestamp per author
+
+Builds a TSV of `author<TAB>earliest_created_utc` for matching records:
+
+~~~sh
+retl first-seen --subreddit programming --start 2006-01 --end 2006-04 --out first_seen.tsv --resume
+~~~
+
+`first-seen` supports `--resume` via the shared matched-record checkpoints under
+`--work-dir`.
 
 ### `integrity` — validate `.zst` monthly files
 
@@ -732,7 +764,7 @@ let parents = RedditETL::new()
     .resolve_parent_maps(&ids, Path::new("parents_cache"), true)?;
 ~~~
 
-Note: extract/spool resume entries are fingerprinted by query/config. Parent-cache and attach resume sidecars include the parent ID set, selected parent fields, payload format, corpus file identity, and resolution window, so widening `--parent-fields` rebuilds stale narrow cache shards instead of reusing them.
+Note: extract/spool and analytics resume entries are fingerprinted by query/config plus selected corpus file identity. Parent-cache and attach resume sidecars include the parent ID set, selected parent fields, payload format, corpus file identity, and resolution window, so widening `--parent-fields` rebuilds stale narrow cache shards instead of reusing them.
 
 The `parents` CLI uses `--window-months 3` by default, scanning three extra months on each side of the spool range. Larger windows catch more old cross-month parents, but scan more corpus bytes and create/use more parent-cache shard files; smaller windows are faster and lighter but can leave more parents unresolved.
 

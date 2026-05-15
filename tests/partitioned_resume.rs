@@ -56,8 +56,8 @@ fn setup_one_month_corpus() -> PathBuf {
     base
 }
 
-fn assert_partitioned_resume(format: ExportFormat) {
-    let (base, jan_source, feb_source) = setup_two_month_corpus();
+fn assert_partitioned_resume_after_repair(format: ExportFormat) {
+    let (base, _jan_source, feb_source) = setup_two_month_corpus();
     let out_dir = base.join(match format {
         ExportFormat::Jsonl => "out_jsonl",
         ExportFormat::Zst => "out_zst",
@@ -82,10 +82,11 @@ fn assert_partitioned_resume(format: ExportFormat) {
         .unwrap()
         .contains_key("RC_2006-02"));
 
-    // If resume fails to skip the completed January output, this invalid source
-    // would make the second strict run fail. February is repaired and should be
-    // the only month processed on the resume run.
-    fs::write(&jan_source, b"not a zstd stream").unwrap();
+    // Repairing February changes the selected corpus file identity, so the
+    // resume fingerprint invalidates the prior checkpoint set and rebuilds
+    // from the current corpus instead of mixing stale January output with the
+    // repaired February month. January remains valid, so the strict rerun
+    // succeeds and commits both months.
     write_zst_lines(&feb_source, &[valid_comment("feb", "repaired")]);
 
     run_export(&base, &out_dir, format, false);
@@ -133,13 +134,13 @@ fn assert_partitioned_resume_rebuilds_corrupt_output(format: ExportFormat) {
 }
 
 #[test]
-fn partitioned_jsonl_resume_retries_incomplete_month_and_skips_completed() {
-    assert_partitioned_resume(ExportFormat::Jsonl);
+fn partitioned_jsonl_resume_retries_incomplete_month_after_repair() {
+    assert_partitioned_resume_after_repair(ExportFormat::Jsonl);
 }
 
 #[test]
-fn partitioned_zst_resume_retries_incomplete_month_and_skips_completed() {
-    assert_partitioned_resume(ExportFormat::Zst);
+fn partitioned_zst_resume_retries_incomplete_month_after_repair() {
+    assert_partitioned_resume_after_repair(ExportFormat::Zst);
 }
 
 #[test]

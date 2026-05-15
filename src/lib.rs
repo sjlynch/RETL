@@ -86,7 +86,9 @@
 //!      path directly. See [`crate::atomic_write`] for the staging contract.
 //!    - The optional resume manifest at `<out_dir>/_progress.json` (see
 //!      [`progress_manifest`](crate::progress_manifest)) records each
-//!      committed month so a crashed run can skip what already landed; months
+//!      committed month so a crashed run can skip what already landed. Exports
+//!      store manifests next to their outputs; analytics helpers store matched
+//!      per-month JSONL checkpoints under `work_dir/scan_checkpoints/`. Months
 //!      skipped by `allow_partial` are intentionally left uncommitted.
 //!
 //! 7. **Verify**

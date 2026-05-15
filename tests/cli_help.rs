@@ -55,7 +55,7 @@ fn parents_help_advertises_required_flags() {
 #[test]
 fn first_seen_help_advertises_out() {
     let assert = retl().args(["first-seen", "--help"]).assert().success();
-    assert.stdout(contains("--out"));
+    assert.stdout(contains("--out").and(contains("--resume")));
 }
 
 #[test]
@@ -79,6 +79,7 @@ fn dedupe_help_advertises_key_out_and_inflight() {
         .and(contains("--inflight-bytes"))
         .and(contains("--inflight-groups"))
         .and(contains("--strict-key"))
+        .and(contains("--resume"))
         .and(contains("json:/pointer"));
     assert.stdout(pred);
 }
@@ -106,6 +107,7 @@ fn scan_help_advertises_common_flags() {
         .and(contains("--domain"))
         .and(contains("--json"))
         .and(contains("--include-deleted"))
+        .and(contains("--resume"))
         .and(contains("--whitelist").not())
         .and(contains("--strict-whitelist").not())
         .and(contains("--human-timestamps").not());
@@ -132,7 +134,8 @@ fn count_help_advertises_modes() {
     let assert = retl().args(["count", "--help"]).assert().success();
     let pred = contains("--mode")
         .and(contains("month"))
-        .and(contains("author"));
+        .and(contains("author"))
+        .and(contains("--resume"));
     assert.stdout(pred);
 }
 
@@ -176,6 +179,26 @@ fn aggregate_help_advertises_spool_inputs_out_and_runtime_flags_only() {
 #[test]
 fn version_flag_works() {
     retl().arg("--version").assert().success();
+}
+
+#[test]
+fn aggregate_resume_flag_fails_with_supported_workflow_hint() {
+    retl()
+        .args(["aggregate", "--resume", "--out", "out.json"])
+        .assert()
+        .failure()
+        .stderr(
+            contains("does not support --resume").and(contains("export --format spool --resume")),
+        );
+}
+
+#[test]
+fn integrity_resume_flag_fails_with_supported_workflow_hint() {
+    retl()
+        .args(["integrity", "--resume"])
+        .assert()
+        .failure()
+        .stderr(contains("does not support --resume").and(contains("--start/--end")));
 }
 
 #[test]

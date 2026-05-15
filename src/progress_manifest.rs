@@ -8,9 +8,10 @@
 //! Entries store the on-disk size of the published file. On re-entry we
 //! cross-check by stat'ing the final destination and comparing sizes — if the
 //! file is missing, smaller, or larger than recorded, the entry is dropped and
-//! that month is re-run. The manifest also records a fingerprint of the query
-//! and output-affecting options; a mismatch invalidates the checkpoint set.
-//! The optional `sha256` field is reserved for v2.
+//! that month is re-run. The manifest also records a fingerprint of the query,
+//! output-affecting options, and (for current scan/export callers) selected
+//! corpus file identities; a mismatch invalidates the checkpoint set. The
+//! optional `sha256` field is reserved for v2.
 
 use anyhow::{Context, Result};
 use parking_lot::Mutex;

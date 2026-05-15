@@ -364,7 +364,10 @@ pub(crate) fn run_schema(args: SchemaArgs) -> Result<()> {
 }
 
 pub(crate) fn run_scan(args: ScanArgs) -> Result<()> {
-    let etl = build_etl(&args.common)?;
+    let mut etl = build_etl(&args.common)?;
+    if args.resume {
+        etl = etl.resume(true);
+    }
     let partial_reporter = etl.partial_read_reporter();
     let mut scan = plan!(etl, args.common, args.query);
     if let Some(limit) = args.limit {
@@ -405,6 +408,9 @@ pub(crate) fn run_dedupe(args: DedupeArgs) -> Result<()> {
     }
     if args.strict_key {
         etl = etl.strict_key(true);
+    }
+    if args.resume {
+        etl = etl.resume(true);
     }
     let partial_reporter = etl.partial_read_reporter();
     let work_dir = args.common.work_dir.clone();
@@ -688,7 +694,10 @@ pub(crate) fn run_sample(args: SampleArgs) -> Result<()> {
 }
 
 pub(crate) fn run_count(args: CountArgs) -> Result<()> {
-    let etl = build_etl(&args.common)?;
+    let mut etl = build_etl(&args.common)?;
+    if args.resume {
+        etl = etl.resume(true);
+    }
     let partial_reporter = etl.partial_read_reporter();
     let scan = plan!(etl, args.common, args.query);
 
@@ -732,6 +741,11 @@ pub(crate) fn run_count(args: CountArgs) -> Result<()> {
 }
 
 pub(crate) fn run_integrity(args: IntegrityArgs) -> Result<()> {
+    if args.resume {
+        anyhow::bail!(
+            "retl integrity does not support --resume; it validates corpus files directly. Narrow long runs with --source/--start/--end or use resumable scan/export/count workflows for record processing."
+        );
+    }
     let etl = build_etl(&args.common)?;
     let mode = match args.mode {
         IntegrityModeArg::Quick => IntegrityMode::Quick {
@@ -775,6 +789,11 @@ pub(crate) fn run_integrity(args: IntegrityArgs) -> Result<()> {
 }
 
 pub(crate) fn run_aggregate(args: AggregateArgs) -> Result<()> {
+    if args.resume {
+        anyhow::bail!(
+            "retl aggregate does not support --resume because it reduces existing JSONL inputs. For resumable corpus filtering, run `retl export --format spool --resume ...` first, then aggregate with `retl aggregate --spool <DIR>`."
+        );
+    }
     let mut etl = RedditETL::new().progress(!args.runtime.no_progress);
     if let Some(p) = args.runtime.parallelism {
         etl = etl.parallelism(p);
@@ -940,7 +959,10 @@ fn write_grouped_tsv(out: &Path, rows: Vec<(String, String)>) -> Result<()> {
 }
 
 pub(crate) fn run_first_seen(args: FirstSeenArgs) -> Result<()> {
-    let etl = build_etl(&args.common)?;
+    let mut etl = build_etl(&args.common)?;
+    if args.resume {
+        etl = etl.resume(true);
+    }
     let partial_reporter = etl.partial_read_reporter();
     let scan = plan!(etl, args.common, args.query);
     scan.build_first_seen_index_to_tsv(&args.out)?;

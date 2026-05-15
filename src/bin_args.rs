@@ -291,6 +291,10 @@ pub(crate) struct ScanArgs {
     /// With file_concurrency >1, already-running workers may emit a bounded over-shoot.
     #[arg(long, visible_alias = "head")]
     pub(crate) limit: Option<u64>,
+    /// Resume by reusing per-source per-month matched-record checkpoints under
+    /// `--work-dir` when the query/config/corpus fingerprint still matches.
+    #[arg(long)]
+    pub(crate) resume: bool,
 }
 
 #[derive(Args, Debug)]
@@ -319,6 +323,10 @@ pub(crate) struct DedupeArgs {
     /// Error if any matched record does not contain the requested dedupe key.
     #[arg(long)]
     pub(crate) strict_key: bool,
+    /// Resume by reusing per-source per-month matched-record checkpoints under
+    /// `--work-dir` when the query/config/corpus fingerprint still matches.
+    #[arg(long)]
+    pub(crate) resume: bool,
 }
 
 #[derive(Args, Debug)]
@@ -406,6 +414,10 @@ pub(crate) struct CountArgs {
     /// Pass `-` to stream either mode to stdout.
     #[arg(long, short)]
     pub(crate) out: Option<PathBuf>,
+    /// Resume by reusing per-source per-month matched-record checkpoints under
+    /// `--work-dir` when the query/config/corpus fingerprint still matches.
+    #[arg(long)]
+    pub(crate) resume: bool,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug)]
@@ -431,6 +443,9 @@ pub(crate) struct IntegrityArgs {
     /// as each failure is discovered.
     #[arg(long)]
     pub(crate) collect: bool,
+    /// Hidden compatibility trap: integrity is intentionally not resumable.
+    #[arg(long, hide = true)]
+    pub(crate) resume: bool,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug)]
@@ -485,6 +500,10 @@ pub(crate) struct AggregateArgs {
     /// emits decimal strings for spreadsheet- and awk-friendly TSV.
     #[arg(long)]
     pub(crate) scientific: bool,
+    /// Hidden compatibility trap: aggregate reduces materialized inputs and is
+    /// intentionally not resumable.
+    #[arg(long, hide = true)]
+    pub(crate) resume: bool,
 }
 
 #[derive(Args, Debug)]
@@ -502,8 +521,8 @@ pub(crate) struct ParentsArgs {
     /// Resume the parents pipeline by reusing cache shards and skipping
     /// already-attached output files only when their attach fingerprint still
     /// matches the spool file, parent cache, resolution window, and attach
-    /// format. `export` is the other CLI subcommand that supports `--resume`;
-    /// aggregate/count/scan/integrity/first-seen do not.
+    /// format. `export`, `scan`, `dedupe`, `count`, and `first-seen` also
+    /// support `--resume`; `aggregate` and `integrity` intentionally do not.
     #[arg(long)]
     pub(crate) resume: bool,
     /// Months of slack added on each side of the spool's date range when
@@ -554,6 +573,10 @@ pub(crate) struct FirstSeenArgs {
     /// Output TSV file: `<author>\t<earliest_created_utc>` per line.
     #[arg(long, short)]
     pub(crate) out: PathBuf,
+    /// Resume by reusing per-source per-month matched-record checkpoints under
+    /// `--work-dir` when the query/config/corpus fingerprint still matches.
+    #[arg(long)]
+    pub(crate) resume: bool,
 }
 
 #[cfg(test)]

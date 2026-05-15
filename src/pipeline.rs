@@ -152,11 +152,11 @@ impl RedditETL {
         self.opts = self.opts.with_adaptive_mem(cfg);
         self
     }
-    /// Opt in to resumable extract/export runs: when enabled, supported export
-    /// paths read/write a `_progress.json` sidecar keyed by month and by a
-    /// fingerprint of the current query/config, so changing filters invalidates
-    /// stale parts instead of reusing them. Default false to preserve existing
-    /// behavior.
+    /// Opt in to resumable scan/export runs: when enabled, supported analytics
+    /// and export paths read/write a `_progress.json` sidecar keyed by month and
+    /// by a fingerprint of the current query/config/corpus, so changing filters
+    /// or input files invalidates stale parts instead of reusing them. Default
+    /// false to preserve existing behavior.
     pub fn resume(mut self, yes: bool) -> Self {
         self.opts = self.opts.with_resume(yes);
         self

@@ -35,6 +35,7 @@ use crate::zstd_jsonl::{
 };
 use anyhow::{anyhow, Context, Result};
 use indicatif::ProgressBar;
+use rayon::prelude::*;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
@@ -43,6 +44,7 @@ use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Export format for partitioned corpus-style outputs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -125,6 +127,7 @@ enum Finalize {
 
 const FILE_PREFIX_RC: &str = "part_RC";
 const FILE_PREFIX_RS: &str = "part_RS";
+const ANALYTICS_CHECKPOINT_OPERATION: &str = "analytics-matched-jsonl-v1";
 const DEDUPE_KEY_DROP_WARN_RATE: f64 = 0.01;
 static EXTRACT_SCRATCH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -344,22 +347,45 @@ impl ScanPlan {
             let scratch_root = shard_writer.scratch_root().to_path_buf();
 
             let result = (|| -> Result<UsernameStream> {
-                scan_records(
-                    &plan.etl,
-                    &plan.query,
-                    /*show_progress=*/ true,
-                    plan.limit,
-                    |min, _kind, _line| {
-                        if let Some(a) = min.author.as_deref() {
-                            let a = a.trim();
-                            if a.is_empty() {
-                                return Ok(());
+                if plan.etl.opts.resume {
+                    let checkpoint = materialize_scan_checkpoint(
+                        &plan.etl,
+                        &plan.query,
+                        /*show_progress=*/ true,
+                        plan.limit,
+                    )?;
+                    for_each_checkpoint_record(
+                        &checkpoint.parts,
+                        plan.etl.opts.read_buffer_bytes,
+                        |min, _line| {
+                            if let Some(a) = min.author.as_deref() {
+                                let a = a.trim();
+                                if a.is_empty() {
+                                    return Ok(());
+                                }
+                                shard_writer.write(a)?;
                             }
-                            shard_writer.write(a)?;
-                        }
-                        Ok(())
-                    },
-                )?;
+                            Ok(())
+                        },
+                    )?;
+                } else {
+                    scan_records(
+                        &plan.etl,
+                        &plan.query,
+                        /*show_progress=*/ true,
+                        plan.limit,
+                        |min, _kind, _line| {
+                            if let Some(a) = min.author.as_deref() {
+                                let a = a.trim();
+                                if a.is_empty() {
+                                    return Ok(());
+                                }
+                                shard_writer.write(a)?;
+                            }
+                            Ok(())
+                        },
+                    )?;
+                }
 
                 let (deduped, scratch_root) = shard_writer.dedup_with_scratch("usernames_q")?;
                 UsernameStream::from_deduped_files_with_cleanup(deduped, vec![scratch_root])
@@ -452,33 +478,49 @@ impl ScanPlan {
 
             let result = (|| -> Result<DedupeKeySummary> {
                 let input = tmp_dir.join("matched.ndjson");
-                let f = create_with_backoff(&input, 16, 50)
-                    .with_context(|| format!("create {}", input.display()))?;
-                let writer = Mutex::new(BufWriter::with_capacity(
-                    plan.etl.opts.write_buffer_bytes,
-                    f,
-                ));
-                let matched_records = AtomicU64::new(0);
+                let matched_total = if plan.etl.opts.resume {
+                    let checkpoint = materialize_scan_checkpoint(
+                        &plan.etl,
+                        &plan.query,
+                        /*show_progress=*/ true,
+                        plan.limit,
+                    )?;
+                    copy_checkpoint_parts_to_jsonl(
+                        &checkpoint.parts,
+                        &input,
+                        plan.etl.opts.write_buffer_bytes,
+                    )?;
+                    checkpoint.matched_records
+                } else {
+                    let f = create_with_backoff(&input, 16, 50)
+                        .with_context(|| format!("create {}", input.display()))?;
+                    let writer = Mutex::new(BufWriter::with_capacity(
+                        plan.etl.opts.write_buffer_bytes,
+                        f,
+                    ));
+                    let matched_records = AtomicU64::new(0);
 
-                scan_records(
-                    &plan.etl,
-                    &plan.query,
-                    /*show_progress=*/ true,
-                    plan.limit,
-                    |_min, _kind, line| {
-                        matched_records.fetch_add(1, Ordering::Relaxed);
-                        let mut w = writer
-                            .lock()
-                            .map_err(|_| anyhow!("dedupe writer lock poisoned"))?;
-                        w.write_all(line.as_bytes())?;
-                        w.write_all(b"\n")?;
-                        Ok(())
-                    },
-                )?;
-                writer
-                    .into_inner()
-                    .map_err(|_| anyhow!("dedupe writer lock poisoned"))?
-                    .flush()?;
+                    scan_records(
+                        &plan.etl,
+                        &plan.query,
+                        /*show_progress=*/ true,
+                        plan.limit,
+                        |_min, _kind, line| {
+                            matched_records.fetch_add(1, Ordering::Relaxed);
+                            let mut w = writer
+                                .lock()
+                                .map_err(|_| anyhow!("dedupe writer lock poisoned"))?;
+                            w.write_all(line.as_bytes())?;
+                            w.write_all(b"\n")?;
+                            Ok(())
+                        },
+                    )?;
+                    writer
+                        .into_inner()
+                        .map_err(|_| anyhow!("dedupe writer lock poisoned"))?
+                        .flush()?;
+                    matched_records.load(Ordering::Relaxed)
+                };
 
                 let key_extractions_failed = AtomicU64::new(0);
                 let cfg = dedupe_cfg_from_options(&plan.etl.opts);
@@ -491,7 +533,6 @@ impl ScanPlan {
                     &cfg,
                     Some(&key_extractions_failed),
                 )?;
-                let matched_total = matched_records.load(Ordering::Relaxed);
                 let failed_after_build = key_extractions_failed.load(Ordering::Relaxed);
                 if plan.etl.opts.strict_key && failed_after_build > 0 {
                     let summary = DedupeKeySummary {
@@ -650,7 +691,7 @@ impl ScanPlan {
 
             let resume = plan.etl.opts.resume;
             let resume_fingerprint =
-                build_resume_fingerprint(&plan.etl, &plan.query, "spool", plan.limit)?;
+                build_resume_fingerprint(&plan.etl, &plan.query, "spool", plan.limit, &files)?;
             // Resume manifest: load on entry, validate each entry against the
             // current query/config fingerprint and the file actually on disk,
             // then snapshot surviving keys before any worker mutates the accumulator.
@@ -767,19 +808,39 @@ impl ScanPlan {
         let parallelism = plan.etl.opts.parallelism;
         with_thread_pool(parallelism, || {
             let total = Mutex::new(BTreeMap::<YearMonth, u64>::new());
-            scan_records(
-                &plan.etl,
-                &plan.query,
-                /*show_progress=*/ false,
-                plan.limit,
-                |min, _kind, _line| {
-                    if let Some(ts) = min.created_utc {
-                        let ym = ym_from_epoch(ts);
-                        *total.lock().unwrap().entry(ym).or_insert(0) += 1;
-                    }
-                    Ok(())
-                },
-            )?;
+            if plan.etl.opts.resume {
+                let checkpoint = materialize_scan_checkpoint(
+                    &plan.etl,
+                    &plan.query,
+                    /*show_progress=*/ false,
+                    plan.limit,
+                )?;
+                for_each_checkpoint_record(
+                    &checkpoint.parts,
+                    plan.etl.opts.read_buffer_bytes,
+                    |min, _line| {
+                        if let Some(ts) = min.created_utc {
+                            let ym = ym_from_epoch(ts);
+                            *total.lock().unwrap().entry(ym).or_insert(0) += 1;
+                        }
+                        Ok(())
+                    },
+                )?;
+            } else {
+                scan_records(
+                    &plan.etl,
+                    &plan.query,
+                    /*show_progress=*/ false,
+                    plan.limit,
+                    |min, _kind, _line| {
+                        if let Some(ts) = min.created_utc {
+                            let ym = ym_from_epoch(ts);
+                            *total.lock().unwrap().entry(ym).or_insert(0) += 1;
+                        }
+                        Ok(())
+                    },
+                )?;
+            }
             Ok(total.into_inner().unwrap())
         })
     }
@@ -795,22 +856,45 @@ impl ScanPlan {
             let scratch_root = kv.scratch_root().to_path_buf();
 
             let result = (|| -> Result<()> {
-                scan_records(
-                    &plan.etl,
-                    &plan.query,
-                    /*show_progress=*/ false,
-                    plan.limit,
-                    |min, _kind, _line| {
-                        if let Some(a) = min.author.as_deref() {
-                            let a = a.trim();
-                            if a.is_empty() {
-                                return Ok(());
+                if plan.etl.opts.resume {
+                    let checkpoint = materialize_scan_checkpoint(
+                        &plan.etl,
+                        &plan.query,
+                        /*show_progress=*/ false,
+                        plan.limit,
+                    )?;
+                    for_each_checkpoint_record(
+                        &checkpoint.parts,
+                        plan.etl.opts.read_buffer_bytes,
+                        |min, _line| {
+                            if let Some(a) = min.author.as_deref() {
+                                let a = a.trim();
+                                if a.is_empty() {
+                                    return Ok(());
+                                }
+                                kv.write_kv(a, 1)?;
                             }
-                            kv.write_kv(a, 1)?;
-                        }
-                        Ok(())
-                    },
-                )?;
+                            Ok(())
+                        },
+                    )?;
+                } else {
+                    scan_records(
+                        &plan.etl,
+                        &plan.query,
+                        /*show_progress=*/ false,
+                        plan.limit,
+                        |min, _kind, _line| {
+                            if let Some(a) = min.author.as_deref() {
+                                let a = a.trim();
+                                if a.is_empty() {
+                                    return Ok(());
+                                }
+                                kv.write_kv(a, 1)?;
+                            }
+                            Ok(())
+                        },
+                    )?;
+                }
 
                 let (shards, _scratch_root) = kv.reduce_sum_with_scratch("author_counts")?;
                 concat_tsvs(&shards, out_path, plan.etl.opts.write_buffer_bytes)?;
@@ -831,22 +915,45 @@ impl ScanPlan {
             let scratch_root = kv.scratch_root().to_path_buf();
 
             let result = (|| -> Result<()> {
-                scan_records(
-                    &plan.etl,
-                    &plan.query,
-                    /*show_progress=*/ false,
-                    plan.limit,
-                    |min, _kind, _line| {
-                        if let (Some(a), Some(ts)) = (min.author.as_deref(), min.created_utc) {
-                            let a = a.trim();
-                            if a.is_empty() {
-                                return Ok(());
+                if plan.etl.opts.resume {
+                    let checkpoint = materialize_scan_checkpoint(
+                        &plan.etl,
+                        &plan.query,
+                        /*show_progress=*/ false,
+                        plan.limit,
+                    )?;
+                    for_each_checkpoint_record(
+                        &checkpoint.parts,
+                        plan.etl.opts.read_buffer_bytes,
+                        |min, _line| {
+                            if let (Some(a), Some(ts)) = (min.author.as_deref(), min.created_utc) {
+                                let a = a.trim();
+                                if a.is_empty() {
+                                    return Ok(());
+                                }
+                                kv.write_kv(a, ts)?;
                             }
-                            kv.write_kv(a, ts)?;
-                        }
-                        Ok(())
-                    },
-                )?;
+                            Ok(())
+                        },
+                    )?;
+                } else {
+                    scan_records(
+                        &plan.etl,
+                        &plan.query,
+                        /*show_progress=*/ false,
+                        plan.limit,
+                        |min, _kind, _line| {
+                            if let (Some(a), Some(ts)) = (min.author.as_deref(), min.created_utc) {
+                                let a = a.trim();
+                                if a.is_empty() {
+                                    return Ok(());
+                                }
+                                kv.write_kv(a, ts)?;
+                            }
+                            Ok(())
+                        },
+                    )?;
+                }
 
                 let (shards, _scratch_root) = kv.reduce_min_with_scratch("first_seen")?;
                 concat_tsvs(&shards, out_path, plan.etl.opts.write_buffer_bytes)?;
@@ -896,6 +1003,7 @@ impl ScanPlan {
                 &plan.query,
                 partitioned_resume_operation(format),
                 plan.limit,
+                &files,
             )?;
             let (initial_months, completed_keys) = if resume {
                 load_and_validate_partitioned_manifest(out_base_dir, &resume_fingerprint, format)?
@@ -1066,6 +1174,11 @@ struct MonthResult {
     lines: u64,
 }
 
+struct ScanCheckpoint {
+    parts: Vec<PathBuf>,
+    matched_records: u64,
+}
+
 fn plan_pipeline_files(etl: &RedditETL) -> Result<Vec<FileJob>> {
     if let Some(err) = etl.opts.build_error.clone() {
         return Err(err.into());
@@ -1163,6 +1276,49 @@ fn stable_hash_component(bytes: &[u8]) -> String {
     stable_fnv1a_hex(bytes).replace(':', "_")
 }
 
+fn system_time_parts(t: SystemTime) -> (i64, u32) {
+    match t.duration_since(UNIX_EPOCH) {
+        Ok(d) => (
+            i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
+            d.subsec_nanos(),
+        ),
+        Err(e) => {
+            let d = e.duration();
+            (
+                -i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
+                d.subsec_nanos(),
+            )
+        }
+    }
+}
+
+fn corpus_file_fingerprints(files: &[FileJob]) -> Result<Vec<Value>> {
+    let mut out = Vec::with_capacity(files.len());
+    for job in files {
+        let metadata = fs::metadata(&job.path)
+            .with_context(|| format!("stat corpus input {}", job.path.display()))?;
+        let modified = metadata.modified().ok().map(system_time_parts);
+        let (modified_unix_secs, modified_nanos) = match modified {
+            Some((secs, nanos)) => (Some(secs), Some(nanos)),
+            None => (None, None),
+        };
+        let prefix = match job.kind {
+            FileKind::Comment => "RC",
+            FileKind::Submission => "RS",
+        };
+        out.push(serde_json::json!({
+            "key": crate::progress_manifest::month_key(prefix, job.ym),
+            "kind": format!("{:?}", job.kind),
+            "month": job.ym.to_string(),
+            "path": path_for_fingerprint(&job.path)?,
+            "len": metadata.len(),
+            "modified_unix_secs": modified_unix_secs,
+            "modified_nanos": modified_nanos,
+        }));
+    }
+    Ok(out)
+}
+
 fn extract_scratch_dir(
     work_dir: &Path,
     tmp_dir_name: &str,
@@ -1190,14 +1346,16 @@ fn extract_scratch_dir(
     Ok(work_dir.join(name))
 }
 
-/// Fingerprint every query/config knob that can change the bytes written by a
-/// resumable extract/spool operation. If it changes between `--resume` runs,
-/// stale month parts are discarded instead of being stitched into the new run.
+/// Fingerprint every query/config knob and selected corpus file identity that
+/// can change the records written by a resumable operation. If it changes
+/// between `--resume` runs, stale month parts are discarded instead of being
+/// stitched or reduced into the new run.
 fn build_resume_fingerprint(
     etl: &RedditETL,
     query: &QuerySpec,
     operation: &str,
     limit: Option<u64>,
+    files: &[FileJob],
 ) -> Result<String> {
     let zst_level = (operation == "partitioned-zst").then_some(etl.opts.zst_level);
     let input = serde_json::json!({
@@ -1207,6 +1365,7 @@ fn build_resume_fingerprint(
             "comments_dir": path_for_fingerprint(&etl.opts.comments_dir)?,
             "submissions_dir": path_for_fingerprint(&etl.opts.submissions_dir)?,
         },
+        "corpus_files": corpus_file_fingerprints(files)?,
         "sources": format!("{:?}", etl.opts.sources),
         "start": opt_ym_string(etl.opts.start),
         "end": opt_ym_string(etl.opts.end),
@@ -1619,6 +1778,224 @@ fn validate_jsonl_part(path: &Path) -> Result<MonthEntry> {
     })
 }
 
+fn checkpoint_part_path(dir: &Path, key: &str) -> PathBuf {
+    dir.join(format!("part_{}.jsonl", key))
+}
+
+fn scan_checkpoint_dir(work_dir: &Path, fingerprint: &str) -> PathBuf {
+    work_dir
+        .join("scan_checkpoints")
+        .join(stable_hash_component(fingerprint.as_bytes()))
+}
+
+fn load_and_validate_scan_checkpoint_manifest(
+    dir: &Path,
+    fingerprint: &str,
+) -> Result<(HashMap<String, MonthEntry>, HashSet<String>)> {
+    let manifest = crate::progress_manifest::load(dir);
+    if manifest.fingerprint.as_deref() != Some(fingerprint) && !manifest.months.is_empty() {
+        tracing::warn!(
+            path=%crate::progress_manifest::manifest_path(dir).display(),
+            stored=?manifest.fingerprint,
+            current=%fingerprint,
+            "scan checkpoint fingerprint does not match current query/config/corpus; discarding cached month parts"
+        );
+        clear_spool_resume_parts(dir)?;
+        return Ok((HashMap::new(), HashSet::new()));
+    }
+
+    let mut keep = HashMap::<String, MonthEntry>::new();
+    for (key, expected) in manifest.months {
+        let part_path = checkpoint_part_path(dir, &key);
+        match validate_jsonl_part(&part_path) {
+            Ok(actual) if actual.size == expected.size && actual.lines == expected.lines => {
+                keep.insert(key, actual);
+            }
+            Ok(actual) => {
+                tracing::info!(
+                    key=%key,
+                    path=%part_path.display(),
+                    expected_size=expected.size,
+                    actual_size=actual.size,
+                    expected_lines=expected.lines,
+                    actual_lines=actual.lines,
+                    "dropping stale scan checkpoint entry; month will be rebuilt"
+                );
+                let _ = remove_with_backoff(&part_path, 8, 50);
+            }
+            Err(e) => {
+                tracing::info!(
+                    key=%key,
+                    path=%part_path.display(),
+                    error=%e,
+                    "dropping invalid scan checkpoint entry; month will be rebuilt"
+                );
+                let _ = remove_with_backoff(&part_path, 8, 50);
+            }
+        }
+    }
+    let completed_keys = keep.keys().cloned().collect();
+    Ok((keep, completed_keys))
+}
+
+fn materialize_scan_checkpoint(
+    etl: &RedditETL,
+    query: &QuerySpec,
+    show_progress: bool,
+    limit: Option<u64>,
+) -> Result<ScanCheckpoint> {
+    let files = plan_pipeline_files(etl)?;
+    warn_if_unfiltered_undated_query(etl, query, &files);
+
+    let work_dir = etl.ensure_work_dir()?;
+    let fingerprint =
+        build_resume_fingerprint(etl, query, ANALYTICS_CHECKPOINT_OPERATION, limit, &files)?;
+    let checkpoint_dir = scan_checkpoint_dir(&work_dir, &fingerprint);
+    create_dir_all_with_backoff(&checkpoint_dir, 16, 50)
+        .with_context(|| format!("creating scan checkpoint dir {}", checkpoint_dir.display()))?;
+    let staging_dir = ensure_staging_dir(&checkpoint_dir)?;
+    sweep_stale_inprogress(&checkpoint_dir, true)?;
+
+    let (initial_months, completed_keys) =
+        load_and_validate_scan_checkpoint_manifest(&checkpoint_dir, &fingerprint)?;
+    crate::progress_manifest::save(&checkpoint_dir, &initial_months, Some(&fingerprint))?;
+    let resumed_lines = committed_line_count(&initial_months);
+    let accumulator =
+        ManifestAccumulator::new(&checkpoint_dir, initial_months, Some(fingerprint.clone()));
+
+    let total_bytes = total_compressed_size(&files);
+    let pb = if show_progress && etl.opts.progress {
+        Some(make_progress_bar_labeled(
+            total_bytes,
+            etl.opts.progress_label.as_deref(),
+        ))
+    } else {
+        None
+    };
+
+    let parts = Mutex::new(Vec::<PathBuf>::new());
+    {
+        let mut guard = parts.lock().unwrap();
+        for key in &completed_keys {
+            guard.push(checkpoint_part_path(&checkpoint_dir, key));
+        }
+    }
+
+    let total_written = AtomicU64::new(0);
+    let targets = resolve_target_subs_from(&etl.opts.subreddit, &query.subreddits);
+    let targets_ref = targets.as_ref();
+    let bounds = bounds_tuple(etl.opts.start, etl.opts.end);
+    let read_buf = etl.opts.read_buffer_bytes;
+    let write_buf = etl.opts.write_buffer_bytes;
+    let record_limit = record_limit_from_with_claimed(limit, resumed_lines);
+    let no_whitelist: Option<Vec<String>> = None;
+
+    crate::concurrency::for_each_file_limited(
+        &files,
+        etl.opts.file_concurrency,
+        |job| -> Result<()> {
+            let ctx = MonthJobCtx {
+                out_dir: &checkpoint_dir,
+                staging_dir: &staging_dir,
+                targets: targets_ref,
+                query,
+                whitelist: &no_whitelist,
+                pb: pb.as_ref(),
+                bounds,
+                read_buf,
+                write_buf,
+                human_ts: false,
+                whitelist_tracker: None,
+                record_limit: record_limit.as_deref(),
+                resume: true,
+                completed_keys: &completed_keys,
+                allow_partial: etl.opts.allow_partial,
+                partial_reporter: Some(&etl.opts.partial_read_reporter),
+            };
+            let outcome = process_month(job, &ctx)?;
+            if let Some(month) = outcome {
+                total_written.fetch_add(month.lines, Ordering::Relaxed);
+                parts.lock().unwrap().push(month.out_path.clone());
+                commit_entry_to_manifest(&accumulator, month).context(
+                    "failed to durably update scan checkpoint progress manifest after publishing month part",
+                )?;
+            }
+            Ok(())
+        },
+    )?;
+
+    if let Some(pb) = pb {
+        pb.finish_with_message("done");
+    }
+    ensure_resume_manifest_durable(Some(&accumulator), "scan checkpoint")?;
+
+    let mut parts = parts.into_inner().unwrap();
+    parts.sort();
+    parts.dedup();
+    Ok(ScanCheckpoint {
+        parts,
+        matched_records: resumed_lines + total_written.load(Ordering::Relaxed),
+    })
+}
+
+fn for_each_checkpoint_record<F>(parts: &[PathBuf], read_buf: usize, on_record: F) -> Result<()>
+where
+    F: Sync + Send + Fn(&MinimalRecord, &str) -> Result<()>,
+{
+    parts.par_iter().try_for_each(|path| -> Result<()> {
+        let file = open_with_backoff(path, 16, 50)
+            .with_context(|| format!("opening scan checkpoint part {}", path.display()))?;
+        let mut reader = BufReader::with_capacity(read_buf.max(8 * 1024), file);
+        let mut buf = String::new();
+        let mut line_number = 0_u64;
+        loop {
+            let n = crate::ndjson::read_line_capped(
+                &mut reader,
+                &mut buf,
+                crate::ndjson::DEFAULT_MAX_LINE_BYTES,
+                path,
+            )
+            .with_context(|| {
+                format!(
+                    "reading scan checkpoint part {} near line {}",
+                    path.display(),
+                    line_number + 1
+                )
+            })?;
+            if n == 0 {
+                break;
+            }
+            if buf.is_empty() {
+                continue;
+            }
+            line_number += 1;
+            let min =
+                parse_minimal(&buf).map_err(|e| malformed_json_error(path, line_number, e))?;
+            on_record(&min, &buf)?;
+        }
+        Ok(())
+    })
+}
+
+fn copy_checkpoint_parts_to_jsonl(
+    parts: &[PathBuf],
+    out_path: &Path,
+    write_buf: usize,
+) -> Result<()> {
+    let file = create_with_backoff(out_path, 16, 50)
+        .with_context(|| format!("creating matched checkpoint copy {}", out_path.display()))?;
+    let mut writer = BufWriter::with_capacity(write_buf.max(8 * 1024), file);
+    for part in parts {
+        let file = open_with_backoff(part, 16, 50)
+            .with_context(|| format!("opening scan checkpoint part {}", part.display()))?;
+        let mut reader = BufReader::new(file);
+        std::io::copy(&mut reader, &mut writer)
+            .with_context(|| format!("copying scan checkpoint part {}", part.display()))?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
 fn normalize_tabular_fields<I, S>(fields: I) -> Result<Vec<String>>
 where
     I: IntoIterator<Item = S>,
@@ -1990,7 +2367,9 @@ fn extract_common(
         let work_dir = etl.ensure_work_dir()?;
         let resume = etl.opts.resume;
         let resume_fingerprint = if resume {
-            Some(build_resume_fingerprint(etl, query, "extract", limit)?)
+            Some(build_resume_fingerprint(
+                etl, query, "extract", limit, &files,
+            )?)
         } else {
             None
         };
@@ -2277,9 +2656,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{build_resume_fingerprint, extract_scratch_dir, ExportFormat};
+    use super::*;
     use crate::progress_manifest::testing::fail_saves_after_attempts_for_tests;
-    use crate::{RedditETL, ScanPlan, Sources, YearMonth};
+    use crate::{KeyExtractor, RedditETL, ScanPlan, Sources, YearMonth};
     use serde_json::{json, Value};
     use std::fs::{self, File};
     use std::io::Write;
@@ -2324,6 +2703,184 @@ mod tests {
 
     fn manifest_json(out_dir: &Path) -> Value {
         serde_json::from_slice(&fs::read(out_dir.join("_progress.json")).unwrap()).unwrap()
+    }
+
+    fn comment_line(id: &str, author: &str, created_utc: i64) -> String {
+        json!({
+            "id": id,
+            "author": author,
+            "subreddit": "programming",
+            "created_utc": created_utc,
+            "score": 1,
+            "body": "hello",
+            "parent_id": "t3_s1",
+            "link_id": "t3_s1",
+        })
+        .to_string()
+    }
+
+    fn make_two_month_comment_corpus() -> PathBuf {
+        let base = tempfile::tempdir().unwrap().keep();
+        write_zst_lines(
+            &base.join("comments").join("RC_2006-01.zst"),
+            &[comment_line("jan_real", "jan_real", 1_136_073_600)],
+        );
+        write_zst_lines(
+            &base.join("comments").join("RC_2006-02.zst"),
+            &[comment_line("feb_real", "feb_real", 1_138_752_000)],
+        );
+        fs::create_dir_all(base.join("submissions")).unwrap();
+        base
+    }
+
+    fn two_month_scan(base: &Path, work_dir: &Path) -> ScanPlan {
+        RedditETL::new()
+            .base_dir(base)
+            .work_dir(work_dir)
+            .sources(Sources::Comments)
+            .date_range(Some(YearMonth::new(2006, 1)), Some(YearMonth::new(2006, 2)))
+            .progress(false)
+            .resume(true)
+            .scan()
+            .subreddit("programming")
+    }
+
+    fn seed_scan_checkpoint_part(
+        plan: &ScanPlan,
+        key: &str,
+        contents: &str,
+        lines: u64,
+    ) -> PathBuf {
+        let files = plan_pipeline_files(&plan.etl).unwrap();
+        let fingerprint = build_resume_fingerprint(
+            &plan.etl,
+            &plan.query,
+            ANALYTICS_CHECKPOINT_OPERATION,
+            plan.limit,
+            &files,
+        )
+        .unwrap();
+        let work_dir = plan.etl.ensure_work_dir().unwrap();
+        let checkpoint_dir = scan_checkpoint_dir(&work_dir, &fingerprint);
+        fs::create_dir_all(&checkpoint_dir).unwrap();
+        let part = checkpoint_part_path(&checkpoint_dir, key);
+        fs::write(&part, contents).unwrap();
+        let mut months = std::collections::HashMap::new();
+        months.insert(
+            key.to_string(),
+            MonthEntry {
+                size: fs::metadata(&part).unwrap().len(),
+                lines,
+                sha256: None,
+            },
+        );
+        crate::progress_manifest::save(&checkpoint_dir, &months, Some(&fingerprint)).unwrap();
+        checkpoint_dir
+    }
+
+    fn read_tsv_i64(path: &Path) -> std::collections::HashMap<String, i64> {
+        fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .filter_map(|line| {
+                let (key, value) = line.split_once('\t')?;
+                Some((key.to_string(), value.parse::<i64>().unwrap()))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn dedupe_resume_reuses_checkpointed_month_and_scans_missing_month() {
+        let base = make_two_month_comment_corpus();
+        let work = base.join("work_dedupe_resume");
+        let checkpoint_line = format!(
+            "{}\n",
+            comment_line("checkpoint_jan", "checkpoint_only", 1_136_073_600)
+        );
+        let plan = two_month_scan(&base, &work).build().unwrap();
+        seed_scan_checkpoint_part(&plan, "RC_2006-01", &checkpoint_line, 1);
+
+        let out = base.join("dedupe_resume.txt");
+        let stats = two_month_scan(&base, &work)
+            .dedupe_keys_to_lines_with_stats(&KeyExtractor::author_lowercase_fast(), &out)
+            .unwrap();
+
+        let got: Vec<String> = fs::read_to_string(&out)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(got, vec!["checkpoint_only", "feb_real"]);
+        assert_eq!(stats.matched_records, 2);
+    }
+
+    #[test]
+    fn count_author_resume_reuses_checkpointed_month_and_scans_missing_month() {
+        let base = make_two_month_comment_corpus();
+        let work = base.join("work_count_resume");
+        let checkpoint_contents = format!(
+            "{}\n{}\n",
+            comment_line("checkpoint_a", "checkpoint_only", 1_136_073_600),
+            comment_line("checkpoint_b", "checkpoint_only", 1_136_073_601)
+        );
+        let plan = two_month_scan(&base, &work).build().unwrap();
+        seed_scan_checkpoint_part(&plan, "RC_2006-01", &checkpoint_contents, 2);
+
+        let out = base.join("count_resume.tsv");
+        two_month_scan(&base, &work)
+            .author_counts_to_tsv(&out)
+            .unwrap();
+
+        let got = read_tsv_i64(&out);
+        assert_eq!(got.get("checkpoint_only").copied(), Some(2));
+        assert_eq!(got.get("feb_real").copied(), Some(1));
+        assert!(!got.contains_key("jan_real"));
+    }
+
+    #[test]
+    fn first_seen_resume_reuses_checkpointed_month_and_scans_missing_month() {
+        let base = make_two_month_comment_corpus();
+        let work = base.join("work_first_seen_resume");
+        let checkpoint_contents = format!(
+            "{}\n{}\n",
+            comment_line("checkpoint_late", "checkpoint_only", 1_136_073_650),
+            comment_line("checkpoint_early", "checkpoint_only", 1_136_073_610)
+        );
+        let plan = two_month_scan(&base, &work).build().unwrap();
+        seed_scan_checkpoint_part(&plan, "RC_2006-01", &checkpoint_contents, 2);
+
+        let out = base.join("first_seen_resume.tsv");
+        two_month_scan(&base, &work)
+            .build_first_seen_index_to_tsv(&out)
+            .unwrap();
+
+        let got = read_tsv_i64(&out);
+        assert_eq!(got.get("checkpoint_only").copied(), Some(1_136_073_610));
+        assert_eq!(got.get("feb_real").copied(), Some(1_138_752_000));
+        assert!(!got.contains_key("jan_real"));
+    }
+
+    #[test]
+    fn resume_rebuilds_invalid_checkpoint_part() {
+        let base = make_two_month_comment_corpus();
+        let work = base.join("work_invalid_checkpoint");
+        let plan = two_month_scan(&base, &work).build().unwrap();
+        let checkpoint_dir = seed_scan_checkpoint_part(&plan, "RC_2006-01", "{not json\n", 1);
+
+        let out = base.join("count_rebuilt.tsv");
+        two_month_scan(&base, &work)
+            .author_counts_to_tsv(&out)
+            .unwrap();
+
+        let got = read_tsv_i64(&out);
+        assert_eq!(got.get("jan_real").copied(), Some(1));
+        assert_eq!(got.get("feb_real").copied(), Some(1));
+        assert!(!got.contains_key("checkpoint_only"));
+        let manifest = manifest_json(&checkpoint_dir);
+        assert!(manifest["months"]
+            .as_object()
+            .unwrap()
+            .contains_key("RC_2006-01"));
     }
 
     #[test]
@@ -2422,7 +2979,10 @@ mod tests {
             .subreddit("programming")
             .build()
             .unwrap();
-        let fingerprint = build_resume_fingerprint(&plan.etl, &plan.query, "extract").unwrap();
+        let files = plan_pipeline_files(&plan.etl).unwrap();
+        let fingerprint =
+            build_resume_fingerprint(&plan.etl, &plan.query, "extract", plan.limit, &files)
+                .unwrap();
         let tmp_dir = extract_scratch_dir(
             &work_dir,
             "extract_jsonl_q_tmp",

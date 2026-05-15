@@ -176,7 +176,7 @@ fn jsonl_resume_fingerprint_change_rebuilds_tmp_parts() {
 }
 
 #[test]
-fn jsonl_resume_reuses_valid_month_parts_without_reading_sources() {
+fn jsonl_resume_rebuilds_when_corpus_file_identity_changes() {
     let months = [YearMonth::new(2006, 1), YearMonth::new(2006, 2)];
     let base = make_corpus_multi_month(&months);
     let work_dir = base.join("work");
@@ -206,16 +206,17 @@ fn jsonl_resume_reuses_valid_month_parts_without_reading_sources() {
         );
     }
 
-    // If resume fails to skip the completed parts, these invalid sources will
-    // make the second extraction fail during zstd decode. A successful second
-    // run therefore proves it stitched the validated checkpoint parts instead.
+    // Resume fingerprints now include selected corpus file identity. If the
+    // corpus changes after a checkpoint is written, RETL must not stitch stale
+    // parts; it should rebuild and surface the decode error from the changed
+    // sources instead.
     for subdir in ["comments", "submissions"] {
         for entry in fs::read_dir(base.join(subdir)).unwrap() {
             fs::write(entry.unwrap().path(), b"not a zstd frame").unwrap();
         }
     }
 
-    RedditETL::new()
+    let err = RedditETL::new()
         .base_dir(&base)
         .work_dir(&work_dir)
         .sources(Sources::Both)
@@ -225,8 +226,10 @@ fn jsonl_resume_reuses_valid_month_parts_without_reading_sources() {
         .scan()
         .subreddit("programming")
         .extract_to_jsonl(&out1)
-        .unwrap();
+        .expect_err("changed corpus identity should force a rebuild and fail on corrupt sources");
 
+    let msg = format!("{err:#}");
+    assert!(msg.contains("zstd decode error"), "unexpected error: {msg}");
     assert_eq!(fs::read_to_string(&out1).unwrap(), first);
 }
 
@@ -250,11 +253,11 @@ fn contains_url_false_reuses_default_resume_fingerprint() {
     let first = fs::read_to_string(&out).unwrap();
     assert!(first.contains("default_url_filter"));
 
-    // If `.contains_url(false)` changed the resume fingerprint, this second
-    // run would try to decode the corrupted source instead of reusing the
-    // completed part from the default/no-URL-filter query.
-    fs::write(base.join("comments").join("RC_2006-01.zst"), b"not zstd").unwrap();
+    let first_tmp_dir = find_extract_resume_dir(&work_dir);
 
+    // `.contains_url(false)` should normalize to the same query fingerprint as
+    // omitting the URL filter, so the second run should reuse the same resume
+    // directory rather than creating a fresh checkpoint namespace.
     RedditETL::new()
         .base_dir(&base)
         .work_dir(&work_dir)
@@ -267,6 +270,7 @@ fn contains_url_false_reuses_default_resume_fingerprint() {
         .extract_to_jsonl(&out)
         .unwrap();
 
+    assert_eq!(find_extract_resume_dir(&work_dir), first_tmp_dir);
     assert_eq!(fs::read_to_string(&out).unwrap(), first);
 }
 
