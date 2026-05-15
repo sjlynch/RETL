@@ -52,6 +52,11 @@ fn cli_rejects_blank_subreddit_before_scanning() {
 }
 
 #[test]
+fn cli_rejects_blank_id_before_scanning() {
+    assert_blank_filter_fails_before_scan(&["--id", "t1_"], "ids_in");
+}
+
+#[test]
 fn cli_rejects_blank_author_before_scanning() {
     assert_blank_filter_fails_before_scan(&["--author", ""], "authors_in");
 }

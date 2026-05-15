@@ -1,9 +1,9 @@
 //! Filtering helpers and query logic that work on MinimalRecord fast-path fields,
-//! plus optional full-parse checks and record-level date bounds.
+//! plus optional full-parse checks and record-level date/timestamp bounds.
 
 use crate::date::YearMonth;
 use crate::paths::FileKind;
-use crate::query::QuerySpec;
+use crate::query::{QuerySpec, RecordIdKind};
 use crate::zstd_jsonl::MinimalRecord;
 use serde_json::Value;
 use time::{Date, OffsetDateTime};
@@ -185,7 +185,16 @@ pub fn matches_minimal(
     min: &MinimalRecord,
     targets_opt: Option<&Vec<String>>,
     q: &QuerySpec,
+    kind: FileKind,
 ) -> bool {
+    let record_kind = match kind {
+        FileKind::Comment => RecordIdKind::Comment,
+        FileKind::Submission => RecordIdKind::Submission,
+    };
+    if !q.id_filter_matches(record_kind, min.id.as_deref()) {
+        return false;
+    }
+
     if let Some(targets) = targets_opt {
         match min.subreddit.as_deref() {
             Some(s) if list_contains_ci(targets, s) => {}
@@ -231,6 +240,14 @@ pub fn matches_minimal(
     if let Some(max_s) = q.max_score {
         match min.score {
             Some(sc) if sc <= max_s => {}
+            _ => return false,
+        }
+    }
+
+    if q.timestamp_bounds.is_active() {
+        match min.created_utc {
+            Some(ts) if q.timestamp_bounds.contains(ts) => {}
+            // Exact timestamp filters reject missing/non-integer created_utc.
             _ => return false,
         }
     }

@@ -1,10 +1,16 @@
 //! Query specification (DSL) and normalization helpers used by the filters.
 
+use crate::date::YearMonth;
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
+use anyhow::Context;
 use regex::Regex;
 use serde_json::Value;
+use std::borrow::Cow;
 use std::fmt;
+use std::io::BufReader;
+use std::path::Path;
 use std::sync::{Arc, OnceLock};
+use time::OffsetDateTime;
 
 /// Structured error returned when a scan/query builder contains contradictory
 /// or invalid filter settings.
@@ -28,6 +34,101 @@ impl fmt::Display for QueryBuildError {
 }
 
 impl std::error::Error for QueryBuildError {}
+
+/// Source kind encoded by Reddit fullname prefixes accepted by record-ID
+/// filters. `t1_` selects comments and `t3_` selects submissions; unprefixed
+/// IDs remain source-agnostic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecordIdKind {
+    Comment,
+    Submission,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NormalizedRecordId {
+    pub(crate) bare: String,
+    pub(crate) kind: Option<RecordIdKind>,
+}
+
+fn split_record_kind_prefix(s: &str) -> (Option<RecordIdKind>, &str) {
+    let bytes = s.as_bytes();
+    if bytes.len() >= 3 && bytes[2] == b'_' && bytes[0].eq_ignore_ascii_case(&b't') {
+        match bytes[1] {
+            b'1' => return (Some(RecordIdKind::Comment), &s[3..]),
+            b'3' => return (Some(RecordIdKind::Submission), &s[3..]),
+            _ => {}
+        }
+    }
+    (None, s)
+}
+
+fn lowercase_ascii_if_needed(s: &str) -> Cow<'_, str> {
+    if s.bytes().any(|b| b.is_ascii_uppercase()) {
+        Cow::Owned(s.to_lowercase())
+    } else {
+        Cow::Borrowed(s)
+    }
+}
+
+/// Normalize a user-provided Reddit record ID selector.
+///
+/// Inputs are trimmed, `t1_` / `t3_` fullname prefixes are stripped and kept as
+/// kind constraints, and bare IDs are lowercased for Reddit's base36 IDs. Other
+/// prefixes (for example `t5_`) are treated as part of the bare ID so callers do
+/// not accidentally strip unsupported fullname kinds.
+pub(crate) fn normalize_record_id_selector(raw: &str) -> NormalizedRecordId {
+    let trimmed = raw.trim();
+    let (kind, bare) = split_record_kind_prefix(trimmed);
+    let bare = bare.trim();
+    NormalizedRecordId {
+        bare: lowercase_ascii_if_needed(bare).into_owned(),
+        kind,
+    }
+}
+
+fn normalize_record_id_value(raw: &str) -> Cow<'_, str> {
+    let trimmed = raw.trim();
+    let (_kind, bare) = split_record_kind_prefix(trimmed);
+    lowercase_ascii_if_needed(bare.trim())
+}
+
+/// Read a newline-delimited record-ID file.
+///
+/// Each non-empty, non-comment line is one ID selector. Leading/trailing
+/// whitespace is trimmed; blank lines and lines whose first non-whitespace
+/// character is `#` are ignored. Inline comments are not stripped, so put one
+/// bare ID (or `t1_` / `t3_` fullname) per line.
+pub fn read_record_ids_file(path: impl AsRef<Path>) -> anyhow::Result<Vec<String>> {
+    let path = path.as_ref();
+    let file = crate::util::open_with_backoff(path, 16, 50)
+        .with_context(|| format!("open IDs file {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    let mut ids = Vec::new();
+    let mut line_number = 0_u64;
+
+    loop {
+        let next_line = line_number + 1;
+        let read = crate::ndjson::read_line_capped(
+            &mut reader,
+            &mut line,
+            crate::ndjson::DEFAULT_MAX_LINE_BYTES,
+            path,
+        )
+        .with_context(|| format!("read IDs file {} line {}", path.display(), next_line))?;
+        if read == 0 {
+            break;
+        }
+        line_number = next_line;
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        ids.push(trimmed.to_string());
+    }
+
+    Ok(ids)
+}
 
 /// Numeric operator used by [`JsonPointerPredicate::number`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -291,12 +392,109 @@ fn validate_json_pointer_syntax(pointer: &str) -> Result<(), QueryBuildError> {
     Ok(())
 }
 
+/// Inclusive/exclusive fast-path bounds for a record's top-level
+/// `created_utc` Unix timestamp.
+///
+/// `created_utc_gte` is inclusive (`created_utc >= value`) and
+/// `created_utc_lt` is exclusive (`created_utc < value`). When either side is
+/// present, records whose `created_utc` is missing or not an integer timestamp
+/// are rejected on the [`MinimalRecord`](crate::MinimalRecord) fast path.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TimestampBounds {
+    pub created_utc_gte: Option<i64>,
+    pub created_utc_lt: Option<i64>,
+}
+
+impl TimestampBounds {
+    pub const fn new(created_utc_gte: Option<i64>, created_utc_lt: Option<i64>) -> Self {
+        Self {
+            created_utc_gte,
+            created_utc_lt,
+        }
+    }
+
+    #[inline]
+    pub fn is_active(self) -> bool {
+        self.created_utc_gte.is_some() || self.created_utc_lt.is_some()
+    }
+
+    #[inline]
+    pub fn contains(self, created_utc: i64) -> bool {
+        if let Some(lo) = self.created_utc_gte {
+            if created_utc < lo {
+                return false;
+            }
+        }
+        if let Some(hi) = self.created_utc_lt {
+            if created_utc >= hi {
+                return false;
+            }
+        }
+        true
+    }
+
+    pub(crate) fn validate(self) -> Result<(), QueryBuildError> {
+        if let (Some(lo), Some(hi)) = (self.created_utc_gte, self.created_utc_lt) {
+            if lo >= hi {
+                return Err(QueryBuildError::new(format!(
+                    "created_utc_gte ({lo}) must be less than created_utc_lt ({hi})"
+                )));
+            }
+        }
+
+        for (field, value) in [
+            ("created_utc_gte", self.created_utc_gte),
+            ("created_utc_lt", self.created_utc_lt),
+        ] {
+            if let Some(ts) = value {
+                unix_timestamp_to_year_month(ts).ok_or_else(|| {
+                    QueryBuildError::new(format!(
+                        "{field} ({ts}) is outside RETL's supported timestamp range"
+                    ))
+                })?;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn derived_start_month(self) -> Option<YearMonth> {
+        self.created_utc_gte.and_then(unix_timestamp_to_year_month)
+    }
+
+    pub(crate) fn derived_end_month(self) -> Option<YearMonth> {
+        self.created_utc_lt
+            .and_then(|ts| ts.checked_sub(1))
+            .and_then(unix_timestamp_to_year_month)
+    }
+}
+
+fn unix_timestamp_to_year_month(ts: i64) -> Option<YearMonth> {
+    let dt = OffsetDateTime::from_unix_timestamp(ts).ok()?;
+    let year = dt.year();
+    if !(0..=u16::MAX as i32).contains(&year) {
+        return None;
+    }
+    Some(YearMonth {
+        year: year as u16,
+        month: dt.month() as u8,
+    })
+}
+
 /// High-level query/filter spec for advanced scans.
 /// All string lists are matched case-insensitively (Unicode-aware for keywords;
 /// subreddit/author/domain matching normalizes non-ASCII values via lowercase).
 #[derive(Debug, Default)]
 pub struct QuerySpec {
     pub subreddits: Option<Vec<String>>,
+    /// Bare Reddit record IDs (without `t1_` / `t3_`) that match either source.
+    /// Prefer [`ScanPlan::ids`](crate::ScanPlan::ids) /
+    /// [`ScanPlan::ids_in`](crate::ScanPlan::ids_in) when accepting user input;
+    /// those builders also understand prefixed fullnames and preserve the
+    /// source constraint.
+    pub ids_in: Option<Vec<String>>,
+    pub(crate) comment_ids_in: Option<Vec<String>>,
+    pub(crate) submission_ids_in: Option<Vec<String>>,
     pub authors_in: Option<Vec<String>>,
     pub authors_out: Option<Vec<String>>,
     pub(crate) authors_out_explicit: bool,
@@ -313,6 +511,9 @@ pub struct QuerySpec {
     pub(crate) author_regex_pattern: Option<String>,
     pub min_score: Option<i64>,
     pub max_score: Option<i64>,
+    /// Exact Unix timestamp bounds for the top-level `created_utc` field.
+    /// Lower bound is inclusive; upper bound is exclusive.
+    pub timestamp_bounds: TimestampBounds,
     /// Keep records where at least one keyword is present in `body`, `selftext`, or `title`.
     pub keywords_any: Option<Vec<String>>, // substring in body/selftext/title (case-insensitive)
     /// Keep records only when every keyword is present across `body`, `selftext`, and `title`.
@@ -357,6 +558,9 @@ impl Clone for QuerySpec {
     fn clone(&self) -> Self {
         Self {
             subreddits: self.subreddits.clone(),
+            ids_in: self.ids_in.clone(),
+            comment_ids_in: self.comment_ids_in.clone(),
+            submission_ids_in: self.submission_ids_in.clone(),
             authors_in: self.authors_in.clone(),
             authors_out: self.authors_out.clone(),
             authors_out_explicit: self.authors_out_explicit,
@@ -365,6 +569,7 @@ impl Clone for QuerySpec {
             author_regex_pattern: self.author_regex_pattern.clone(),
             min_score: self.min_score,
             max_score: self.max_score,
+            timestamp_bounds: self.timestamp_bounds,
             keywords_any: self.keywords_any.clone(),
             keywords_all: self.keywords_all.clone(),
             keywords_exclude: self.keywords_exclude.clone(),
@@ -383,7 +588,9 @@ impl Clone for QuerySpec {
 }
 
 impl QuerySpec {
-    /// Normalize to lowercase, then sort + dedup for binary_search-based filters.
+    /// Normalize to lowercase and sort list filters. Most string lists are
+    /// deduplicated; record-ID filters intentionally keep duplicates so
+    /// [`QuerySpec::validate`] can reject accidental repeated IDs.
     pub fn normalize(mut self) -> Self {
         let lower_sort_dedup = |v: &mut Option<Vec<String>>| {
             if let Some(list) = v.as_mut() {
@@ -396,6 +603,7 @@ impl QuerySpec {
         };
 
         lower_sort_dedup(&mut self.subreddits);
+        normalize_id_filters(&mut self);
         lower_sort_dedup(&mut self.authors_in);
         lower_sort_dedup(&mut self.authors_out);
 
@@ -430,8 +638,13 @@ impl QuerySpec {
                 )));
             }
         }
+        self.timestamp_bounds.validate()?;
 
         validate_string_list_filter("subreddits", &self.subreddits)?;
+        validate_id_list_filter("ids_in", &self.ids_in)?;
+        validate_id_list_filter("ids_in", &self.comment_ids_in)?;
+        validate_id_list_filter("ids_in", &self.submission_ids_in)?;
+        validate_id_filter_overlaps(self)?;
         validate_string_list_filter("authors_in", &self.authors_in)?;
         validate_string_list_filter("authors_out", &self.authors_out)?;
         validate_string_list_filter("domains_in", &self.domains_in)?;
@@ -499,7 +712,8 @@ impl QuerySpec {
     }
 
     /// Only JSON-pointer predicates require full-record parsing; all fixed
-    /// filters are handled on the MinimalRecord fast path.
+    /// filters, including `created_utc` timestamp bounds, are handled on the
+    /// MinimalRecord fast path.
     pub fn requires_full_parse(&self) -> bool {
         !self.json_predicates.is_empty()
     }
@@ -547,6 +761,62 @@ impl QuerySpec {
         keyword_list_all_ascii(&self.keywords_exclude)
     }
 
+    pub(crate) fn has_unqualified_id_selectors(&self) -> bool {
+        self.ids_in.as_ref().is_some_and(|v| !v.is_empty())
+    }
+
+    pub(crate) fn has_comment_id_selectors(&self) -> bool {
+        self.comment_ids_in.as_ref().is_some_and(|v| !v.is_empty())
+    }
+
+    pub(crate) fn has_submission_id_selectors(&self) -> bool {
+        self.submission_ids_in
+            .as_ref()
+            .is_some_and(|v| !v.is_empty())
+    }
+
+    pub(crate) fn has_id_filters(&self) -> bool {
+        self.has_unqualified_id_selectors()
+            || self.has_comment_id_selectors()
+            || self.has_submission_id_selectors()
+    }
+
+    pub(crate) fn id_source_hint(&self) -> Option<RecordIdKind> {
+        if self.has_unqualified_id_selectors() {
+            return None;
+        }
+        match (
+            self.has_comment_id_selectors(),
+            self.has_submission_id_selectors(),
+        ) {
+            (true, false) => Some(RecordIdKind::Comment),
+            (false, true) => Some(RecordIdKind::Submission),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn id_filter_matches(&self, kind: RecordIdKind, raw_id: Option<&str>) -> bool {
+        if !self.has_id_filters() {
+            return true;
+        }
+        let Some(raw_id) = raw_id else {
+            return false;
+        };
+        let bare = normalize_record_id_value(raw_id);
+        if bare.is_empty() {
+            return false;
+        }
+        sorted_id_list_contains(self.ids_in.as_ref(), &bare)
+            || match kind {
+                RecordIdKind::Comment => {
+                    sorted_id_list_contains(self.comment_ids_in.as_ref(), &bare)
+                }
+                RecordIdKind::Submission => {
+                    sorted_id_list_contains(self.submission_ids_in.as_ref(), &bare)
+                }
+            }
+    }
+
     pub(crate) fn json_predicates_fingerprint(&self) -> Vec<Value> {
         self.json_predicates
             .iter()
@@ -556,6 +826,7 @@ impl QuerySpec {
 
     pub(crate) fn has_selective_filters(&self) -> bool {
         self.subreddits.as_ref().is_some_and(|v| !v.is_empty())
+            || self.has_id_filters()
             || self.authors_in.as_ref().is_some_and(|v| !v.is_empty())
             || self.author_regex.is_some()
             || self.author_regex_pattern.is_some()
@@ -563,6 +834,7 @@ impl QuerySpec {
                 && self.authors_out.as_ref().is_some_and(|v| !v.is_empty()))
             || self.min_score.is_some()
             || self.max_score.is_some()
+            || self.timestamp_bounds.is_active()
             || self.keywords_any.as_ref().is_some_and(|v| !v.is_empty())
             || self.keywords_all.as_ref().is_some_and(|v| !v.is_empty())
             || self
@@ -644,6 +916,111 @@ fn validate_text_regex_filter(
     Ok(())
 }
 
+fn sort_id_list(list: &mut Vec<String>) {
+    list.sort();
+}
+
+fn normalize_id_filters(query: &mut QuerySpec) {
+    let had_any_id_field = query.ids_in.is_some()
+        || query.comment_ids_in.is_some()
+        || query.submission_ids_in.is_some();
+
+    let mut ids_any = Vec::new();
+    let mut ids_comments = Vec::new();
+    let mut ids_submissions = Vec::new();
+
+    if let Some(list) = query.ids_in.take() {
+        for raw in list {
+            let normalized = normalize_record_id_selector(&raw);
+            match normalized.kind {
+                Some(RecordIdKind::Comment) => ids_comments.push(normalized.bare),
+                Some(RecordIdKind::Submission) => ids_submissions.push(normalized.bare),
+                None => ids_any.push(normalized.bare),
+            }
+        }
+    }
+    if let Some(list) = query.comment_ids_in.take() {
+        for raw in list {
+            ids_comments.push(normalize_record_id_selector(&raw).bare);
+        }
+    }
+    if let Some(list) = query.submission_ids_in.take() {
+        for raw in list {
+            ids_submissions.push(normalize_record_id_selector(&raw).bare);
+        }
+    }
+
+    sort_id_list(&mut ids_any);
+    sort_id_list(&mut ids_comments);
+    sort_id_list(&mut ids_submissions);
+
+    let all_empty = ids_any.is_empty() && ids_comments.is_empty() && ids_submissions.is_empty();
+    query.ids_in = if !ids_any.is_empty() || (had_any_id_field && all_empty) {
+        Some(ids_any)
+    } else {
+        None
+    };
+    query.comment_ids_in = (!ids_comments.is_empty()).then_some(ids_comments);
+    query.submission_ids_in = (!ids_submissions.is_empty()).then_some(ids_submissions);
+}
+
+fn sorted_id_list_contains(list: Option<&Vec<String>>, needle: &str) -> bool {
+    list.is_some_and(|list| {
+        list.binary_search_by(|candidate| candidate.as_str().cmp(needle))
+            .is_ok()
+    })
+}
+
+fn validate_id_filter_overlaps(query: &QuerySpec) -> Result<(), QueryBuildError> {
+    let Some(any_ids) = query.ids_in.as_ref() else {
+        return Ok(());
+    };
+    for id in any_ids {
+        if sorted_id_list_contains(query.comment_ids_in.as_ref(), id)
+            || sorted_id_list_contains(query.submission_ids_in.as_ref(), id)
+        {
+            return Err(QueryBuildError::new(format!(
+                "ids_in contains duplicate ID '{id}' after normalization"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_id_list_filter(
+    field: &'static str,
+    value: &Option<Vec<String>>,
+) -> Result<(), QueryBuildError> {
+    let Some(list) = value else {
+        return Ok(());
+    };
+    if list.is_empty() {
+        return Err(QueryBuildError::new(format!(
+            "{field} cannot be an empty list; omit {field} to match all"
+        )));
+    }
+    for id in list {
+        if id.trim().is_empty() {
+            return Err(QueryBuildError::new(format!(
+                "{field} contains a blank entry after normalization; blank entries are not allowed"
+            )));
+        }
+    }
+
+    let mut sorted = list.clone();
+    sorted.sort();
+    if let Some(duplicate) = sorted
+        .windows(2)
+        .find_map(|pair| (pair[0] == pair[1]).then(|| pair[0].clone()))
+    {
+        return Err(QueryBuildError::new(format!(
+            "{field} contains duplicate ID '{duplicate}' after normalization"
+        )));
+    }
+
+    Ok(())
+}
+
 #[inline]
 fn validate_string_list_filter(
     field: &'static str,
@@ -671,5 +1048,49 @@ pub fn normalize_str(s: &str) -> String {
         rest.to_string()
     } else {
         s
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timestamp_bounds_validate_order_and_stay_minimal() {
+        let query = QuerySpec {
+            timestamp_bounds: TimestampBounds::new(Some(1_606_737_600), Some(1_606_824_000)),
+            ..Default::default()
+        };
+        query.validate().expect("valid timestamp range");
+        assert!(query.has_selective_filters());
+        assert!(
+            !query.requires_full_parse(),
+            "created_utc timestamp bounds are a MinimalRecord fast-path filter"
+        );
+
+        let invalid = QuerySpec {
+            timestamp_bounds: TimestampBounds::new(Some(10), Some(10)),
+            ..Default::default()
+        };
+        let err = invalid
+            .validate()
+            .expect_err("empty timestamp range should be rejected");
+        assert!(err.to_string().contains("created_utc_gte"));
+    }
+
+    #[test]
+    fn timestamp_bounds_derive_months_from_inclusive_exclusive_edges() {
+        // 2020-11-30T12:00:00Z .. 2020-12-01T00:00:00Z should plan Nov only;
+        // the exclusive upper endpoint is exactly at the start of December.
+        let bounds = TimestampBounds::new(Some(1_606_737_600), Some(1_606_780_800));
+        assert_eq!(bounds.derived_start_month(), Some(YearMonth::new(2020, 11)));
+        assert_eq!(bounds.derived_end_month(), Some(YearMonth::new(2020, 11)));
+
+        let spanning = TimestampBounds::new(Some(1_606_737_600), Some(1_606_824_000));
+        assert_eq!(
+            spanning.derived_start_month(),
+            Some(YearMonth::new(2020, 11))
+        );
+        assert_eq!(spanning.derived_end_month(), Some(YearMonth::new(2020, 12)));
     }
 }
