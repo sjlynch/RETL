@@ -160,7 +160,10 @@ pub use crate::config::{
 };
 pub use crate::date::YearMonth;
 pub use crate::pipeline::{RedditETL, ScanPlan};
-pub use crate::pipeline_exec::{DedupeKeySummary, ExportFormat, TabularExportOptions};
+pub use crate::pipeline_exec::{
+    convert_jsonl_to_csv, convert_jsonl_to_tsv, DedupeKeySummary, ExportFormat,
+    TabularExportOptions,
+};
 pub use crate::query::{JsonPointerPredicate, NumericComparison, QueryBuildError, QuerySpec};
 pub use crate::shard::UsernameStream;
 
