@@ -160,6 +160,13 @@ and validation flags because it does not filter records by query:
 | `--include-deleted` | Include pseudo-users (`[deleted]`, `[removed]`, and empty authors) that are filtered by default. |
 | `--parallelism <N>` / `--file-concurrency <N>` | Rayon threads / concurrent monthly files; oversized values are clamped to RETL's documented safety caps. |
 | `--no-progress` | Disable progress bars. |
+| `--no-manifest` | Do not write provenance sidecars next to outputs. |
+
+### Provenance manifests
+
+By default, user-facing file outputs get a `<output>.retl-manifest.json` sidecar and directory outputs (spool, partitioned exports, parents output) get `<out_dir>/_retl_manifest.json`. The manifest records the RETL version (and build git hash when provided), operation/API surface, normalized query/options, selected corpus file identities (path, kind, month, size/mtime), output path/format, counts, partial-read skips, resume/checkpoint fingerprint when relevant, timestamps, warnings, and upstream spool manifest links used by downstream parents/aggregate flows.
+
+Manifests intentionally contain local filesystem paths to make runs auditable. Treat them as reproducibility artifacts: redact or omit them before sharing if paths reveal private directory names. Use `--no-manifest` on the CLI or `.run_manifest(false)` on `RedditETL` to disable sidecar emission.
 
 ### Pseudo-user filtering (default ON)
 

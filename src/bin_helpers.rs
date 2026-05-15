@@ -608,6 +608,7 @@ pub(crate) fn build_etl(common: &CommonOpts) -> Result<RedditETL> {
         .base_dir(&common.data_dir)
         .work_dir(&lib_tmp)
         .progress(!common.no_progress)
+        .run_manifest(!common.no_manifest)
         .sources(Sources::from(common.source))
         .date_range(common.start, common.end)
         .allow_partial(common.allow_partial);

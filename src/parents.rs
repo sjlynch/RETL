@@ -10,6 +10,10 @@ use crate::parents_ids::{IdShards, SharedIdsetCache, WorkerShardCache};
 use crate::paths::{discover_all_checked, plan_files_checked, FileJob, FileKind};
 use crate::pipeline::RedditETL;
 use crate::progress::{make_count_progress, make_progress_bar_labeled, total_compressed_size};
+use crate::run_manifest::{
+    discover_upstream_manifests_from_inputs, file_identities, maybe_write_run_manifest,
+    path_to_stable_string, ManifestDestination, RunManifestInput, RunManifestStart,
+};
 use crate::util::{
     create_dir_all_with_backoff, create_with_backoff, open_with_backoff, read_dir_with_backoff,
     remove_with_backoff, replace_file_atomic_backoff, with_thread_pool,
@@ -20,7 +24,7 @@ use crate::zstd_jsonl::{
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -1679,6 +1683,8 @@ impl RedditETL {
         resume: bool,
     ) -> Result<(Vec<PathBuf>, ParentAttachStats)> {
         with_thread_pool(self.opts.parallelism, || {
+            let manifest_start = RunManifestStart::now();
+            let manifest_inputs = inputs.clone();
             create_dir_all_with_backoff(out_dir, 16, 50).with_context(|| {
                 format!("create parent attach output dir {}", out_dir.display())
             })?;
@@ -1993,7 +1999,7 @@ impl RedditETL {
 
             let mut stats = ParentAttachStats::default();
             let mut diagnostics = ParentAttachDiagnostics::default();
-            let out_paths = attached
+            let out_paths: Vec<PathBuf> = attached
                 .into_inner()
                 .unwrap()
                 .into_iter()
@@ -2006,6 +2012,42 @@ impl RedditETL {
                 })
                 .collect();
             warn_if_no_comment_shaped_records(diagnostics);
+
+            let mut counts = BTreeMap::new();
+            counts.insert("input_files".to_string(), manifest_inputs.len() as u64);
+            counts.insert("attached_files".to_string(), out_paths.len() as u64);
+            counts.insert("parents_resolved".to_string(), stats.resolved);
+            counts.insert("parents_unresolved".to_string(), stats.unresolved);
+            counts.insert("records_scanned".to_string(), diagnostics.parsed_records);
+            let mut manifest = RunManifestInput::new("parents.attach_parents_jsonls_parallel");
+            manifest.start = manifest_start;
+            manifest.api_operation = Some("RedditETL::attach_parents_jsonls_parallel".to_string());
+            manifest.options = serde_json::json!({
+                "resume": resume,
+                "resolution_range": {
+                    "start": self.opts.start.map(|ym| ym.to_string()),
+                    "end": self.opts.end.map(|ym| ym.to_string()),
+                },
+                "parent_payload": {
+                    "full_record": parents.payload_spec.is_full_record(),
+                    "fields": parents.payload_spec.fields(),
+                },
+                "base_dir": path_to_stable_string(&self.opts.base_dir),
+                "comments_dir": path_to_stable_string(&self.opts.comments_dir),
+                "submissions_dir": path_to_stable_string(&self.opts.submissions_dir),
+                "parallelism": self.opts.parallelism,
+                "file_concurrency": self.opts.file_concurrency,
+                "emit_manifest": self.opts.emit_manifest,
+            });
+            manifest.inputs = file_identities(&manifest_inputs);
+            manifest.output_format = "jsonl-directory".to_string();
+            manifest.counts = counts;
+            manifest.upstream_manifests = discover_upstream_manifests_from_inputs(&manifest_inputs);
+            maybe_write_run_manifest(
+                self.opts.emit_manifest,
+                manifest,
+                ManifestDestination::Directory(out_dir.to_path_buf()),
+            )?;
             Ok((out_paths, stats))
         })
     }

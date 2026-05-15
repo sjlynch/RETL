@@ -162,6 +162,14 @@ impl RedditETL {
         self
     }
 
+    /// Enable or disable user-facing provenance manifest sidecars next to
+    /// file/directory outputs. Enabled by default; disable when local absolute
+    /// paths should not be written to sidecar metadata.
+    pub fn run_manifest(mut self, yes: bool) -> Self {
+        self.opts = self.opts.with_run_manifest(yes);
+        self
+    }
+
     /// Select top-level parent fields attached by the parents pipeline. The
     /// default is backwards-compatible (`body` for comments and
     /// `title,selftext` for submissions).

@@ -19,6 +19,10 @@ use crate::pipeline::{RedditETL, ScanPlan};
 use crate::progress::{make_progress_bar_labeled, total_compressed_size};
 use crate::progress_manifest::{ManifestAccumulator, MonthEntry};
 use crate::query::QuerySpec;
+use crate::run_manifest::{
+    corpus_snapshot_from_etl, etl_options_value, maybe_write_run_manifest, scan_query_value,
+    ManifestDestination, RunManifestInput, RunManifestStart,
+};
 use crate::shard::{ShardedWriter, UsernameStream};
 use crate::stitch::{concat_tsvs, stitch_tmp_parts, stitch_tmp_parts_to_json_array};
 use crate::streaming::{
@@ -411,6 +415,8 @@ impl ScanPlan {
             "extract_jsonl_q_tmp",
             out_path,
             Finalize::Jsonl,
+            "jsonl",
+            "scan.extract_to_jsonl",
             plan.limit,
         )
     }
@@ -441,6 +447,8 @@ impl ScanPlan {
         let plan = self.build()?;
         let parallelism = plan.etl.opts.parallelism;
         with_thread_pool(parallelism, || {
+            let manifest_start = RunManifestStart::now();
+            let files = plan_pipeline_files(&plan.etl)?;
             let work_dir = plan.etl.ensure_work_dir()?;
             let unique = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -537,6 +545,29 @@ impl ScanPlan {
                 }
                 warn_dedupe_key_drops(key, &summary);
 
+                let manifest = scan_manifest_input(
+                    manifest_start,
+                    "scan.dedupe_keys_to_lines",
+                    "text-lines",
+                    &plan.etl,
+                    &plan.query,
+                    &files,
+                    plan.limit,
+                    manifest_counts(&[
+                        ("matched_records", summary.matched_records),
+                        ("unique_keys", summary.unique_keys),
+                        ("key_extractions_failed", summary.key_extractions_failed),
+                    ]),
+                    None,
+                    None,
+                    serde_json::json!({ "dedupe_key": dedupe_key_label(key) }),
+                );
+                maybe_write_run_manifest(
+                    plan.etl.opts.emit_manifest,
+                    manifest,
+                    ManifestDestination::File(out_path.to_path_buf()),
+                )?;
+
                 Ok(summary)
             })();
 
@@ -556,6 +587,8 @@ impl ScanPlan {
             "extract_json_q_tmp",
             out_path,
             Finalize::JsonArray { pretty },
+            "json",
+            "scan.extract_to_json",
             plan.limit,
         )
     }
@@ -638,6 +671,7 @@ impl ScanPlan {
         let parallelism = plan.etl.opts.parallelism;
 
         with_thread_pool(parallelism, || {
+            let manifest_start = RunManifestStart::now();
             create_dir_all_with_backoff(out_dir, 16, 50)
                 .with_context(|| format!("creating spool dir {}", out_dir.display()))?;
             let staging_dir = ensure_staging_dir(out_dir)?;
@@ -683,6 +717,7 @@ impl ScanPlan {
             }
 
             let resumed_lines = committed_line_count(&initial_months);
+            let total_output_lines = AtomicU64::new(resumed_lines);
 
             // Persist the (pruned) manifest before any work, so a crash mid-
             // prune cannot resurrect entries we already know are stale.
@@ -738,6 +773,7 @@ impl ScanPlan {
 
                     if let Some(month) = outcome {
                         total_written.fetch_add(month.lines, Ordering::Relaxed);
+                        total_output_lines.fetch_add(month.lines, Ordering::Relaxed);
                         parts.lock().unwrap().push(month.out_path.clone());
                         if let Some(acc) = &accumulator {
                             commit_entry_to_manifest(acc, month).context(
@@ -757,6 +793,34 @@ impl ScanPlan {
             let mut list = parts.into_inner().unwrap();
             list.sort();
             list.dedup();
+            let manifest = scan_manifest_input(
+                manifest_start,
+                "scan.extract_spool_monthly",
+                "spool-jsonl-directory",
+                &plan.etl,
+                &plan.query,
+                &files,
+                plan.limit,
+                manifest_counts(&[
+                    (
+                        "records_written",
+                        total_output_lines.load(Ordering::Relaxed),
+                    ),
+                    ("part_files", list.len() as u64),
+                    (
+                        "records_written_this_run",
+                        total_written.load(Ordering::Relaxed),
+                    ),
+                ]),
+                Some(resume_fingerprint.clone()),
+                resume.then(|| crate::progress_manifest::manifest_path(out_dir)),
+                serde_json::json!({}),
+            );
+            maybe_write_run_manifest(
+                plan.etl.opts.emit_manifest,
+                manifest,
+                ManifestDestination::Directory(out_dir.to_path_buf()),
+            )?;
             Ok((list, total_written.load(Ordering::Relaxed)))
         })
     }
@@ -789,12 +853,15 @@ impl ScanPlan {
         log_pseudo_user_filter(&plan.query);
         let parallelism = plan.etl.opts.parallelism;
         with_thread_pool(parallelism, || {
+            let manifest_start = RunManifestStart::now();
+            let files = plan_pipeline_files(&plan.etl)?;
             let work_dir = plan.etl.ensure_work_dir()?;
             let kv =
                 ShardedKVWriter::create(&work_dir, "author_counts", plan.etl.opts.shard_count)?;
             let scratch_root = kv.scratch_root().to_path_buf();
 
             let result = (|| -> Result<()> {
+                let matched_records = AtomicU64::new(0);
                 scan_records(
                     &plan.etl,
                     &plan.query,
@@ -806,6 +873,7 @@ impl ScanPlan {
                             if a.is_empty() {
                                 return Ok(());
                             }
+                            matched_records.fetch_add(1, Ordering::Relaxed);
                             kv.write_kv(a, 1)?;
                         }
                         Ok(())
@@ -814,6 +882,28 @@ impl ScanPlan {
 
                 let (shards, _scratch_root) = kv.reduce_sum_with_scratch("author_counts")?;
                 concat_tsvs(&shards, out_path, plan.etl.opts.write_buffer_bytes)?;
+                let output_rows = count_text_lines(out_path)?;
+                let manifest = scan_manifest_input(
+                    manifest_start,
+                    "scan.author_counts_to_tsv",
+                    "tsv",
+                    &plan.etl,
+                    &plan.query,
+                    &files,
+                    plan.limit,
+                    manifest_counts(&[
+                        ("matched_records", matched_records.load(Ordering::Relaxed)),
+                        ("output_rows", output_rows),
+                    ]),
+                    None,
+                    None,
+                    serde_json::json!({}),
+                );
+                maybe_write_run_manifest(
+                    plan.etl.opts.emit_manifest,
+                    manifest,
+                    ManifestDestination::File(out_path.to_path_buf()),
+                )?;
                 Ok(())
             })();
             cleanup_scratch_dir(&scratch_root, "author_counts");
@@ -826,11 +916,14 @@ impl ScanPlan {
         log_pseudo_user_filter(&plan.query);
         let parallelism = plan.etl.opts.parallelism;
         with_thread_pool(parallelism, || {
+            let manifest_start = RunManifestStart::now();
+            let files = plan_pipeline_files(&plan.etl)?;
             let work_dir = plan.etl.ensure_work_dir()?;
             let kv = ShardedKVWriter::create(&work_dir, "first_seen", plan.etl.opts.shard_count)?;
             let scratch_root = kv.scratch_root().to_path_buf();
 
             let result = (|| -> Result<()> {
+                let matched_records = AtomicU64::new(0);
                 scan_records(
                     &plan.etl,
                     &plan.query,
@@ -842,6 +935,7 @@ impl ScanPlan {
                             if a.is_empty() {
                                 return Ok(());
                             }
+                            matched_records.fetch_add(1, Ordering::Relaxed);
                             kv.write_kv(a, ts)?;
                         }
                         Ok(())
@@ -850,6 +944,28 @@ impl ScanPlan {
 
                 let (shards, _scratch_root) = kv.reduce_min_with_scratch("first_seen")?;
                 concat_tsvs(&shards, out_path, plan.etl.opts.write_buffer_bytes)?;
+                let output_rows = count_text_lines(out_path)?;
+                let manifest = scan_manifest_input(
+                    manifest_start,
+                    "scan.build_first_seen_index_to_tsv",
+                    "tsv",
+                    &plan.etl,
+                    &plan.query,
+                    &files,
+                    plan.limit,
+                    manifest_counts(&[
+                        ("matched_records", matched_records.load(Ordering::Relaxed)),
+                        ("output_rows", output_rows),
+                    ]),
+                    None,
+                    None,
+                    serde_json::json!({}),
+                );
+                maybe_write_run_manifest(
+                    plan.etl.opts.emit_manifest,
+                    manifest,
+                    ManifestDestination::File(out_path.to_path_buf()),
+                )?;
                 Ok(())
             })();
             cleanup_scratch_dir(&scratch_root, "first_seen");
@@ -873,6 +989,7 @@ impl ScanPlan {
         let parallelism = plan.etl.opts.parallelism;
 
         with_thread_pool(parallelism, || {
+            let manifest_start = RunManifestStart::now();
             let files = plan_pipeline_files(&plan.etl)?;
             warn_if_unfiltered_undated_query(&plan.etl, &plan.query, &files);
 
@@ -903,6 +1020,8 @@ impl ScanPlan {
                 (HashMap::new(), HashSet::new())
             };
             let resumed_lines = committed_line_count(&initial_months);
+            let output_records = AtomicU64::new(resumed_lines);
+            let output_files = AtomicU64::new(completed_keys.len() as u64);
             let accumulator = if resume {
                 crate::progress_manifest::save(
                     out_base_dir,
@@ -1013,8 +1132,11 @@ impl ScanPlan {
                         Err(e) => return Err(e),
                     };
 
+                    output_records.fetch_add(written, Ordering::Relaxed);
                     if written == 0 {
                         let _ = remove_with_backoff(&out_path, 8, 50);
+                    } else {
+                        output_files.fetch_add(1, Ordering::Relaxed);
                     }
                     if let Some(acc) = &accumulator {
                         let size = if written == 0 {
@@ -1042,6 +1164,30 @@ impl ScanPlan {
                 pb.finish_with_message("done");
             }
             ensure_resume_manifest_durable(accumulator.as_ref(), "partitioned export")?;
+            let manifest = scan_manifest_input(
+                manifest_start,
+                "scan.export_partitioned",
+                partitioned_resume_operation(format),
+                &plan.etl,
+                &plan.query,
+                &files,
+                plan.limit,
+                manifest_counts(&[
+                    ("records_written", output_records.load(Ordering::Relaxed)),
+                    ("partition_files", output_files.load(Ordering::Relaxed)),
+                ]),
+                Some(resume_fingerprint.clone()),
+                resume.then(|| crate::progress_manifest::manifest_path(out_base_dir)),
+                serde_json::json!({
+                    "partition_format": partitioned_ext(format),
+                    "zst_level": (format == ExportFormat::Zst).then_some(plan.etl.opts.zst_level),
+                }),
+            );
+            maybe_write_run_manifest(
+                plan.etl.opts.emit_manifest,
+                manifest,
+                ManifestDestination::Directory(out_base_dir.to_path_buf()),
+            )?;
             Ok(())
         })
     }
@@ -1103,6 +1249,41 @@ fn warn_if_unfiltered_undated_query(etl: &RedditETL, query: &QuerySpec, files: &
         compressed_bytes = compressed_bytes,
         "running an unfiltered, undated query over the full corpus (files={file_count}, compressed_bytes={compressed_bytes}); pass --subreddit and/or --start/--end to narrow the scope"
     );
+}
+
+fn manifest_counts(entries: &[(&str, u64)]) -> BTreeMap<String, u64> {
+    entries
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), *value))
+        .collect()
+}
+
+fn scan_manifest_input(
+    start: RunManifestStart,
+    operation: &str,
+    format: &str,
+    etl: &RedditETL,
+    query: &QuerySpec,
+    files: &[FileJob],
+    limit: Option<u64>,
+    counts: BTreeMap<String, u64>,
+    checkpoint_fingerprint: Option<String>,
+    checkpoint_path: Option<PathBuf>,
+    extra_options: Value,
+) -> RunManifestInput {
+    let mut input = RunManifestInput::new(operation);
+    input.start = start;
+    input.api_operation = Some(operation.to_string());
+    input.query = scan_query_value(query, limit);
+    input.options = etl_options_value(&etl.opts, limit, extra_options);
+    input.corpus = corpus_snapshot_from_etl(&etl.opts, files);
+    input.output_format = format.to_string();
+    input.counts = counts;
+    input.partial_read = etl.opts.partial_read_reporter.snapshot();
+    input.resume_enabled = etl.opts.resume;
+    input.checkpoint_fingerprint = checkpoint_fingerprint;
+    input.checkpoint_path = checkpoint_path;
+    input
 }
 
 fn validate_export_whitelist(etl: &RedditETL) -> Result<()> {
@@ -1619,6 +1800,29 @@ fn validate_jsonl_part(path: &Path) -> Result<MonthEntry> {
     })
 }
 
+fn count_text_lines(path: &Path) -> Result<u64> {
+    let file = open_with_backoff(path, 16, 50)
+        .with_context(|| format!("opening output to count lines {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut buf = String::new();
+    let mut lines = 0_u64;
+    loop {
+        let n = crate::ndjson::read_line_capped(
+            &mut reader,
+            &mut buf,
+            crate::ndjson::DEFAULT_MAX_LINE_BYTES,
+            path,
+        )?;
+        if n == 0 {
+            break;
+        }
+        if !buf.is_empty() {
+            lines += 1;
+        }
+    }
+    Ok(lines)
+}
+
 fn normalize_tabular_fields<I, S>(fields: I) -> Result<Vec<String>>
 where
     I: IntoIterator<Item = S>,
@@ -1880,6 +2084,7 @@ fn extract_tabular_common(
 ) -> Result<()> {
     let parallelism = etl.opts.parallelism;
     with_thread_pool(parallelism, || {
+        let manifest_start = RunManifestStart::now();
         let files = plan_pipeline_files(etl)?;
         warn_if_unfiltered_undated_query(etl, query, &files);
 
@@ -1912,6 +2117,7 @@ fn extract_tabular_common(
         let bounds = bounds_tuple(etl.opts.start, etl.opts.end);
         let read_buf = etl.opts.read_buffer_bytes;
         let write_buf = etl.opts.write_buffer_bytes;
+        let output_records = AtomicU64::new(0);
 
         crate::concurrency::for_each_file_limited(
             &files,
@@ -1950,6 +2156,7 @@ fn extract_tabular_common(
                     }
                     Err(e) => return Err(e),
                 };
+                output_records.fetch_add(lines, Ordering::Relaxed);
                 if lines == 0 {
                     let _ = remove_with_backoff(&tmp_file, 8, 50);
                 }
@@ -1961,6 +2168,27 @@ fn extract_tabular_common(
             pb.finish_with_message("done");
         }
         stitch_tabular_parts(&tmp_dir, out_path, fields, opts, format, write_buf)?;
+        let manifest = scan_manifest_input(
+            manifest_start,
+            &format!("scan.extract_to_{}", format.label()),
+            format.label(),
+            etl,
+            query,
+            &files,
+            limit,
+            manifest_counts(&[("records_written", output_records.load(Ordering::Relaxed))]),
+            None,
+            None,
+            serde_json::json!({
+                "tabular_fields": fields,
+                "header": opts.header,
+            }),
+        );
+        maybe_write_run_manifest(
+            etl.opts.emit_manifest,
+            manifest,
+            ManifestDestination::File(out_path.to_path_buf()),
+        )?;
         if let Err(e) = remove_dir_all_with_backoff(&tmp_dir, 8, 50) {
             tracing::warn!(path=%tmp_dir.display(), error=%e, "failed to remove tabular extract scratch dir");
         }
@@ -1979,11 +2207,14 @@ fn extract_common(
     tmp_dir_name: &str,
     out_path: &Path,
     finalize: Finalize,
+    output_format: &str,
+    operation: &str,
     limit: Option<u64>,
 ) -> Result<()> {
     validate_export_whitelist(etl)?;
     let parallelism = etl.opts.parallelism;
     with_thread_pool(parallelism, || {
+        let manifest_start = RunManifestStart::now();
         let files = plan_pipeline_files(etl)?;
         warn_if_unfiltered_undated_query(etl, query, &files);
 
@@ -2013,6 +2244,7 @@ fn extract_common(
                 (HashMap::new(), HashSet::new())
             };
         let resumed_lines = committed_line_count(&initial_months);
+        let output_records = AtomicU64::new(resumed_lines);
         let accumulator = if let Some(fingerprint) = resume_fingerprint.as_ref() {
             crate::progress_manifest::save(&tmp_dir, &initial_months, Some(fingerprint))?;
             Some(ManifestAccumulator::new(
@@ -2071,6 +2303,7 @@ fn extract_common(
                 if resume && tmp_file.exists() {
                     match validate_jsonl_part(&tmp_file) {
                         Ok(entry) => {
+                            output_records.fetch_add(entry.lines, Ordering::Relaxed);
                             if let Some(acc) = &accumulator {
                                 acc.commit(key.clone(), entry).with_context(|| {
                                     format!(
@@ -2117,6 +2350,7 @@ fn extract_common(
                     Err(e) => return Err(e),
                 };
 
+                output_records.fetch_add(lines, Ordering::Relaxed);
                 if let Some(acc) = &accumulator {
                     let size = fs::metadata(&tmp_file).map(|m| m.len()).unwrap_or(0);
                     let entry = MonthEntry {
@@ -2143,6 +2377,24 @@ fn extract_common(
                 stitch_tmp_parts_to_json_array(&tmp_dir, out_path, pretty, write_buf)?
             }
         }
+        let manifest = scan_manifest_input(
+            manifest_start,
+            operation,
+            output_format,
+            etl,
+            query,
+            &files,
+            limit,
+            manifest_counts(&[("records_written", output_records.load(Ordering::Relaxed))]),
+            resume_fingerprint.clone(),
+            resume.then(|| crate::progress_manifest::manifest_path(&tmp_dir)),
+            serde_json::json!({}),
+        );
+        maybe_write_run_manifest(
+            etl.opts.emit_manifest,
+            manifest,
+            ManifestDestination::File(out_path.to_path_buf()),
+        )?;
         if !resume {
             if let Err(e) = remove_dir_all_with_backoff(&tmp_dir, 8, 50) {
                 tracing::warn!(path=%tmp_dir.display(), error=%e, "failed to remove extract scratch dir");
@@ -2422,7 +2674,8 @@ mod tests {
             .subreddit("programming")
             .build()
             .unwrap();
-        let fingerprint = build_resume_fingerprint(&plan.etl, &plan.query, "extract").unwrap();
+        let fingerprint =
+            build_resume_fingerprint(&plan.etl, &plan.query, "extract", plan.limit).unwrap();
         let tmp_dir = extract_scratch_dir(
             &work_dir,
             "extract_jsonl_q_tmp",

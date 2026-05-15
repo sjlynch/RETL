@@ -98,6 +98,10 @@ pub(crate) struct CommonOpts {
     #[arg(long)]
     pub(crate) no_progress: bool,
 
+    /// Do not write `<output>.retl-manifest.json` / `_retl_manifest.json` provenance sidecars.
+    #[arg(long)]
+    pub(crate) no_manifest: bool,
+
     /// Source selection: rc (comments), rs (submissions), or both.
     #[arg(long, value_enum, default_value_t = SourceArg::Both)]
     pub(crate) source: SourceArg,
@@ -448,6 +452,10 @@ pub(crate) struct AggregateRuntimeOpts {
     /// Disable progress bars.
     #[arg(long)]
     pub(crate) no_progress: bool,
+
+    /// Do not write aggregate provenance manifest sidecars.
+    #[arg(long)]
+    pub(crate) no_manifest: bool,
 }
 
 #[derive(Args, Debug)]
@@ -534,6 +542,9 @@ pub(crate) struct ParentsArgs {
     /// Disable progress bars.
     #[arg(long)]
     pub(crate) no_progress: bool,
+    /// Do not write parents provenance manifest sidecars.
+    #[arg(long)]
+    pub(crate) no_manifest: bool,
     /// Per-flush byte budget for bucketing/dedupe (`per_flush_cap = N / 2`).
     /// NOTE: this is NOT the worst-case peak — see `--inflight-groups`.
     #[arg(long)]

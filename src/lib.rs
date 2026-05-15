@@ -137,6 +137,7 @@ mod pipeline;
 mod pipeline_exec;
 mod progress;
 mod progress_manifest;
+mod run_manifest;
 mod stitch;
 mod streaming;
 mod util;
@@ -162,6 +163,13 @@ pub use crate::date::YearMonth;
 pub use crate::pipeline::{RedditETL, ScanPlan};
 pub use crate::pipeline_exec::{DedupeKeySummary, ExportFormat, TabularExportOptions};
 pub use crate::query::{JsonPointerPredicate, NumericComparison, QueryBuildError, QuerySpec};
+pub use crate::run_manifest::{
+    discover_upstream_manifests_from_inputs, file_identities, file_identity,
+    manifest_path_for_directory, manifest_path_for_file, path_to_stable_string,
+    upstream_manifest_for_directory, write_run_manifest, CorpusSnapshot, FileIdentity, GeneratedBy,
+    ManifestDestination, OutputSnapshot, ResumeSnapshot, RunManifest, RunManifestInput,
+    RunManifestStart, UpstreamManifest, DIR_MANIFEST_NAME, FILE_MANIFEST_SUFFIX,
+};
 pub use crate::shard::UsernameStream;
 
 pub use crate::aggregate::{

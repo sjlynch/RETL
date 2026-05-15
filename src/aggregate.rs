@@ -5,6 +5,10 @@ use crate::atomic_write::{ensure_staging_dir, write_jsonl_atomic};
 use crate::ndjson::for_each_jsonl_line_cfg;
 use crate::pipeline::RedditETL;
 use crate::progress::make_count_progress;
+use crate::run_manifest::{
+    discover_upstream_manifests_from_inputs, file_identities, maybe_write_run_manifest,
+    ManifestDestination, RunManifestInput, RunManifestStart,
+};
 use crate::util::{
     create_dir_all_with_backoff, open_with_backoff, read_dir_with_backoff, remove_with_backoff,
     with_thread_pool,
@@ -15,6 +19,7 @@ use rayon::prelude::*;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -428,7 +433,9 @@ impl RedditETL {
         final_out: &Path,
         pretty: bool,
     ) -> Result<AggregateBuildReport> {
+        let manifest_start = RunManifestStart::now();
         let input_count = inputs.len();
+        let manifest_inputs = inputs.clone();
         let (total, report) = self.aggregate_jsonls_parallel_collect::<A>(inputs, shards_dir)?;
         if input_count > 0 && report.merged_shards == 0 && report.problem_count() > 0 {
             anyhow::bail!(
@@ -451,6 +458,34 @@ impl RedditETL {
             Ok(())
         })
         .with_context(|| format!("publishing aggregate output {}", final_out.display()))?;
+
+        let mut counts = BTreeMap::new();
+        counts.insert("input_files".to_string(), input_count as u64);
+        counts.insert("ok_inputs".to_string(), report.ok_inputs.len() as u64);
+        counts.insert("partial_inputs".to_string(), report.partial_count() as u64);
+        counts.insert("fatal_inputs".to_string(), report.fatal_count() as u64);
+        counts.insert("merged_shards".to_string(), report.merged_shards as u64);
+        let mut manifest = RunManifestInput::new("aggregate_jsonls_parallel");
+        manifest.start = manifest_start;
+        manifest.api_operation = Some("RedditETL::aggregate_jsonls_parallel".to_string());
+        manifest.query = serde_json::Value::Null;
+        manifest.options = serde_json::json!({
+            "pretty": pretty,
+            "partial_read_policy": "strict",
+            "shards_dir": crate::run_manifest::path_to_stable_string(shards_dir),
+            "parallelism": self.opts.parallelism,
+            "progress": self.opts.progress,
+            "emit_manifest": self.opts.emit_manifest,
+        });
+        manifest.inputs = file_identities(&manifest_inputs);
+        manifest.output_format = "json".to_string();
+        manifest.counts = counts;
+        manifest.upstream_manifests = discover_upstream_manifests_from_inputs(&manifest_inputs);
+        maybe_write_run_manifest(
+            self.opts.emit_manifest,
+            manifest,
+            ManifestDestination::File(final_out.to_path_buf()),
+        )?;
 
         Ok(report)
     }

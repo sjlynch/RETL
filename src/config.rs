@@ -241,6 +241,12 @@ pub struct ETLOptions {
     /// submissions).
     pub parent_payload_spec: ParentPayloadSpec,
 
+    /// Emit user-facing provenance manifests next to file/directory outputs.
+    /// Enabled by default; disable via [`ETLOptions::with_run_manifest`] or the
+    /// CLI's `--no-manifest` when absolute local paths are too sensitive for a
+    /// sidecar artifact.
+    pub emit_manifest: bool,
+
     /// Opt-in lossy mode for corrupt zstd inputs. The default (`false`) treats
     /// zstd decode errors as fatal so scans/exports cannot silently return
     /// partial results. When `true`, corrupt monthly files are skipped, recorded
@@ -290,6 +296,7 @@ impl Default for ETLOptions {
             adaptive_mem: AdaptiveMemCfg::default(),
             resume: false,
             parent_payload_spec: ParentPayloadSpec::default(),
+            emit_manifest: true,
             allow_partial: false,
             partial_read_reporter: PartialReadReporter::default(),
             build_error: None,
@@ -468,6 +475,13 @@ impl ETLOptions {
     /// parents helpers).
     pub fn with_resume(mut self, yes: bool) -> Self {
         self.resume = yes;
+        self
+    }
+
+    /// Enable or disable user-facing provenance manifest sidecars next to
+    /// file/directory outputs. Enabled by default.
+    pub fn with_run_manifest(mut self, yes: bool) -> Self {
+        self.emit_manifest = yes;
         self
     }
 
