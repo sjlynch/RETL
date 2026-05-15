@@ -160,7 +160,9 @@ pub use crate::shard::UsernameStream;
 pub use crate::aggregate::{
     AggregateBuildReport, AggregateInputIssue, AggregatePartialReadPolicy, Aggregator,
 };
-pub use crate::parents::{ParentAttachStats, ParentIds, ParentMaps};
+pub use crate::parents::{
+    ParentAttachStats, ParentIds, ParentMaps, ParentPayload, ParentPayloadSpec,
+};
 
 #[doc(hidden)]
 pub use crate::aggregate::{merge_aggregator_shards_parallel, merge_aggregator_shards_serial};

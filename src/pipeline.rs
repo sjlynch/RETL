@@ -1,6 +1,7 @@
 use crate::config::{ETLOptions, Sources};
 use crate::date::YearMonth;
 use crate::mem::AdaptiveMemCfg;
+use crate::parents::ParentPayloadSpec;
 use crate::query::{
     normalize_str, JsonPointerPredicate, NumericComparison, QueryBuildError, QuerySpec,
 };
@@ -158,6 +159,31 @@ impl RedditETL {
     /// behavior.
     pub fn resume(mut self, yes: bool) -> Self {
         self.opts = self.opts.with_resume(yes);
+        self
+    }
+
+    /// Select top-level parent fields attached by the parents pipeline. The
+    /// default is backwards-compatible (`body` for comments and
+    /// `title,selftext` for submissions).
+    pub fn parent_fields<I, S>(mut self, fields: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.opts = self.opts.with_parent_fields(fields);
+        self
+    }
+
+    /// Attach each resolved parent as its full source JSON record, plus RETL's
+    /// `kind` and `id` metadata.
+    pub fn parent_full(mut self, yes: bool) -> Self {
+        self.opts = self.opts.with_parent_full(yes);
+        self
+    }
+
+    /// Replace the full parent-payload specification used by parents helpers.
+    pub fn parent_payload_spec(mut self, spec: ParentPayloadSpec) -> Self {
+        self.opts = self.opts.with_parent_payload_spec(spec);
         self
     }
 

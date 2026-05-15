@@ -362,8 +362,12 @@ pub(crate) struct AggregateRuntimeOpts {
 pub(crate) struct AggregateArgs {
     #[command(flatten)]
     pub(crate) runtime: AggregateRuntimeOpts,
-    /// JSONL input files to aggregate.
-    #[arg(required = true, num_args = 1..)]
+    /// Spool directory containing `part_RC_YYYY-MM.jsonl` /
+    /// `part_RS_YYYY-MM.jsonl` files to aggregate.
+    #[arg(long)]
+    pub(crate) spool: Option<PathBuf>,
+    /// JSONL input files to aggregate. Omit when using `--spool`.
+    #[arg(num_args = 1.., value_name = "INPUTS")]
     pub(crate) inputs: Vec<PathBuf>,
     /// Output path. Without `--by`, writes JSON record-count state; with `--by`, writes TSV.
     #[arg(long, short)]
@@ -414,6 +418,15 @@ pub(crate) struct ParentsArgs {
     /// scanning the corpus to resolve parent payloads.
     #[arg(long, default_value_t = 3)]
     pub(crate) window_months: u32,
+    /// Top-level parent fields to attach under `parent` (comma-separated,
+    /// repeatable). Defaults to body,title,selftext for backwards-compatible
+    /// output.
+    #[arg(long = "parent-fields", value_delimiter = ',', value_name = "FIELD")]
+    pub(crate) parent_fields: Vec<String>,
+    /// Attach the full source parent JSON record under `parent` (plus RETL's
+    /// `kind`/`id` metadata). Overrides `--parent-fields`.
+    #[arg(long = "parent-full")]
+    pub(crate) parent_full: bool,
     /// Path to corpus base dir (containing `comments/` and `submissions/`).
     #[arg(long, default_value = "./data")]
     pub(crate) data_dir: PathBuf,

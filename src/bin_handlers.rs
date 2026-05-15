@@ -6,8 +6,8 @@ use retl::{
     create_dir_all_with_backoff, create_new_with_backoff, discover_all, format_year_month_ranges,
     missing_month_diagnostics, open_with_backoff, plan_files, read_line_capped,
     remove_with_backoff, replace_file_atomic_backoff, total_compressed_size, AggregateBuildReport,
-    ExportFormat, FileKind, IntegrityMode, KeyExtractor, RedditETL, Sources, YearMonth,
-    DEFAULT_MAX_LINE_BYTES,
+    ExportFormat, FileKind, IntegrityMode, KeyExtractor, ParentPayloadSpec, RedditETL, Sources,
+    YearMonth, DEFAULT_MAX_LINE_BYTES,
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -469,6 +469,9 @@ pub(crate) fn run_aggregate(args: AggregateArgs) -> Result<()> {
         etl = etl.parallelism(p);
     }
 
+    let inputs = resolve_aggregate_inputs(&args)?;
+    let input_count = inputs.len();
+
     let shards_dir = args.shards_dir.unwrap_or_else(|| {
         args.out
             .parent()
@@ -477,14 +480,12 @@ pub(crate) fn run_aggregate(args: AggregateArgs) -> Result<()> {
     });
     create_dir_all_with_backoff(&shards_dir, 16, 50)
         .with_context(|| format!("creating shards_dir {}", shards_dir.display()))?;
-
-    let input_count = args.inputs.len();
     if let Some(by) = args.by {
         let group_by = GroupBySpec::parse(&by)?;
         let metric = MetricSpec::parse(args.metric.as_deref())?;
         let top = args.top;
         let (agg, report) = etl.aggregate_jsonls_parallel_collect_with::<GroupMetricAgg, _>(
-            args.inputs,
+            inputs,
             &shards_dir,
             || GroupMetricAgg::new(group_by.clone(), metric.clone()),
         )?;
@@ -510,7 +511,7 @@ pub(crate) fn run_aggregate(args: AggregateArgs) -> Result<()> {
             anyhow::bail!("--top requires --by");
         }
         let (agg, report) =
-            etl.aggregate_jsonls_parallel_collect::<RecCount>(args.inputs, &shards_dir)?;
+            etl.aggregate_jsonls_parallel_collect::<RecCount>(inputs, &shards_dir)?;
         report_aggregate_input_issues(&report);
         ensure_aggregate_inputs_succeeded(input_count, &report)?;
         write_rec_count_json(&args.out, &agg, args.pretty)?;
@@ -522,6 +523,58 @@ pub(crate) fn run_aggregate(args: AggregateArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn resolve_aggregate_inputs(args: &AggregateArgs) -> Result<Vec<PathBuf>> {
+    if args.spool.is_some() && !args.inputs.is_empty() {
+        anyhow::bail!(
+            "retl aggregate accepts either --spool <DIR> or explicit JSONL input files, not both"
+        );
+    }
+
+    if let Some(spool) = &args.spool {
+        let (parts, _, _) = discover_spool_parts(spool).with_context(|| {
+            format!(
+                "discovering spool parts for aggregate in {}; use a directory produced by `retl export --format spool --out {}` or pass explicit JSONL files",
+                spool.display(),
+                spool.display()
+            )
+        })?;
+        return Ok(parts);
+    }
+
+    if args.inputs.is_empty() {
+        anyhow::bail!(
+            "retl aggregate requires --spool <DIR> or one or more explicit JSONL input files"
+        );
+    }
+
+    reject_unexpanded_aggregate_globs(&args.inputs)?;
+    Ok(args.inputs.clone())
+}
+
+fn reject_unexpanded_aggregate_globs(inputs: &[PathBuf]) -> Result<()> {
+    for input in inputs {
+        if path_contains_glob_meta(input) && !input.exists() {
+            let suggested_spool = input
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            anyhow::bail!(
+                "aggregate input {} looks like an unexpanded glob. RETL does not expand globs itself; use `retl aggregate --spool {}` for spool directories, or pass explicit JSONL file paths.",
+                input.display(),
+                suggested_spool.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn path_contains_glob_meta(path: &Path) -> bool {
+    path.as_os_str()
+        .to_string_lossy()
+        .chars()
+        .any(|c| matches!(c, '*' | '?' | '[' | ']'))
 }
 
 fn report_aggregate_input_issues(report: &AggregateBuildReport) {
@@ -678,10 +731,19 @@ pub(crate) fn run_parents(args: ParentsArgs) -> Result<()> {
     create_dir_all_with_backoff(&lib_tmp, 16, 50)
         .with_context(|| format!("creating work_dir {}", lib_tmp.display()))?;
 
+    let parent_payload_spec = if args.parent_full {
+        ParentPayloadSpec::full_record()
+    } else if args.parent_fields.is_empty() {
+        ParentPayloadSpec::default()
+    } else {
+        ParentPayloadSpec::from_fields(&args.parent_fields)
+    };
+
     let build = |sources: Option<Sources>, range: Option<(YearMonth, YearMonth)>| -> RedditETL {
         let mut etl = RedditETL::new()
             .base_dir(&args.data_dir)
             .work_dir(&lib_tmp)
+            .parent_payload_spec(parent_payload_spec.clone())
             .progress(!args.no_progress);
         if let Some(s) = sources {
             etl = etl.sources(s);
