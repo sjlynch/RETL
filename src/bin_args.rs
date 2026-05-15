@@ -505,7 +505,8 @@ pub(crate) struct AggregateArgs {
     /// Output path. Without `--by`, writes JSON record-count state; with `--by`, writes TSV.
     #[arg(long, short)]
     pub(crate) out: PathBuf,
-    /// Directory used for per-input aggregate shards (default: alongside `--out`).
+    /// Directory used for per-run aggregate shard namespaces (default:
+    /// alongside `--out`).
     #[arg(long)]
     pub(crate) shards_dir: Option<PathBuf>,
     /// Field-indent the final JSON (only used when `--by` is omitted).

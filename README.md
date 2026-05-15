@@ -387,9 +387,10 @@ to buffer the failure list and print it only after all files finish.
 
 Aggregates one or more already-filtered JSONL inputs using the
 `retl::Aggregator` pipeline (each input is processed in parallel; per-input
-shard intermediates land under `--shards-dir`, which defaults to `agg_shards/`
-next to `--out`). `aggregate` does not scan the RC/RS corpus and does not
-accept corpus selectors such as `--data-dir`, `--start`, or `--subreddit`; run
+shard intermediates land in a per-run subdirectory under `--shards-dir`, which
+defaults to `agg_shards/` next to `--out`). `aggregate` does not scan the
+RC/RS corpus and does not accept corpus selectors such as `--data-dir`,
+`--start`, or `--subreddit`; run
 `retl export --format spool ...` first if you need to filter the corpus. Its
 runtime flags are limited to `--parallelism`, `--no-progress`, and
 `--shards-dir`. Use `--spool DIR` to discover `part_RC_YYYY-MM.jsonl` /
