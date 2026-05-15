@@ -1218,6 +1218,9 @@ fn build_resume_fingerprint(
         "limit": limit,
         "query": {
             "subreddits": query.subreddits.as_ref(),
+            "ids_in": query.ids_in.as_ref(),
+            "comment_ids_in": query.comment_ids_in.as_ref(),
+            "submission_ids_in": query.submission_ids_in.as_ref(),
             "authors_in": query.authors_in.as_ref(),
             "authors_out": query.authors_out.as_ref(),
             "exclude_common_bots": query.exclude_common_bots,
@@ -1809,7 +1812,7 @@ fn stream_tabular_job<W: Write + ?Sized>(
                 Err(e) => return Err(malformed_json_error(&job.path, line_number, e)),
             },
         };
-        if !matches_minimal(&min, targets, query) || !within_bounds(&min, bounds) {
+        if !matches_minimal(&min, targets, query, job.kind) || !within_bounds(&min, bounds) {
             return Ok(());
         }
         if query.requires_full_parse() {
@@ -2220,7 +2223,7 @@ where
                         Err(e) => return Err(malformed_json_error(&job.path, line_number, e)),
                     },
                 };
-                if !matches_minimal(&min, targets_ref, query) {
+                if !matches_minimal(&min, targets_ref, query, kind) {
                     return Ok(());
                 }
                 if !within_bounds(&min, bounds) {
@@ -2327,6 +2330,20 @@ mod tests {
     }
 
     #[test]
+    fn resume_fingerprint_changes_when_record_id_filter_changes() {
+        let base = make_one_comment_corpus();
+        let plan_c1 = one_month_scan(&base).ids(["c1"]).build().unwrap();
+        let plan_c2 = one_month_scan(&base).ids(["c2"]).build().unwrap();
+
+        let fp_c1 =
+            build_resume_fingerprint(&plan_c1.etl, &plan_c1.query, "spool", plan_c1.limit).unwrap();
+        let fp_c2 =
+            build_resume_fingerprint(&plan_c2.etl, &plan_c2.query, "spool", plan_c2.limit).unwrap();
+
+        assert_ne!(fp_c1, fp_c2);
+    }
+
+    #[test]
     fn spool_resume_commit_failure_after_publish_returns_error_and_next_run_succeeds() {
         let base = make_one_comment_corpus();
         let out_dir = base.join("spool_manifest_failure");
@@ -2422,7 +2439,8 @@ mod tests {
             .subreddit("programming")
             .build()
             .unwrap();
-        let fingerprint = build_resume_fingerprint(&plan.etl, &plan.query, "extract").unwrap();
+        let fingerprint =
+            build_resume_fingerprint(&plan.etl, &plan.query, "extract", plan.limit).unwrap();
         let tmp_dir = extract_scratch_dir(
             &work_dir,
             "extract_jsonl_q_tmp",

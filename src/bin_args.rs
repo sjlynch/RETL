@@ -119,6 +119,14 @@ pub(crate) struct CommonOpts {
 
 #[derive(Args, Debug, Clone)]
 pub(crate) struct QueryOpts {
+    /// Record ID allow-list entry (repeatable). Accepts bare IDs plus t1_/t3_ fullnames; prefixed IDs constrain comment/submission matching. Blank or duplicate IDs are rejected.
+    #[arg(long = "id", value_name = "ID")]
+    pub(crate) ids: Vec<String>,
+
+    /// Newline-delimited record IDs to include. Blank lines and lines beginning with # are ignored; inline comments are not stripped. Repeatable.
+    #[arg(long = "ids-file", value_name = "PATH")]
+    pub(crate) ids_files: Vec<PathBuf>,
+
     /// Author allow-list entry (repeatable). `--author-in` is an alias. Blank values are rejected.
     #[arg(long = "author", visible_alias = "author-in", value_name = "NAME")]
     pub(crate) authors: Vec<String>,

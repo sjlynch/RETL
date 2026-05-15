@@ -601,7 +601,7 @@ pub(crate) fn stream_job_with_partial_policy<W: Write + ?Sized>(
                 Err(e) => return Err(malformed_json_error(&job.path, line_number, e)),
             },
         };
-        if !matches_minimal(&min, targets, query) {
+        if !matches_minimal(&min, targets, query, job.kind) {
             return Ok(());
         }
         if !within_bounds(&min, bounds) {

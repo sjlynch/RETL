@@ -641,6 +641,13 @@ macro_rules! plan {
         if !common.subreddits.is_empty() {
             scan = scan.subreddits(common.subreddits.iter().map(String::as_str));
         }
+        if !query.ids.is_empty() || !query.ids_files.is_empty() {
+            let mut id_selectors = query.ids.clone();
+            for ids_file in &query.ids_files {
+                id_selectors.extend(retl::read_record_ids_file(ids_file)?);
+            }
+            scan = scan.ids_in(id_selectors.iter().map(String::as_str));
+        }
         if !query.authors.is_empty() {
             scan = scan.authors_in(query.authors.iter().map(String::as_str));
         }

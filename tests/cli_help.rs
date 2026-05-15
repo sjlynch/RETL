@@ -95,6 +95,8 @@ fn scan_help_advertises_common_flags() {
         .and(contains("--no-progress"))
         .and(contains("--source"))
         .and(contains("--subreddit"))
+        .and(contains("--id"))
+        .and(contains("--ids-file"))
         .and(contains("--author"))
         .and(contains("--exclude-author"))
         .and(contains("--exclude-common-bots"))
