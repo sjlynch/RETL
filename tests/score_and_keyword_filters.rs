@@ -387,6 +387,161 @@ fn contains_url_true_matches_submission_top_level_url() {
     );
 }
 
+fn corpus_with_keyword_family_combinations() -> PathBuf {
+    let dir = tempfile::tempdir().unwrap().keep();
+    let rc = dir.join("comments").join("RC_2006-01.zst");
+    let rc_lines: Vec<String> = vec![
+        json!({"subreddit":"programming","author":"u_keep","id":"c1","body":"Rust async guide","parent_id":"t3_s1","created_utc":1136074600_i64,"score":1_i64}).to_string(),
+        json!({"subreddit":"programming","author":"u_spam","id":"c2","body":"Rust async guide spam","parent_id":"t3_s1","created_utc":1136074601_i64,"score":1_i64}).to_string(),
+        json!({"subreddit":"programming","author":"u_missing_all","id":"c3","body":"Rust async notes","parent_id":"t3_s1","created_utc":1136074602_i64,"score":1_i64}).to_string(),
+        json!({"subreddit":"programming","author":"u_missing_any","id":"c4","body":"Go async guide","parent_id":"t3_s1","created_utc":1136074603_i64,"score":1_i64}).to_string(),
+    ];
+    write_zst_lines(&rc, &rc_lines);
+
+    let rs = dir.join("submissions").join("RS_2006-01.zst");
+    let rs_lines: Vec<String> = vec![json!({
+        "subreddit":"programming","author":"u_submit_keep","id":"s1",
+        "domain":"self.programming","is_self":true,
+        "title":"Rust guide","selftext":"async details",
+        "created_utc":1136074700_i64,"score":1_i64
+    })
+    .to_string()];
+    write_zst_lines(&rs, &rs_lines);
+    dir
+}
+
+#[test]
+fn keywords_any_all_and_exclude_combine_across_text_fields() {
+    let base = corpus_with_keyword_family_combinations();
+    let counts = RedditETL::new()
+        .base_dir(&base)
+        .sources(Sources::Both)
+        .date_range(Some(YearMonth::new(2006, 1)), Some(YearMonth::new(2006, 1)))
+        .progress(false)
+        .scan()
+        .subreddit("programming")
+        .keywords_any(["rust", "python"])
+        .keywords_all(["async", "guide"])
+        .exclude_keywords(["spam"])
+        .count_by_month()
+        .unwrap();
+
+    assert_eq!(counts.get(&YearMonth::new(2006, 1)).copied(), Some(2));
+}
+
+fn corpus_with_unicode_keyword_families() -> PathBuf {
+    let dir = tempfile::tempdir().unwrap().keep();
+    let rc = dir.join("comments").join("RC_2006-01.zst");
+    let lines: Vec<String> = vec![
+        json!({"subreddit":"programming","author":"u_excluded","id":"c1","body":"CAFÉ crème brûlée","parent_id":"t3_s1","created_utc":1136074600_i64,"score":1_i64}).to_string(),
+        json!({"subreddit":"programming","author":"u_keep","id":"c2","body":"CAFÉ crème notes","parent_id":"t3_s1","created_utc":1136074601_i64,"score":1_i64}).to_string(),
+        json!({"subreddit":"programming","author":"u_ascii","id":"c3","body":"cafe creme notes","parent_id":"t3_s1","created_utc":1136074602_i64,"score":1_i64}).to_string(),
+    ];
+    write_zst_lines(&rc, &lines);
+    std::fs::create_dir_all(dir.join("submissions")).unwrap();
+    dir
+}
+
+#[test]
+fn keyword_all_and_exclude_use_unicode_case_folding() {
+    let base = corpus_with_unicode_keyword_families();
+    let counts = RedditETL::new()
+        .base_dir(&base)
+        .sources(Sources::Comments)
+        .date_range(Some(YearMonth::new(2006, 1)), Some(YearMonth::new(2006, 1)))
+        .progress(false)
+        .scan()
+        .subreddit("programming")
+        .keywords_all(["café", "CRÈME"])
+        .exclude_keywords(["BRÛLÉE"])
+        .count_by_month()
+        .unwrap();
+
+    assert_eq!(counts.get(&YearMonth::new(2006, 1)).copied(), Some(1));
+}
+
+#[test]
+fn text_regex_matches_body_selftext_or_title() {
+    let base = corpus_with_keyword_family_combinations();
+    let counts = RedditETL::new()
+        .base_dir(&base)
+        .sources(Sources::Both)
+        .date_range(Some(YearMonth::new(2006, 1)), Some(YearMonth::new(2006, 1)))
+        .progress(false)
+        .scan()
+        .subreddit("programming")
+        .text_regex(r"(?i)async (guide|details)")
+        .count_by_month()
+        .unwrap();
+
+    assert_eq!(counts.get(&YearMonth::new(2006, 1)).copied(), Some(4));
+}
+
+fn corpus_for_no_url_policy() -> PathBuf {
+    let dir = tempfile::tempdir().unwrap().keep();
+    let rc = dir.join("comments").join("RC_2006-01.zst");
+    let rc_lines: Vec<String> = vec![
+        json!({"subreddit":"programming","author":"u_comment_url","id":"c_url","body":"see https://example.com","parent_id":"t3_s1","created_utc":1136074600_i64,"score":1_i64}).to_string(),
+        json!({"subreddit":"programming","author":"u_comment_plain","id":"c_plain","body":"plain discussion","parent_id":"t3_s1","created_utc":1136074601_i64,"score":1_i64}).to_string(),
+    ];
+    write_zst_lines(&rc, &rc_lines);
+
+    let rs = dir.join("submissions").join("RS_2006-01.zst");
+    let rs_lines: Vec<String> = vec![
+        json!({
+            "subreddit":"programming","author":"u_link","id":"s_link",
+            "domain":"example.com","is_self":false,
+            "title":"Link post","selftext":"plain title text",
+            "url":"https://example.com/article",
+            "created_utc":1136074700_i64,"score":1_i64
+        })
+        .to_string(),
+        json!({
+            "subreddit":"programming","author":"u_self","id":"s_self",
+            "domain":"self.programming","is_self":true,
+            "title":"Self post","selftext":"plain discussion",
+            "url":"https://www.reddit.com/r/programming/comments/s_self/self_post/",
+            "created_utc":1136074701_i64,"score":1_i64
+        })
+        .to_string(),
+        json!({
+            "subreddit":"programming","author":"u_self_text_url","id":"s_self_text_url",
+            "domain":"self.programming","is_self":true,
+            "title":"Self post with text URL","selftext":"see HTTP://example.com in text",
+            "url":"https://www.reddit.com/r/programming/comments/s_self_text_url/self_post/",
+            "created_utc":1136074702_i64,"score":1_i64
+        })
+        .to_string(),
+    ];
+    write_zst_lines(&rs, &rs_lines);
+    dir
+}
+
+#[test]
+fn no_url_keeps_plain_comments_and_self_posts_but_drops_url_records() {
+    let base = corpus_for_no_url_policy();
+    let out = base.join("no_url.jsonl");
+
+    RedditETL::new()
+        .base_dir(&base)
+        .sources(Sources::Both)
+        .date_range(Some(YearMonth::new(2006, 1)), Some(YearMonth::new(2006, 1)))
+        .progress(false)
+        .scan()
+        .subreddit("programming")
+        .no_url()
+        .extract_to_jsonl(&out)
+        .unwrap();
+
+    let mut ids: Vec<String> = read_jsonl_values(&out)
+        .into_iter()
+        .map(|v| v["id"].as_str().unwrap().to_string())
+        .collect();
+    ids.sort();
+
+    assert_eq!(ids, vec!["c_plain".to_string(), "s_self".to_string()]);
+}
+
 /// `domains_in` is submission-only: comments have no `domain` field, so they
 /// are rejected, and `Sources::Both` should warn instead of silently looking
 /// like a zero-match query.

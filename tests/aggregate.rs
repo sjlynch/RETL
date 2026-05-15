@@ -7,6 +7,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs::{self, File};
 use std::io::{BufReader, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::thread;
+use std::time::{Duration, Instant};
 
 /// A tiny aggregator: counts how many JSON objects were ingested overall.
 /// Demonstrates implementing `Aggregator` and running `aggregate_jsonls_parallel`.
@@ -33,6 +37,136 @@ impl Aggregator for ThreadCountAgg {
     }
     fn merge(&mut self, other: Self) {
         self.max_threads = self.max_threads.max(other.max_threads);
+    }
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct BlockingRecCount {
+    count: u64,
+}
+
+impl Aggregator for BlockingRecCount {
+    fn ingest(&mut self, record: &Value) {
+        self.count += 1;
+        if record.get("pause").and_then(Value::as_bool) == Some(true) {
+            if let Some(pause) = current_aggregate_pause() {
+                pause.mark_entered_and_wait();
+            }
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.count += other.count;
+    }
+}
+
+struct AggregatePause {
+    entered: Mutex<bool>,
+    entered_cv: Condvar,
+    released: Mutex<bool>,
+    released_cv: Condvar,
+}
+
+impl AggregatePause {
+    fn new() -> Self {
+        Self {
+            entered: Mutex::new(false),
+            entered_cv: Condvar::new(),
+            released: Mutex::new(false),
+            released_cv: Condvar::new(),
+        }
+    }
+
+    fn mark_entered_and_wait(&self) {
+        {
+            let mut entered = self.entered.lock().unwrap();
+            *entered = true;
+            self.entered_cv.notify_all();
+        }
+
+        let released = self.released.lock().unwrap();
+        drop(
+            self.released_cv
+                .wait_while(released, |released| !*released)
+                .unwrap(),
+        );
+    }
+
+    fn wait_entered(&self, timeout: Duration) -> bool {
+        let entered = self.entered.lock().unwrap();
+        let (entered, _) = self
+            .entered_cv
+            .wait_timeout_while(entered, timeout, |entered| !*entered)
+            .unwrap();
+        *entered
+    }
+
+    fn release(&self) {
+        let mut released = self.released.lock().unwrap();
+        *released = true;
+        self.released_cv.notify_all();
+    }
+}
+
+fn aggregate_pause_slot() -> &'static Mutex<Option<Arc<AggregatePause>>> {
+    static SLOT: OnceLock<Mutex<Option<Arc<AggregatePause>>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+fn current_aggregate_pause() -> Option<Arc<AggregatePause>> {
+    aggregate_pause_slot().lock().unwrap().clone()
+}
+
+struct AggregatePauseGuard {
+    pause: Arc<AggregatePause>,
+}
+
+impl AggregatePauseGuard {
+    fn install(pause: Arc<AggregatePause>) -> Self {
+        *aggregate_pause_slot().lock().unwrap() = Some(pause.clone());
+        Self { pause }
+    }
+}
+
+impl Drop for AggregatePauseGuard {
+    fn drop(&mut self) {
+        self.pause.release();
+        *aggregate_pause_slot().lock().unwrap() = None;
+    }
+}
+
+fn aggregate_shard_paths_recursive(dir: &Path) -> Vec<PathBuf> {
+    if !dir.exists() {
+        return Vec::new();
+    }
+
+    let mut shards = Vec::new();
+    for entry in fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            shards.extend(aggregate_shard_paths_recursive(&path));
+            continue;
+        }
+        let is_aggregate_shard = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.starts_with("agg_") && name.ends_with(".json"))
+            .unwrap_or(false);
+        if is_aggregate_shard {
+            shards.push(path);
+        }
+    }
+    shards
+}
+
+fn wait_for_aggregate_shards(dir: &Path, timeout: Duration) -> Vec<PathBuf> {
+    let start = Instant::now();
+    loop {
+        let shards = aggregate_shard_paths_recursive(dir);
+        if !shards.is_empty() || start.elapsed() >= timeout {
+            return shards;
+        }
+        thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -103,10 +237,9 @@ fn aggregate_same_basename_inputs_get_distinct_shards() {
     assert_eq!(report.merged_shards, 2);
     assert_eq!(report.problem_count(), 0);
 
-    let mut shard_names: Vec<String> = fs::read_dir(&shards_dir)
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-        .filter(|name| name.starts_with("agg_") && name.ends_with(".json"))
+    let mut shard_names: Vec<String> = aggregate_shard_paths_recursive(&shards_dir)
+        .into_iter()
+        .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
         .collect();
     shard_names.sort();
     assert_eq!(shard_names.len(), 2);
@@ -130,18 +263,7 @@ fn aggregate_malformed_json_line_counts_shard_error() {
     assert_eq!(report.merged_shards, 0);
     assert_eq!(report.fatal_count(), 1);
     assert_eq!(report.fatal_inputs[0].input, bad);
-    let shard_count = fs::read_dir(&shards_dir)
-        .unwrap()
-        .filter(|entry| {
-            entry
-                .as_ref()
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .ends_with(".json")
-        })
-        .count();
-    assert_eq!(shard_count, 0);
+    assert_eq!(aggregate_shard_paths_recursive(&shards_dir).len(), 0);
 }
 
 #[test]
@@ -171,6 +293,90 @@ fn aggregate_ignores_stale_shards_between_runs() {
     );
     assert_eq!(report.merged_shards, 1);
     assert_eq!(report.problem_count(), 0);
+}
+
+#[test]
+fn aggregate_concurrent_same_shards_dir_different_outputs_complete() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a_fast = tmp.path().join("a_fast.jsonl");
+    let a_slow = tmp.path().join("a_slow.jsonl");
+    let b_input = tmp.path().join("b.jsonl");
+    fs::write(&a_fast, "{\"id\":\"a1\"}\n{\"id\":\"a2\"}\n").unwrap();
+    fs::write(&a_slow, "{\"id\":\"a3\",\"pause\":true}\n").unwrap();
+    fs::write(&b_input, "{\"id\":\"b1\"}\n{\"id\":\"b2\"}\n").unwrap();
+    let shards_dir = tmp.path().join("agg_shards");
+    let final_a = tmp.path().join("agg_a.json");
+    let final_b = tmp.path().join("agg_b.json");
+
+    let pause = Arc::new(AggregatePause::new());
+    let _pause_guard = AggregatePauseGuard::install(pause.clone());
+
+    let shards_for_a = shards_dir.clone();
+    let out_a = final_a.clone();
+    let handle_a = thread::spawn(move || {
+        RedditETL::new()
+            .progress(false)
+            .parallelism(2)
+            .aggregate_jsonls_parallel::<BlockingRecCount>(
+                vec![a_fast, a_slow],
+                &shards_for_a,
+                &out_a,
+                false,
+            )
+    });
+
+    if !pause.wait_entered(Duration::from_secs(5)) {
+        pause.release();
+        let _ = handle_a.join();
+        panic!("first aggregate did not reach the synchronization point");
+    }
+
+    let first_shards = wait_for_aggregate_shards(&shards_dir, Duration::from_secs(5));
+    if first_shards.is_empty() {
+        pause.release();
+        let _ = handle_a.join();
+        panic!("first aggregate did not publish a live shard before the second run");
+    }
+
+    let shards_for_b = shards_dir.clone();
+    let out_b = final_b.clone();
+    let handle_b = thread::spawn(move || {
+        RedditETL::new()
+            .progress(false)
+            .parallelism(1)
+            .aggregate_jsonls_parallel::<BlockingRecCount>(
+                vec![b_input],
+                &shards_for_b,
+                &out_b,
+                false,
+            )
+    });
+
+    let report_b = match handle_b.join().expect("second aggregate thread panicked") {
+        Ok(report) => report,
+        Err(e) => {
+            pause.release();
+            let _ = handle_a.join();
+            panic!("second aggregate failed: {e:#}");
+        }
+    };
+    assert_eq!(report_b.merged_shards, 1);
+    assert_eq!(report_b.problem_count(), 0);
+
+    pause.release();
+    let report_a = handle_a
+        .join()
+        .expect("first aggregate thread panicked")
+        .expect("first aggregate failed after second run shared shards_dir");
+    assert_eq!(report_a.merged_shards, 2);
+    assert_eq!(report_a.problem_count(), 0);
+
+    let agg_a: BlockingRecCount =
+        serde_json::from_str(&fs::read_to_string(&final_a).unwrap()).unwrap();
+    let agg_b: BlockingRecCount =
+        serde_json::from_str(&fs::read_to_string(&final_b).unwrap()).unwrap();
+    assert_eq!(agg_a.count, 3);
+    assert_eq!(agg_b.count, 2);
 }
 
 #[test]

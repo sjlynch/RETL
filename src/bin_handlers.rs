@@ -3,12 +3,16 @@
 
 use anyhow::{Context, Result};
 use retl::{
-    create_dir_all_with_backoff, create_new_with_backoff, create_with_backoff,
-    discover_sources_checked, for_each_line_cfg, format_year_month_ranges,
-    missing_month_diagnostics, open_with_backoff, plan_files, plan_files_checked, read_line_capped,
-    remove_with_backoff, replace_file_atomic_backoff, total_compressed_size, AggregateBuildReport,
-    ExportFormat, FileKind, IntegrityMode, KeyExtractor, ParentPayloadSpec, RedditETL, Sources,
-    TabularExportOptions, YearMonth, DEFAULT_MAX_LINE_BYTES,
+    convert_jsonl_to_csv, convert_jsonl_to_tsv, create_dir_all_with_backoff,
+    create_new_with_backoff, create_with_backoff, discover_sources_checked,
+    discover_upstream_manifests_from_inputs, file_identities, file_identity, for_each_line_cfg,
+    format_year_month_ranges, missing_month_diagnostics, open_with_backoff, path_to_stable_string,
+    plan_files, plan_files_checked, read_line_capped, remove_with_backoff,
+    replace_file_atomic_backoff, total_compressed_size, upstream_manifest_for_directory,
+    write_run_manifest, AggregateBuildReport, CorpusSnapshot, ExportFormat, FileIdentity, FileKind,
+    IntegrityMode, KeyExtractor, ManifestDestination, ParentPayloadSpec, RedditETL,
+    RunManifestInput, RunManifestStart, Sources, TabularExportOptions, YearMonth,
+    DEFAULT_MAX_LINE_BYTES,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -20,9 +24,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::bin_args::{
-    AggregateArgs, CountArgs, CountMode, DedupeArgs, DescribeArgs, ExportArgs, ExportFmt,
-    FirstSeenArgs, IntegrityArgs, IntegrityModeArg, ParentsArgs, QuickstartArgs, SampleArgs,
-    ScanArgs, SchemaArgs, SchemaFmt, SourceArg,
+    AggregateArgs, CommonOpts, ConvertArgs, ConvertFmt, CountArgs, CountMode, DedupeArgs,
+    DescribeArgs, ExportArgs, ExportFmt, FirstSeenArgs, IntegrityArgs, IntegrityModeArg,
+    ParentsArgs, QueryOpts, QuickstartArgs, SampleArgs, ScanArgs, SchemaArgs, SchemaFmt, SourceArg,
 };
 use crate::bin_helpers::{
     build_etl, discover_spool_parts, emit_partial_read_report, plan, stream_extract_to_stdout,
@@ -94,6 +98,152 @@ where
     }
 
     Ok(result)
+}
+
+fn counts_map(entries: &[(&str, u64)]) -> BTreeMap<String, u64> {
+    entries
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), *value))
+        .collect()
+}
+
+fn normalize_cli_values(values: &[String], strip_subreddit_prefix: bool) -> Vec<String> {
+    let mut out: Vec<String> = values
+        .iter()
+        .filter_map(|value| {
+            let mut normalized = value.trim().to_lowercase();
+            if strip_subreddit_prefix {
+                if let Some(rest) = normalized.strip_prefix("r/") {
+                    normalized = rest.to_string();
+                }
+            }
+            (!normalized.is_empty()).then_some(normalized)
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn source_arg_manifest_label(source: SourceArg) -> &'static str {
+    match source {
+        SourceArg::Rc => "comments",
+        SourceArg::Rs => "submissions",
+        SourceArg::Both => "both",
+    }
+}
+
+fn file_kind_manifest_label(kind: FileKind) -> &'static str {
+    match kind {
+        FileKind::Comment => "comment",
+        FileKind::Submission => "submission",
+    }
+}
+
+fn cli_selected_file_identities(common: &CommonOpts) -> Result<Vec<FileIdentity>> {
+    let comments_dir = common.data_dir.join("comments");
+    let submissions_dir = common.data_dir.join("submissions");
+    let discovered = discover_sources_checked(
+        &comments_dir,
+        &submissions_dir,
+        Sources::from(common.source),
+    )?;
+    let jobs = plan_files_checked(
+        &discovered,
+        &comments_dir,
+        &submissions_dir,
+        Sources::from(common.source),
+        common.start,
+        common.end,
+    )?;
+    let mut identities: Vec<FileIdentity> = jobs
+        .iter()
+        .map(|job| {
+            let mut identity = file_identity(&job.path);
+            identity.kind = Some(file_kind_manifest_label(job.kind).to_string());
+            identity.month = Some(job.ym.to_string());
+            identity
+        })
+        .collect();
+    identities.sort_by(|a, b| {
+        a.kind
+            .cmp(&b.kind)
+            .then_with(|| a.month.cmp(&b.month))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    Ok(identities)
+}
+
+fn cli_corpus_snapshot(common: &CommonOpts) -> Result<CorpusSnapshot> {
+    Ok(CorpusSnapshot {
+        base_dir: Some(path_to_stable_string(&common.data_dir)),
+        comments_dir: Some(path_to_stable_string(&common.data_dir.join("comments"))),
+        submissions_dir: Some(path_to_stable_string(&common.data_dir.join("submissions"))),
+        sources: Some(source_arg_manifest_label(common.source).to_string()),
+        selected_files: cli_selected_file_identities(common)?,
+    })
+}
+
+fn cli_query_value(common: &CommonOpts, query: &QueryOpts) -> Value {
+    serde_json::json!({
+        "subreddits": normalize_cli_values(&common.subreddits, true),
+        "authors_in": normalize_cli_values(&query.authors, false),
+        "authors_out": normalize_cli_values(&query.exclude_authors, false),
+        "exclude_common_bots": query.exclude_common_bots,
+        "author_regex": query.author_regex.as_deref(),
+        "min_score": query.min_score,
+        "max_score": query.max_score,
+        "keywords_any": normalize_cli_values(&query.keywords, false),
+        "domains_in": normalize_cli_values(&query.domains, false),
+        "contains_url": query.contains_url.then_some(true),
+        "json_predicates": &query.json_predicates,
+        "filter_pseudo_users": !common.include_deleted,
+    })
+}
+
+fn cli_common_options_value(common: &CommonOpts, extra: Value) -> Value {
+    serde_json::json!({
+        "data_dir": path_to_stable_string(&common.data_dir),
+        "work_dir": path_to_stable_string(&common.work_dir),
+        "start": common.start.map(|ym| ym.to_string()),
+        "end": common.end.map(|ym| ym.to_string()),
+        "source": source_arg_manifest_label(common.source),
+        "parallelism": common.parallelism,
+        "file_concurrency": common.file_concurrency,
+        "progress": !common.no_progress,
+        "allow_partial": common.allow_partial,
+        "emit_manifest": !common.no_manifest,
+        "extra": extra,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_cli_scan_manifest_for_file(
+    start: RunManifestStart,
+    operation: &str,
+    command: &str,
+    common: &CommonOpts,
+    query: &QueryOpts,
+    out_path: &Path,
+    output_format: &str,
+    counts: BTreeMap<String, u64>,
+    partial_reporter: &retl::PartialReadReporter,
+    extra_options: Value,
+) -> Result<()> {
+    if common.no_manifest || out_path == Path::new("-") {
+        return Ok(());
+    }
+    let mut manifest = RunManifestInput::new(operation);
+    manifest.start = start;
+    manifest.command = Some(command.to_string());
+    manifest.query = cli_query_value(common, query);
+    manifest.options = cli_common_options_value(common, extra_options);
+    manifest.corpus = cli_corpus_snapshot(common)?;
+    manifest.output_format = output_format.to_string();
+    manifest.counts = counts;
+    manifest.partial_read = partial_reporter.snapshot();
+    write_run_manifest(manifest, ManifestDestination::File(out_path.to_path_buf()))?;
+    Ok(())
 }
 
 pub(crate) fn run_describe(args: DescribeArgs) -> Result<()> {
@@ -461,7 +611,10 @@ pub(crate) fn run_schema(args: SchemaArgs) -> Result<()> {
 }
 
 pub(crate) fn run_scan(args: ScanArgs) -> Result<()> {
-    let etl = build_etl(&args.common)?;
+    let mut etl = build_etl(&args.common)?;
+    if args.resume {
+        etl = etl.resume(true);
+    }
     let partial_reporter = etl.partial_read_reporter();
     let mut scan = plan!(etl, args.common, args.query);
     if let Some(limit) = args.limit {
@@ -470,12 +623,28 @@ pub(crate) fn run_scan(args: ScanArgs) -> Result<()> {
 
     match args.out {
         Some(path) => {
-            write_text_file_atomic(&path, |w| {
+            let manifest_start = RunManifestStart::now();
+            let written = write_text_file_atomic(&path, |w| {
+                let mut written = 0_u64;
                 scan.try_for_each_username(|u| {
                     writeln!(w, "{u}")?;
+                    written += 1;
                     Ok(())
-                })
+                })?;
+                Ok(written)
             })?;
+            write_cli_scan_manifest_for_file(
+                manifest_start,
+                "cli.scan",
+                "retl scan",
+                &args.common,
+                &args.query,
+                &path,
+                "text-lines",
+                counts_map(&[("unique_usernames", written)]),
+                &partial_reporter,
+                serde_json::json!({ "limit": args.limit }),
+            )?;
         }
         None => {
             let stdout = io::stdout();
@@ -494,6 +663,9 @@ pub(crate) fn run_scan(args: ScanArgs) -> Result<()> {
 pub(crate) fn run_dedupe(args: DedupeArgs) -> Result<()> {
     let key = parse_dedupe_key(&args.key)?;
     let mut etl = build_etl(&args.common)?;
+    if args.out == Path::new("-") {
+        etl = etl.run_manifest(false);
+    }
     if let Some(b) = args.inflight_bytes {
         etl = etl.inflight_bytes(b);
     }
@@ -502,6 +674,9 @@ pub(crate) fn run_dedupe(args: DedupeArgs) -> Result<()> {
     }
     if args.strict_key {
         etl = etl.strict_key(true);
+    }
+    if args.resume {
+        etl = etl.resume(true);
     }
     let partial_reporter = etl.partial_read_reporter();
     let work_dir = args.common.work_dir.clone();
@@ -610,13 +785,16 @@ pub(crate) fn run_export(args: ExportArgs) -> Result<()> {
     if args.resume {
         etl = etl.resume(true);
     }
+    let to_stdout = args.out == Path::new("-");
+    if to_stdout {
+        etl = etl.run_manifest(false);
+    }
     let partial_reporter = etl.partial_read_reporter();
     let work_dir = args.common.work_dir.clone();
     let mut scan = plan!(etl, args.common, args.query);
     if let Some(limit) = args.limit {
         scan = scan.limit(limit);
     }
-    let to_stdout = args.out == Path::new("-");
 
     match args.format {
         ExportFmt::Jsonl => {
@@ -704,10 +882,13 @@ pub(crate) fn run_sample(args: SampleArgs) -> Result<()> {
     if args.human_timestamps {
         etl = etl.timestamps_human_readable(true);
     }
+    let to_stdout = args.out == Path::new("-");
+    if to_stdout {
+        etl = etl.run_manifest(false);
+    }
     let partial_reporter = etl.partial_read_reporter();
     let work_dir = args.common.work_dir.clone();
     let scan = plan!(etl, args.common, args.query).limit(args.limit);
-    let to_stdout = args.out == Path::new("-");
 
     match args.format {
         ExportFmt::Jsonl => {
@@ -784,13 +965,63 @@ pub(crate) fn run_sample(args: SampleArgs) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn run_convert(args: ConvertArgs) -> Result<()> {
+    if args.fields.iter().all(|field| field.trim().is_empty()) {
+        anyhow::bail!("retl convert requires at least one --field selector");
+    }
+
+    let mut inputs = Vec::new();
+    if let Some(spool) = &args.spool {
+        let (parts, _min, _max) = discover_spool_parts(spool)?;
+        inputs.extend(parts);
+    }
+    inputs.extend(args.inputs.iter().cloned());
+    if inputs.is_empty() {
+        anyhow::bail!("retl convert requires --spool or at least one JSONL input file");
+    }
+
+    let opts = TabularExportOptions {
+        header: !args.no_header,
+    };
+    let fields = args.fields.clone();
+    let to_stdout = args.out == Path::new("-");
+    let write = |path: &Path| -> Result<u64> {
+        match args.format {
+            ConvertFmt::Csv => convert_jsonl_to_csv(&inputs, path, fields.clone(), opts),
+            ConvertFmt::Tsv => convert_jsonl_to_tsv(&inputs, path, fields.clone(), opts),
+        }
+    };
+
+    if to_stdout {
+        let stem = match args.format {
+            ConvertFmt::Csv => "convert.csv",
+            ConvertFmt::Tsv => "convert.tsv",
+        };
+        stream_path_output_to_stdout(&args.work_dir, "convert", stem, |path| {
+            write(path).map(|_| ())
+        })?;
+    } else {
+        write(&args.out)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn run_count(args: CountArgs) -> Result<()> {
-    let etl = build_etl(&args.common)?;
+    let author_stdout = matches!(args.mode, CountMode::Author)
+        && args.out.as_deref().is_some_and(|p| p == Path::new("-"));
+    let mut etl = build_etl(&args.common)?;
+    if author_stdout {
+        etl = etl.run_manifest(false);
+    }
+    if args.resume {
+        etl = etl.resume(true);
+    }
     let partial_reporter = etl.partial_read_reporter();
     let scan = plan!(etl, args.common, args.query);
 
     match args.mode {
         CountMode::Month => {
+            let manifest_start = RunManifestStart::now();
             let counts = scan.count_by_month()?;
             let to_stdout = args.out.as_deref().map_or(true, |p| p == Path::new("-"));
             if to_stdout {
@@ -801,13 +1032,29 @@ pub(crate) fn run_count(args: CountArgs) -> Result<()> {
                 }
                 w.flush()?;
             } else {
-                let path = args.out.unwrap();
+                let path = args.out.as_ref().expect("checked to_stdout").clone();
                 write_text_file_atomic(&path, |w| {
                     for (ym, n) in &counts {
                         writeln!(w, "{ym}\t{n}")?;
                     }
                     Ok(())
                 })?;
+                let total_records: u64 = counts.values().copied().sum();
+                write_cli_scan_manifest_for_file(
+                    manifest_start,
+                    "cli.count_by_month",
+                    "retl count --mode month",
+                    &args.common,
+                    &args.query,
+                    &path,
+                    "tsv",
+                    counts_map(&[
+                        ("months", counts.len() as u64),
+                        ("records_counted", total_records),
+                    ]),
+                    &partial_reporter,
+                    serde_json::json!({ "mode": "month" }),
+                )?;
             }
         }
         CountMode::Author => {
@@ -829,6 +1076,11 @@ pub(crate) fn run_count(args: CountArgs) -> Result<()> {
 }
 
 pub(crate) fn run_integrity(args: IntegrityArgs) -> Result<()> {
+    if args.resume {
+        anyhow::bail!(
+            "retl integrity does not support --resume; it validates corpus files directly. Narrow long runs with --source/--start/--end or use resumable scan/export/count workflows for record processing."
+        );
+    }
     let etl = build_etl(&args.common)?;
     let mode = match args.mode {
         IntegrityModeArg::Quick => IntegrityMode::Quick {
@@ -872,15 +1124,24 @@ pub(crate) fn run_integrity(args: IntegrityArgs) -> Result<()> {
 }
 
 pub(crate) fn run_aggregate(args: AggregateArgs) -> Result<()> {
-    let mut etl = RedditETL::new().progress(!args.runtime.no_progress);
+    if args.resume {
+        anyhow::bail!(
+            "retl aggregate does not support --resume because it reduces existing JSONL inputs. For resumable corpus filtering, run `retl export --format spool --resume ...` first, then aggregate with `retl aggregate --spool <DIR>`."
+        );
+    }
+    let manifest_start = RunManifestStart::now();
+    let mut etl = RedditETL::new()
+        .progress(!args.runtime.no_progress)
+        .run_manifest(!args.runtime.no_manifest);
     if let Some(p) = args.runtime.parallelism {
         etl = etl.parallelism(p);
     }
 
     let inputs = resolve_aggregate_inputs(&args)?;
+    let manifest_inputs = inputs.clone();
     let input_count = inputs.len();
 
-    let shards_dir = args.shards_dir.unwrap_or_else(|| {
+    let shards_dir = args.shards_dir.clone().unwrap_or_else(|| {
         args.out
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."))
@@ -888,7 +1149,7 @@ pub(crate) fn run_aggregate(args: AggregateArgs) -> Result<()> {
     });
     create_dir_all_with_backoff(&shards_dir, 16, 50)
         .with_context(|| format!("creating shards_dir {}", shards_dir.display()))?;
-    if let Some(by) = args.by {
+    if let Some(by) = args.by.clone() {
         let group_by = GroupBySpec::parse(&by)?;
         let metric = MetricSpec::parse(args.metric.as_deref())?;
         let top = args.top;
@@ -905,6 +1166,27 @@ pub(crate) fn run_aggregate(args: AggregateArgs) -> Result<()> {
             agg.rows(top)
         };
         write_grouped_tsv(&args.out, rows)?;
+        let mut counts = counts_map(&[
+            ("input_files", input_count as u64),
+            ("ok_inputs", report.ok_inputs.len() as u64),
+            ("partial_inputs", report.partial_count() as u64),
+            ("fatal_inputs", report.fatal_count() as u64),
+            ("merged_shards", report.merged_shards as u64),
+            ("output_rows", agg.rows(None).len() as u64),
+        ]);
+        if let Some(top) = args.top {
+            counts.insert("top".to_string(), top as u64);
+        }
+        let warnings = aggregate_manifest_warnings(&report);
+        write_cli_aggregate_manifest(
+            manifest_start,
+            &args,
+            &shards_dir,
+            &manifest_inputs,
+            "tsv",
+            counts,
+            warnings,
+        )?;
         eprintln!(
             "Aggregated {} shard(s) to TSV; {} input(s) failed during shard build; {} input(s) skipped after partial read",
             report.merged_shards,
@@ -923,6 +1205,24 @@ pub(crate) fn run_aggregate(args: AggregateArgs) -> Result<()> {
         report_aggregate_input_issues(&report);
         ensure_aggregate_inputs_succeeded(input_count, &report)?;
         write_rec_count_json(&args.out, &agg, args.pretty)?;
+        let counts = counts_map(&[
+            ("input_files", input_count as u64),
+            ("ok_inputs", report.ok_inputs.len() as u64),
+            ("partial_inputs", report.partial_count() as u64),
+            ("fatal_inputs", report.fatal_count() as u64),
+            ("merged_shards", report.merged_shards as u64),
+            ("records_aggregated", agg.count),
+        ]);
+        let warnings = aggregate_manifest_warnings(&report);
+        write_cli_aggregate_manifest(
+            manifest_start,
+            &args,
+            &shards_dir,
+            &manifest_inputs,
+            "json",
+            counts,
+            warnings,
+        )?;
         eprintln!(
             "Aggregated {} shard(s); {} input(s) failed during shard build; {} input(s) skipped after partial read",
             report.merged_shards,
@@ -985,6 +1285,23 @@ fn path_contains_glob_meta(path: &Path) -> bool {
         .any(|c| matches!(c, '*' | '?' | '[' | ']'))
 }
 
+fn aggregate_manifest_warnings(report: &AggregateBuildReport) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if report.fatal_count() > 0 {
+        warnings.push(format!(
+            "{} aggregate input(s) failed during shard build",
+            report.fatal_count()
+        ));
+    }
+    if report.partial_count() > 0 {
+        warnings.push(format!(
+            "{} aggregate input(s) were skipped after partial read",
+            report.partial_count()
+        ));
+    }
+    warnings
+}
+
 fn report_aggregate_input_issues(report: &AggregateBuildReport) {
     if !report.fatal_inputs.is_empty() {
         eprintln!("Aggregate input(s) failed during shard build:");
@@ -1036,8 +1353,49 @@ fn write_grouped_tsv(out: &Path, rows: Vec<(String, String)>) -> Result<()> {
     .with_context(|| format!("publishing output file {}", out.display()))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn write_cli_aggregate_manifest(
+    start: RunManifestStart,
+    args: &AggregateArgs,
+    shards_dir: &Path,
+    inputs: &[PathBuf],
+    output_format: &str,
+    counts: BTreeMap<String, u64>,
+    warnings: Vec<String>,
+) -> Result<()> {
+    if args.runtime.no_manifest {
+        return Ok(());
+    }
+    let mut manifest = RunManifestInput::new("cli.aggregate");
+    manifest.start = start;
+    manifest.command = Some("retl aggregate".to_string());
+    manifest.options = serde_json::json!({
+        "spool": args.spool.as_ref().map(|p| path_to_stable_string(p)),
+        "explicit_inputs": args.inputs.iter().map(|p| path_to_stable_string(p)).collect::<Vec<_>>(),
+        "shards_dir": path_to_stable_string(shards_dir),
+        "pretty": args.pretty,
+        "by": args.by.as_deref(),
+        "metric": args.metric.as_deref(),
+        "top": args.top,
+        "scientific": args.scientific,
+        "parallelism": args.runtime.parallelism,
+        "progress": !args.runtime.no_progress,
+        "emit_manifest": !args.runtime.no_manifest,
+    });
+    manifest.inputs = file_identities(inputs);
+    manifest.output_format = output_format.to_string();
+    manifest.counts = counts;
+    manifest.warnings = warnings;
+    manifest.upstream_manifests = discover_upstream_manifests_from_inputs(inputs);
+    write_run_manifest(manifest, ManifestDestination::File(args.out.clone()))?;
+    Ok(())
+}
+
 pub(crate) fn run_first_seen(args: FirstSeenArgs) -> Result<()> {
-    let etl = build_etl(&args.common)?;
+    let mut etl = build_etl(&args.common)?;
+    if args.resume {
+        etl = etl.resume(true);
+    }
     let partial_reporter = etl.partial_read_reporter();
     let scan = plan!(etl, args.common, args.query);
     scan.build_first_seen_index_to_tsv(&args.out)?;
@@ -1117,7 +1475,9 @@ fn bail_empty_parent_ids(spool_parts: &[PathBuf]) -> Result<()> {
 }
 
 pub(crate) fn run_parents(args: ParentsArgs) -> Result<()> {
+    let manifest_start = RunManifestStart::now();
     let (spool_parts, min_ym, max_ym) = discover_spool_parts(&args.spool)?;
+    let manifest_spool_parts = spool_parts.clone();
 
     let mut wstart = min_ym;
     let mut wend = max_ym;
@@ -1153,7 +1513,8 @@ pub(crate) fn run_parents(args: ParentsArgs) -> Result<()> {
             .base_dir(&args.data_dir)
             .work_dir(&lib_tmp)
             .parent_payload_spec(parent_payload_spec.clone())
-            .progress(!args.no_progress);
+            .progress(!args.no_progress)
+            .run_manifest(!args.no_manifest);
         if let Some(s) = sources {
             etl = etl.sources(s);
         }
@@ -1187,6 +1548,50 @@ pub(crate) fn run_parents(args: ParentsArgs) -> Result<()> {
     )?;
     let (attached, stats) = build(None, Some((wstart, wend)))
         .attach_parents_jsonls_parallel_with_stats(spool_parts, &args.out, &parents, args.resume)?;
+
+    if !args.no_manifest {
+        let mut warnings = Vec::new();
+        if stats.total() > 0 && stats.unresolved_rate() > 0.05 {
+            warnings.push(format!(
+                "more than 5% of parent lookups were unresolved ({:.2}%)",
+                stats.unresolved_rate() * 100.0
+            ));
+        }
+        let mut manifest = RunManifestInput::new("cli.parents");
+        manifest.start = manifest_start;
+        manifest.command = Some("retl parents".to_string());
+        manifest.options = serde_json::json!({
+            "spool": path_to_stable_string(&args.spool),
+            "cache": path_to_stable_string(&args.cache),
+            "out": path_to_stable_string(&args.out),
+            "data_dir": path_to_stable_string(&args.data_dir),
+            "work_dir": path_to_stable_string(&args.work_dir),
+            "resume": args.resume,
+            "window_months": args.window_months,
+            "resolved_range": { "start": wstart.to_string(), "end": wend.to_string() },
+            "parent_payload": {
+                "full_record": parent_payload_spec.is_full_record(),
+                "fields": parent_payload_spec.fields(),
+            },
+            "parallelism": args.parallelism,
+            "file_concurrency": args.file_concurrency,
+            "inflight_bytes": args.inflight_bytes,
+            "inflight_groups": args.inflight_groups,
+            "progress": !args.no_progress,
+            "emit_manifest": !args.no_manifest,
+        });
+        manifest.inputs = file_identities(&manifest_spool_parts);
+        manifest.output_format = "jsonl-directory".to_string();
+        manifest.counts = counts_map(&[
+            ("input_files", manifest_spool_parts.len() as u64),
+            ("attached_files", attached.len() as u64),
+            ("parents_resolved", stats.resolved),
+            ("parents_unresolved", stats.unresolved),
+        ]);
+        manifest.warnings = warnings;
+        manifest.upstream_manifests = vec![upstream_manifest_for_directory(&args.spool)];
+        write_run_manifest(manifest, ManifestDestination::Directory(args.out.clone()))?;
+    }
 
     if stats.total() > 0 && stats.unresolved_rate() > 0.05 {
         tracing::warn!(

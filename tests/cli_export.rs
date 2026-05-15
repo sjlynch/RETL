@@ -326,6 +326,100 @@ fn export_format_zst_writes_partitioned_decodable_corpus() {
 }
 
 #[test]
+fn export_csv_rejects_unsupported_human_timestamps_and_resume_flags() {
+    let cwd = tempfile::tempdir().unwrap();
+
+    retl()
+        .arg("export")
+        .arg("--data-dir")
+        .arg(cwd.path().join("missing_data"))
+        .args([
+            "--format",
+            "csv",
+            "--whitelist",
+            "id",
+            "--human-timestamps",
+            "--no-progress",
+            "--out",
+        ])
+        .arg(cwd.path().join("out.csv"))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--human-timestamps is not supported",
+        ));
+
+    retl()
+        .arg("export")
+        .arg("--data-dir")
+        .arg(cwd.path().join("missing_data"))
+        .args([
+            "--format",
+            "tsv",
+            "--whitelist",
+            "id",
+            "--resume",
+            "--no-progress",
+            "--out",
+        ])
+        .arg(cwd.path().join("out.tsv"))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--resume is not supported"));
+
+    retl()
+        .arg("sample")
+        .arg("--data-dir")
+        .arg(cwd.path().join("missing_data"))
+        .args([
+            "--format",
+            "csv",
+            "--whitelist",
+            "id",
+            "--human-timestamps",
+            "--no-progress",
+            "--out",
+        ])
+        .arg(cwd.path().join("sample.csv"))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--human-timestamps is not supported",
+        ));
+}
+
+#[test]
+fn convert_cli_flattens_parent_enriched_jsonl_to_csv() {
+    let cwd = tempfile::tempdir().unwrap();
+    let input = cwd.path().join("with_parent.jsonl");
+    std::fs::write(
+        &input,
+        r#"{"id":"c1","body":"child","parent":{"kind":"t1","id":"p1","body":"parent","author":"bob"}}
+"#,
+    )
+    .unwrap();
+    let out = cwd.path().join("parents.csv");
+
+    retl()
+        .arg("convert")
+        .arg("--format")
+        .arg("csv")
+        .arg("--field")
+        .arg("id,body,parent.kind,parent.id,parent.body,parent.author")
+        .arg("--out")
+        .arg(&out)
+        .arg(&input)
+        .assert()
+        .success();
+
+    let csv = std::fs::read_to_string(&out).unwrap();
+    assert_eq!(
+        csv,
+        "id,body,parent.kind,parent.id,parent.body,parent.author\r\nc1,child,t1,p1,parent,bob\r\n"
+    );
+}
+
+#[test]
 fn export_csv_requires_whitelist_and_renders_header_and_rows() {
     let base = make_corpus_basic();
     let cwd = tempfile::tempdir().unwrap();
