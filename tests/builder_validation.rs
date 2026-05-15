@@ -1,7 +1,7 @@
 mod common;
 
 use common::write_zst_lines;
-use retl::{RedditETL, ScanPlan, Sources, YearMonth};
+use retl::{QuerySpec, RedditETL, ScanPlan, Sources, YearMonth};
 
 fn err_msg<E: std::fmt::Display>(err: E) -> String {
     err.to_string()
@@ -59,6 +59,10 @@ fn build_rejects_empty_subreddit_list() {
 fn build_rejects_empty_explicit_string_lists() {
     let empty: [&str; 0] = [];
     expect_query_build_error(
+        RedditETL::new().scan().ids(empty),
+        &["ids_in", "empty list"],
+    );
+    expect_query_build_error(
         RedditETL::new().scan().authors_in(empty),
         &["authors_in", "empty list"],
     );
@@ -67,7 +71,10 @@ fn build_rejects_empty_explicit_string_lists() {
         &["authors_out", "empty list"],
     );
     expect_query_build_error(
-        RedditETL::new().scan().authors_out(empty).exclude_common_bots(),
+        RedditETL::new()
+            .scan()
+            .authors_out(empty)
+            .exclude_common_bots(),
         &["authors_out", "empty list"],
     );
     expect_query_build_error(
@@ -78,6 +85,14 @@ fn build_rejects_empty_explicit_string_lists() {
         RedditETL::new().scan().keywords_any(empty),
         &["keywords_any", "empty list"],
     );
+    expect_query_build_error(
+        RedditETL::new().scan().keywords_all(empty),
+        &["keywords_all", "empty list"],
+    );
+    expect_query_build_error(
+        RedditETL::new().scan().exclude_keywords(empty),
+        &["keywords_exclude", "empty list"],
+    );
 }
 
 #[test]
@@ -85,6 +100,10 @@ fn build_rejects_blank_normalized_filter_values() {
     expect_query_build_error(
         RedditETL::new().scan().subreddit(" r/ "),
         &["subreddits", "blank entries are not allowed"],
+    );
+    expect_query_build_error(
+        RedditETL::new().scan().ids(["t1_"]),
+        &["ids_in", "blank entries are not allowed"],
     );
     expect_query_build_error(
         RedditETL::new().scan().authors_in([""]),
@@ -106,6 +125,18 @@ fn build_rejects_blank_normalized_filter_values() {
         RedditETL::new().scan().keywords_any(["\n"]),
         &["keywords_any", "blank entries are not allowed"],
     );
+    expect_query_build_error(
+        RedditETL::new().scan().keywords_all(["\n"]),
+        &["keywords_all", "blank entries are not allowed"],
+    );
+    expect_query_build_error(
+        RedditETL::new().scan().exclude_keywords(["\n"]),
+        &["keywords_exclude", "blank entries are not allowed"],
+    );
+    expect_query_build_error(
+        RedditETL::new().scan().text_regex("\t"),
+        &["text_regex", "blank regex patterns are not allowed"],
+    );
 
     #[allow(deprecated)]
     let legacy_blank_subreddit = RedditETL::new().subreddit(" ").scan();
@@ -113,6 +144,27 @@ fn build_rejects_blank_normalized_filter_values() {
         legacy_blank_subreddit,
         &["subreddits", "blank entries are not allowed"],
     );
+}
+
+#[test]
+fn build_rejects_duplicate_record_ids_after_normalization() {
+    expect_query_build_error(
+        RedditETL::new().scan().ids(["t1_abc", "T1_ABC"]),
+        &["ids_in", "duplicate ID", "abc"],
+    );
+    expect_query_build_error(
+        RedditETL::new().scan().ids(["abc", "t1_abc"]),
+        &["ids_in", "duplicate ID", "abc"],
+    );
+}
+
+#[test]
+fn record_id_filters_do_not_require_full_parse() {
+    let mut query = QuerySpec::default();
+    query.ids_in = Some(vec!["t1_abc".to_string()]);
+    let query = query.normalize();
+
+    assert!(!query.requires_full_parse());
 }
 
 #[test]
@@ -125,6 +177,26 @@ fn build_rejects_invalid_author_regex_pattern() {
         .expect("expected ScanPlan::build to fail");
     let msg = err_msg(err);
     assert!(msg.contains("author_regex"), "{msg}");
+}
+
+#[test]
+fn build_rejects_invalid_text_regex_pattern() {
+    let err = RedditETL::new()
+        .scan()
+        .text_regex("[")
+        .build()
+        .err()
+        .expect("expected ScanPlan::build to fail");
+    let msg = err_msg(err);
+    assert!(msg.contains("text_regex"), "{msg}");
+}
+
+#[test]
+fn build_rejects_contradictory_url_filters() {
+    expect_query_build_error(
+        RedditETL::new().scan().contains_url(true).no_url(),
+        &["contains_url", "no_url"],
+    );
 }
 
 #[test]

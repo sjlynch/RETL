@@ -15,6 +15,7 @@
   - Partitioned per source/month in corpus layout as JSONL or ZST (CLI: `retl export --format partitioned-jsonl` / `--format zst`)
 - 📈 **Analytics helpers**: `count_by_month()`, per‑author counts, “first seen” index
 - 👪 **Parent pipeline**: collect parent IDs → resolve content → attach parent payloads back to records
+- 🗺️ **Corpus acquisition planning** from a versioned manifest (`retl corpus plan`)
 - 🧪 **Integrity checks** for corrupted monthly files (quick or full)
 - 🧵 **Parallel, backpressure‑aware** I/O with file concurrency caps and cooperative throttling
 - 🪟 **Windows‑friendly I/O** with robust retry/backoff on transient errors
@@ -25,6 +26,7 @@
 
 - [Try it in 60 seconds (no corpus needed)](#try-it-in-60-seconds-no-corpus-needed)
 - [Data Layout](#data-layout)
+- [Corpus acquisition workflow](#corpus-acquisition-workflow)
 - [Install](#install)
 - [Command-Line Interface](#command-line-interface)
 - [Quick CLI start](#quick-cli-start)
@@ -48,29 +50,31 @@
 
 ## Try it in 60 seconds (no corpus needed)
 
-You can verify a fresh checkout without downloading the multi-GB Reddit corpus.
-This builds the release CLI binary, then runs the `quickstart` example against
-the committed `benches/data/sample.jsonl` fixture. The example writes a tiny
-Reddit-style `.zst` corpus under `target/retl_quickstart_sample/data` and runs
-real RETL scans over it.
+After installing a release binary, verify it without downloading the multi-GB
+Reddit corpus. `retl quickstart` writes a tiny Reddit-style `.zst` corpus from
+the embedded `benches/data/sample.jsonl` fixture and runs real RETL scans over
+it.
 
 ~~~sh
-cargo build --release
-cargo run --release --example quickstart
+retl --help
+retl quickstart
 ~~~
 
 Expected output:
 
 ~~~text
-Prepared sample corpus from benches/data/sample.jsonl under target/retl_quickstart_sample/data
+Prepared sample corpus from benches/data/sample.jsonl under ./retl_quickstart_sample/data
 Feature demo: subreddit=programming, source=RC+RS
 2019-12	2 records
 2020-01	3 records
 Found 4 unique authors: alice, cory, kate, quinn
+Next: retl sample --data-dir ./retl_quickstart_sample/data --source both --subreddit programming --limit 3
 ~~~
 
-If that works and you already have monthly Reddit dumps, continue with the
-full [Quick Start](#quick-start).
+From a source checkout you can run the same installed-binary path with
+`cargo run --release -- quickstart` (the library example remains available as
+`cargo run --release --example quickstart`). If that works and you already have
+monthly Reddit dumps, continue with the full [Quick Start](#quick-start).
 
 ---
 
@@ -96,15 +100,119 @@ File name patterns are enforced at discovery time:
 
 ---
 
-You can browse and download monthly dumps via Academic Torrents:
-https://academictorrents.com/browse.php?search=reddit
+## Corpus acquisition workflow
+
+RETL now includes a manifest-backed acquisition planner so a fresh machine can
+start from an empty `./data` directory without hand-browsing Academic Torrents.
+The built-in manifest is versioned and knows the canonical `comments/RC_*.zst`
+/ `submissions/RS_*.zst` layout, public-corpus start months, known unavailable
+pre-corpus months, and Academic Torrents search URLs. It intentionally does not
+claim byte counts or checksums; pass `--manifest my_corpus_manifest.json` when
+your project maintains verified `compressed_bytes` or `sha256` values.
+
+Plan the desired months and expected paths:
+
+~~~sh
+retl corpus plan \
+  --source both \
+  --start 2006-01 --end 2006-01 \
+  --dest ./data \
+  --format json \
+  --out download_plan.json
+~~~
+
+Each JSON item includes `source`, `month`, `availability`, `file_name`,
+`expected_path`, optional `compressed_bytes` / `sha256`, Academic Torrents
+search fields (`url` / `torrent`), and a `local.status` of `missing`,
+`present`, or `inaccessible`. Use the plan as a machine-readable checklist for
+your download tool, placing files exactly at `expected_path`. For a shell/CSV
+friendly checklist, use `--format tsv`; to emit only files still missing locally,
+add `--only-missing`.
+
+After download, compare the requested manifest range against local files, then
+validate the zstd payloads:
+
+~~~sh
+retl describe --expected --data-dir ./data --source both --start 2006-01 --end 2006-01
+retl integrity --expected --mode full --data-dir ./data --source both --start 2006-01 --end 2006-01
+retl sample --data-dir ./data --source rc --start 2006-01 --end 2006-01 --limit 5
+~~~
+
+If you use a custom manifest, pass the same `--manifest path/to/manifest.json`
+to `corpus plan`, `describe --expected`, and `integrity --expected`. Add
+`--verify-checksums` to `corpus plan` or `integrity --expected` when the
+manifest contains SHA-256 values and you want RETL to read present files and
+compare them.
+
+Minimal custom manifest shape:
+
+~~~json
+{
+  "version": 1,
+  "sources": [{
+    "source": "rc",
+    "directory": "comments",
+    "prefix": "RC",
+    "first_month": "2005-12",
+    "url_template": "https://example.invalid/{file_name}",
+    "files": [{
+      "month": "2006-01",
+      "compressed_bytes": 123456789,
+      "sha256": "<64 lowercase hex chars>"
+    }],
+    "unavailable": [{
+      "start": "2005-01",
+      "end": "2005-11",
+      "reason": "comments begin at 2005-12"
+    }]
+  }]
+}
+~~~
 
 Note on scale & performance:
 The monthly files become very large in later years. It’s normal for broader queries to run longer and consume significant I/O. RETL’s streaming design and throttling aim to keep resource use predictable; tune `.file_concurrency(n)`, `.parallelism(n)`, and `.io_buffers(...)` as appropriate for your hardware and dataset size. Oversized resource knobs are clamped with a warning rather than allowed to create unbounded threads, zstd decoders, or shard files.
 
 ## Install
 
-### As a library (recommended)
+### CLI binary (no Rust toolchain)
+
+Download the latest prebuilt `retl` binary from GitHub Releases and verify it
+with the no-corpus quickstart:
+
+~~~sh
+# Linux x86_64
+curl -L https://github.com/sjlynch/retl/releases/latest/download/retl-x86_64-unknown-linux-gnu.tar.gz \
+  | tar xz
+sudo install -m 0755 retl /usr/local/bin/retl
+retl --help
+retl quickstart
+~~~
+
+~~~sh
+# macOS x86_64
+curl -L https://github.com/sjlynch/retl/releases/latest/download/retl-x86_64-apple-darwin.tar.gz \
+  | tar xz
+sudo install -m 0755 retl /usr/local/bin/retl
+retl --help
+retl quickstart
+~~~
+
+~~~powershell
+# Windows x86_64 (PowerShell)
+$dest = "$env:LOCALAPPDATA\retl\bin"
+New-Item -ItemType Directory -Force $dest | Out-Null
+Invoke-WebRequest https://github.com/sjlynch/retl/releases/latest/download/retl-x86_64-pc-windows-msvc.zip -OutFile "$env:TEMP\retl.zip"
+Expand-Archive -Force "$env:TEMP\retl.zip" $dest
+$env:Path = "$dest;$env:Path"
+retl.exe --help
+retl.exe quickstart
+~~~
+
+Release CI builds those archives on Windows/macOS/Linux, extracts each archive,
+and smoke-tests the packaged binary with `retl --help`, `retl quickstart`, and
+`retl sample` against the generated fixture.
+
+### As a library
 
 Add RETL to your Cargo.toml via Git:
 
@@ -113,17 +221,18 @@ Add RETL to your Cargo.toml via Git:
 retl = { git = "https://github.com/sjlynch/retl", branch = "main" }
 ~~~
 
-> This repository currently sets `publish = false` in `Cargo.toml`, so installing from crates.io is not expected.
+> This repository currently sets `publish = false` in `Cargo.toml`, so installing from crates.io is not expected. The Git dependency path remains the supported library path.
 
-### Build the CLI binary
+### Build the CLI binary from source
 
 This repo ships a `retl` binary (`src/main.rs`) that exposes the most common
-ETL operations as subcommands. The original demo lives at
+ETL operations as subcommands. The original library demo lives at
 `examples/quickstart.rs`.
 
 ~~~sh
 cargo build --release
 ./target/release/retl --help
+./target/release/retl quickstart
 ~~~
 
 For copy-pasteable per-subcommand invocations, see
@@ -160,6 +269,14 @@ and validation flags because it does not filter records by query:
 | `--include-deleted` | Include pseudo-users (`[deleted]`, `[removed]`, and empty authors) that are filtered by default. |
 | `--parallelism <N>` / `--file-concurrency <N>` | Rayon threads / concurrent monthly files; oversized values are clamped to RETL's documented safety caps. |
 | `--no-progress` | Disable progress bars. |
+| `--no-manifest` | Do not write provenance sidecars next to outputs. |
+| `--resume` | For `scan`, `dedupe`, `export`, `count`, and `first-seen`, reuse validated per-month checkpoints instead of restarting a long run from month one. `integrity`, `aggregate`, and `sample` are intentionally non-resumable. |
+
+### Provenance manifests
+
+By default, user-facing file outputs get a `<output>.retl-manifest.json` sidecar and directory outputs (spool, partitioned exports, parents output) get `<out_dir>/_retl_manifest.json`. The manifest records the RETL version (and build git hash when provided), operation/API surface, normalized query/options, selected corpus file identities (path, kind, month, size/mtime), output path/format, counts, partial-read skips, resume/checkpoint fingerprint when relevant, timestamps, warnings, and upstream spool manifest links used by downstream parents/aggregate flows.
+
+Manifests intentionally contain local filesystem paths to make runs auditable. Treat them as reproducibility artifacts: redact or omit them before sharing if paths reveal private directory names. Use `--no-manifest` on the CLI or `.run_manifest(false)` on `RedditETL` to disable sidecar emission.
 
 ### Pseudo-user filtering (default ON)
 
@@ -168,6 +285,19 @@ By default, scans exclude records whose `author` is `[deleted]`, `[removed]`, or
 ### Date ranges and missing months
 
 When `--start` or `--end` is set, RETL filters individual records by the same inclusive month bounds it uses for file planning. Records without `created_utc` are dropped while any date bound is active. If files are missing inside the requested range (for example Jan and Mar exist but Feb is absent), corpus-scanning commands emit a warning and `retl describe` reports the missing month list. Discovery errors (for example a `comments/` path that is a file or cannot be read) fail fast with the directory name; filenames like `RC_2024-00.zst` or `RS_2024-99.zst` are warned and skipped because their months are invalid.
+
+### `quickstart` — verify an install without a corpus
+
+Creates a tiny local corpus under `./retl_quickstart_sample/data` (override with
+`--out-dir`) from RETL's embedded sample fixture, then runs a count and username
+scan over it:
+
+~~~sh
+retl quickstart
+retl sample --data-dir ./retl_quickstart_sample/data --source both --subreddit programming --limit 3
+~~~
+
+Alias: `retl demo`.
 
 ### `describe` — inspect the discovered corpus
 
@@ -185,6 +315,31 @@ retl describe --data-dir ./data --source both --start 2016-01 --end 2016-12
 ~~~
 
 Aliases: `retl ls`, `retl plan`.
+
+Pass `--expected` (and optionally `--manifest path/to/manifest.json`) with an
+explicit `--start` / `--end` to add a manifest comparison table showing desired
+months, local present/missing counts, unavailable ranges, and known expected
+compressed bytes. This is the quick post-download check before integrity
+validation.
+
+### `corpus plan` — plan downloads and expected layout
+
+`retl corpus plan` is a no-download acquisition workflow: it emits a JSON or TSV
+checklist of source/month files, expected destination paths, optional manifest
+sizes/checksums, known unavailable months, and whether each file is already
+present locally.
+
+~~~sh
+retl corpus plan --source rc --start 2006-01 --end 2006-03 --dest ./data --format tsv
+retl corpus plan --source both --start 2019-01 --end 2019-12 --dest ./data --only-missing --out plan.json
+retl corpus manifest --out reddit_corpus_manifest.v1.json
+~~~
+
+Use `--manifest custom.json` to consume a project-maintained versioned manifest
+with verified `compressed_bytes`, `sha256`, direct URLs, or additional
+unavailable ranges. `--verify-checksums` compares SHA-256 for present files that
+have manifest checksums; it is off by default because later monthly dumps are
+multi-GB.
 
 ### Analyst-facing exports & exploration
 
@@ -218,7 +373,7 @@ retl export \
   --out rust_submissions_2020.csv
 ~~~
 
-CSV uses standard doubled-quote escaping and CRLF row endings. TSV uses literal tab separators and refuses values containing tabs; use CSV when fields may contain arbitrary text. Missing whitelisted fields render as empty cells.
+CSV uses standard doubled-quote escaping and CRLF row endings, including quoted multiline cells. TSV uses literal tab separators and refuses values containing tabs or line breaks; use CSV when fields may contain arbitrary Reddit text. Missing whitelisted fields render as empty cells.
 
 ### `scan` — emit unique usernames
 
@@ -232,6 +387,10 @@ retl scan \
   --subreddit programming --subreddit reddit.com \
   --out usernames.txt
 ~~~
+
+Add `--resume` to persist per-source per-month matched-record checkpoints under
+`--work-dir/scan_checkpoints/`; a later run with the same query/config/corpus
+skips completed months and rebuilds missing, stale, or partial checkpoint parts.
 
 ### `dedupe` — emit unique keys
 
@@ -261,7 +420,10 @@ Records that match the query but do not contain the extracted key are omitted
 from the dedupe output (for example, `--key json:/parent_id --source both`
 drops submissions because they have no `parent_id`). The CLI prints a summary
 with the drop count and warns when more than 1% of matching records lack the
-key. Add `--strict-key` to make any missing key a hard error instead.
+key. Add `--strict-key` to make any missing key a hard error instead. With
+`--resume`, the expensive corpus scan is checkpointed per month under
+`--work-dir/scan_checkpoints/`; final key sorting/deduplication still reruns so
+changing `--key` can reuse the same matched-record checkpoints.
 
 ### `export` — extract filtered records
 
@@ -270,15 +432,36 @@ Formats:
 * `--format jsonl` → single stitched `.jsonl` file (default).
 * `--format json`  → single `.json` file containing a JSON array (`--pretty`
   field-indents records, matching `aggregate --pretty`).
-* `--format csv` → single RFC4180-style CSV file. Requires `--whitelist` to define the fixed column order; missing fields render as empty cells.
-* `--format tsv` → single tab-separated file. Requires `--whitelist`; values containing literal tabs are rejected with a warning because TSV has no standard escaping.
+* `--format csv` → single RFC4180-style CSV file. Requires `--whitelist` to define the fixed column order; missing fields render as empty cells. `--human-timestamps` and `--resume` are not supported for CSV/TSV.
+* `--format tsv` → single tab-separated file. Requires `--whitelist`; values containing literal tabs or line breaks are rejected with a warning because TSV has no standard escaping.
 * `--format spool` → per-source per-month files (`part_RC_YYYY-MM.jsonl`, `part_RS_YYYY-MM.jsonl`) under the directory passed to `--out`. Use this for the parents-pipeline workflow.
 * `--format zst` → corpus-style partitioned `.zst` output under `<out>/comments/RC_YYYY-MM.zst` and `<out>/submissions/RS_YYYY-MM.zst`.
 * `--format partitioned-jsonl` → the same corpus-style directory layout, but as uncompressed `.jsonl` files.
 
-Export-only modifiers include `--whitelist a,b,c`, `--strict-whitelist`, `--human-timestamps`, `--limit N`, `--zst-level <N>`, and `--resume`. With `--resume`, `jsonl`/`json` exports checkpoint per-month `.part_*.jsonl` files under `--work-dir`; `spool`, `zst`, and `partitioned-jsonl` use `_progress.json` under `--out`. The checkpoint includes a fingerprint of the query and output-affecting config; changing filters, sources, date range, whitelist fields, `--limit`, `--human-timestamps`, or (for ZST) `--zst-level` discards stale parts instead of mixing results from different runs. Partitioned ZST resume validates completed `.zst` outputs with a full decode before skipping them.
+Export-only modifiers include `--whitelist a,b,c`, `--strict-whitelist`, `--limit N`, and, for JSON-family formats (`jsonl`, `json`, `spool`, `zst`, `partitioned-jsonl`), `--human-timestamps` and `--resume`; `--zst-level <N>` applies to `zst`. CSV/TSV reject `--human-timestamps` and `--resume` rather than silently ignoring them. With `--resume`, `jsonl`/`json` exports checkpoint per-month `.part_*.jsonl` files under `--work-dir`; `spool`, `zst`, and `partitioned-jsonl` use `_progress.json` under `--out`. The checkpoint includes a fingerprint of the query, output-affecting config, selected corpus paths, and selected monthly file identities; changing filters, sources, date range, corpus files, whitelist fields, `--limit`, `--human-timestamps`, or (for ZST) `--zst-level` discards stale parts instead of mixing results from different runs. Partitioned ZST resume validates completed `.zst` outputs with a full decode before skipping them.
 
 Corpus scans and exports are strict by default: zstd decode errors fail the command instead of returning plausible partial results. Pass `--allow-partial` to preserve the explicit lossy mode; skipped file counts and paths are emitted as a JSON object on stderr, and skipped months are not committed to resume manifests.
+
+Resumable analytics (`scan`, `dedupe`, `count`, and `first-seen`) use a shared
+matched-record checkpoint format under `--work-dir/scan_checkpoints/<fingerprint>/`.
+Each part is `part_RC_YYYY-MM.jsonl` or `part_RS_YYYY-MM.jsonl` plus a
+`_progress.json` entry. On resume, RETL checks the query/config/corpus
+fingerprint and validates each JSONL part's size and line count; mismatches,
+malformed JSON, and uncommitted partial months are rebuilt.
+
+### `convert` — flatten existing JSONL/spool files
+
+`retl convert` reads already-produced JSONL files (including spool or parent-enriched spool parts) and writes analysis-friendly CSV/TSV without rescanning the raw corpus. Select columns with top-level names (`id`), dotted paths (`parent.author`), or JSON Pointers (`/parent/body`):
+
+~~~sh
+retl convert \
+  --spool spool_with_parents \
+  --format csv \
+  --field id,body,parent.kind,parent.id,parent.author,parent.body \
+  --out comments_with_parent_text.csv
+~~~
+
+Use JSON Pointer syntax for keys containing dots or slashes. TSV conversion has the same limitation as TSV export: cells containing tabs or line breaks fail with the field name and a recommendation to use CSV.
 
 ~~~sh
 # JSONL with a field whitelist and human timestamps
@@ -348,7 +531,24 @@ retl count --start 2016-01 --end 2016-12 --subreddit worldnews
 
 # Author-level counts
 retl count --mode author --subreddit programming --start 2006-01 --end 2006-04 --out authors.tsv
+
+# Resume an interrupted author-count scan
+retl count --mode author --resume --subreddit programming --start 2006-01 --end 2006-04 --out authors.tsv
 ~~~
+
+Both modes support `--resume` and reuse the same matched-record checkpoints as
+`scan`/`dedupe` when the fingerprint still matches.
+
+### `first-seen` — earliest timestamp per author
+
+Builds a TSV of `author<TAB>earliest_created_utc` for matching records:
+
+~~~sh
+retl first-seen --subreddit programming --start 2006-01 --end 2006-04 --out first_seen.tsv --resume
+~~~
+
+`first-seen` supports `--resume` via the shared matched-record checkpoints under
+`--work-dir`.
 
 ### `integrity` — validate `.zst` monthly files
 
@@ -358,7 +558,16 @@ retl integrity --mode quick --sample-bytes 65536 --source rc --start 2006-02 --e
 
 # Full: decode every byte (validates trailing checksum)
 retl integrity --mode full --source both --start 2006-01 --end 2006-04
+
+# Manifest preflight + full decode after following a corpus plan
+retl integrity --expected --mode full --source both --start 2006-01 --end 2006-04
 ~~~
+
+`--expected` (or `--manifest path/to/manifest.json`) first compares the requested
+range against the corpus manifest and fails before decoding if an available month
+is missing locally, a manifest size/checksum does not match, or the request
+includes a known-unavailable month. Use `--verify-checksums` with manifests that
+provide SHA-256 values.
 
 Quick mode validates only the first `--sample-bytes` decompressed bytes of each
 file. `--sample-bytes` must be positive (default: 65536); very small samples
@@ -373,9 +582,10 @@ to buffer the failure list and print it only after all files finish.
 
 Aggregates one or more already-filtered JSONL inputs using the
 `retl::Aggregator` pipeline (each input is processed in parallel; per-input
-shard intermediates land under `--shards-dir`, which defaults to `agg_shards/`
-next to `--out`). `aggregate` does not scan the RC/RS corpus and does not
-accept corpus selectors such as `--data-dir`, `--start`, or `--subreddit`; run
+shard intermediates land in a per-run subdirectory under `--shards-dir`, which
+defaults to `agg_shards/` next to `--out`). `aggregate` does not scan the
+RC/RS corpus and does not accept corpus selectors such as `--data-dir`,
+`--start`, or `--subreddit`; run
 `retl export --format spool ...` first if you need to filter the corpus. Its
 runtime flags are limited to `--parallelism`, `--no-progress`, and
 `--shards-dir`. Use `--spool DIR` to discover `part_RC_YYYY-MM.jsonl` /
@@ -398,10 +608,15 @@ retl aggregate --spool ./spool --by 'json:/subreddit' --metric 'sum:/score' --ou
 ~~~
 
 `--pretty` field-indents the final JSON when `--by` is omitted, matching
-`export --format json --pretty`. Grouped TSV metrics render integer-valued
-numbers as plain decimal strings by default (for example large `sum:/score`
-values do not use scientific notation); pass `--scientific` to opt back into
-Rust's default `f64` formatting.
+`export --format json --pretty`. Grouped TSV integer metrics are accumulated
+and compared exactly as `i128` when JSON numbers or numeric strings fit that
+range, so large `sum`, `min`, and `max` values beyond f64's exact range keep
+plain decimal output. Non-integer floating metrics use Rust's shortest
+round-trip float text instead of six-place rounding; averages from exact
+integer sums are rounded to at most 18 fractional decimal places and then
+trimmed. `--scientific` is only a display-style toggle that allows Rust's
+float formatter to use exponent notation for inexact floating values; it does
+not lower numeric precision, and exact integer results remain decimal.
 
 `--metric` defaults to `count` and also supports `avg:/pointer`,
 `min:/pointer`, and `max:/pointer` for numeric JSON-pointer values.
@@ -764,6 +979,14 @@ let _out_paths = RedditETL::new()
 
 By default, resolved comments receive a `"parent"` object containing either the parent comment’s body (`t1_...`) or the submission’s title/selftext (`t3_...`). Use `.parent_fields([...])` or CLI `--parent-fields author,body,score,created_utc,subreddit,domain,url,title,selftext` to attach extra top-level parent fields; use `.parent_full(true)` / `--parent-full` to attach the full parent JSON record. `kind` and `id` are always included for resolved parents. If a referenced parent cannot be resolved from the cache/window, `retl` leaves the `"parent"` key absent rather than writing an empty object; the CLI reports resolved/unresolved totals and warns when more than 5% are unresolved.
 
+After attachment, flatten the enriched JSONL directly for DuckDB/spreadsheets:
+
+~~~sh
+retl convert --spool spool_with_parents --format csv \
+  --field id,author,body,parent.kind,parent.id,parent.author,parent.body \
+  --out comments_with_parents.csv
+~~~
+
 If you already have parent IDs from SQL/Python, build `ParentIds` directly instead of writing a fake spool:
 
 ~~~rust
@@ -779,7 +1002,7 @@ let parents = RedditETL::new()
     .resolve_parent_maps(&ids, Path::new("parents_cache"), true)?;
 ~~~
 
-Note: extract/spool resume entries are fingerprinted by query/config. Parent-cache and attach resume sidecars include the parent ID set, selected parent fields, payload format, corpus file identity, and resolution window, so widening `--parent-fields` rebuilds stale narrow cache shards instead of reusing them.
+Note: extract/spool and analytics resume entries are fingerprinted by query/config plus selected corpus file identity. Parent-cache and attach resume sidecars include the parent ID set, selected parent fields, payload format, corpus file identity, and resolution window, so widening `--parent-fields` rebuilds stale narrow cache shards instead of reusing them.
 
 In spool mode, the `parents` CLI uses `--window-months 3` by default, scanning three extra months on each side of the spool range. Direct-ID mode instead uses `--start` / `--end` when provided, or scans all discovered months when omitted. Larger windows/ranges catch more old cross-month parents, but scan more corpus bytes and create/use more parent-cache shard files; smaller windows/ranges are faster and lighter but can leave more parents unresolved.
 

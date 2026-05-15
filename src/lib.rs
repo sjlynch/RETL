@@ -25,17 +25,23 @@
 //!      sizes, `zst_level`.
 //!    - [`YearMonth`] / `iter_year_months` — inclusive month range cursors.
 //!    - [`ScanPlan`] / [`QuerySpec`] — the query builder returned by
-//!      [`RedditETL::scan`], plus subreddit / author / regex / keyword / domain
-//!      / score / JSON-pointer predicate filters. `ScanPlan::build` returns
-//!      [`QueryBuildError`] for contradictory, empty, or blank-normalized query
-//!      settings before any corpus file is scanned. `.contains_url(true)` is a
-//!      positive URL-presence filter; `.contains_url(false)` clears it and is
-//!      equivalent to omitting the filter (there is no negative URL filter yet).
+//!      [`RedditETL::scan`], plus subreddit / record-ID / author / regex /
+//!      keyword / domain / score / exact `created_utc` timestamp /
+//!      URL / JSON-pointer predicate filters. Keyword any/all/exclude and
+//!      text-regex filters search comment `body` plus submission `selftext`
+//!      and `title` on the fast path. `ScanPlan::build` returns
+//!      [`QueryBuildError`] for contradictory, empty, blank-normalized, or
+//!      malformed query settings before any corpus file is scanned.
+//!      `.contains_url(true)` is a positive URL-presence filter;
+//!      `.contains_url(false)` clears it and is equivalent to omitting the
+//!      filter; `.no_url()` applies the negative URL predicate.
 //!      `QuerySpec` exposes
 //!      `requires_full_parse()` to choose between the [`MinimalRecord`] fast-path
 //!      and a full `serde_json::Value` parse.
 //!
 //! 2. **Discover & plan**
+//!    - [`CorpusManifest`] / [`CorpusPlanItem`] power the CLI's manifest-backed
+//!      acquisition checklist (`retl corpus plan`) before files exist locally.
 //!    - `discover_sources_checked` / `plan_files_checked` (doc(hidden)) walk
 //!      the corpus and emit [`FileJob`]s honoring the configured sources and
 //!      date bounds while surfacing directory/filename diagnostics.
@@ -86,7 +92,9 @@
 //!      path directly. See [`crate::atomic_write`] for the staging contract.
 //!    - The optional resume manifest at `<out_dir>/_progress.json` (see
 //!      [`progress_manifest`](crate::progress_manifest)) records each
-//!      committed month so a crashed run can skip what already landed; months
+//!      committed month so a crashed run can skip what already landed. Exports
+//!      store manifests next to their outputs; analytics helpers store matched
+//!      per-month JSONL checkpoints under `work_dir/scan_checkpoints/`. Months
 //!      skipped by `allow_partial` are intentionally left uncommitted.
 //!
 //! 7. **Verify**
@@ -120,6 +128,7 @@
 //! contract, backpressure model, taskboard rules) and bench/fuzz commands.
 
 mod config;
+mod corpus_manifest;
 mod date;
 mod kv_shard;
 mod paths;
@@ -137,6 +146,7 @@ mod pipeline;
 mod pipeline_exec;
 mod progress;
 mod progress_manifest;
+mod run_manifest;
 mod stitch;
 mod streaming;
 mod util;
@@ -158,10 +168,27 @@ pub use crate::config::{
     max_parallelism_limit, ConfigBuildError, ETLOptions, PartialReadReport, PartialReadReporter,
     SkippedFile, Sources, MAX_FILE_CONCURRENCY, MAX_RAYON_THREADS, MAX_SHARDS,
 };
+pub use crate::corpus_manifest::{
+    CorpusAvailability, CorpusLocalStatus, CorpusManifest, CorpusManifestError, CorpusManifestFile,
+    CorpusPlanItem, CorpusSource, CorpusSourceManifest, CorpusUnavailableRange,
+};
 pub use crate::date::YearMonth;
 pub use crate::pipeline::{RedditETL, ScanPlan};
-pub use crate::pipeline_exec::{DedupeKeySummary, ExportFormat, TabularExportOptions};
-pub use crate::query::{JsonPointerPredicate, NumericComparison, QueryBuildError, QuerySpec};
+pub use crate::pipeline_exec::{
+    convert_jsonl_to_csv, convert_jsonl_to_tsv, DedupeKeySummary, ExportFormat,
+    TabularExportOptions,
+};
+pub use crate::query::{
+    read_record_ids_file, JsonPointerPredicate, NumericComparison, QueryBuildError, QuerySpec,
+    TimestampBounds,
+};
+pub use crate::run_manifest::{
+    discover_upstream_manifests_from_inputs, file_identities, file_identity,
+    manifest_path_for_directory, manifest_path_for_file, path_to_stable_string,
+    upstream_manifest_for_directory, write_run_manifest, CorpusSnapshot, FileIdentity, GeneratedBy,
+    ManifestDestination, OutputSnapshot, ResumeSnapshot, RunManifest, RunManifestInput,
+    RunManifestStart, UpstreamManifest, DIR_MANIFEST_NAME, FILE_MANIFEST_SUFFIX,
+};
 pub use crate::shard::UsernameStream;
 
 pub use crate::aggregate::{

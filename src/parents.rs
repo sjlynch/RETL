@@ -1,5 +1,6 @@
 use crate::atomic_write::{
-    ensure_staging_dir, sweep_stale_inprogress, write_jsonl_atomic, INPROGRESS_EXT,
+    ensure_staging_dir, sweep_stale_inprogress, write_json_pretty_atomic, write_jsonl_atomic,
+    INPROGRESS_EXT,
 };
 use crate::date::YearMonth;
 use crate::filters::ym_from_epoch;
@@ -10,9 +11,13 @@ use crate::parents_ids::{IdShards, SharedIdsetCache, WorkerShardCache};
 use crate::paths::{discover_all_checked, plan_files_checked, FileJob, FileKind};
 use crate::pipeline::RedditETL;
 use crate::progress::{make_count_progress, make_progress_bar_labeled, total_compressed_size};
+use crate::run_manifest::{
+    discover_upstream_manifests_from_inputs, file_identities, maybe_write_run_manifest,
+    path_to_stable_string, ManifestDestination, RunManifestInput, RunManifestStart,
+};
 use crate::util::{
-    create_dir_all_with_backoff, create_with_backoff, open_with_backoff, read_dir_with_backoff,
-    remove_with_backoff, replace_file_atomic_backoff, with_thread_pool,
+    create_dir_all_with_backoff, open_with_backoff, read_dir_with_backoff, remove_with_backoff,
+    with_thread_pool,
 };
 use crate::zstd_jsonl::{
     for_each_line_with_progress_cfg_no_throttle_status, malformed_json_error, parse_minimal,
@@ -20,9 +25,9 @@ use crate::zstd_jsonl::{
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
-use std::io::{BufReader, BufWriter, Write};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -852,6 +857,62 @@ fn attach_fingerprint_path(final_dest: &Path) -> PathBuf {
     PathBuf::from(sidecar)
 }
 
+fn is_owned_spool_part_name(name: &str) -> bool {
+    let ym = name
+        .strip_prefix("part_RC_")
+        .or_else(|| name.strip_prefix("part_RS_"))
+        .and_then(|rest| rest.strip_suffix(".jsonl"));
+    ym.is_some_and(|ym| ym.parse::<YearMonth>().is_ok())
+}
+
+fn owned_attach_output_base_name(name: &str) -> Option<String> {
+    if is_owned_spool_part_name(name) {
+        return Some(name.to_string());
+    }
+    let base = name.strip_suffix(ATTACH_SIDECAR_SUFFIX)?;
+    is_owned_spool_part_name(base).then(|| base.to_string())
+}
+
+fn attach_output_basenames(inputs: &[(usize, PathBuf)]) -> Result<BTreeSet<String>> {
+    let mut names = BTreeSet::new();
+    for (_idx, input) in inputs {
+        let name = input.file_name().ok_or_else(|| {
+            anyhow::anyhow!(
+                "attach_parents input path has no file name: {}",
+                input.display()
+            )
+        })?;
+        names.insert(name.to_string_lossy().to_string());
+    }
+    Ok(names)
+}
+
+fn prune_stale_attach_outputs(out_dir: &Path, keep_basenames: &BTreeSet<String>) -> Result<()> {
+    if !out_dir.exists() {
+        return Ok(());
+    }
+    for entry in read_dir_with_backoff(out_dir, 16, 50)
+        .with_context(|| format!("read_dir {}", out_dir.display()))?
+    {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(base_name) = owned_attach_output_base_name(name) else {
+            continue;
+        };
+        if keep_basenames.contains(&base_name) {
+            continue;
+        }
+        remove_with_backoff(&path, 8, 50)
+            .with_context(|| format!("remove stale parent attach output {}", path.display()))?;
+    }
+    Ok(())
+}
+
 fn system_time_parts(t: SystemTime) -> (i64, u32) {
     match t.duration_since(UNIX_EPOCH) {
         Ok(d) => (
@@ -1255,43 +1316,26 @@ fn write_resolver_fingerprint_atomic(
     fingerprint: &ResolverFingerprint,
     write_buf_bytes: usize,
 ) -> Result<()> {
-    let mut staged = sidecar_path.as_os_str().to_os_string();
-    staged.push(INPROGRESS_EXT);
-    let staged = PathBuf::from(staged);
+    let sidecar_parent = sidecar_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let staging_dir = ensure_staging_dir(&sidecar_parent).with_context(|| {
+        format!(
+            "ensure resolver sidecar staging dir under {}",
+            sidecar_parent.display()
+        )
+    })?;
 
-    if let Some(parent) = sidecar_path.parent() {
-        create_dir_all_with_backoff(parent, 16, 50)
-            .with_context(|| format!("create resolver sidecar parent {}", parent.display()))?;
-    }
-
-    let file = create_with_backoff(&staged, 16, 50)
-        .with_context(|| format!("create staged resolver fingerprint {}", staged.display()))?;
-    let mut writer = BufWriter::with_capacity(write_buf_bytes, file);
-    let write_result = (|| -> Result<()> {
-        serde_json::to_writer_pretty(&mut writer, fingerprint)?;
-        writer.write_all(b"\n")?;
-        writer.flush()?;
-        Ok(())
-    })();
-
-    if let Err(e) = write_result {
-        drop(writer);
-        let _ = remove_with_backoff(&staged, 8, 50);
-        return Err(e)
-            .with_context(|| format!("write staged resolver fingerprint {}", staged.display()));
-    }
-    drop(writer);
-
-    if let Err(e) = replace_file_atomic_backoff(&staged, sidecar_path) {
-        let _ = remove_with_backoff(&staged, 8, 50);
-        return Err(e).with_context(|| {
+    write_json_pretty_atomic(&staging_dir, sidecar_path, write_buf_bytes, fingerprint).with_context(
+        || {
             format!(
-                "publish resolver fingerprint sidecar {}",
+                "write resolver fingerprint sidecar {}",
                 sidecar_path.display()
             )
-        });
-    }
-    Ok(())
+        },
+    )
 }
 
 fn attach_fingerprint_matches(sidecar_path: &Path, expected: &AttachFingerprint) -> bool {
@@ -1324,50 +1368,27 @@ fn write_attach_fingerprint_atomic(
     fingerprint: &AttachFingerprint,
     write_buf_bytes: usize,
 ) -> Result<()> {
-    let file_name = sidecar_path.file_name().ok_or_else(|| {
-        anyhow::anyhow!(
+    if sidecar_path.file_name().is_none() {
+        return Err(anyhow::anyhow!(
             "attach fingerprint sidecar has no file name: {}",
             sidecar_path.display()
-        )
-    })?;
-    let mut staged = staging_dir.join(file_name);
-    staged.as_mut_os_string().push(INPROGRESS_EXT);
-
+        ));
+    }
     create_dir_all_with_backoff(staging_dir, 16, 50)
         .with_context(|| format!("create staging dir {}", staging_dir.display()))?;
-    if let Some(parent) = sidecar_path.parent() {
+    if let Some(parent) = sidecar_path.parent().filter(|p| !p.as_os_str().is_empty()) {
         create_dir_all_with_backoff(parent, 16, 50)
             .with_context(|| format!("create sidecar parent {}", parent.display()))?;
     }
 
-    let file = create_with_backoff(&staged, 16, 50)
-        .with_context(|| format!("create staged attach fingerprint {}", staged.display()))?;
-    let mut writer = BufWriter::with_capacity(write_buf_bytes, file);
-    let write_result = (|| -> Result<()> {
-        serde_json::to_writer_pretty(&mut writer, fingerprint)?;
-        writer.write_all(b"\n")?;
-        writer.flush()?;
-        Ok(())
-    })();
-
-    if let Err(e) = write_result {
-        drop(writer);
-        let _ = remove_with_backoff(&staged, 8, 50);
-        return Err(e)
-            .with_context(|| format!("write staged attach fingerprint {}", staged.display()));
-    }
-    drop(writer);
-
-    if let Err(e) = replace_file_atomic_backoff(&staged, sidecar_path) {
-        let _ = remove_with_backoff(&staged, 8, 50);
-        return Err(e).with_context(|| {
+    write_json_pretty_atomic(staging_dir, sidecar_path, write_buf_bytes, fingerprint).with_context(
+        || {
             format!(
-                "publish attach fingerprint sidecar {}",
+                "write attach fingerprint sidecar {}",
                 sidecar_path.display()
             )
-        });
-    }
-    Ok(())
+        },
+    )
 }
 
 fn validate_jsonl_file(path: &Path) -> bool {
@@ -1800,11 +1821,17 @@ impl RedditETL {
         resume: bool,
     ) -> Result<(Vec<PathBuf>, ParentAttachStats)> {
         with_thread_pool(self.opts.parallelism, || {
+            let manifest_start = RunManifestStart::now();
+            let manifest_inputs = inputs.clone();
             create_dir_all_with_backoff(out_dir, 16, 50).with_context(|| {
                 format!("create parent attach output dir {}", out_dir.display())
             })?;
             let staging_dir = ensure_staging_dir(out_dir)?;
             sweep_stale_inprogress(out_dir, true)?;
+
+            let indexed_inputs: Vec<(usize, PathBuf)> = inputs.into_iter().enumerate().collect();
+            let keep_basenames = attach_output_basenames(&indexed_inputs)?;
+            prune_stale_attach_outputs(out_dir, &keep_basenames)?;
 
             let label = self
                 .opts
@@ -1812,7 +1839,7 @@ impl RedditETL {
                 .as_deref()
                 .unwrap_or("Attaching parents");
             let pb = if self.opts.progress {
-                Some(make_count_progress(inputs.len() as u64, label))
+                Some(make_count_progress(indexed_inputs.len() as u64, label))
             } else {
                 None
             };
@@ -1827,7 +1854,6 @@ impl RedditETL {
             let parent_cache_fingerprint = attach_parent_cache_fingerprint(parents);
             let resolution_range = attach_resolution_range(self.opts.start, self.opts.end);
 
-            let indexed_inputs: Vec<(usize, PathBuf)> = inputs.into_iter().enumerate().collect();
             diagnose_initial_attach_shape(&indexed_inputs, self.opts.read_buffer_bytes)?;
             let attached = std::sync::Mutex::new(vec![None; indexed_inputs.len()]);
 
@@ -2114,7 +2140,7 @@ impl RedditETL {
 
             let mut stats = ParentAttachStats::default();
             let mut diagnostics = ParentAttachDiagnostics::default();
-            let out_paths = attached
+            let out_paths: Vec<PathBuf> = attached
                 .into_inner()
                 .unwrap()
                 .into_iter()
@@ -2127,6 +2153,42 @@ impl RedditETL {
                 })
                 .collect();
             warn_if_no_comment_shaped_records(diagnostics);
+
+            let mut counts = BTreeMap::new();
+            counts.insert("input_files".to_string(), manifest_inputs.len() as u64);
+            counts.insert("attached_files".to_string(), out_paths.len() as u64);
+            counts.insert("parents_resolved".to_string(), stats.resolved);
+            counts.insert("parents_unresolved".to_string(), stats.unresolved);
+            counts.insert("records_scanned".to_string(), diagnostics.parsed_records);
+            let mut manifest = RunManifestInput::new("parents.attach_parents_jsonls_parallel");
+            manifest.start = manifest_start;
+            manifest.api_operation = Some("RedditETL::attach_parents_jsonls_parallel".to_string());
+            manifest.options = serde_json::json!({
+                "resume": resume,
+                "resolution_range": {
+                    "start": self.opts.start.map(|ym| ym.to_string()),
+                    "end": self.opts.end.map(|ym| ym.to_string()),
+                },
+                "parent_payload": {
+                    "full_record": parents.payload_spec.is_full_record(),
+                    "fields": parents.payload_spec.fields(),
+                },
+                "base_dir": path_to_stable_string(&self.opts.base_dir),
+                "comments_dir": path_to_stable_string(&self.opts.comments_dir),
+                "submissions_dir": path_to_stable_string(&self.opts.submissions_dir),
+                "parallelism": self.opts.parallelism,
+                "file_concurrency": self.opts.file_concurrency,
+                "emit_manifest": self.opts.emit_manifest,
+            });
+            manifest.inputs = file_identities(&manifest_inputs);
+            manifest.output_format = "jsonl-directory".to_string();
+            manifest.counts = counts;
+            manifest.upstream_manifests = discover_upstream_manifests_from_inputs(&manifest_inputs);
+            maybe_write_run_manifest(
+                self.opts.emit_manifest,
+                manifest,
+                ManifestDestination::Directory(out_dir.to_path_buf()),
+            )?;
             Ok((out_paths, stats))
         })
     }
@@ -2138,6 +2200,280 @@ mod tests {
     use crate::pipeline::RedditETL;
     use std::collections::HashMap;
     use std::path::PathBuf;
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    fn dummy_file_identity(tag: &str) -> AttachFileIdentity {
+        AttachFileIdentity {
+            path: tag.to_string(),
+            exists: true,
+            len: Some(tag.len() as u64),
+            modified_unix_secs: Some(1),
+            modified_nanos: Some(2),
+        }
+    }
+
+    fn dummy_payload_fingerprint() -> ParentPayloadFingerprint {
+        ParentPayloadFingerprint {
+            payload_format_version: STRUCTURED_PARENT_PAYLOAD_FORMAT_VERSION,
+            full_record: false,
+            fields: vec!["body".to_string()],
+        }
+    }
+
+    fn dummy_parent_id_set(kind: &str) -> ParentIdSetFingerprint {
+        ParentIdSetFingerprint {
+            kind: kind.to_string(),
+            storage: "memory".to_string(),
+            ids: 1,
+            digest: format!("{kind}-digest"),
+            shard_count: 0,
+            backing_shards: Vec::new(),
+        }
+    }
+
+    fn dummy_parent_ids_fingerprint() -> ParentIdsFingerprint {
+        ParentIdsFingerprint {
+            t1: dummy_parent_id_set("t1"),
+            t3: dummy_parent_id_set("t3"),
+        }
+    }
+
+    fn dummy_resolver_fingerprint(tag: &str) -> ResolverFingerprint {
+        ResolverFingerprint {
+            version: RESOLVER_FINGERPRINT_VERSION,
+            resolver_format_version: RESOLVER_FORMAT_VERSION,
+            source: ResolverSourceFingerprint {
+                kind: "comments".to_string(),
+                month: "2020-01".to_string(),
+                file: dummy_file_identity(tag),
+            },
+            resolution_range: AttachResolutionRange {
+                start: None,
+                end: None,
+            },
+            parent_ids: dummy_parent_ids_fingerprint(),
+            payload: dummy_payload_fingerprint(),
+        }
+    }
+
+    fn dummy_attach_fingerprint(tag: &str) -> AttachFingerprint {
+        AttachFingerprint {
+            version: ATTACH_FINGERPRINT_VERSION,
+            attach_format_version: ATTACH_FORMAT_VERSION,
+            input: dummy_file_identity(tag),
+            resolution_range: AttachResolutionRange {
+                start: None,
+                end: None,
+            },
+            parent_cache: AttachParentCacheFingerprint {
+                payload: dummy_payload_fingerprint(),
+                comment_shards: AttachShardSetFingerprint {
+                    index_present: false,
+                    shards: 0,
+                    digest: format!("comments-{tag}"),
+                },
+                submission_shards: AttachShardSetFingerprint {
+                    index_present: false,
+                    shards: 0,
+                    digest: format!("submissions-{tag}"),
+                },
+                eager_comments: AttachMapDigest {
+                    entries: 0,
+                    digest: format!("comments-map-{tag}"),
+                },
+                eager_submissions: AttachMapDigest {
+                    entries: 0,
+                    digest: format!("submissions-map-{tag}"),
+                },
+            },
+        }
+    }
+
+    fn inprogress_entries(staging: &Path) -> Vec<PathBuf> {
+        if !staging.exists() {
+            return Vec::new();
+        }
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(staging)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|s| s.to_str())
+                    .map(|name| name.ends_with(INPROGRESS_EXT))
+                    .unwrap_or(false)
+            })
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    fn fixed_inprogress_path(path: &Path) -> PathBuf {
+        let mut staged = path.as_os_str().to_os_string();
+        staged.push(INPROGRESS_EXT);
+        PathBuf::from(staged)
+    }
+
+    fn release_waiters(release: &Arc<(Mutex<bool>, Condvar)>) {
+        let (lock, cvar) = &**release;
+        *lock.lock().unwrap() = true;
+        cvar.notify_all();
+    }
+
+    #[test]
+    fn resolver_fingerprint_publish_failure_cleans_only_current_staged_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let staging = ensure_staging_dir(root).expect("staging dir");
+        let unrelated = staging.join("other-run.retl-999999-0.inprogress");
+        std::fs::write(&unrelated, b"other run").expect("write unrelated staged file");
+
+        let sidecar_path = root.join("RC_2020-01.json.parents-resolve.json");
+        std::fs::create_dir(&sidecar_path).expect("create publish-blocking directory");
+
+        let result = write_resolver_fingerprint_atomic(
+            &sidecar_path,
+            &dummy_resolver_fingerprint("resolver-failure"),
+            1024,
+        );
+        assert!(
+            result.is_err(),
+            "publishing over a directory should fail and trigger cleanup"
+        );
+
+        assert!(
+            unrelated.exists(),
+            "cleanup must not remove another run's staged file"
+        );
+        assert_eq!(
+            inprogress_entries(&staging),
+            vec![unrelated],
+            "only this run's unique staged sidecar should be removed"
+        );
+        assert!(
+            !fixed_inprogress_path(&sidecar_path).exists(),
+            "resolver sidecars must not stage next to the final path"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn concurrent_attach_fingerprint_writes_use_distinct_staged_paths() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let staging = ensure_staging_dir(root).expect("staging dir");
+        let sidecar_path = root.join("part_RC_2020-01.jsonl.parents-attach.json");
+        let sidecar_name = sidecar_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap()
+            .to_string();
+
+        let observed = Arc::new((Mutex::new(Vec::<PathBuf>::new()), Condvar::new()));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let observed_for_hook = Arc::clone(&observed);
+        let release_for_hook = Arc::clone(&release);
+        let staging_for_hook = staging.clone();
+        let sidecar_name_for_hook = sidecar_name.clone();
+        let _guard = crate::atomic_write::set_stage_path_observer_for_tests(Arc::new(
+            move |staged: &Path| {
+                let matches_sidecar = staged.parent() == Some(staging_for_hook.as_path())
+                    && staged
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .map(|name| {
+                            name.starts_with(&sidecar_name_for_hook)
+                                && name.ends_with(INPROGRESS_EXT)
+                        })
+                        .unwrap_or(false);
+                if !matches_sidecar {
+                    return;
+                }
+
+                let (observed_lock, observed_cvar) = &*observed_for_hook;
+                observed_lock.lock().unwrap().push(staged.to_path_buf());
+                observed_cvar.notify_all();
+
+                let (release_lock, release_cvar) = &*release_for_hook;
+                let mut released = release_lock.lock().unwrap();
+                while !*released {
+                    released = release_cvar.wait(released).unwrap();
+                }
+            },
+        ));
+
+        let mut handles = Vec::new();
+        for tag in ["first", "second"] {
+            let staging = staging.clone();
+            let sidecar_path = sidecar_path.clone();
+            handles.push(thread::spawn(move || {
+                write_attach_fingerprint_atomic(
+                    &staging,
+                    &sidecar_path,
+                    &dummy_attach_fingerprint(tag),
+                    1024,
+                )
+            }));
+        }
+
+        let snapshot = {
+            let (lock, cvar) = &*observed;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut observed_paths = lock.lock().unwrap();
+            while observed_paths.len() < 2 {
+                let now = Instant::now();
+                if now >= deadline {
+                    release_waiters(&release);
+                    panic!(
+                        "timed out waiting for two live sidecar staged paths; saw {:?}",
+                        *observed_paths
+                    );
+                }
+                let timeout = deadline.saturating_duration_since(now);
+                let (guard, wait) = cvar.wait_timeout(observed_paths, timeout).unwrap();
+                observed_paths = guard;
+                if wait.timed_out() && observed_paths.len() < 2 {
+                    release_waiters(&release);
+                    panic!(
+                        "timed out waiting for two live sidecar staged paths; saw {:?}",
+                        *observed_paths
+                    );
+                }
+            }
+            observed_paths.clone()
+        };
+        let live_entries = inprogress_entries(&staging);
+        let fixed_path_exists = fixed_inprogress_path(&sidecar_path).exists();
+
+        release_waiters(&release);
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+
+        assert_eq!(snapshot.len(), 2);
+        assert_ne!(
+            snapshot[0], snapshot[1],
+            "concurrent sidecar writers must not share a fixed staged path"
+        );
+        assert_eq!(
+            live_entries.len(),
+            2,
+            "both concurrent sidecar staging files should be visible while writers are live"
+        );
+        assert!(
+            live_entries.iter().all(|path| snapshot.contains(path)),
+            "live staged entries should be the observed unique sidecar paths"
+        );
+        assert!(
+            !fixed_path_exists,
+            "attach sidecars must not use the legacy fixed .inprogress sibling path"
+        );
+        assert!(
+            inprogress_entries(&staging).is_empty(),
+            "successful sidecar writes clean up staged files"
+        );
+    }
 
     #[test]
     fn attach_parents_with_no_file_name_input_returns_err() {
