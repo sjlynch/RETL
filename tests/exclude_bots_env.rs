@@ -111,6 +111,73 @@ fn etl_exclude_authors_file_env_var_reads_newline_separated_names() {
 
 #[test]
 #[serial]
+fn etl_exclude_authors_file_invalid_utf8_fails_before_scanning() {
+    clear_env();
+
+    let excludes_dir = tempfile::tempdir().unwrap();
+    let excludes_path = excludes_dir.path().join("bad_utf8.txt");
+    fs::write(&excludes_path, b"alice\n\xff\n").unwrap();
+    std::env::set_var(
+        "ETL_EXCLUDE_AUTHORS_FILE",
+        excludes_path.display().to_string(),
+    );
+
+    let base = tempfile::tempdir().unwrap().keep();
+    fs::create_dir_all(base.join("comments")).unwrap();
+    fs::create_dir_all(base.join("submissions")).unwrap();
+    fs::write(
+        base.join("comments").join("RC_2006-01.zst"),
+        b"not a zstd frame",
+    )
+    .unwrap();
+
+    let err = RedditETL::new()
+        .base_dir(&base)
+        .sources(Sources::Comments)
+        .date_range(Some(YearMonth::new(2006, 1)), Some(YearMonth::new(2006, 1)))
+        .progress(false)
+        .scan()
+        .exclude_common_bots()
+        .count_by_month()
+        .err()
+        .expect("invalid exclude file should fail before scanning corrupt corpus");
+    let msg = err.to_string();
+    assert!(msg.contains("ETL_EXCLUDE_AUTHORS_FILE"), "{msg}");
+    assert!(msg.contains(&excludes_path.display().to_string()), "{msg}");
+    assert!(msg.contains("line 2"), "{msg}");
+    assert!(
+        !msg.contains("zstd"),
+        "should not scan corpus after build error: {msg}"
+    );
+
+    clear_env();
+}
+
+#[test]
+#[serial]
+fn etl_exclude_authors_file_missing_path_is_fatal_when_set() {
+    clear_env();
+
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing.txt");
+    std::env::set_var("ETL_EXCLUDE_AUTHORS_FILE", missing.display().to_string());
+
+    let err = RedditETL::new()
+        .scan()
+        .exclude_common_bots()
+        .build()
+        .err()
+        .expect("missing exclude file should be fatal when env var is set");
+    let msg = err.to_string();
+    assert!(msg.contains("ETL_EXCLUDE_AUTHORS_FILE"), "{msg}");
+    assert!(msg.contains(&missing.display().to_string()), "{msg}");
+    assert!(msg.contains("cannot be opened"), "{msg}");
+
+    clear_env();
+}
+
+#[test]
+#[serial]
 fn etl_exclude_authors_env_combines_with_file_and_defaults() {
     clear_env();
 

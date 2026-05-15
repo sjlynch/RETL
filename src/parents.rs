@@ -19,8 +19,8 @@ use crate::zstd_jsonl::{
 };
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use std::collections::HashMap;
+use serde_json::{Map, Value};
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -44,6 +44,8 @@ const ATTACH_FORMAT_VERSION: u32 = 1;
 const ATTACH_SIDECAR_SUFFIX: &str = ".parents-attach.json";
 const RESOLVER_FINGERPRINT_VERSION: u32 = 1;
 const RESOLVER_FORMAT_VERSION: u32 = 1;
+const LEGACY_PARENT_PAYLOAD_FORMAT_VERSION: u32 = 1;
+const STRUCTURED_PARENT_PAYLOAD_FORMAT_VERSION: u32 = 2;
 const RESOLVER_SIDECAR_SUFFIX: &str = ".parents-resolve.json";
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x100000001b3;
@@ -72,6 +74,113 @@ impl ParentAttachStats {
         self.resolved += other.resolved;
         self.unresolved += other.unresolved;
     }
+}
+
+/// A resolved parent payload stored in structured parent-cache shards.
+pub type ParentPayload = Map<String, Value>;
+
+const DEFAULT_PARENT_PAYLOAD_FIELDS: &[&str] = &["body", "selftext", "title"];
+
+/// Selects which top-level fields from a resolved parent record are attached
+/// under the child record's `parent` object.
+///
+/// The default preserves RETL's original parents output: comment parents carry
+/// `body`, while submission parents carry `title` and `selftext`. `kind` and
+/// `id` metadata are always attached when a parent resolves successfully.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ParentPayloadSpec {
+    fields: Vec<String>,
+    full_record: bool,
+}
+
+impl Default for ParentPayloadSpec {
+    fn default() -> Self {
+        Self::from_fields(DEFAULT_PARENT_PAYLOAD_FIELDS)
+    }
+}
+
+impl ParentPayloadSpec {
+    /// Return the backwards-compatible default (`body,title,selftext`).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Build a spec that copies the named top-level parent fields. Empty names
+    /// are ignored and duplicates are de-duplicated after trimming.
+    pub fn from_fields<I, S>(fields: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let fields = normalize_parent_payload_fields(fields);
+        Self {
+            fields,
+            full_record: false,
+        }
+    }
+
+    /// Attach the full source parent JSON record (plus RETL's `kind`/`id`
+    /// metadata). When enabled, explicit field selections are ignored.
+    pub fn full_record() -> Self {
+        Self {
+            fields: Vec::new(),
+            full_record: true,
+        }
+    }
+
+    /// Toggle full-record attachment on this spec. Enabling full-record mode
+    /// clears the field list so equivalent full specs fingerprint the same way.
+    pub fn with_full_record(mut self, yes: bool) -> Self {
+        self.full_record = yes;
+        if yes {
+            self.fields.clear();
+        }
+        self
+    }
+
+    /// Selected top-level fields, sorted and de-duplicated. Empty when
+    /// [`Self::is_full_record`] is true.
+    pub fn fields(&self) -> &[String] {
+        &self.fields
+    }
+
+    /// Whether the full parent JSON record should be attached.
+    pub fn is_full_record(&self) -> bool {
+        self.full_record
+    }
+
+    fn is_legacy_default(&self) -> bool {
+        !self.full_record
+            && self.fields == normalize_parent_payload_fields(DEFAULT_PARENT_PAYLOAD_FIELDS)
+    }
+
+    fn payload_format_version(&self) -> u32 {
+        if self.is_legacy_default() {
+            LEGACY_PARENT_PAYLOAD_FORMAT_VERSION
+        } else {
+            STRUCTURED_PARENT_PAYLOAD_FORMAT_VERSION
+        }
+    }
+}
+
+fn normalize_parent_payload_fields<I, S>(fields: I) -> Vec<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    fields
+        .into_iter()
+        .filter_map(|field| {
+            let field = field.as_ref().trim();
+            if field.is_empty() {
+                None
+            } else {
+                Some(field.to_string())
+            }
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -172,6 +281,7 @@ struct AttachResolutionRange {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct AttachParentCacheFingerprint {
+    payload: ParentPayloadFingerprint,
     comment_shards: AttachShardSetFingerprint,
     submission_shards: AttachShardSetFingerprint,
     eager_comments: AttachMapDigest,
@@ -207,6 +317,7 @@ struct ResolverFingerprint {
     source: ResolverSourceFingerprint,
     resolution_range: AttachResolutionRange,
     parent_ids: ParentIdsFingerprint,
+    payload: ParentPayloadFingerprint,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -214,6 +325,13 @@ struct ResolverSourceFingerprint {
     kind: String,
     month: String,
     file: AttachFileIdentity,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct ParentPayloadFingerprint {
+    payload_format_version: u32,
+    full_record: bool,
+    fields: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -256,6 +374,7 @@ impl ParentIds {
             t3_ids_sharded: None,
         }
     }
+
     pub(crate) fn from_shards(t1: IdShards, t3: IdShards) -> Self {
         Self {
             t1_ids_mem: None,
@@ -264,6 +383,75 @@ impl ParentIds {
             t3_ids_sharded: Some(t3),
         }
     }
+
+    /// Insert a prefixed parent ID (`t1_...` for comments or `t3_...` for
+    /// submissions). Returns `true` only when a valid, non-empty ID was newly
+    /// inserted; malformed prefixes and duplicates are ignored safely.
+    pub fn insert_prefixed(&mut self, id: impl AsRef<str>) -> bool {
+        let id = id.as_ref().trim();
+        if let Some(rest) = id.strip_prefix("t1_") {
+            return self.insert_t1(rest);
+        }
+        if let Some(rest) = id.strip_prefix("t3_") {
+            return self.insert_t3(rest);
+        }
+        false
+    }
+
+    /// Insert a comment parent ID. Accepts either a bare base36 ID (`abc`) or
+    /// the matching prefixed form (`t1_abc`); `t3_...` and empty IDs are
+    /// ignored.
+    pub fn insert_t1(&mut self, id: impl AsRef<str>) -> bool {
+        let Some(id) = normalize_parent_id_for_kind(id.as_ref(), "t1_") else {
+            return false;
+        };
+        self.t1_ids_mem.get_or_insert_with(AHashSet::new).insert(id)
+    }
+
+    /// Insert a submission parent ID. Accepts either a bare base36 ID (`abc`)
+    /// or the matching prefixed form (`t3_abc`); `t1_...` and empty IDs are
+    /// ignored.
+    pub fn insert_t3(&mut self, id: impl AsRef<str>) -> bool {
+        let Some(id) = normalize_parent_id_for_kind(id.as_ref(), "t3_") else {
+            return false;
+        };
+        self.t3_ids_mem.get_or_insert_with(AHashSet::new).insert(id)
+    }
+
+    /// Extend from prefixed `t1_...` / `t3_...` IDs. Returns the number of
+    /// newly inserted unique IDs.
+    pub fn extend_prefixed<I, S>(&mut self, ids: I) -> usize
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        ids.into_iter()
+            .filter(|id| self.insert_prefixed(id.as_ref()))
+            .count()
+    }
+
+    /// Extend the comment-ID set from bare or `t1_`-prefixed IDs.
+    pub fn extend_t1<I, S>(&mut self, ids: I) -> usize
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        ids.into_iter()
+            .filter(|id| self.insert_t1(id.as_ref()))
+            .count()
+    }
+
+    /// Extend the submission-ID set from bare or `t3_`-prefixed IDs.
+    pub fn extend_t3<I, S>(&mut self, ids: I) -> usize
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        ids.into_iter()
+            .filter(|id| self.insert_t3(id.as_ref()))
+            .count()
+    }
+
     /// Return true when neither the comment (`t1_`) nor submission (`t3_`)
     /// parent-id backing contains any IDs.
     pub fn is_empty(&self) -> bool {
@@ -282,8 +470,13 @@ impl ParentIds {
         id: &'a str,
         loader: &mut impl FnMut(&Path) -> Result<&AHashSet<String>>,
     ) -> Result<bool> {
-        if let Some(mem) = &self.t1_ids_mem {
-            return Ok(mem.contains(id));
+        if self
+            .t1_ids_mem
+            .as_ref()
+            .map(|mem| mem.contains(id))
+            .unwrap_or(false)
+        {
+            return Ok(true);
         }
         if let Some(sh) = &self.t1_ids_sharded {
             let idx = sh.idx(id);
@@ -293,14 +486,20 @@ impl ParentIds {
         }
         Ok(false)
     }
+
     #[inline]
     pub fn contains_t3<'a>(
         &self,
         id: &'a str,
         loader: &mut impl FnMut(&Path) -> Result<&AHashSet<String>>,
     ) -> Result<bool> {
-        if let Some(mem) = &self.t3_ids_mem {
-            return Ok(mem.contains(id));
+        if self
+            .t3_ids_mem
+            .as_ref()
+            .map(|mem| mem.contains(id))
+            .unwrap_or(false)
+        {
+            return Ok(true);
         }
         if let Some(sh) = &self.t3_ids_sharded {
             let idx = sh.idx(id);
@@ -312,6 +511,27 @@ impl ParentIds {
     }
 }
 
+impl Default for ParentIds {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn normalize_parent_id_for_kind(id: &str, prefix: &str) -> Option<String> {
+    let id = id.trim();
+    if id.is_empty() {
+        return None;
+    }
+    if let Some(rest) = id.strip_prefix(prefix) {
+        let rest = rest.trim();
+        return (!rest.is_empty()).then(|| rest.to_string());
+    }
+    if id.starts_with("t1_") || id.starts_with("t3_") {
+        return None;
+    }
+    Some(id.to_string())
+}
+
 /// Parent shard cache lookup tables.
 ///
 /// Replaces the prior per-id index (one entry PER parent id — tens of millions
@@ -319,10 +539,26 @@ impl ParentIds {
 /// (YearMonth, FileKind), and consumers resolve a parent id to its shard via
 /// the child record's own-month metadata + the parent's prefix-derived FileKind.
 pub struct ParentMaps {
+    /// Backwards-compatible eager comment cache (`id -> body`) used by the
+    /// default parent payload spec.
     pub comments: HashMap<String, String>,
+    /// Backwards-compatible eager submission cache (`id -> (title, selftext)`).
     pub submissions: HashMap<String, (String, String)>,
     pub comment_shards: Option<HashMap<YearMonth, PathBuf>>,
     pub submission_shards: Option<HashMap<YearMonth, PathBuf>>,
+    pub payload_spec: ParentPayloadSpec,
+}
+
+impl Default for ParentMaps {
+    fn default() -> Self {
+        Self {
+            comments: HashMap::new(),
+            submissions: HashMap::new(),
+            comment_shards: None,
+            submission_shards: None,
+            payload_spec: ParentPayloadSpec::default(),
+        }
+    }
 }
 
 impl ParentMaps {
@@ -350,11 +586,31 @@ fn idset_cache_cap_for_free_memory(free: f64) -> usize {
     }
 }
 
+fn parent_payload_from_line(line: &str, spec: &ParentPayloadSpec) -> Result<ParentPayload> {
+    let v: Value = serde_json::from_str(line)?;
+    let Some(obj) = v.as_object() else {
+        return Ok(ParentPayload::new());
+    };
+
+    if spec.is_full_record() {
+        return Ok(obj.clone());
+    }
+
+    let mut payload = ParentPayload::new();
+    for field in spec.fields() {
+        if let Some(value) = obj.get(field) {
+            payload.insert(field.clone(), value.clone());
+        }
+    }
+    Ok(payload)
+}
+
 fn build_id_shard_index(
     files: &[FileJob],
     ids: &ParentIds,
     parent_ids_fp: &ParentIdsFingerprint,
     resolution_range: &AttachResolutionRange,
+    payload_spec: &ParentPayloadSpec,
     comments_out: &Path,
     submissions_out: &Path,
     resume: bool,
@@ -381,7 +637,8 @@ fn build_id_shard_index(
         };
         let out = out_dir.join(format!("{}_{}.json", prefix, job.ym));
         let sidecar_path = resolver_fingerprint_path(&out);
-        let fingerprint = build_resolver_fingerprint(job, parent_ids_fp, resolution_range);
+        let fingerprint =
+            build_resolver_fingerprint(job, parent_ids_fp, resolution_range, payload_spec);
 
         // Always record the shard path for downstream lookups, even on
         // resume — attach() needs the shard map populated regardless of
@@ -401,7 +658,7 @@ fn build_id_shard_index(
             // corpus file, source kind/month, resolver format, and requested
             // resolver window; stale-but-parseable shards are rebuilt.
             let valid_json = match open_with_backoff(&out, 16, 50) {
-                Ok(f) => match job.kind {
+                Ok(f) if payload_spec.is_legacy_default() => match job.kind {
                     FileKind::Comment => {
                         serde_json::from_reader::<_, HashMap<String, String>>(BufReader::new(f))
                             .is_ok()
@@ -412,6 +669,10 @@ fn build_id_shard_index(
                     >(BufReader::new(f))
                     .is_ok(),
                 },
+                Ok(f) => {
+                    serde_json::from_reader::<_, HashMap<String, ParentPayload>>(BufReader::new(f))
+                        .is_ok()
+                }
                 Err(_) => false,
             };
             if valid_json && resolver_fingerprint_matches(&sidecar_path, &fingerprint) {
@@ -431,9 +692,26 @@ fn build_id_shard_index(
             let set = idset_cache.get_or_load(shard_path)?;
             Ok(set.contains(id))
         };
+        let id_needed = |mem: Option<&AHashSet<String>>,
+                         sharded: Option<&IdShards>,
+                         id: &str|
+         -> Result<bool> {
+            if mem.map(|ids| ids.contains(id)).unwrap_or(false) {
+                return Ok(true);
+            }
+            if let Some(sh) = sharded {
+                let idx = sh.idx(id);
+                let p = sh.path_for(idx);
+                return ensure_contains(&p, id);
+            }
+            Ok(false)
+        };
 
+        let legacy_payload = payload_spec.is_legacy_default();
         let mut out_map_c: HashMap<String, String> = HashMap::new();
         let mut out_map_s: HashMap<String, (String, String)> = HashMap::new();
+        let mut out_payload_c: HashMap<String, ParentPayload> = HashMap::new();
+        let mut out_payload_s: HashMap<String, ParentPayload> = HashMap::new();
 
         let mut line_number = 0u64;
         let completed = for_each_line_with_progress_cfg_no_throttle_status(
@@ -451,38 +729,47 @@ fn build_id_shard_index(
                 if let Some(id) = min.id.as_deref() {
                     match job.kind {
                         FileKind::Comment => {
-                            let needed = if let Some(sh) = &ids.t1_ids_sharded {
-                                let idx = sh.idx(id);
-                                let p = sh.path_for(idx);
-                                ensure_contains(&p, id)?
-                            } else if let Some(mem) = &ids.t1_ids_mem {
-                                mem.contains(id)
-                            } else {
-                                false
-                            };
+                            let needed = id_needed(
+                                ids.t1_ids_mem.as_ref(),
+                                ids.t1_ids_sharded.as_ref(),
+                                id,
+                            )?;
 
                             if needed {
-                                if let Some(body) = min.body.as_deref() {
-                                    out_map_c.insert(id.to_string(), body.to_string());
+                                if legacy_payload {
+                                    if let Some(body) = min.body.as_deref() {
+                                        out_map_c.insert(id.to_string(), body.to_string());
+                                    }
+                                } else {
+                                    let payload = parent_payload_from_line(line, payload_spec)
+                                        .map_err(|e| {
+                                            malformed_json_error(&job.path, line_number, e)
+                                        })?;
+                                    out_payload_c.insert(id.to_string(), payload);
                                 }
                             }
                         }
                         FileKind::Submission => {
-                            let needed = if let Some(sh) = &ids.t3_ids_sharded {
-                                let idx = sh.idx(id);
-                                let p = sh.path_for(idx);
-                                ensure_contains(&p, id)?
-                            } else if let Some(mem) = &ids.t3_ids_mem {
-                                mem.contains(id)
-                            } else {
-                                false
-                            };
+                            let needed = id_needed(
+                                ids.t3_ids_mem.as_ref(),
+                                ids.t3_ids_sharded.as_ref(),
+                                id,
+                            )?;
 
                             if needed {
-                                let title = min.title.as_deref().unwrap_or_default().to_string();
-                                let selftext =
-                                    min.selftext.as_deref().unwrap_or_default().to_string();
-                                out_map_s.insert(id.to_string(), (title, selftext));
+                                if legacy_payload {
+                                    let title =
+                                        min.title.as_deref().unwrap_or_default().to_string();
+                                    let selftext =
+                                        min.selftext.as_deref().unwrap_or_default().to_string();
+                                    out_map_s.insert(id.to_string(), (title, selftext));
+                                } else {
+                                    let payload = parent_payload_from_line(line, payload_spec)
+                                        .map_err(|e| {
+                                            malformed_json_error(&job.path, line_number, e)
+                                        })?;
+                                    out_payload_s.insert(id.to_string(), payload);
+                                }
                             }
                         }
                     }
@@ -512,9 +799,11 @@ fn build_id_shard_index(
         let shard_staging = ensure_staging_dir(&out_parent)
             .with_context(|| format!("ensure staging dir under {}", out_parent.display()))?;
         write_jsonl_atomic(&shard_staging, &out, write_buf, |w| -> Result<()> {
-            match job.kind {
-                FileKind::Comment => serde_json::to_writer(w, &out_map_c)?,
-                FileKind::Submission => serde_json::to_writer(w, &out_map_s)?,
+            match (legacy_payload, job.kind) {
+                (true, FileKind::Comment) => serde_json::to_writer(w, &out_map_c)?,
+                (true, FileKind::Submission) => serde_json::to_writer(w, &out_map_s)?,
+                (false, FileKind::Comment) => serde_json::to_writer(w, &out_payload_c)?,
+                (false, FileKind::Submission) => serde_json::to_writer(w, &out_payload_s)?,
             }
             Ok(())
         })
@@ -730,6 +1019,14 @@ fn attach_submission_map_digest(map: &HashMap<String, (String, String)>) -> Atta
     finish_unordered_digest(map.len(), sum, xor)
 }
 
+fn parent_payload_fingerprint(spec: &ParentPayloadSpec) -> ParentPayloadFingerprint {
+    ParentPayloadFingerprint {
+        payload_format_version: spec.payload_format_version(),
+        full_record: spec.is_full_record(),
+        fields: spec.fields().to_vec(),
+    }
+}
+
 fn update_unordered_id_digest(count: &mut u64, sum: &mut u64, xor: &mut u64, id: &str) {
     let mut entry_hash = FNV_OFFSET_BASIS;
     update_digest_str(&mut entry_hash, id);
@@ -819,17 +1116,39 @@ fn fingerprint_sharded_id_set(kind: &str, shards: &IdShards) -> Result<ParentIdS
     })
 }
 
+fn fingerprint_mixed_id_set(
+    kind: &str,
+    mem: &AHashSet<String>,
+    shards: &IdShards,
+) -> Result<ParentIdSetFingerprint> {
+    let mem_fp = fingerprint_mem_id_set(kind, mem);
+    let shard_fp = fingerprint_sharded_id_set(kind, shards)?;
+    let ids = mem_fp.ids + shard_fp.ids;
+
+    let mut hash = FNV_OFFSET_BASIS;
+    update_digest_str(&mut hash, &mem_fp.digest);
+    update_digest_str(&mut hash, &shard_fp.digest);
+
+    Ok(ParentIdSetFingerprint {
+        kind: kind.to_string(),
+        storage: "mixed".to_string(),
+        ids,
+        digest: finish_unordered_digest_string(ids, hash, 0),
+        shard_count: shard_fp.shard_count,
+        backing_shards: shard_fp.backing_shards,
+    })
+}
+
 fn parent_id_set_fingerprint(
     kind: &str,
     mem: Option<&AHashSet<String>>,
     sharded: Option<&IdShards>,
 ) -> Result<ParentIdSetFingerprint> {
-    if let Some(shards) = sharded {
-        fingerprint_sharded_id_set(kind, shards)
-    } else if let Some(ids) = mem {
-        Ok(fingerprint_mem_id_set(kind, ids))
-    } else {
-        Ok(fingerprint_empty_id_set(kind))
+    match (mem, sharded) {
+        (Some(ids), Some(shards)) if !ids.is_empty() => fingerprint_mixed_id_set(kind, ids, shards),
+        (_, Some(shards)) => fingerprint_sharded_id_set(kind, shards),
+        (Some(ids), None) => Ok(fingerprint_mem_id_set(kind, ids)),
+        (None, None) => Ok(fingerprint_empty_id_set(kind)),
     }
 }
 
@@ -842,6 +1161,7 @@ fn parent_ids_fingerprint(ids: &ParentIds) -> Result<ParentIdsFingerprint> {
 
 fn attach_parent_cache_fingerprint(parents: &ParentMaps) -> AttachParentCacheFingerprint {
     AttachParentCacheFingerprint {
+        payload: parent_payload_fingerprint(&parents.payload_spec),
         comment_shards: attach_shard_set_fingerprint(parents.comment_shards.as_ref()),
         submission_shards: attach_shard_set_fingerprint(parents.submission_shards.as_ref()),
         eager_comments: attach_comment_map_digest(&parents.comments),
@@ -890,6 +1210,7 @@ fn build_resolver_fingerprint(
     job: &FileJob,
     parent_ids: &ParentIdsFingerprint,
     resolution_range: &AttachResolutionRange,
+    payload_spec: &ParentPayloadSpec,
 ) -> ResolverFingerprint {
     ResolverFingerprint {
         version: RESOLVER_FINGERPRINT_VERSION,
@@ -901,6 +1222,7 @@ fn build_resolver_fingerprint(
         },
         resolution_range: resolution_range.clone(),
         parent_ids: parent_ids.clone(),
+        payload: parent_payload_fingerprint(payload_spec),
     }
 }
 
@@ -1236,6 +1558,7 @@ impl RedditETL {
             })?;
             let parent_ids_fp = parent_ids_fingerprint(ids)?;
             let resolution_range = attach_resolution_range(self.opts.start, self.opts.end);
+            let payload_spec = self.opts.parent_payload_spec.clone();
 
             let total_bytes = total_compressed_size(&files);
             let pb = if self.opts.progress {
@@ -1252,6 +1575,7 @@ impl RedditETL {
                 ids,
                 &parent_ids_fp,
                 &resolution_range,
+                &payload_spec,
                 &comments_out,
                 &submissions_out,
                 resume,
@@ -1276,7 +1600,7 @@ impl RedditETL {
             let mut comments_map: HashMap<String, String> = HashMap::new();
             let mut submissions_map: HashMap<String, (String, String)> = HashMap::new();
 
-            if eager_ok {
+            if eager_ok && payload_spec.is_legacy_default() {
                 let load = |dir: &Path| -> Vec<PathBuf> {
                     let mut v: Vec<PathBuf> = read_dir_with_backoff(dir, 16, 50)
                         .map_err(|e| {
@@ -1330,6 +1654,7 @@ impl RedditETL {
                 submissions: submissions_map,
                 comment_shards: Some(comment_shards),
                 submission_shards: Some(submission_shards),
+                payload_spec,
             })
         })
     }
@@ -1373,6 +1698,8 @@ impl RedditETL {
 
             let parents_c_eager = &parents.comments;
             let parents_s_eager = &parents.submissions;
+            let empty_parent_payloads: HashMap<String, ParentPayload> = HashMap::new();
+            let legacy_payload = parents.payload_spec.is_legacy_default();
 
             let comment_shards = parents.comment_shards.as_ref();
             let submission_shards = parents.submission_shards.as_ref();
@@ -1432,6 +1759,10 @@ impl RedditETL {
                     let mut c_cache = WorkerShardCache::<String>::new(COMMENT_SHARD_CACHE_CAP);
                     let mut s_cache =
                         WorkerShardCache::<(String, String)>::new(SUBMISSION_SHARD_CACHE_CAP);
+                    let mut c_payload_cache =
+                        WorkerShardCache::<ParentPayload>::new(COMMENT_SHARD_CACHE_CAP);
+                    let mut s_payload_cache =
+                        WorkerShardCache::<ParentPayload>::new(SUBMISSION_SHARD_CACHE_CAP);
 
                     let is_rc_spool_part = looks_like_rc_spool_path(in_path);
                     let (file_stats, diagnostics) = write_jsonl_atomic(
@@ -1510,62 +1841,121 @@ impl RedditETL {
                                     if let Some(parent_id) =
                                         v.get("parent_id").and_then(|x| x.as_str())
                                     {
-                                        let mut parent_obj = serde_json::Map::new();
-                                        let mut payload_fields = 0usize;
+                                        let mut resolved_parent = false;
 
-                                        if let Some(rest) = parent_id.strip_prefix("t1_") {
-                                            if let Some(text) = load_shard_value(
-                                                parents_c_eager,
+                                        if legacy_payload {
+                                            let mut parent_obj = serde_json::Map::new();
+                                            let mut payload_fields = 0usize;
+
+                                            if let Some(rest) = parent_id.strip_prefix("t1_") {
+                                                if let Some(text) = load_shard_value(
+                                                    parents_c_eager,
+                                                    comment_shards,
+                                                    &mut c_cache,
+                                                    rest,
+                                                    own_ym,
+                                                )? {
+                                                    parent_obj.insert(
+                                                        "kind".into(),
+                                                        Value::String("comment".into()),
+                                                    );
+                                                    parent_obj.insert(
+                                                        "id".into(),
+                                                        Value::String(rest.to_string()),
+                                                    );
+                                                    parent_obj
+                                                        .insert("body".into(), Value::String(text));
+                                                    payload_fields += 1;
+                                                }
+                                            } else if let Some(rest) = parent_id.strip_prefix("t3_")
+                                            {
+                                                if let Some((title, selftext)) = load_shard_value(
+                                                    parents_s_eager,
+                                                    submission_shards,
+                                                    &mut s_cache,
+                                                    rest,
+                                                    own_ym,
+                                                )? {
+                                                    parent_obj.insert(
+                                                        "kind".into(),
+                                                        Value::String("submission".into()),
+                                                    );
+                                                    parent_obj.insert(
+                                                        "id".into(),
+                                                        Value::String(rest.to_string()),
+                                                    );
+                                                    parent_obj.insert(
+                                                        "title".into(),
+                                                        Value::String(title),
+                                                    );
+                                                    parent_obj.insert(
+                                                        "selftext".into(),
+                                                        Value::String(selftext),
+                                                    );
+                                                    payload_fields += 2;
+                                                }
+                                            }
+
+                                            if payload_fields > 0 {
+                                                if let Some(map) = v.as_object_mut() {
+                                                    map.insert(
+                                                        "parent".into(),
+                                                        Value::Object(parent_obj),
+                                                    );
+                                                }
+                                                resolved_parent = true;
+                                            }
+                                        } else if let Some(rest) = parent_id.strip_prefix("t1_") {
+                                            if let Some(mut payload) = load_shard_value(
+                                                &empty_parent_payloads,
                                                 comment_shards,
-                                                &mut c_cache,
+                                                &mut c_payload_cache,
                                                 rest,
                                                 own_ym,
                                             )? {
-                                                parent_obj.insert(
+                                                payload.insert(
                                                     "kind".into(),
                                                     Value::String("comment".into()),
                                                 );
-                                                parent_obj.insert(
+                                                payload.insert(
                                                     "id".into(),
                                                     Value::String(rest.to_string()),
                                                 );
-                                                parent_obj
-                                                    .insert("body".into(), Value::String(text));
-                                                payload_fields += 1;
+                                                if let Some(map) = v.as_object_mut() {
+                                                    map.insert(
+                                                        "parent".into(),
+                                                        Value::Object(payload),
+                                                    );
+                                                }
+                                                resolved_parent = true;
                                             }
                                         } else if let Some(rest) = parent_id.strip_prefix("t3_") {
-                                            if let Some((title, selftext)) = load_shard_value(
-                                                parents_s_eager,
+                                            if let Some(mut payload) = load_shard_value(
+                                                &empty_parent_payloads,
                                                 submission_shards,
-                                                &mut s_cache,
+                                                &mut s_payload_cache,
                                                 rest,
                                                 own_ym,
                                             )? {
-                                                parent_obj.insert(
+                                                payload.insert(
                                                     "kind".into(),
                                                     Value::String("submission".into()),
                                                 );
-                                                parent_obj.insert(
+                                                payload.insert(
                                                     "id".into(),
                                                     Value::String(rest.to_string()),
                                                 );
-                                                parent_obj
-                                                    .insert("title".into(), Value::String(title));
-                                                parent_obj.insert(
-                                                    "selftext".into(),
-                                                    Value::String(selftext),
-                                                );
-                                                payload_fields += 2;
+                                                if let Some(map) = v.as_object_mut() {
+                                                    map.insert(
+                                                        "parent".into(),
+                                                        Value::Object(payload),
+                                                    );
+                                                }
+                                                resolved_parent = true;
                                             }
                                         }
 
-                                        if payload_fields > 0 {
-                                            if let Some(map) = v.as_object_mut() {
-                                                map.insert(
-                                                    "parent".into(),
-                                                    Value::Object(parent_obj),
-                                                );
-                                            }
+                                        if resolved_parent {
                                             file_stats.resolved += 1;
                                         } else {
                                             file_stats.unresolved += 1;
@@ -1637,6 +2027,7 @@ mod tests {
             submissions: HashMap::new(),
             comment_shards: None,
             submission_shards: None,
+            payload_spec: Default::default(),
         };
 
         // `..` has no `file_name()` per `Path::file_name` semantics. The function

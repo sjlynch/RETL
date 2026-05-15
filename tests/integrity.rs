@@ -1,8 +1,15 @@
 #[path = "common/mod.rs"]
 mod common;
 
+use assert_cmd::Command;
 use common::*;
-use retl::{IntegrityMode, RedditETL, Sources, YearMonth};
+use predicates::prelude::*;
+use predicates::str::contains;
+use retl::{quick_validate_zst, IntegrityMode, RedditETL, Sources, YearMonth};
+
+fn retl_cmd() -> Command {
+    Command::cargo_bin("retl").expect("retl binary should be built")
+}
 
 /// Demonstrates integrity checks over a deliberately broken monthly file:
 /// - We add `RC_2006-02.zst` with invalid (non-zstd) contents.
@@ -43,6 +50,77 @@ fn integrity_check_detects_corrupt_month() {
         1,
         "full integrity should also flag the corrupt file"
     );
+}
+
+#[test]
+fn quick_validate_rejects_zero_sample_bytes() {
+    let base = make_corpus_basic();
+    let path = base.join("comments").join("RC_2006-01.zst");
+
+    let err = quick_validate_zst(&path, 0).unwrap_err();
+
+    assert!(
+        err.to_string().contains("--sample-bytes must be > 0"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn integrity_mode_quick_rejects_zero_sample_bytes() {
+    let base = make_corpus_basic();
+
+    let err = RedditETL::new()
+        .base_dir(&base)
+        .sources(Sources::Comments)
+        .progress(false)
+        .check_corpus_integrity(IntegrityMode::Quick { sample_bytes: 0 })
+        .unwrap_err();
+
+    assert!(
+        err.to_string().contains("--sample-bytes must be > 0"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn cli_integrity_rejects_zero_sample_bytes_before_success() {
+    retl_cmd()
+        .args(["integrity", "--mode", "quick", "--sample-bytes", "0"])
+        .assert()
+        .failure()
+        .stderr(
+            contains("--sample-bytes must be > 0")
+                .and(contains("OK: no corruption detected.").not()),
+        );
+}
+
+#[test]
+fn cli_integrity_warns_for_tiny_sample_bytes() {
+    let base = make_corpus_basic();
+
+    retl_cmd()
+        .args([
+            "integrity",
+            "--data-dir",
+            base.to_str().unwrap(),
+            "--source",
+            "rc",
+            "--start",
+            "2006-01",
+            "--end",
+            "2006-01",
+            "--no-progress",
+            "--mode",
+            "quick",
+            "--sample-bytes",
+            "1",
+        ])
+        .assert()
+        .success()
+        .stderr(
+            contains("quick integrity mode validates only a decompressed prefix sample")
+                .and(contains("OK: no corruption detected.")),
+        );
 }
 
 #[test]

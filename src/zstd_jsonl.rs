@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use serde::Deserialize;
 use std::fs;
-use std::io::{self, BufRead, BufReader, Read};
+use std::io::{self, BufReader, Read};
 use std::path::Path;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -10,6 +10,7 @@ use std::sync::{
 use zstd::stream::read::Decoder;
 
 use crate::mem::maybe_throttle_low_memory;
+use crate::ndjson::{read_line_capped, DEFAULT_MAX_LINE_BYTES};
 use crate::util::open_with_backoff;
 
 /// Prevents "Frame requires too much memory" on large Reddit dumps.
@@ -97,6 +98,7 @@ fn warn_decode_skip(path: &Path, e: &anyhow::Error) {
     // Try to print an absolute, canonical path to avoid truncation/ambiguity.
     let abs = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     // Emit a multi-line message to stderr (separate from progress bars) and to tracing.
+    let err_chain = format!("{e:#}");
     let msg = format!(
         "Zstd decode error while streaming file\n  path : {}\n  error: {}\n\
          note : This usually indicates file corruption (often late/trailing). \
@@ -104,7 +106,7 @@ fn warn_decode_skip(path: &Path, e: &anyhow::Error) {
                 Consider running a Full integrity check or re-downloading this month. \
                 Tolerant callers skip this file; strict callers surface it as fatal.",
         abs.display(),
-        e
+        err_chain
     );
     eprintln!("{}", msg);
     tracing::warn!("{}", msg);
@@ -137,12 +139,13 @@ pub fn malformed_json_error(
     )
 }
 
-pub fn zstd_decode_error(path: &Path, source: impl std::fmt::Display) -> anyhow::Error {
-    anyhow!(
+pub fn zstd_decode_error(path: &Path, source: anyhow::Error) -> anyhow::Error {
+    let source_msg = source.to_string();
+    source.context(format!(
         "zstd decode error while streaming {}: {}",
         path.display(),
-        source
-    )
+        source_msg
+    ))
 }
 
 // ----------------------------- Streaming ----------------------------------
@@ -166,8 +169,9 @@ pub struct LineStreamOpts<'a> {
     /// `BufReader` capacity in bytes. `None` → [`DEFAULT_READ_BUF_BYTES`].
     pub read_buf_bytes: Option<usize>,
     /// If `Some`, called with the delta of compressed bytes read after each
-    /// line, plus a final flush at EOF. On a decode error the file's full
-    /// length is reported so progress bars stay monotonic.
+    /// line, plus a final flush at EOF. On an allowed partial-read skip, only
+    /// the remaining compressed bytes are reported so totals do not exceed the
+    /// file length.
     pub progress: Option<&'a mut dyn FnMut(u64)>,
     /// If `Some`, called once when the file is skipped due to a decode error
     /// in [`PartialReadPolicy::AllowPartial`] mode. The error is also logged
@@ -203,9 +207,10 @@ impl<'a> Default for LineStreamOpts<'a> {
 /// "Frame requires too much memory" on very large frames. If decoding
 /// still fails (e.g., checksum/corruption), strict mode returns a contextual
 /// error. In [`PartialReadPolicy::AllowPartial`] mode we log a single warning,
-/// invoke `opts.on_skip` (if set), advance progress to the file's size
-/// (if a progress callback is set), and return `Ok(false)` so callers can keep
-/// resume manifests from marking the month complete.
+/// invoke `opts.on_skip` (if set), report only the remaining compressed-byte
+/// progress needed to reach the file's size (if a progress callback is set),
+/// and return `Ok(false)` so callers can keep resume manifests from marking
+/// the month complete.
 pub fn for_each_line_with_opts_status(
     path: &Path,
     opts: LineStreamOpts<'_>,
@@ -228,8 +233,11 @@ pub fn for_each_line_with_opts_status(
     match result {
         Ok(()) => Ok(true),
         Err(LineStreamAttemptError::Open(e)) => Err(e),
-        Err(LineStreamAttemptError::Decode(e)) => {
-            let e = zstd_decode_error(path, e);
+        Err(LineStreamAttemptError::Decode {
+            source,
+            bytes_reported,
+        }) => {
+            let e = zstd_decode_error(path, source);
             match partial_read_policy {
                 PartialReadPolicy::Strict => Err(e),
                 PartialReadPolicy::AllowPartial => {
@@ -237,16 +245,18 @@ pub fn for_each_line_with_opts_status(
                     if let Some(cb) = on_skip.as_deref_mut() {
                         cb(path, &e);
                     }
-                    // Keep progress bars monotonic on skip.
+                    // Keep progress bars monotonic on skip without double-counting
+                    // bytes already reported by the inner line loop.
                     if let Some(cb) = progress.as_deref_mut() {
                         if let Ok(meta) = fs::metadata(path) {
-                            cb(meta.len());
+                            cb(meta.len().saturating_sub(bytes_reported));
                         }
                     }
                     Ok(false)
                 }
             }
         }
+        Err(LineStreamAttemptError::InvalidLine(e)) => Err(e),
         Err(LineStreamAttemptError::Callback(e)) => Err(e),
     }
 }
@@ -446,7 +456,17 @@ impl<R: Read> Read for CountingReader<R> {
 
 enum LineStreamAttemptError {
     Open(anyhow::Error),
-    Decode(anyhow::Error),
+    Decode {
+        source: anyhow::Error,
+        /// Sum of compressed-byte deltas already delivered to the progress
+        /// callback. Allow-partial skip handling reports only the remaining
+        /// metadata bytes so progress never exceeds 100%.
+        bytes_reported: u64,
+    },
+    /// A decoded JSONL line exceeded the configured cap or was not valid UTF-8.
+    /// This is record-level invalid data, not a zstd-frame skip, so it remains
+    /// fatal even when `PartialReadPolicy::AllowPartial` is set.
+    InvalidLine(anyhow::Error),
     Callback(anyhow::Error),
 }
 
@@ -479,10 +499,16 @@ fn for_each_line_attempt<'borrow, 'cb: 'borrow>(
         counter: counter.clone(),
     };
 
-    let mut decoder = Decoder::new(cnt).map_err(|e| LineStreamAttemptError::Decode(e.into()))?;
+    let mut decoder = Decoder::new(cnt).map_err(|e| LineStreamAttemptError::Decode {
+        source: e.into(),
+        bytes_reported: 0,
+    })?;
     decoder
         .window_log_max(ZSTD_WINDOW_LOG_MAX)
-        .map_err(|e| LineStreamAttemptError::Decode(e.into()))?;
+        .map_err(|e| LineStreamAttemptError::Decode {
+            source: e.into(),
+            bytes_reported: 0,
+        })?;
 
     let cap = read_buf_bytes.unwrap_or(DEFAULT_READ_BUF_BYTES);
     let mut reader = BufReader::with_capacity(cap, decoder);
@@ -496,10 +522,26 @@ fn for_each_line_attempt<'borrow, 'cb: 'borrow>(
     // of the hot read loop.
     let mut tick: u32 = 0;
     loop {
-        buf.clear();
-        let n = reader
-            .read_line(&mut buf)
-            .map_err(|e| LineStreamAttemptError::Decode(e.into()))?;
+        let n = match read_line_capped(&mut reader, &mut buf, DEFAULT_MAX_LINE_BYTES, path) {
+            Ok(n) => n,
+            Err(e) => {
+                let is_line_cap = e.kind() == io::ErrorKind::InvalidData
+                    && e.to_string().contains("max_line_bytes");
+                if is_line_cap {
+                    return Err(LineStreamAttemptError::InvalidLine(
+                        anyhow::Error::new(e).context(format!(
+                            "read zstd JSONL line from {} with max_line_bytes={}",
+                            path.display(),
+                            DEFAULT_MAX_LINE_BYTES
+                        )),
+                    ));
+                }
+                return Err(LineStreamAttemptError::Decode {
+                    source: e.into(),
+                    bytes_reported: last,
+                });
+            }
+        };
         if n == 0 {
             // Final progress flush at EOF.
             if let Some(cb) = on_progress.as_deref_mut() {
@@ -509,12 +551,6 @@ fn for_each_line_attempt<'borrow, 'cb: 'borrow>(
                 }
             }
             break;
-        }
-        if buf.ends_with('\n') {
-            let _ = buf.pop();
-            if buf.ends_with('\r') {
-                let _ = buf.pop();
-            }
         }
         // Per-line progress delta (preserves prior cadence: drained before
         // the user's `on_line` callback runs so "bytes read" never lags
@@ -734,6 +770,56 @@ mod tests {
         assert_eq!(
             skip_count, 0,
             "on_skip must not fire for caller callback errors"
+        );
+    }
+
+    #[test]
+    fn allow_partial_progress_reports_only_remaining_bytes_on_truncated_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("truncated-progress.zst");
+
+        let mut payload = Vec::new();
+        for i in 0..500 {
+            payload.extend_from_slice(format!("{{\"id\":\"r{i}\"}}\n").as_bytes());
+        }
+        write_zst_with_checksum(&path, &payload);
+
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.truncate(bytes.len().saturating_sub(4));
+        fs::write(&path, &bytes).unwrap();
+        let file_len = fs::metadata(&path).unwrap().len();
+
+        let mut progress_total = 0u64;
+        let mut on_progress = |delta: u64| {
+            progress_total = progress_total.saturating_add(delta);
+        };
+        let mut skip_count = 0usize;
+        let mut on_skip = |_p: &Path, _e: &anyhow::Error| {
+            skip_count += 1;
+        };
+
+        let complete = for_each_line_with_opts_status(
+            &path,
+            LineStreamOpts {
+                read_buf_bytes: Some(256),
+                progress: Some(&mut on_progress),
+                on_skip: Some(&mut on_skip),
+                partial_read_policy: PartialReadPolicy::AllowPartial,
+                ..Default::default()
+            },
+            |_line| Ok(()),
+        )
+        .expect("allow_partial should tolerate the truncation");
+
+        assert!(!complete, "truncated file must be reported incomplete");
+        assert_eq!(skip_count, 1, "on_skip must fire exactly once");
+        assert!(
+            progress_total <= file_len,
+            "progress over-reported: {progress_total} > {file_len}"
+        );
+        assert_eq!(
+            progress_total, file_len,
+            "allow_partial skip should advance progress exactly to metadata length"
         );
     }
 }

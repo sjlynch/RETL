@@ -1,8 +1,9 @@
+use crate::ndjson::{read_line_capped, DEFAULT_MAX_LINE_BYTES};
 use crate::util::{open_with_backoff, remove_dir_all_with_backoff};
 use anyhow::Result;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Maximum consecutive read errors tolerated on a single shard file before
 /// `UsernameStream` gives up on it and advances to the next file. Prevents the
@@ -126,16 +127,14 @@ impl UsernameStream {
     }
 
     fn step<R: BufRead>(buf: &mut String, errors: &mut usize, reader: &mut R) -> ReadStep {
-        buf.clear();
-        match reader.read_line(buf) {
+        match read_line_capped(
+            reader,
+            buf,
+            DEFAULT_MAX_LINE_BYTES,
+            Path::new("username shard"),
+        ) {
             Ok(0) => ReadStep::Eof,
             Ok(_) => {
-                if buf.ends_with('\n') {
-                    let _ = buf.pop();
-                    if buf.ends_with('\r') {
-                        let _ = buf.pop();
-                    }
-                }
                 if buf.is_empty() {
                     ReadStep::Empty
                 } else {

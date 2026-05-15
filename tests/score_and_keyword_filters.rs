@@ -314,6 +314,34 @@ fn contains_url_true_matches_https_uppercase_in_body() {
     );
 }
 
+#[test]
+fn contains_url_false_is_same_as_default_no_filter() {
+    let base = corpus_with_https_only();
+
+    let default_counts = RedditETL::new()
+        .base_dir(&base)
+        .sources(Sources::Comments)
+        .date_range(Some(YearMonth::new(2006, 1)), Some(YearMonth::new(2006, 1)))
+        .progress(false)
+        .scan()
+        .subreddit("programming")
+        .count_by_month()
+        .unwrap();
+    let false_counts = RedditETL::new()
+        .base_dir(&base)
+        .sources(Sources::Comments)
+        .date_range(Some(YearMonth::new(2006, 1)), Some(YearMonth::new(2006, 1)))
+        .progress(false)
+        .scan()
+        .subreddit("programming")
+        .contains_url(false)
+        .count_by_month()
+        .unwrap();
+
+    assert_eq!(false_counts, default_counts);
+    assert_eq!(false_counts.get(&YearMonth::new(2006, 1)).copied(), Some(2));
+}
+
 /// Link-post submissions store the outbound URL in top-level `url`; title and
 /// selftext may contain no URL-looking text.
 fn corpus_with_link_post_url_only() -> PathBuf {

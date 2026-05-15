@@ -8,9 +8,10 @@
 //! POSIX.
 
 use crate::atomic_write::{ensure_staging_dir, write_jsonl_atomic};
+use crate::ndjson::{read_line_capped, DEFAULT_MAX_LINE_BYTES};
 use crate::util::{open_with_backoff, read_dir_with_backoff};
 use anyhow::Result;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
 
 const STITCH_BUF_BYTES: usize = 16 * 1024;
@@ -50,8 +51,8 @@ pub fn stitch_tmp_parts(tmp_dir: &Path, out_path: &Path, write_buf: usize) -> Re
 /// `pretty=false` for large machine-consumed exports.
 ///
 /// IO errors from corrupt or truncated temp parts are surfaced via `?`;
-/// the previous `r.lines().flatten()` form silently swallowed them and
-/// produced a truncated array.
+/// the previous line-iterator form silently swallowed them and produced a
+/// truncated array.
 pub fn stitch_tmp_parts_to_json_array(
     tmp_dir: &Path,
     out_path: &Path,
@@ -72,17 +73,9 @@ pub fn stitch_tmp_parts_to_json_array(
         for path in &parts {
             let mut r = BufReader::new(open_with_backoff(path, 16, 50)?);
             loop {
-                buf.clear();
-                let n = r.read_line(&mut buf)?;
+                let n = read_line_capped(&mut r, &mut buf, DEFAULT_MAX_LINE_BYTES, path)?;
                 if n == 0 {
                     break;
-                }
-                // strip trailing \n and optional \r
-                if buf.ends_with('\n') {
-                    let _ = buf.pop();
-                    if buf.ends_with('\r') {
-                        let _ = buf.pop();
-                    }
                 }
                 if buf.is_empty() {
                     continue;
@@ -115,17 +108,9 @@ fn stitch_tmp_parts_to_json_array_pretty(
         for path in &parts {
             let mut r = BufReader::new(open_with_backoff(path, 16, 50)?);
             loop {
-                buf.clear();
-                let n = r.read_line(&mut buf)?;
+                let n = read_line_capped(&mut r, &mut buf, DEFAULT_MAX_LINE_BYTES, path)?;
                 if n == 0 {
                     break;
-                }
-                // strip trailing \n and optional \r
-                if buf.ends_with('\n') {
-                    let _ = buf.pop();
-                    if buf.ends_with('\r') {
-                        let _ = buf.pop();
-                    }
                 }
                 if buf.is_empty() {
                     continue;
@@ -137,6 +122,10 @@ fn stitch_tmp_parts_to_json_array_pretty(
 
                 let value: serde_json::Value = serde_json::from_str(&buf)?;
                 let pretty = serde_json::to_string_pretty(&value)?;
+                // Reviewed exception to the capped-file-read rule: `pretty`
+                // is an in-memory string just produced by serde from one
+                // already-capped JSONL record, so `.lines()` cannot grow from
+                // external input.
                 for (idx, line) in pretty.lines().enumerate() {
                     if idx > 0 {
                         out.write_all(b"\n")?;
@@ -194,8 +183,8 @@ mod tests {
 
     /// A temp part containing invalid UTF-8 must cause stitching to return
     /// `Err` instead of silently truncating the JSON array. Regression test
-    /// for the prior `r.lines().flatten()` form which dropped `io::Error`
-    /// values on the floor.
+    /// for the prior line-iterator form which dropped `io::Error` values on
+    /// the floor.
     #[test]
     fn corrupt_temp_part_surfaces_io_error() {
         let dir = tempfile::tempdir().unwrap();

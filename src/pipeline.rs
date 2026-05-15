@@ -1,10 +1,11 @@
 use crate::config::{ETLOptions, Sources};
 use crate::date::YearMonth;
 use crate::mem::AdaptiveMemCfg;
+use crate::parents::ParentPayloadSpec;
 use crate::query::{
     normalize_str, JsonPointerPredicate, NumericComparison, QueryBuildError, QuerySpec,
 };
-use crate::util::{create_dir_all_with_backoff, default_bot_authors, merge_extra_exclusions};
+use crate::util::{create_dir_all_with_backoff, default_bot_authors, try_merge_extra_exclusions};
 use anyhow::Result;
 use regex::Regex;
 use std::path::{Path, PathBuf};
@@ -158,6 +159,31 @@ impl RedditETL {
     /// behavior.
     pub fn resume(mut self, yes: bool) -> Self {
         self.opts = self.opts.with_resume(yes);
+        self
+    }
+
+    /// Select top-level parent fields attached by the parents pipeline. The
+    /// default is backwards-compatible (`body` for comments and
+    /// `title,selftext` for submissions).
+    pub fn parent_fields<I, S>(mut self, fields: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.opts = self.opts.with_parent_fields(fields);
+        self
+    }
+
+    /// Attach each resolved parent as its full source JSON record, plus RETL's
+    /// `kind` and `id` metadata.
+    pub fn parent_full(mut self, yes: bool) -> Self {
+        self.opts = self.opts.with_parent_full(yes);
+        self
+    }
+
+    /// Replace the full parent-payload specification used by parents helpers.
+    pub fn parent_payload_spec(mut self, spec: ParentPayloadSpec) -> Self {
+        self.opts = self.opts.with_parent_payload_spec(spec);
         self
     }
 
@@ -372,8 +398,12 @@ impl ScanPlan {
     {
         self.set_string_list(|q, v| q.domains_in = Some(v), iter, lowercase_str)
     }
+    /// Keep only records that contain an HTTP(S) URL when `yes` is true.
+    ///
+    /// Passing `false` clears/disables the positive URL filter. RETL does not
+    /// currently expose a negative "without URL" predicate.
     pub fn contains_url(mut self, yes: bool) -> Self {
-        self.query.contains_url = Some(yes);
+        self.query.contains_url = yes.then_some(true);
         self
     }
     /// Add an arbitrary full-record JSON Pointer predicate.
@@ -444,15 +474,28 @@ impl ScanPlan {
         self.include_pseudo_users()
     }
     pub fn build(mut self) -> std::result::Result<Self, QueryBuildError> {
+        if self
+            .etl
+            .opts
+            .subreddit
+            .as_deref()
+            .is_some_and(str::is_empty)
+        {
+            return Err(QueryBuildError::new(
+                "subreddits contains a blank entry after normalization; blank entries are not allowed",
+            ));
+        }
+
         self.query = self.query.normalize();
+        self.query.validate()?;
         if self.query.exclude_common_bots {
             let mut authors_out = self.query.authors_out.take().unwrap_or_default();
             authors_out.extend(default_bot_authors());
-            merge_extra_exclusions(&mut authors_out);
+            try_merge_extra_exclusions(&mut authors_out)?;
             self.query.authors_out = Some(authors_out);
             self.query = self.query.normalize();
+            self.query.validate()?;
         }
-        self.query.validate()?;
         self.query = self.query.compile_author_regex()?;
         self.query = self.query.compile_json_predicates()?;
         log_domain_filter_comment_drop(&self.query, self.etl.opts.sources);

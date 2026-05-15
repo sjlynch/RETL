@@ -100,7 +100,7 @@ You can browse and download monthly dumps via Academic Torrents:
 https://academictorrents.com/browse.php?search=reddit
 
 Note on scale & performance:
-The monthly files become very large in later years. It’s normal for broader queries to run longer and consume significant I/O. RETL’s streaming design and throttling aim to keep resource use predictable; tune .file_concurrency(n), .parallelism(n), and .io_buffers(...) as appropriate for your hardware and dataset size.
+The monthly files become very large in later years. It’s normal for broader queries to run longer and consume significant I/O. RETL’s streaming design and throttling aim to keep resource use predictable; tune `.file_concurrency(n)`, `.parallelism(n)`, and `.io_buffers(...)` as appropriate for your hardware and dataset size. Oversized resource knobs are clamped with a warning rather than allowed to create unbounded threads, zstd decoders, or shard files.
 
 ## Install
 
@@ -147,18 +147,18 @@ and validation flags because it does not filter records by query:
 | `--work-dir <PATH>` | Scratch directory for sharded writers (default `./etl_work`). |
 | `--start <YYYY-MM>` / `--end <YYYY-MM>` | Inclusive month range. Omit either to leave that side unbounded; the present side is still enforced against each record's `created_utc`. |
 | `--source rc\|rs\|both` | Comments only, submissions only, or both (default). |
-| `--subreddit <NAME>` (`-s`) | Subreddit selector. Repeatable; omit for "any subreddit". |
-| `--author <NAME>` / `--author-in <NAME>` | Author allow-list selector. Repeatable. |
-| `--exclude-author <NAME>` | Author deny-list selector. Repeatable. |
+| `--subreddit <NAME>` (`-s`) | Subreddit selector. Repeatable; omit for "any subreddit". Blank values are rejected. |
+| `--author <NAME>` / `--author-in <NAME>` | Author allow-list selector. Repeatable. Blank values are rejected. |
+| `--exclude-author <NAME>` | Author deny-list selector. Repeatable. Blank values are rejected. |
 | `--exclude-common-bots` | Exclude RETL's built-in bot/service-account list plus `ETL_EXCLUDE_AUTHORS*` augments; composes with `--exclude-author`. |
 | `--author-regex <REGEX>` | Keep authors matching a regex. |
-| `--keyword <TEXT>` | Keep records containing a keyword in body/title/selftext. Repeatable. |
+| `--keyword <TEXT>` | Keep records containing a keyword in body/title/selftext. Repeatable; blank values are rejected. |
 | `--min-score <N>` / `--max-score <N>` | Inclusive score thresholds. |
-| `--contains-url` | Keep records with an HTTP(S) URL in text or submission URL. |
-| `--domain <DOMAIN>` | Submission-domain allow-list. Repeatable; comments are dropped when this filter is active. |
+| `--contains-url` | Keep records with an HTTP(S) URL in text or submission URL. This is a positive-only filter. |
+| `--domain <DOMAIN>` | Submission-domain allow-list. Repeatable; comments are dropped when this filter is active. Blank values are rejected. |
 | `--json <PREDICATE>` | Full-record JSON Pointer predicate. Repeatable. Examples: `exists:/link_flair_text`, `/over_18=false`, `/is_self=true`, `/num_comments>=100`, `/link_flair_text~=^Question` (quote predicates containing `>` or `<` in shells). |
 | `--include-deleted` | Include pseudo-users (`[deleted]`, `[removed]`, and empty authors) that are filtered by default. |
-| `--parallelism <N>` / `--file-concurrency <N>` | Rayon threads / concurrent monthly files. |
+| `--parallelism <N>` / `--file-concurrency <N>` | Rayon threads / concurrent monthly files; oversized values are clamped to RETL's documented safety caps. |
 | `--no-progress` | Disable progress bars. |
 
 ### Pseudo-user filtering (default ON)
@@ -353,12 +353,17 @@ retl count --mode author --subreddit programming --start 2006-01 --end 2006-04 -
 ### `integrity` — validate `.zst` monthly files
 
 ~~~sh
-# Quick: decode at most 64 KiB per file
+# Quick: decode the first 64 KiB (decompressed) per file
 retl integrity --mode quick --sample-bytes 65536 --source rc --start 2006-02 --end 2006-02
 
 # Full: decode every byte (validates trailing checksum)
 retl integrity --mode full --source both --start 2006-01 --end 2006-04
 ~~~
+
+Quick mode validates only the first `--sample-bytes` decompressed bytes of each
+file. `--sample-bytes` must be positive (default: 65536); very small samples
+(for example, below 4096 bytes) only cover a tiny prefix and emit a warning. Use
+`--mode full` for complete payload/trailer validation.
 
 Bad files print one `path<TAB>error` line per failure on stdout as soon as
 they are discovered, and the process exits with status `2`. Pass `--collect`
@@ -373,22 +378,23 @@ next to `--out`). `aggregate` does not scan the RC/RS corpus and does not
 accept corpus selectors such as `--data-dir`, `--start`, or `--subreddit`; run
 `retl export --format spool ...` first if you need to filter the corpus. Its
 runtime flags are limited to `--parallelism`, `--no-progress`, and
-`--shards-dir`. With no `--by`, the CLI keeps the original built-in
-record-count fallback and writes a JSON aggregate state:
+`--shards-dir`. Use `--spool DIR` to discover `part_RC_YYYY-MM.jsonl` /
+`part_RS_YYYY-MM.jsonl` spool parts chronologically (cross-platform and
+recommended); explicit JSONL file paths are still accepted for advanced use,
+but cannot be combined with `--spool`. With no `--by`, the CLI keeps the
+original built-in record-count fallback and writes a JSON aggregate state:
 
 ~~~sh
-retl aggregate \
-  --out agg.json --pretty \
-  ./spool/part_RC_2006-01.jsonl ./spool/part_RS_2006-01.jsonl
+retl aggregate --spool ./spool --out agg.json --pretty
 ~~~
 
 Built-in grouped rollups write two-column TSV:
 
 ~~~sh
-retl aggregate --by subreddit --out counts.tsv ./spool/*.jsonl
-retl aggregate --by month --out months.tsv ./spool/*.jsonl
-retl aggregate --by author --top 100 --out top_authors.tsv ./spool/*.jsonl
-retl aggregate --by 'json:/subreddit' --metric 'sum:/score' --out scores.tsv ./spool/*.jsonl
+retl aggregate --spool ./spool --by subreddit --out counts.tsv
+retl aggregate --spool ./spool --by month --out months.tsv
+retl aggregate --spool ./spool --by author --top 100 --out top_authors.tsv
+retl aggregate --spool ./spool --by 'json:/subreddit' --metric 'sum:/score' --out scores.tsv
 ~~~
 
 `--pretty` field-indents the final JSON when `--by` is omitted, matching
@@ -525,11 +531,17 @@ All examples below operate on the same API you saw in the Quick Start.
 
 - `.contains_url(true)` keeps records with `http`/`https` in comment bodies,
   submission `selftext`/`title`, or a link-post submission whose top-level
-  `url` starts with `http`/`https`.
+  `url` starts with `http`/`https`. `.contains_url(false)` clears/disables
+  that positive filter and is equivalent to omitting it; RETL does not yet
+  provide a negative "without URL" filter.
 - `.domains_in([...])` matches the submission-only top-level `domain` field.
   Reddit comments do not have `domain`; when used with `Sources::Both` or
   `Sources::Comments`, comments are dropped and RETL emits a warning. Use
   `Sources::Submissions` when you intend a domain-only scan.
+- Empty explicit lists are invalid; omit a filter to match all values for that
+  field. Blank normalized entries in `.subreddits(...)`, `.authors_in(...)`,
+  `.authors_out(...)`, `.domains_in(...)`, and `.keywords_any(...)` return a
+  `QueryBuildError` before any corpus file is scanned.
 - `.keywords_any([...])` is case-insensitive for Unicode text too: ASCII-only
   keyword/haystack pairs stay on the zero-allocation Aho-Corasick fast path,
   while non-ASCII keywords or text fields use a lowercase fallback.
@@ -692,6 +704,8 @@ let parents: ParentMaps = RedditETL::new()
     .base_dir("./data")
     .date_range(Some(YearMonth::new(2005, 10)), Some(YearMonth::new(2006, 4)))
     .progress(true)
+    // Optional: request more context than the legacy body/title/selftext payload.
+    .parent_fields(["author", "body", "score", "created_utc", "subreddit", "title", "selftext"])
     .resolve_parent_maps(&ids, Path::new("parents_cache"), resume)?;
 
 // Step 4: Attach parent payloads; resume skips outputs that already exist
@@ -701,15 +715,32 @@ let _out_paths = RedditETL::new()
     .attach_parents_jsonls_parallel(spool_parts, Path::new("spool_with_parents"), &parents, resume)?;
 ~~~
 
-Resolved comments receive a `"parent"` object containing either the parent comment’s body (`t1_...`) or the submission’s title/selftext (`t3_...`). If a referenced parent cannot be resolved from the cache/window, `retl` leaves the `"parent"` key absent rather than writing an empty object; the CLI reports resolved/unresolved totals and warns when more than 5% are unresolved.
+By default, resolved comments receive a `"parent"` object containing either the parent comment’s body (`t1_...`) or the submission’s title/selftext (`t3_...`). Use `.parent_fields([...])` or CLI `--parent-fields author,body,score,created_utc,subreddit,domain,url,title,selftext` to attach extra top-level parent fields; use `.parent_full(true)` / `--parent-full` to attach the full parent JSON record. `kind` and `id` are always included for resolved parents. If a referenced parent cannot be resolved from the cache/window, `retl` leaves the `"parent"` key absent rather than writing an empty object; the CLI reports resolved/unresolved totals and warns when more than 5% are unresolved.
 
-Note: extract/spool resume entries are fingerprinted by query/config. Parent-cache resume files are keyed by source/month and validated by parsing; regenerate the parent ID set when changing the upstream query.
+If you already have parent IDs from SQL/Python, build `ParentIds` directly instead of writing a fake spool:
+
+~~~rust
+let mut ids = ParentIds::new();
+ids.extend_prefixed(["t1_comment_id", "t3_submission_id"]); // validates prefixes, de-dupes
+ids.insert_t1("bare_comment_id");
+ids.insert_t3("bare_submission_id");
+
+let parents = RedditETL::new()
+    .base_dir("./data")
+    .date_range(Some(YearMonth::new(2005, 10)), Some(YearMonth::new(2006, 4)))
+    .parent_fields(["author", "body", "score", "created_utc", "subreddit", "title", "selftext"])
+    .resolve_parent_maps(&ids, Path::new("parents_cache"), true)?;
+~~~
+
+Note: extract/spool resume entries are fingerprinted by query/config. Parent-cache and attach resume sidecars include the parent ID set, selected parent fields, payload format, corpus file identity, and resolution window, so widening `--parent-fields` rebuilds stale narrow cache shards instead of reusing them.
 
 The `parents` CLI uses `--window-months 3` by default, scanning three extra months on each side of the spool range. Larger windows catch more old cross-month parents, but scan more corpus bytes and create/use more parent-cache shard files; smaller windows are faster and lighter but can leave more parents unresolved.
 
 ### Integrity Checks
 
-Quick sampling (fast) and full decode (slow but thorough):
+Quick sampling validates only the first positive `sample_bytes` decompressed
+bytes per file (fast, prefix-only); full decode validates the complete stream
+(slow but thorough):
 
 ~~~rust
 use retl::{IntegrityMode, RedditETL, Sources, YearMonth};
@@ -775,15 +806,21 @@ Suggested starting points for `.file_concurrency(n)` by total system RAM:
 | 16–31 GB | 2 |
 | 32–63 GB | 4 |
 | 64–127 GB | 8 |
-| ≥ 128 GB | 8–12, then measure |
+| ≥ 128 GB | 8 (the built-in maximum), then tune other bottlenecks |
 
 ### Tuning knobs
 
 - `.parallelism(n)` — Rayon worker threads. CPU-bound work (decompression,
-  parsing) scales with this up to physical core count.
+  parsing) scales with this up to physical core count. RETL clamps requests to
+  a conservative runtime limit (a small multiple of available CPUs, never above
+  `MAX_RAYON_THREADS = 256`) and logs a warning when it clamps.
 - `.file_concurrency(n)` — number of monthly files decoded in parallel. The
   per-file working set is large; raising this is the fastest way to use up
-  RAM.
+  RAM because every in-flight Reddit zstd frame can reserve a multi-GiB decode
+  window. RETL clamps this to `MAX_FILE_CONCURRENCY = 8`.
+- `.shard_count(n)` — number of open-all-writer scratch shards for username
+  and key/value reductions. RETL clamps this to `MAX_SHARDS = 256` so a typo
+  cannot open millions of files or allocate millions of writer buffers.
 - `.inflight_bytes(bytes)` — per-flush byte budget for the bucketing/dedupe
   producer (`per_flush_cap = inflight_bytes / 2`). On its own this caps one
   in-memory map; the bucketing channel adds more buffered groups on top
@@ -875,7 +912,9 @@ The three benchmark groups:
 - `ETL_EXCLUDE_AUTHORS` — comma/semicolon/whitespace-separated authors to add
   to the default bot/service exclusion list.
 - `ETL_EXCLUDE_AUTHORS_FILE` — path to a newline-separated file of additional
-  authors to exclude.
+  authors to exclude. If this variable is set to a non-blank path, the file
+  must be opened and read completely as UTF-8; missing/unreadable/invalid files
+  are fatal build errors before scanning starts.
 
 The merged exclusion list is applied by `.exclude_common_bots()` on a
 `ScanPlan`, or by passing `--exclude-common-bots` to scan-capable CLI commands

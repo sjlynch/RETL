@@ -740,9 +740,9 @@ impl ScanPlan {
                         total_written.fetch_add(month.lines, Ordering::Relaxed);
                         parts.lock().unwrap().push(month.out_path.clone());
                         if let Some(acc) = &accumulator {
-                            if let Err(e) = commit_entry_to_manifest(acc, month) {
-                                tracing::warn!(error=%e, "failed to update progress manifest; continuing");
-                            }
+                            commit_entry_to_manifest(acc, month).context(
+                                "failed to durably update resume progress manifest after publishing spool output",
+                            )?;
                         }
                     }
                     Ok(())
@@ -752,6 +752,7 @@ impl ScanPlan {
             if let Some(pb) = pb {
                 pb.finish_with_message("done");
             }
+            ensure_resume_manifest_durable(accumulator.as_ref(), "spool")?;
 
             let mut list = parts.into_inner().unwrap();
             list.sort();
@@ -1021,16 +1022,17 @@ impl ScanPlan {
                         } else {
                             fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0)
                         };
-                        if let Err(e) = acc.commit(
+                        acc.commit(
                             key,
                             MonthEntry {
                                 size,
                                 lines: written,
                                 sha256: None,
                             },
-                        ) {
-                            tracing::warn!(error=%e, "failed to update partitioned export progress manifest; continuing");
-                        }
+                        )
+                        .context(
+                            "failed to durably update partitioned export progress manifest after publishing partition",
+                        )?;
                     }
                     Ok(())
                 },
@@ -1039,6 +1041,7 @@ impl ScanPlan {
             if let Some(pb) = pb {
                 pb.finish_with_message("done");
             }
+            ensure_resume_manifest_durable(accumulator.as_ref(), "partitioned export")?;
             Ok(())
         })
     }
@@ -1389,9 +1392,9 @@ fn process_month(job: &FileJob, ctx: &MonthJobCtx<'_>) -> Result<Option<MonthRes
 
 /// Atomically commit a month's manifest entry after a successful publish.
 /// `write_jsonl_atomic` only returns Ok once the rename landed, so the size
-/// stat is taken from the published path. Best-effort: a manifest rewrite
-/// failure must not abort the run — at worst, a subsequent re-run redoes
-/// this month.
+/// stat is taken from the published path. Resume-enabled callers fail the run
+/// immediately if this commit fails: the data file may remain published, but
+/// returning success would incorrectly claim a durable checkpoint.
 fn commit_entry_to_manifest(acc: &ManifestAccumulator, result: MonthResult) -> Result<()> {
     let size = fs::metadata(&result.out_path).map(|m| m.len()).unwrap_or(0);
     let entry = MonthEntry {
@@ -1400,6 +1403,18 @@ fn commit_entry_to_manifest(acc: &ManifestAccumulator, result: MonthResult) -> R
         sha256: None,
     };
     acc.commit(result.key, entry)
+}
+
+fn ensure_resume_manifest_durable(
+    accumulator: Option<&ManifestAccumulator>,
+    operation: &str,
+) -> Result<()> {
+    if let Some(error) = accumulator.and_then(ManifestAccumulator::last_save_error) {
+        anyhow::bail!(
+            "{operation} resume progress manifest is not durable; earlier save failed: {error}"
+        );
+    }
+    Ok(())
 }
 
 fn export_part_key(job: &FileJob) -> String {
@@ -2057,9 +2072,11 @@ fn extract_common(
                     match validate_jsonl_part(&tmp_file) {
                         Ok(entry) => {
                             if let Some(acc) = &accumulator {
-                                if let Err(e) = acc.commit(key.clone(), entry) {
-                                    tracing::warn!(error=%e, key=%key, "failed to update extract progress manifest; continuing");
-                                }
+                                acc.commit(key.clone(), entry).with_context(|| {
+                                    format!(
+                                        "failed to durably update extract progress manifest for existing resume part {key}"
+                                    )
+                                })?;
                             }
                             if let Some(pb) = &pb {
                                 let sz = fs::metadata(&job.path).map(|m| m.len()).unwrap_or(0);
@@ -2107,9 +2124,9 @@ fn extract_common(
                         lines,
                         sha256: None,
                     };
-                    if let Err(e) = acc.commit(key, entry) {
-                        tracing::warn!(error=%e, "failed to update extract progress manifest; continuing");
-                    }
+                    acc.commit(key, entry).context(
+                        "failed to durably update extract progress manifest after publishing resume part",
+                    )?;
                 }
                 Ok(())
             },
@@ -2118,6 +2135,7 @@ fn extract_common(
         if let Some(pb) = pb {
             pb.finish_with_message("done");
         }
+        ensure_resume_manifest_durable(accumulator.as_ref(), "extract")?;
 
         match finalize {
             Finalize::Jsonl => stitch_tmp_parts(&tmp_dir, out_path, write_buf)?,
@@ -2255,4 +2273,216 @@ where
         pb.finish_with_message("done");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_resume_fingerprint, extract_scratch_dir, ExportFormat};
+    use crate::progress_manifest::testing::fail_saves_after_attempts_for_tests;
+    use crate::{RedditETL, ScanPlan, Sources, YearMonth};
+    use serde_json::{json, Value};
+    use std::fs::{self, File};
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
+
+    fn write_zst_lines(path: &Path, lines: &[String]) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let file = File::create(path).unwrap();
+        let mut enc = zstd::stream::write::Encoder::new(file, 3).unwrap();
+        for line in lines {
+            writeln!(&mut enc, "{line}").unwrap();
+        }
+        enc.finish().unwrap();
+    }
+
+    fn make_one_comment_corpus() -> PathBuf {
+        let base = tempfile::tempdir().unwrap().keep();
+        let line = json!({
+            "id":"c1",
+            "author":"alice",
+            "subreddit":"programming",
+            "created_utc":1136073600_i64,
+            "score":1,
+            "body":"hello",
+        })
+        .to_string();
+        write_zst_lines(&base.join("comments").join("RC_2006-01.zst"), &[line]);
+        fs::create_dir_all(base.join("submissions")).unwrap();
+        base
+    }
+
+    fn one_month_scan(base: &Path) -> ScanPlan {
+        RedditETL::new()
+            .base_dir(base)
+            .sources(Sources::Comments)
+            .date_range(Some(YearMonth::new(2006, 1)), Some(YearMonth::new(2006, 1)))
+            .progress(false)
+            .resume(true)
+            .scan()
+            .subreddit("programming")
+    }
+
+    fn manifest_json(out_dir: &Path) -> Value {
+        serde_json::from_slice(&fs::read(out_dir.join("_progress.json")).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn spool_resume_commit_failure_after_publish_returns_error_and_next_run_succeeds() {
+        let base = make_one_comment_corpus();
+        let out_dir = base.join("spool_manifest_failure");
+
+        let err = {
+            // The first save is the initial pruned manifest; fail the per-month
+            // commit that happens only after the spool part has been published.
+            let _guard = fail_saves_after_attempts_for_tests(&out_dir, 1, 1);
+            one_month_scan(&base)
+                .extract_spool_monthly(&out_dir)
+                .expect_err("manifest commit failure must fail the run")
+        };
+        assert!(
+            err.to_string()
+                .contains("durably update resume progress manifest"),
+            "unexpected error: {err:#}"
+        );
+
+        let part = out_dir.join("part_RC_2006-01.jsonl");
+        assert!(
+            part.exists(),
+            "data publish should remain atomic and durable"
+        );
+        let manifest = manifest_json(&out_dir);
+        assert!(
+            manifest["months"].as_object().unwrap().is_empty(),
+            "failed commit must not claim the month is resumable: {manifest}"
+        );
+
+        let (_parts, written) = one_month_scan(&base)
+            .extract_spool_monthly(&out_dir)
+            .expect("subsequent run without manifest failure should succeed");
+        assert_eq!(written, 1);
+        let manifest = manifest_json(&out_dir);
+        assert!(manifest["months"]
+            .as_object()
+            .unwrap()
+            .contains_key("RC_2006-01"));
+    }
+
+    #[test]
+    fn partitioned_resume_commit_failure_after_publish_returns_error() {
+        let base = make_one_comment_corpus();
+        let out_dir = base.join("partitioned_manifest_failure");
+
+        let err = {
+            let _guard = fail_saves_after_attempts_for_tests(&out_dir, 1, 1);
+            one_month_scan(&base)
+                .export_partitioned(&out_dir, ExportFormat::Jsonl)
+                .expect_err("manifest commit failure must fail the partitioned export")
+        };
+        assert!(
+            err.to_string()
+                .contains("durably update partitioned export progress manifest"),
+            "unexpected error: {err:#}"
+        );
+
+        let part = out_dir.join("comments").join("RC_2006-01.jsonl");
+        assert!(
+            part.exists(),
+            "partition should remain published after commit failure"
+        );
+        let manifest = manifest_json(&out_dir);
+        assert!(
+            manifest["months"].as_object().unwrap().is_empty(),
+            "failed commit must not mark the partition resumable: {manifest}"
+        );
+
+        one_month_scan(&base)
+            .export_partitioned(&out_dir, ExportFormat::Jsonl)
+            .expect("subsequent partitioned export should succeed");
+        let manifest = manifest_json(&out_dir);
+        assert!(manifest["months"]
+            .as_object()
+            .unwrap()
+            .contains_key("RC_2006-01"));
+    }
+
+    #[test]
+    fn extract_resume_commit_failure_after_temp_part_publish_returns_error_and_next_run_stitches() {
+        let base = make_one_comment_corpus();
+        let work_dir = base.join("work_manifest_failure");
+        let out = base.join("out.jsonl");
+
+        let plan = RedditETL::new()
+            .base_dir(&base)
+            .work_dir(&work_dir)
+            .sources(Sources::Comments)
+            .date_range(Some(YearMonth::new(2006, 1)), Some(YearMonth::new(2006, 1)))
+            .progress(false)
+            .resume(true)
+            .scan()
+            .subreddit("programming")
+            .build()
+            .unwrap();
+        let fingerprint = build_resume_fingerprint(&plan.etl, &plan.query, "extract").unwrap();
+        let tmp_dir = extract_scratch_dir(
+            &work_dir,
+            "extract_jsonl_q_tmp",
+            &out,
+            true,
+            Some(&fingerprint),
+        )
+        .unwrap();
+
+        let err = {
+            let _guard = fail_saves_after_attempts_for_tests(&tmp_dir, 1, 1);
+            RedditETL::new()
+                .base_dir(&base)
+                .work_dir(&work_dir)
+                .sources(Sources::Comments)
+                .date_range(Some(YearMonth::new(2006, 1)), Some(YearMonth::new(2006, 1)))
+                .progress(false)
+                .resume(true)
+                .scan()
+                .subreddit("programming")
+                .extract_to_jsonl(&out)
+                .expect_err("manifest commit failure must fail extract_to_jsonl")
+        };
+        assert!(
+            err.to_string()
+                .contains("durably update extract progress manifest"),
+            "unexpected error: {err:#}"
+        );
+
+        let tmp_part = tmp_dir.join(".part_RC_2006-01.jsonl");
+        assert!(
+            tmp_part.exists(),
+            "resume temp part should remain published"
+        );
+        assert!(
+            !out.exists(),
+            "final extract output should not be stitched after a failed checkpoint"
+        );
+        let manifest = manifest_json(&tmp_dir);
+        assert!(
+            manifest["months"].as_object().unwrap().is_empty(),
+            "failed commit must not mark the temp part resumable: {manifest}"
+        );
+
+        RedditETL::new()
+            .base_dir(&base)
+            .work_dir(&work_dir)
+            .sources(Sources::Comments)
+            .date_range(Some(YearMonth::new(2006, 1)), Some(YearMonth::new(2006, 1)))
+            .progress(false)
+            .resume(true)
+            .scan()
+            .subreddit("programming")
+            .extract_to_jsonl(&out)
+            .expect("subsequent extract should commit the temp part and stitch output");
+        assert!(out.exists());
+        let manifest = manifest_json(&tmp_dir);
+        assert!(manifest["months"]
+            .as_object()
+            .unwrap()
+            .contains_key("RC_2006-01"));
+    }
 }

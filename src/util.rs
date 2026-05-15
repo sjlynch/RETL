@@ -1,4 +1,6 @@
-use crate::query::normalize_str;
+use crate::config::clamp_parallelism_threads;
+use crate::ndjson::{read_line_capped, DEFAULT_MAX_LINE_BYTES};
+use crate::query::{normalize_str, QueryBuildError};
 use anyhow::{Context, Result};
 
 static INIT_ONCE: std::sync::Once = std::sync::Once::new();
@@ -17,7 +19,7 @@ pub fn init_tracing_for_binary() {
 
 /// Returns a normalized (lowercase) default list of bot/service authors to exclude.
 /// This is a conservative set focused on high-volume/systemic accounts.
-/// Feel free to extend as needed; merge_extra_exclusions() will add env/file entries.
+/// Feel free to extend as needed; try_merge_extra_exclusions() will add env/file entries.
 pub fn default_bot_authors() -> Vec<String> {
     // Hand-curated defaults (normalized to lowercase)
     let defaults = [
@@ -43,34 +45,62 @@ pub fn default_bot_authors() -> Vec<String> {
 /// Merge extra exclusions from env/file into the provided vector (in-place).
 /// - ETL_EXCLUDE_AUTHORS: comma/semicolon/space separated names
 /// - ETL_EXCLUDE_AUTHORS_FILE: path to newline-separated file of names
-/// All entries are normalized (lowercase), then the list is sort+dedup.
-pub fn merge_extra_exclusions(target: &mut Vec<String>) {
-    use std::io::{BufRead, BufReader};
+///
+/// All entries are normalized (lowercase), then the list is sort+dedup. If
+/// `ETL_EXCLUDE_AUTHORS_FILE` is set to a non-blank path, failure to open or
+/// fully read it is fatal because the file is part of the query semantics.
+/// Per-line reads are bounded by [`DEFAULT_MAX_LINE_BYTES`] so an adversarial
+/// exclusions file cannot OOM the process.
+pub(crate) fn try_merge_extra_exclusions(
+    target: &mut Vec<String>,
+) -> std::result::Result<(), QueryBuildError> {
+    use std::io::BufReader;
+
+    let mut extras = Vec::new();
 
     if let Ok(s) = std::env::var("ETL_EXCLUDE_AUTHORS") {
         for raw in s.split(|c: char| c == ',' || c == ';' || c.is_whitespace()) {
             let n = normalize_str(raw);
             if !n.is_empty() {
-                target.push(n);
+                extras.push(n);
             }
         }
     }
 
-    if let Ok(path) = std::env::var("ETL_EXCLUDE_AUTHORS_FILE") {
-        if !path.trim().is_empty() {
-            if let Ok(f) = open_with_backoff(std::path::Path::new(&path), 16, 50) {
-                let r = BufReader::new(f);
-                for line in r.lines().flatten() {
-                    let n = normalize_str(&line);
-                    if !n.is_empty() {
-                        target.push(n);
+    if let Some(path_os) = std::env::var_os("ETL_EXCLUDE_AUTHORS_FILE") {
+        let path = std::path::PathBuf::from(path_os);
+        if !path.to_string_lossy().trim().is_empty() {
+            let f = open_with_backoff(&path, 16, 50).map_err(|e| {
+                QueryBuildError::new(format!(
+                    "ETL_EXCLUDE_AUTHORS_FILE {} cannot be opened: {e}",
+                    path.display()
+                ))
+            })?;
+            let mut r = BufReader::new(f);
+            let mut line = String::with_capacity(1024);
+            let mut line_no: usize = 0;
+            loop {
+                line_no += 1;
+                match read_line_capped(&mut r, &mut line, DEFAULT_MAX_LINE_BYTES, &path) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        let n = normalize_str(&line);
+                        if !n.is_empty() {
+                            extras.push(n);
+                        }
+                    }
+                    Err(e) => {
+                        return Err(QueryBuildError::new(format!(
+                            "ETL_EXCLUDE_AUTHORS_FILE {} could not be read at line {line_no}: {e}",
+                            path.display()
+                        )));
                     }
                 }
-            } else {
-                tracing::warn!("ETL_EXCLUDE_AUTHORS_FILE is set but cannot be opened: {}", path);
             }
         }
     }
+
+    target.extend(extras);
 
     // normalize + sort + dedup
     for s in target.iter_mut() {
@@ -78,12 +108,16 @@ pub fn merge_extra_exclusions(target: &mut Vec<String>) {
     }
     target.sort();
     target.dedup();
+    Ok(())
 }
 
 // -------- NEW: scoped Rayon thread pool helper --------
 
 /// Run `f` inside a scoped Rayon thread pool sized to `n` threads. If `n` is
-/// `None` (or `Some(0)`), run on the global default pool.
+/// `None` (or `Some(0)`), run on the global default pool. Positive values are
+/// clamped through [`crate::config::max_parallelism_limit`]; if Rayon still
+/// rejects the pool, RETL logs a warning and safely falls back to the global
+/// pool instead of panicking.
 ///
 /// Prefer this over `rayon::ThreadPoolBuilder::build_global()`, which mutates
 /// process-wide state, only succeeds for the first caller, and prevents
@@ -95,11 +129,19 @@ where
 {
     match n {
         Some(k) if k > 0 => {
-            let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(k)
-                .build()
-                .expect("failed to build rayon thread pool");
-            pool.install(f)
+            let clamped = clamp_parallelism_threads(k, "with_thread_pool");
+            match rayon::ThreadPoolBuilder::new().num_threads(clamped).build() {
+                Ok(pool) => pool.install(f),
+                Err(e) => {
+                    tracing::warn!(
+                        requested = k,
+                        clamped,
+                        error = %e,
+                        "failed to build scoped Rayon thread pool; falling back to global pool"
+                    );
+                    f()
+                }
+            }
         }
         _ => f(),
     }
