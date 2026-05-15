@@ -1226,8 +1226,13 @@ fn build_resume_fingerprint(
             "min_score": query.min_score,
             "max_score": query.max_score,
             "keywords_any": query.keywords_any.as_ref(),
+            "keywords_all": query.keywords_all.as_ref(),
+            "keywords_exclude": query.keywords_exclude.as_ref(),
+            "text_regex": query.text_regex.as_ref().map(|re| re.as_str()),
+            "text_regex_pattern": query.text_regex_pattern.as_ref(),
             "domains_in": query.domains_in.as_ref(),
             "contains_url": query.contains_url,
+            "no_url": query.no_url,
             "json_predicates": query.json_predicates_fingerprint(),
             "filter_pseudo_users": query.filter_pseudo_users,
         }
@@ -2326,6 +2331,28 @@ mod tests {
         serde_json::from_slice(&fs::read(out_dir.join("_progress.json")).unwrap()).unwrap()
     }
 
+    fn spool_fingerprint_for(plan: ScanPlan) -> String {
+        let plan = plan.build().unwrap();
+        build_resume_fingerprint(&plan.etl, &plan.query, "spool", plan.limit).unwrap()
+    }
+
+    #[test]
+    fn resume_fingerprint_includes_new_text_and_url_filters() {
+        let base = make_one_comment_corpus();
+        let base_fp = spool_fingerprint_for(one_month_scan(&base));
+
+        let keyword_all_fp = spool_fingerprint_for(one_month_scan(&base).keywords_all(["hello"]));
+        let exclude_keyword_fp =
+            spool_fingerprint_for(one_month_scan(&base).exclude_keywords(["spam"]));
+        let text_regex_fp = spool_fingerprint_for(one_month_scan(&base).text_regex("hello"));
+        let no_url_fp = spool_fingerprint_for(one_month_scan(&base).no_url());
+
+        assert_ne!(base_fp, keyword_all_fp);
+        assert_ne!(base_fp, exclude_keyword_fp);
+        assert_ne!(base_fp, text_regex_fp);
+        assert_ne!(base_fp, no_url_fp);
+    }
+
     #[test]
     fn spool_resume_commit_failure_after_publish_returns_error_and_next_run_succeeds() {
         let base = make_one_comment_corpus();
@@ -2422,7 +2449,8 @@ mod tests {
             .subreddit("programming")
             .build()
             .unwrap();
-        let fingerprint = build_resume_fingerprint(&plan.etl, &plan.query, "extract").unwrap();
+        let fingerprint =
+            build_resume_fingerprint(&plan.etl, &plan.query, "extract", None).unwrap();
         let tmp_dir = extract_scratch_dir(
             &work_dir,
             "extract_jsonl_q_tmp",

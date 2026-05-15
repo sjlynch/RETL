@@ -135,9 +135,21 @@ pub(crate) struct QueryOpts {
     #[arg(long = "author-regex", value_name = "REGEX")]
     pub(crate) author_regex: Option<String>,
 
-    /// Keyword/text filter matched in comment bodies and submission titles/selftext. Blank values are rejected.
+    /// Keyword/text filter matched in comment bodies and submission titles/selftext (repeatable; any entry may match). Blank values are rejected.
     #[arg(long = "keyword", value_name = "TEXT")]
     pub(crate) keywords: Vec<String>,
+
+    /// Require this keyword/text to be present across comment body or submission title/selftext (repeatable; all entries must match). Blank values are rejected.
+    #[arg(long = "keyword-all", value_name = "TEXT")]
+    pub(crate) keywords_all: Vec<String>,
+
+    /// Reject records containing this keyword/text in comment body or submission title/selftext (repeatable). Blank values are rejected.
+    #[arg(long = "exclude-keyword", value_name = "TEXT")]
+    pub(crate) exclude_keywords: Vec<String>,
+
+    /// Regex matched against comment body or submission title/selftext. Invalid or blank patterns are rejected before scanning.
+    #[arg(long = "text-regex", value_name = "REGEX")]
+    pub(crate) text_regex: Option<String>,
 
     /// Minimum score (inclusive).
     #[arg(long = "min-score", value_name = "N")]
@@ -147,9 +159,13 @@ pub(crate) struct QueryOpts {
     #[arg(long = "max-score", value_name = "N")]
     pub(crate) max_score: Option<i64>,
 
-    /// Keep only records that contain an http(s) URL in text or submission URL (positive-only filter).
+    /// Keep only records that contain an http(s) URL in text or an outbound link-submission URL.
     #[arg(long = "contains-url")]
     pub(crate) contains_url: bool,
+
+    /// Keep only records without an http(s) URL in text and without an outbound link-submission URL.
+    #[arg(long = "no-url")]
+    pub(crate) no_url: bool,
 
     /// Submission domain allow-list entry (repeatable). Comments have no domain and are dropped. Blank values are rejected.
     #[arg(long = "domain", value_name = "DOMAIN")]

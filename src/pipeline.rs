@@ -378,12 +378,38 @@ impl ScanPlan {
         self.query.max_score = Some(v);
         self
     }
+    /// Keep records where at least one keyword appears in `body`, `selftext`, or `title`.
     pub fn keywords_any<I, S>(self, iter: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
         self.set_string_list(|q, v| q.keywords_any = Some(v), iter, lowercase_str)
+    }
+    /// Keep records only when every keyword appears across `body`, `selftext`, and `title`.
+    pub fn keywords_all<I, S>(self, iter: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.set_string_list(|q, v| q.keywords_all = Some(v), iter, lowercase_str)
+    }
+    /// Reject records where any keyword appears in `body`, `selftext`, or `title`.
+    pub fn exclude_keywords<I, S>(self, iter: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.set_string_list(|q, v| q.keywords_exclude = Some(v), iter, lowercase_str)
+    }
+    /// Keep records where `pattern` matches `body`, `selftext`, or `title`.
+    ///
+    /// The pattern uses Rust `regex` syntax and is compiled by [`ScanPlan::build`],
+    /// so malformed patterns return [`QueryBuildError`] before scanning starts.
+    pub fn text_regex(mut self, pattern: impl Into<String>) -> Self {
+        self.query.text_regex_pattern = Some(pattern.into());
+        self.query.text_regex = None;
+        self
     }
     /// Restrict to submissions whose top-level `domain` field matches one of
     /// the provided domains (case-insensitive).
@@ -400,11 +426,21 @@ impl ScanPlan {
     }
     /// Keep only records that contain an HTTP(S) URL when `yes` is true.
     ///
-    /// Passing `false` clears/disables the positive URL filter. RETL does not
-    /// currently expose a negative "without URL" predicate.
+    /// Passing `false` clears/disables the positive URL filter. Use
+    /// [`ScanPlan::no_url`] for the negative URL predicate.
     pub fn contains_url(mut self, yes: bool) -> Self {
         self.query.contains_url = yes.then_some(true);
         self
+    }
+    /// Keep only records without an HTTP(S) URL in text and without an outbound
+    /// link-submission URL.
+    pub fn no_url(mut self) -> Self {
+        self.query.no_url = true;
+        self
+    }
+    /// Alias for [`ScanPlan::no_url`].
+    pub fn without_url(self) -> Self {
+        self.no_url()
     }
     /// Add an arbitrary full-record JSON Pointer predicate.
     pub fn json_predicate(mut self, predicate: JsonPointerPredicate) -> Self {
@@ -497,6 +533,7 @@ impl ScanPlan {
             self.query.validate()?;
         }
         self.query = self.query.compile_author_regex()?;
+        self.query = self.query.compile_text_regex()?;
         self.query = self.query.compile_json_predicates()?;
         log_domain_filter_comment_drop(&self.query, self.etl.opts.sources);
         Ok(self)

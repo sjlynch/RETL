@@ -67,7 +67,10 @@ fn build_rejects_empty_explicit_string_lists() {
         &["authors_out", "empty list"],
     );
     expect_query_build_error(
-        RedditETL::new().scan().authors_out(empty).exclude_common_bots(),
+        RedditETL::new()
+            .scan()
+            .authors_out(empty)
+            .exclude_common_bots(),
         &["authors_out", "empty list"],
     );
     expect_query_build_error(
@@ -77,6 +80,14 @@ fn build_rejects_empty_explicit_string_lists() {
     expect_query_build_error(
         RedditETL::new().scan().keywords_any(empty),
         &["keywords_any", "empty list"],
+    );
+    expect_query_build_error(
+        RedditETL::new().scan().keywords_all(empty),
+        &["keywords_all", "empty list"],
+    );
+    expect_query_build_error(
+        RedditETL::new().scan().exclude_keywords(empty),
+        &["keywords_exclude", "empty list"],
     );
 }
 
@@ -106,6 +117,18 @@ fn build_rejects_blank_normalized_filter_values() {
         RedditETL::new().scan().keywords_any(["\n"]),
         &["keywords_any", "blank entries are not allowed"],
     );
+    expect_query_build_error(
+        RedditETL::new().scan().keywords_all(["\n"]),
+        &["keywords_all", "blank entries are not allowed"],
+    );
+    expect_query_build_error(
+        RedditETL::new().scan().exclude_keywords(["\n"]),
+        &["keywords_exclude", "blank entries are not allowed"],
+    );
+    expect_query_build_error(
+        RedditETL::new().scan().text_regex("\t"),
+        &["text_regex", "blank regex patterns are not allowed"],
+    );
 
     #[allow(deprecated)]
     let legacy_blank_subreddit = RedditETL::new().subreddit(" ").scan();
@@ -125,6 +148,26 @@ fn build_rejects_invalid_author_regex_pattern() {
         .expect("expected ScanPlan::build to fail");
     let msg = err_msg(err);
     assert!(msg.contains("author_regex"), "{msg}");
+}
+
+#[test]
+fn build_rejects_invalid_text_regex_pattern() {
+    let err = RedditETL::new()
+        .scan()
+        .text_regex("[")
+        .build()
+        .err()
+        .expect("expected ScanPlan::build to fail");
+    let msg = err_msg(err);
+    assert!(msg.contains("text_regex"), "{msg}");
+}
+
+#[test]
+fn build_rejects_contradictory_url_filters() {
+    expect_query_build_error(
+        RedditETL::new().scan().contains_url(true).no_url(),
+        &["contains_url", "no_url"],
+    );
 }
 
 #[test]

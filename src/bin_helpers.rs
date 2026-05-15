@@ -656,6 +656,15 @@ macro_rules! plan {
         if !query.keywords.is_empty() {
             scan = scan.keywords_any(query.keywords.iter().map(String::as_str));
         }
+        if !query.keywords_all.is_empty() {
+            scan = scan.keywords_all(query.keywords_all.iter().map(String::as_str));
+        }
+        if !query.exclude_keywords.is_empty() {
+            scan = scan.exclude_keywords(query.exclude_keywords.iter().map(String::as_str));
+        }
+        if let Some(text_regex) = &query.text_regex {
+            scan = scan.text_regex(text_regex.as_str());
+        }
         if let Some(min_score) = query.min_score {
             scan = scan.min_score(min_score);
         }
@@ -664,6 +673,9 @@ macro_rules! plan {
         }
         if query.contains_url {
             scan = scan.contains_url(true);
+        }
+        if query.no_url {
+            scan = scan.no_url();
         }
         if !query.domains.is_empty() {
             scan = scan.domains_in(query.domains.iter().map(String::as_str));

@@ -48,8 +48,12 @@ fn ascii_ci_contains_http(haystack: &[u8]) -> bool {
 }
 
 #[inline]
-fn keyword_field_matches(q: &QuerySpec, ac: &aho_corasick::AhoCorasick, text: &str) -> bool {
-    if q.keywords_all_ascii() && text.is_ascii() {
+fn keyword_field_matches(
+    ac: &aho_corasick::AhoCorasick,
+    keywords_all_ascii: bool,
+    text: &str,
+) -> bool {
+    if keywords_all_ascii && text.is_ascii() {
         return ac.is_match(text.as_bytes());
     }
 
@@ -64,6 +68,115 @@ fn keyword_field_matches(q: &QuerySpec, ac: &aho_corasick::AhoCorasick, text: &s
     // keyword set or the text field leaves the all-ASCII fast path.
     let lower = text.to_lowercase();
     ac.is_match(lower.as_bytes())
+}
+
+#[inline]
+fn any_text_field_matches(min: &MinimalRecord, mut pred: impl FnMut(&str) -> bool) -> bool {
+    min.body.as_deref().map_or(false, &mut pred)
+        || min.selftext.as_deref().map_or(false, &mut pred)
+        || min.title.as_deref().map_or(false, pred)
+}
+
+#[inline]
+fn keyword_any_matches_record(
+    min: &MinimalRecord,
+    ac: &aho_corasick::AhoCorasick,
+    keywords_all_ascii: bool,
+) -> bool {
+    any_text_field_matches(min, |s| keyword_field_matches(ac, keywords_all_ascii, s))
+}
+
+fn mark_keyword_matches_bytes(
+    ac: &aho_corasick::AhoCorasick,
+    bytes: &[u8],
+    seen: &mut [bool],
+    remaining: &mut usize,
+) {
+    for mat in ac.find_overlapping_iter(bytes) {
+        let idx = mat.pattern().as_usize();
+        if !seen[idx] {
+            seen[idx] = true;
+            *remaining -= 1;
+            if *remaining == 0 {
+                return;
+            }
+        }
+    }
+}
+
+fn mark_keyword_field_matches(
+    ac: &aho_corasick::AhoCorasick,
+    keywords_all_ascii: bool,
+    text: &str,
+    seen: &mut [bool],
+    remaining: &mut usize,
+) {
+    if *remaining == 0 {
+        return;
+    }
+    mark_keyword_matches_bytes(ac, text.as_bytes(), seen, remaining);
+    if *remaining == 0 || (keywords_all_ascii && text.is_ascii()) {
+        return;
+    }
+    let lower = text.to_lowercase();
+    mark_keyword_matches_bytes(ac, lower.as_bytes(), seen, remaining);
+}
+
+fn keyword_all_matches_record(
+    min: &MinimalRecord,
+    ac: &aho_corasick::AhoCorasick,
+    keyword_count: usize,
+    keywords_all_ascii: bool,
+) -> bool {
+    if keyword_count == 0 {
+        return true;
+    }
+    let mut seen = vec![false; keyword_count];
+    let mut remaining = keyword_count;
+
+    if let Some(body) = min.body.as_deref() {
+        mark_keyword_field_matches(ac, keywords_all_ascii, body, &mut seen, &mut remaining);
+    }
+    if let Some(selftext) = min.selftext.as_deref() {
+        mark_keyword_field_matches(ac, keywords_all_ascii, selftext, &mut seen, &mut remaining);
+    }
+    if let Some(title) = min.title.as_deref() {
+        mark_keyword_field_matches(ac, keywords_all_ascii, title, &mut seen, &mut remaining);
+    }
+
+    remaining == 0
+}
+
+#[inline]
+fn record_text_regex_matches(min: &MinimalRecord, re: &regex::Regex) -> bool {
+    any_text_field_matches(min, |s| re.is_match(s))
+}
+
+#[inline]
+fn domain_marks_self_post(domain: &str) -> bool {
+    domain.eq_ignore_ascii_case("self")
+        || domain
+            .get(..5)
+            .is_some_and(|p| p.eq_ignore_ascii_case("self."))
+}
+
+#[inline]
+fn is_self_submission(min: &MinimalRecord) -> bool {
+    min.is_self == Some(true) || min.domain.as_deref().is_some_and(domain_marks_self_post)
+}
+
+#[inline]
+fn submission_url_matches_url_filter(min: &MinimalRecord) -> bool {
+    min.url
+        .as_deref()
+        .is_some_and(|s| ascii_ci_is_http_prefix(s.as_bytes()))
+        && !is_self_submission(min)
+}
+
+#[inline]
+fn record_contains_url(min: &MinimalRecord) -> bool {
+    any_text_field_matches(min, |s| ascii_ci_contains_http(s.as_bytes()))
+        || submission_url_matches_url_filter(min)
 }
 
 /// Decide using only fields in MinimalRecord (fast path).
@@ -131,47 +244,38 @@ pub fn matches_minimal(
         }
     }
 
-    // keywords_any: all-ASCII keywords + all-ASCII haystacks stay on the
-    // pre-built Aho-Corasick raw-byte path. Non-ASCII keywords/text get a
-    // lowercase fallback so the documented case-insensitive behavior covers
-    // Unicode (e.g. `café` matching `CAFÉ`).
-    if let Some(ac) = q.keywords_automaton() {
-        let matched = min
-            .body
-            .as_deref()
-            .map_or(false, |s| keyword_field_matches(q, ac, s))
-            || min
-                .selftext
-                .as_deref()
-                .map_or(false, |s| keyword_field_matches(q, ac, s))
-            || min
-                .title
-                .as_deref()
-                .map_or(false, |s| keyword_field_matches(q, ac, s));
-        if !matched {
+    // Keyword filters search the same MinimalRecord text fields: comment
+    // `body`, submission `selftext`, and submission `title`. All-ASCII
+    // keywords + all-ASCII haystacks stay on the pre-built Aho-Corasick
+    // raw-byte path. Non-ASCII keywords/text get a lowercase fallback so the
+    // documented case-insensitive behavior covers Unicode (e.g. `café`
+    // matching `CAFÉ`).
+    if let Some(ac) = q.keywords_any_automaton() {
+        if !keyword_any_matches_record(min, ac, q.keywords_any_all_ascii()) {
             return false;
         }
     }
-    if q.contains_url == Some(true) {
-        let matched = min
-            .body
-            .as_deref()
-            .map_or(false, |s| ascii_ci_contains_http(s.as_bytes()))
-            || min
-                .selftext
-                .as_deref()
-                .map_or(false, |s| ascii_ci_contains_http(s.as_bytes()))
-            || min
-                .title
-                .as_deref()
-                .map_or(false, |s| ascii_ci_contains_http(s.as_bytes()))
-            || min
-                .url
-                .as_deref()
-                .map_or(false, |s| ascii_ci_is_http_prefix(s.as_bytes()));
-        if !matched {
+    if let Some(ac) = q.keywords_all_automaton() {
+        let keyword_count = q.keywords_all.as_ref().map_or(0, Vec::len);
+        if !keyword_all_matches_record(min, ac, keyword_count, q.keywords_all_all_ascii()) {
             return false;
         }
+    }
+    if let Some(ac) = q.keywords_exclude_automaton() {
+        if keyword_any_matches_record(min, ac, q.keywords_exclude_all_ascii()) {
+            return false;
+        }
+    }
+    if let Some(re) = &q.text_regex {
+        if !record_text_regex_matches(min, re) {
+            return false;
+        }
+    }
+    if q.contains_url == Some(true) && !record_contains_url(min) {
+        return false;
+    }
+    if q.no_url && record_contains_url(min) {
+        return false;
     }
 
     true
