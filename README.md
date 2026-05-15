@@ -398,10 +398,15 @@ retl aggregate --spool ./spool --by 'json:/subreddit' --metric 'sum:/score' --ou
 ~~~
 
 `--pretty` field-indents the final JSON when `--by` is omitted, matching
-`export --format json --pretty`. Grouped TSV metrics render integer-valued
-numbers as plain decimal strings by default (for example large `sum:/score`
-values do not use scientific notation); pass `--scientific` to opt back into
-Rust's default `f64` formatting.
+`export --format json --pretty`. Grouped TSV integer metrics are accumulated
+and compared exactly as `i128` when JSON numbers or numeric strings fit that
+range, so large `sum`, `min`, and `max` values beyond f64's exact range keep
+plain decimal output. Non-integer floating metrics use Rust's shortest
+round-trip float text instead of six-place rounding; averages from exact
+integer sums are rounded to at most 18 fractional decimal places and then
+trimmed. `--scientific` is only a display-style toggle that allows Rust's
+float formatter to use exponent notation for inexact floating values; it does
+not lower numeric precision, and exact integer results remain decimal.
 
 `--metric` defaults to `count` and also supports `avg:/pointer`,
 `min:/pointer`, and `max:/pointer` for numeric JSON-pointer values.

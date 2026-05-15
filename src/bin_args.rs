@@ -480,9 +480,9 @@ pub(crate) struct AggregateArgs {
     /// Keep only the top N groups by metric value (ties sort by key).
     #[arg(long)]
     pub(crate) top: Option<usize>,
-    /// Render grouped numeric TSV metrics with Rust's default f64 formatting
-    /// (scientific notation when chosen by the formatter). By default RETL
-    /// emits decimal strings for spreadsheet- and awk-friendly TSV.
+    /// Allow exponent notation for inexact floating grouped metrics. This is a
+    /// display-style toggle, not a precision toggle: exact integer results stay
+    /// exact decimal, and default decimal output no longer rounds to six places.
     #[arg(long)]
     pub(crate) scientific: bool,
 }
