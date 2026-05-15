@@ -852,6 +852,62 @@ fn attach_fingerprint_path(final_dest: &Path) -> PathBuf {
     PathBuf::from(sidecar)
 }
 
+fn is_owned_spool_part_name(name: &str) -> bool {
+    let ym = name
+        .strip_prefix("part_RC_")
+        .or_else(|| name.strip_prefix("part_RS_"))
+        .and_then(|rest| rest.strip_suffix(".jsonl"));
+    ym.is_some_and(|ym| ym.parse::<YearMonth>().is_ok())
+}
+
+fn owned_attach_output_base_name(name: &str) -> Option<String> {
+    if is_owned_spool_part_name(name) {
+        return Some(name.to_string());
+    }
+    let base = name.strip_suffix(ATTACH_SIDECAR_SUFFIX)?;
+    is_owned_spool_part_name(base).then(|| base.to_string())
+}
+
+fn attach_output_basenames(inputs: &[(usize, PathBuf)]) -> Result<BTreeSet<String>> {
+    let mut names = BTreeSet::new();
+    for (_idx, input) in inputs {
+        let name = input.file_name().ok_or_else(|| {
+            anyhow::anyhow!(
+                "attach_parents input path has no file name: {}",
+                input.display()
+            )
+        })?;
+        names.insert(name.to_string_lossy().to_string());
+    }
+    Ok(names)
+}
+
+fn prune_stale_attach_outputs(out_dir: &Path, keep_basenames: &BTreeSet<String>) -> Result<()> {
+    if !out_dir.exists() {
+        return Ok(());
+    }
+    for entry in read_dir_with_backoff(out_dir, 16, 50)
+        .with_context(|| format!("read_dir {}", out_dir.display()))?
+    {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(base_name) = owned_attach_output_base_name(name) else {
+            continue;
+        };
+        if keep_basenames.contains(&base_name) {
+            continue;
+        }
+        remove_with_backoff(&path, 8, 50)
+            .with_context(|| format!("remove stale parent attach output {}", path.display()))?;
+    }
+    Ok(())
+}
+
 fn system_time_parts(t: SystemTime) -> (i64, u32) {
     match t.duration_since(UNIX_EPOCH) {
         Ok(d) => (
@@ -1685,13 +1741,17 @@ impl RedditETL {
             let staging_dir = ensure_staging_dir(out_dir)?;
             sweep_stale_inprogress(out_dir, true)?;
 
+            let indexed_inputs: Vec<(usize, PathBuf)> = inputs.into_iter().enumerate().collect();
+            let keep_basenames = attach_output_basenames(&indexed_inputs)?;
+            prune_stale_attach_outputs(out_dir, &keep_basenames)?;
+
             let label = self
                 .opts
                 .progress_label
                 .as_deref()
                 .unwrap_or("Attaching parents");
             let pb = if self.opts.progress {
-                Some(make_count_progress(inputs.len() as u64, label))
+                Some(make_count_progress(indexed_inputs.len() as u64, label))
             } else {
                 None
             };
@@ -1706,7 +1766,6 @@ impl RedditETL {
             let parent_cache_fingerprint = attach_parent_cache_fingerprint(parents);
             let resolution_range = attach_resolution_range(self.opts.start, self.opts.end);
 
-            let indexed_inputs: Vec<(usize, PathBuf)> = inputs.into_iter().enumerate().collect();
             diagnose_initial_attach_shape(&indexed_inputs, self.opts.read_buffer_bytes)?;
             let attached = std::sync::Mutex::new(vec![None; indexed_inputs.len()]);
 

@@ -647,6 +647,7 @@ impl ScanPlan {
                 resolve_target_subs_from(&plan.etl.opts.subreddit, &plan.query.subreddits);
             let files = plan_pipeline_files(&plan.etl)?;
             warn_if_unfiltered_undated_query(&plan.etl, &plan.query, &files);
+            let planned_keys = planned_job_keys(&files);
 
             let resume = plan.etl.opts.resume;
             let resume_fingerprint =
@@ -655,10 +656,14 @@ impl ScanPlan {
             // current query/config fingerprint and the file actually on disk,
             // then snapshot surviving keys before any worker mutates the accumulator.
             let (initial_months, completed_keys) = if resume {
-                load_and_validate_manifest(out_dir, &resume_fingerprint)?
+                load_and_validate_manifest(out_dir, &resume_fingerprint, &planned_keys)?
             } else {
+                clear_spool_resume_parts(out_dir)?;
                 (HashMap::new(), HashSet::new())
             };
+            if resume {
+                prune_spool_outputs_except(out_dir, &completed_keys)?;
+            }
 
             let total_bytes = total_compressed_size(&files);
             let pb = if plan.etl.opts.progress {
@@ -890,6 +895,7 @@ impl ScanPlan {
             let staging_dir = ensure_staging_dir(out_base_dir)?;
             sweep_stale_inprogress(out_base_dir, true)?;
 
+            let planned_keys = planned_job_keys(&files);
             let resume = plan.etl.opts.resume;
             let resume_fingerprint = build_resume_fingerprint(
                 &plan.etl,
@@ -898,10 +904,19 @@ impl ScanPlan {
                 plan.limit,
             )?;
             let (initial_months, completed_keys) = if resume {
-                load_and_validate_partitioned_manifest(out_base_dir, &resume_fingerprint, format)?
+                load_and_validate_partitioned_manifest(
+                    out_base_dir,
+                    &resume_fingerprint,
+                    format,
+                    &planned_keys,
+                )?
             } else {
+                clear_partitioned_resume_outputs(out_base_dir, format)?;
                 (HashMap::new(), HashSet::new())
             };
+            if resume {
+                prune_partitioned_outputs_except(out_base_dir, format, &completed_keys)?;
+            }
             let resumed_lines = committed_line_count(&initial_months);
             let accumulator = if resume {
                 crate::progress_manifest::save(
@@ -1251,17 +1266,38 @@ fn remove_matching_files(dir: &Path, mut should_remove: impl FnMut(&str) -> bool
             continue;
         };
         if should_remove(name) {
-            if let Err(e) = remove_with_backoff(&path, 8, 50) {
-                tracing::warn!(path=%path.display(), error=%e, "failed to remove stale resume part");
-            }
+            remove_with_backoff(&path, 8, 50)
+                .with_context(|| format!("remove stale RETL-owned output {}", path.display()))?;
         }
     }
     Ok(())
 }
 
+fn planned_job_keys(files: &[FileJob]) -> HashSet<String> {
+    files.iter().map(export_part_key).collect()
+}
+
+fn spool_key_from_part_name(name: &str) -> Option<String> {
+    let (prefix, key_prefix) = if name.starts_with("part_RC_") {
+        ("part_RC_", "RC")
+    } else if name.starts_with("part_RS_") {
+        ("part_RS_", "RS")
+    } else {
+        return None;
+    };
+    let ym = name.strip_prefix(prefix)?.strip_suffix(".jsonl")?;
+    ym.parse::<YearMonth>().ok()?;
+    Some(format!("{key_prefix}_{ym}"))
+}
+
 fn clear_spool_resume_parts(out_dir: &Path) -> Result<()> {
-    remove_matching_files(out_dir, |name| {
-        (name.starts_with("part_RC_") || name.starts_with("part_RS_")) && name.ends_with(".jsonl")
+    remove_matching_files(out_dir, |name| spool_key_from_part_name(name).is_some())
+}
+
+fn prune_spool_outputs_except(out_dir: &Path, keep_keys: &HashSet<String>) -> Result<()> {
+    remove_matching_files(out_dir, |name| match spool_key_from_part_name(name) {
+        Some(key) => !keep_keys.contains(&key),
+        None => false,
     })
 }
 
@@ -1296,6 +1332,7 @@ struct MonthJobCtx<'a> {
 fn load_and_validate_manifest(
     out_dir: &Path,
     fingerprint: &str,
+    planned_keys: &HashSet<String>,
 ) -> Result<(HashMap<String, MonthEntry>, HashSet<String>)> {
     let manifest = crate::progress_manifest::load(out_dir);
     if manifest.fingerprint.as_deref() != Some(fingerprint) && !manifest.months.is_empty() {
@@ -1310,6 +1347,10 @@ fn load_and_validate_manifest(
     }
     let mut keep: HashMap<String, MonthEntry> = HashMap::new();
     for (k, v) in manifest.months {
+        if !planned_keys.contains(&k) {
+            tracing::info!(key=%k, "dropping progress manifest entry outside current spool plan");
+            continue;
+        }
         let final_name = format!("part_{}.jsonl", k);
         let final_path = out_dir.join(&final_name);
         match fs::metadata(&final_path) {
@@ -1468,13 +1509,44 @@ fn partitioned_output_path_for_key(
     )
 }
 
-fn clear_partitioned_resume_outputs(out_base_dir: &Path, format: ExportFormat) -> Result<()> {
+fn partitioned_key_from_output_name(
+    name: &str,
+    key_prefix: &str,
+    format: ExportFormat,
+) -> Option<String> {
+    let prefix = format!("{key_prefix}_");
     let suffix = format!(".{}", partitioned_ext(format));
+    let ym = name.strip_prefix(&prefix)?.strip_suffix(&suffix)?;
+    ym.parse::<YearMonth>().ok()?;
+    Some(format!("{key_prefix}_{ym}"))
+}
+
+fn clear_partitioned_resume_outputs(out_base_dir: &Path, format: ExportFormat) -> Result<()> {
     remove_matching_files(&out_base_dir.join("comments"), |name| {
-        name.starts_with("RC_") && name.ends_with(&suffix)
+        partitioned_key_from_output_name(name, "RC", format).is_some()
     })?;
     remove_matching_files(&out_base_dir.join("submissions"), |name| {
-        name.starts_with("RS_") && name.ends_with(&suffix)
+        partitioned_key_from_output_name(name, "RS", format).is_some()
+    })?;
+    Ok(())
+}
+
+fn prune_partitioned_outputs_except(
+    out_base_dir: &Path,
+    format: ExportFormat,
+    keep_keys: &HashSet<String>,
+) -> Result<()> {
+    remove_matching_files(&out_base_dir.join("comments"), |name| {
+        match partitioned_key_from_output_name(name, "RC", format) {
+            Some(key) => !keep_keys.contains(&key),
+            None => false,
+        }
+    })?;
+    remove_matching_files(&out_base_dir.join("submissions"), |name| {
+        match partitioned_key_from_output_name(name, "RS", format) {
+            Some(key) => !keep_keys.contains(&key),
+            None => false,
+        }
     })?;
     Ok(())
 }
@@ -1521,6 +1593,7 @@ fn load_and_validate_partitioned_manifest(
     out_base_dir: &Path,
     fingerprint: &str,
     format: ExportFormat,
+    planned_keys: &HashSet<String>,
 ) -> Result<(HashMap<String, MonthEntry>, HashSet<String>)> {
     let manifest = crate::progress_manifest::load(out_base_dir);
     if manifest.fingerprint.as_deref() != Some(fingerprint) && !manifest.months.is_empty() {
@@ -1536,6 +1609,10 @@ fn load_and_validate_partitioned_manifest(
 
     let mut keep: HashMap<String, MonthEntry> = HashMap::new();
     for (key, entry) in manifest.months {
+        if !planned_keys.contains(&key) {
+            tracing::info!(key=%key, "dropping partitioned progress entry outside current plan");
+            continue;
+        }
         let Some(path) = partitioned_output_path_for_key(out_base_dir, &key, format) else {
             tracing::info!(key=%key, "dropping unrecognized partitioned progress entry");
             continue;
@@ -2422,7 +2499,8 @@ mod tests {
             .subreddit("programming")
             .build()
             .unwrap();
-        let fingerprint = build_resume_fingerprint(&plan.etl, &plan.query, "extract").unwrap();
+        let fingerprint =
+            build_resume_fingerprint(&plan.etl, &plan.query, "extract", None).unwrap();
         let tmp_dir = extract_scratch_dir(
             &work_dir,
             "extract_jsonl_q_tmp",

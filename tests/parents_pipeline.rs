@@ -414,6 +414,67 @@ fn unresolved_parent_is_absent_and_counted() {
 }
 
 #[test]
+fn attach_parents_rerun_prunes_stale_owned_parts_when_inputs_shrink() {
+    let tmp = tempfile::tempdir().unwrap();
+    let spool_dir = tmp.path().join("spool");
+    fs::create_dir_all(&spool_dir).unwrap();
+    let jan = spool_dir.join("part_RC_2006-01.jsonl");
+    let feb = spool_dir.join("part_RC_2006-02.jsonl");
+    fs::write(
+        &jan,
+        "{\"id\":\"c1\",\"body\":\"child\",\"parent_id\":\"t1_missing\",\"created_utc\":1136073600}\n",
+    )
+    .unwrap();
+    fs::write(
+        &feb,
+        "{\"id\":\"c2\",\"body\":\"child\",\"parent_id\":\"t1_missing\",\"created_utc\":1138752000}\n",
+    )
+    .unwrap();
+
+    let parents = ParentMaps {
+        comments: HashMap::new(),
+        submissions: HashMap::new(),
+        comment_shards: Some(HashMap::new()),
+        submission_shards: Some(HashMap::new()),
+        payload_spec: Default::default(),
+    };
+    let out_dir = tmp.path().join("attached");
+
+    let (_paths, first_stats) = RedditETL::new()
+        .progress(false)
+        .attach_parents_jsonls_parallel_with_stats(
+            vec![jan.clone(), feb.clone()],
+            &out_dir,
+            &parents,
+            false,
+        )
+        .unwrap();
+    assert_eq!(first_stats.unresolved, 2);
+    assert!(out_dir.join("part_RC_2006-02.jsonl").exists());
+    assert!(out_dir
+        .join("part_RC_2006-02.jsonl.parents-attach.json")
+        .exists());
+    fs::write(out_dir.join("notes.txt"), "do not delete").unwrap();
+
+    let (paths, second_stats) = RedditETL::new()
+        .progress(false)
+        .attach_parents_jsonls_parallel_with_stats(vec![jan.clone()], &out_dir, &parents, false)
+        .unwrap();
+
+    assert_eq!(paths, vec![out_dir.join("part_RC_2006-01.jsonl")]);
+    assert_eq!(second_stats.unresolved, 1);
+    assert!(out_dir.join("part_RC_2006-01.jsonl").exists());
+    assert!(!out_dir.join("part_RC_2006-02.jsonl").exists());
+    assert!(!out_dir
+        .join("part_RC_2006-02.jsonl.parents-attach.json")
+        .exists());
+    assert_eq!(
+        fs::read_to_string(out_dir.join("notes.txt")).unwrap(),
+        "do not delete"
+    );
+}
+
+#[test]
 fn attach_parents_resume_rebuilds_corrupt_published_output() {
     let tmp = tempfile::tempdir().unwrap();
     let input = tmp.path().join("part_RC_2006-01.jsonl");
