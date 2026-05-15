@@ -2406,6 +2406,39 @@ mod tests {
     }
 
     #[test]
+    fn resume_fingerprint_includes_record_limit() {
+        let base = make_one_comment_corpus();
+        let no_limit_plan = one_month_scan(&base).build().unwrap();
+        let limit_one_plan = one_month_scan(&base).limit(1).build().unwrap();
+        let limit_two_plan = one_month_scan(&base).limit(2).build().unwrap();
+
+        let no_limit = build_resume_fingerprint(
+            &no_limit_plan.etl,
+            &no_limit_plan.query,
+            "extract",
+            no_limit_plan.limit,
+        )
+        .unwrap();
+        let limit_one = build_resume_fingerprint(
+            &limit_one_plan.etl,
+            &limit_one_plan.query,
+            "extract",
+            limit_one_plan.limit,
+        )
+        .unwrap();
+        let limit_two = build_resume_fingerprint(
+            &limit_two_plan.etl,
+            &limit_two_plan.query,
+            "extract",
+            limit_two_plan.limit,
+        )
+        .unwrap();
+
+        assert_ne!(no_limit, limit_one);
+        assert_ne!(limit_one, limit_two);
+    }
+
+    #[test]
     fn extract_resume_commit_failure_after_temp_part_publish_returns_error_and_next_run_stitches() {
         let base = make_one_comment_corpus();
         let work_dir = base.join("work_manifest_failure");
@@ -2422,7 +2455,8 @@ mod tests {
             .subreddit("programming")
             .build()
             .unwrap();
-        let fingerprint = build_resume_fingerprint(&plan.etl, &plan.query, "extract").unwrap();
+        let fingerprint =
+            build_resume_fingerprint(&plan.etl, &plan.query, "extract", None).unwrap();
         let tmp_dir = extract_scratch_dir(
             &work_dir,
             "extract_jsonl_q_tmp",
