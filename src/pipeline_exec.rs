@@ -263,7 +263,7 @@ impl RedditETL {
 
         with_thread_pool(parallelism, || {
             let work_dir = self.ensure_work_dir()?;
-            let files = plan_pipeline_files(&self)?;
+            let files = plan_pipeline_files(&self, None)?;
             tracing::info!("Planned {} files for processing.", files.len());
 
             let shard_writer =
@@ -645,7 +645,7 @@ impl ScanPlan {
 
             let targets =
                 resolve_target_subs_from(&plan.etl.opts.subreddit, &plan.query.subreddits);
-            let files = plan_pipeline_files(&plan.etl)?;
+            let files = plan_pipeline_files(&plan.etl, Some(&plan.query))?;
             warn_if_unfiltered_undated_query(&plan.etl, &plan.query, &files);
 
             let resume = plan.etl.opts.resume;
@@ -873,7 +873,7 @@ impl ScanPlan {
         let parallelism = plan.etl.opts.parallelism;
 
         with_thread_pool(parallelism, || {
-            let files = plan_pipeline_files(&plan.etl)?;
+            let files = plan_pipeline_files(&plan.etl, Some(&plan.query))?;
             warn_if_unfiltered_undated_query(&plan.etl, &plan.query, &files);
 
             let comments_dir = out_base_dir.join("comments");
@@ -1066,7 +1066,26 @@ struct MonthResult {
     lines: u64,
 }
 
-fn plan_pipeline_files(etl: &RedditETL) -> Result<Vec<FileJob>> {
+fn effective_plan_range(
+    etl: &RedditETL,
+    query: Option<&QuerySpec>,
+) -> (Option<YearMonth>, Option<YearMonth>) {
+    let mut start = etl.opts.start;
+    let mut end = etl.opts.end;
+
+    if let Some(bounds) = query.map(|q| q.timestamp_bounds) {
+        if start.is_none() {
+            start = bounds.derived_start_month();
+        }
+        if end.is_none() {
+            end = bounds.derived_end_month();
+        }
+    }
+
+    (start, end)
+}
+
+fn plan_pipeline_files(etl: &RedditETL, query: Option<&QuerySpec>) -> Result<Vec<FileJob>> {
     if let Some(err) = etl.opts.build_error.clone() {
         return Err(err.into());
     }
@@ -1075,15 +1094,16 @@ fn plan_pipeline_files(etl: &RedditETL) -> Result<Vec<FileJob>> {
         &etl.opts.submissions_dir,
         etl.opts.sources,
     )?;
+    let (start, end) = effective_plan_range(etl, query);
     let jobs = plan_files_checked(
         &discovered,
         &etl.opts.comments_dir,
         &etl.opts.submissions_dir,
         etl.opts.sources,
-        etl.opts.start,
-        etl.opts.end,
+        start,
+        end,
     )?;
-    log_missing_month_warnings(&discovered, etl.opts.sources, etl.opts.start, etl.opts.end);
+    log_missing_month_warnings(&discovered, etl.opts.sources, start, end);
     Ok(jobs)
 }
 
@@ -1225,6 +1245,10 @@ fn build_resume_fingerprint(
             "author_regex_pattern": query.author_regex_pattern.as_ref(),
             "min_score": query.min_score,
             "max_score": query.max_score,
+            "timestamp_bounds": {
+                "created_utc_gte": query.timestamp_bounds.created_utc_gte,
+                "created_utc_lt": query.timestamp_bounds.created_utc_lt,
+            },
             "keywords_any": query.keywords_any.as_ref(),
             "domains_in": query.domains_in.as_ref(),
             "contains_url": query.contains_url,
@@ -1880,7 +1904,7 @@ fn extract_tabular_common(
 ) -> Result<()> {
     let parallelism = etl.opts.parallelism;
     with_thread_pool(parallelism, || {
-        let files = plan_pipeline_files(etl)?;
+        let files = plan_pipeline_files(etl, Some(query))?;
         warn_if_unfiltered_undated_query(etl, query, &files);
 
         let work_dir = etl.ensure_work_dir()?;
@@ -1984,7 +2008,7 @@ fn extract_common(
     validate_export_whitelist(etl)?;
     let parallelism = etl.opts.parallelism;
     with_thread_pool(parallelism, || {
-        let files = plan_pipeline_files(etl)?;
+        let files = plan_pipeline_files(etl, Some(query))?;
         warn_if_unfiltered_undated_query(etl, query, &files);
 
         let work_dir = etl.ensure_work_dir()?;
@@ -2186,7 +2210,7 @@ where
         return Ok(());
     }
 
-    let files = plan_pipeline_files(etl)?;
+    let files = plan_pipeline_files(etl, Some(query))?;
     warn_if_unfiltered_undated_query(etl, query, &files);
 
     let pb = if show_progress && etl.opts.progress {
@@ -2327,6 +2351,35 @@ mod tests {
     }
 
     #[test]
+    fn resume_fingerprint_changes_when_timestamp_bounds_change() {
+        let base = make_one_comment_corpus();
+        let plan_a = RedditETL::new()
+            .base_dir(&base)
+            .sources(Sources::Comments)
+            .progress(false)
+            .scan()
+            .created_utc_gte(1_136_073_600)
+            .created_utc_lt(1_136_160_000)
+            .build()
+            .unwrap();
+        let plan_b = RedditETL::new()
+            .base_dir(&base)
+            .sources(Sources::Comments)
+            .progress(false)
+            .scan()
+            .created_utc_gte(1_136_073_601)
+            .created_utc_lt(1_136_160_000)
+            .build()
+            .unwrap();
+
+        let fp_a = build_resume_fingerprint(&plan_a.etl, &plan_a.query, "extract", plan_a.limit)
+            .expect("fingerprint a");
+        let fp_b = build_resume_fingerprint(&plan_b.etl, &plan_b.query, "extract", plan_b.limit)
+            .expect("fingerprint b");
+        assert_ne!(fp_a, fp_b);
+    }
+
+    #[test]
     fn spool_resume_commit_failure_after_publish_returns_error_and_next_run_succeeds() {
         let base = make_one_comment_corpus();
         let out_dir = base.join("spool_manifest_failure");
@@ -2422,7 +2475,8 @@ mod tests {
             .subreddit("programming")
             .build()
             .unwrap();
-        let fingerprint = build_resume_fingerprint(&plan.etl, &plan.query, "extract").unwrap();
+        let fingerprint =
+            build_resume_fingerprint(&plan.etl, &plan.query, "extract", plan.limit).unwrap();
         let tmp_dir = extract_scratch_dir(
             &work_dir,
             "extract_jsonl_q_tmp",

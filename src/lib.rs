@@ -26,7 +26,8 @@
 //!    - [`YearMonth`] / `iter_year_months` — inclusive month range cursors.
 //!    - [`ScanPlan`] / [`QuerySpec`] — the query builder returned by
 //!      [`RedditETL::scan`], plus subreddit / author / regex / keyword / domain
-//!      / score / JSON-pointer predicate filters. `ScanPlan::build` returns
+//!      / score / exact `created_utc` timestamp / JSON-pointer predicate filters.
+//!      `ScanPlan::build` returns
 //!      [`QueryBuildError`] for contradictory, empty, or blank-normalized query
 //!      settings before any corpus file is scanned. `.contains_url(true)` is a
 //!      positive URL-presence filter; `.contains_url(false)` clears it and is
@@ -161,7 +162,9 @@ pub use crate::config::{
 pub use crate::date::YearMonth;
 pub use crate::pipeline::{RedditETL, ScanPlan};
 pub use crate::pipeline_exec::{DedupeKeySummary, ExportFormat, TabularExportOptions};
-pub use crate::query::{JsonPointerPredicate, NumericComparison, QueryBuildError, QuerySpec};
+pub use crate::query::{
+    JsonPointerPredicate, NumericComparison, QueryBuildError, QuerySpec, TimestampBounds,
+};
 pub use crate::shard::UsernameStream;
 
 pub use crate::aggregate::{

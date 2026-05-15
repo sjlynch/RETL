@@ -1,10 +1,12 @@
 //! Query specification (DSL) and normalization helpers used by the filters.
 
+use crate::date::YearMonth;
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 use regex::Regex;
 use serde_json::Value;
 use std::fmt;
 use std::sync::{Arc, OnceLock};
+use time::OffsetDateTime;
 
 /// Structured error returned when a scan/query builder contains contradictory
 /// or invalid filter settings.
@@ -291,6 +293,95 @@ fn validate_json_pointer_syntax(pointer: &str) -> Result<(), QueryBuildError> {
     Ok(())
 }
 
+/// Inclusive/exclusive fast-path bounds for a record's top-level
+/// `created_utc` Unix timestamp.
+///
+/// `created_utc_gte` is inclusive (`created_utc >= value`) and
+/// `created_utc_lt` is exclusive (`created_utc < value`). When either side is
+/// present, records whose `created_utc` is missing or not an integer timestamp
+/// are rejected on the [`MinimalRecord`](crate::MinimalRecord) fast path.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TimestampBounds {
+    pub created_utc_gte: Option<i64>,
+    pub created_utc_lt: Option<i64>,
+}
+
+impl TimestampBounds {
+    pub const fn new(created_utc_gte: Option<i64>, created_utc_lt: Option<i64>) -> Self {
+        Self {
+            created_utc_gte,
+            created_utc_lt,
+        }
+    }
+
+    #[inline]
+    pub fn is_active(self) -> bool {
+        self.created_utc_gte.is_some() || self.created_utc_lt.is_some()
+    }
+
+    #[inline]
+    pub fn contains(self, created_utc: i64) -> bool {
+        if let Some(lo) = self.created_utc_gte {
+            if created_utc < lo {
+                return false;
+            }
+        }
+        if let Some(hi) = self.created_utc_lt {
+            if created_utc >= hi {
+                return false;
+            }
+        }
+        true
+    }
+
+    pub(crate) fn validate(self) -> Result<(), QueryBuildError> {
+        if let (Some(lo), Some(hi)) = (self.created_utc_gte, self.created_utc_lt) {
+            if lo >= hi {
+                return Err(QueryBuildError::new(format!(
+                    "created_utc_gte ({lo}) must be less than created_utc_lt ({hi})"
+                )));
+            }
+        }
+
+        for (field, value) in [
+            ("created_utc_gte", self.created_utc_gte),
+            ("created_utc_lt", self.created_utc_lt),
+        ] {
+            if let Some(ts) = value {
+                unix_timestamp_to_year_month(ts).ok_or_else(|| {
+                    QueryBuildError::new(format!(
+                        "{field} ({ts}) is outside RETL's supported timestamp range"
+                    ))
+                })?;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn derived_start_month(self) -> Option<YearMonth> {
+        self.created_utc_gte.and_then(unix_timestamp_to_year_month)
+    }
+
+    pub(crate) fn derived_end_month(self) -> Option<YearMonth> {
+        self.created_utc_lt
+            .and_then(|ts| ts.checked_sub(1))
+            .and_then(unix_timestamp_to_year_month)
+    }
+}
+
+fn unix_timestamp_to_year_month(ts: i64) -> Option<YearMonth> {
+    let dt = OffsetDateTime::from_unix_timestamp(ts).ok()?;
+    let year = dt.year();
+    if !(0..=u16::MAX as i32).contains(&year) {
+        return None;
+    }
+    Some(YearMonth {
+        year: year as u16,
+        month: dt.month() as u8,
+    })
+}
+
 /// High-level query/filter spec for advanced scans.
 /// All string lists are matched case-insensitively (Unicode-aware for keywords;
 /// subreddit/author/domain matching normalizes non-ASCII values via lowercase).
@@ -313,6 +404,9 @@ pub struct QuerySpec {
     pub(crate) author_regex_pattern: Option<String>,
     pub min_score: Option<i64>,
     pub max_score: Option<i64>,
+    /// Exact Unix timestamp bounds for the top-level `created_utc` field.
+    /// Lower bound is inclusive; upper bound is exclusive.
+    pub timestamp_bounds: TimestampBounds,
     pub keywords_any: Option<Vec<String>>, // substring in body/selftext/title (case-insensitive)
     /// Submissions only: matches the top-level `domain` field. Comments do not
     /// have this field and are rejected when the filter is active.
@@ -347,6 +441,7 @@ impl Clone for QuerySpec {
             author_regex_pattern: self.author_regex_pattern.clone(),
             min_score: self.min_score,
             max_score: self.max_score,
+            timestamp_bounds: self.timestamp_bounds,
             keywords_any: self.keywords_any.clone(),
             domains_in: self.domains_in.clone(),
             contains_url: self.contains_url,
@@ -413,6 +508,7 @@ impl QuerySpec {
                 )));
             }
         }
+        self.timestamp_bounds.validate()?;
 
         validate_string_list_filter("subreddits", &self.subreddits)?;
         validate_string_list_filter("authors_in", &self.authors_in)?;
@@ -461,7 +557,8 @@ impl QuerySpec {
     }
 
     /// Only JSON-pointer predicates require full-record parsing; all fixed
-    /// filters are handled on the MinimalRecord fast path.
+    /// filters, including `created_utc` timestamp bounds, are handled on the
+    /// MinimalRecord fast path.
     pub fn requires_full_parse(&self) -> bool {
         !self.json_predicates.is_empty()
     }
@@ -507,6 +604,7 @@ impl QuerySpec {
                 && self.authors_out.as_ref().is_some_and(|v| !v.is_empty()))
             || self.min_score.is_some()
             || self.max_score.is_some()
+            || self.timestamp_bounds.is_active()
             || self.keywords_any.as_ref().is_some_and(|v| !v.is_empty())
             || self.domains_in.as_ref().is_some_and(|v| !v.is_empty())
             || self.contains_url == Some(true)
@@ -541,5 +639,49 @@ pub fn normalize_str(s: &str) -> String {
         rest.to_string()
     } else {
         s
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timestamp_bounds_validate_order_and_stay_minimal() {
+        let query = QuerySpec {
+            timestamp_bounds: TimestampBounds::new(Some(1_606_737_600), Some(1_606_824_000)),
+            ..Default::default()
+        };
+        query.validate().expect("valid timestamp range");
+        assert!(query.has_selective_filters());
+        assert!(
+            !query.requires_full_parse(),
+            "created_utc timestamp bounds are a MinimalRecord fast-path filter"
+        );
+
+        let invalid = QuerySpec {
+            timestamp_bounds: TimestampBounds::new(Some(10), Some(10)),
+            ..Default::default()
+        };
+        let err = invalid
+            .validate()
+            .expect_err("empty timestamp range should be rejected");
+        assert!(err.to_string().contains("created_utc_gte"));
+    }
+
+    #[test]
+    fn timestamp_bounds_derive_months_from_inclusive_exclusive_edges() {
+        // 2020-11-30T12:00:00Z .. 2020-12-01T00:00:00Z should plan Nov only;
+        // the exclusive upper endpoint is exactly at the start of December.
+        let bounds = TimestampBounds::new(Some(1_606_737_600), Some(1_606_780_800));
+        assert_eq!(bounds.derived_start_month(), Some(YearMonth::new(2020, 11)));
+        assert_eq!(bounds.derived_end_month(), Some(YearMonth::new(2020, 11)));
+
+        let spanning = TimestampBounds::new(Some(1_606_737_600), Some(1_606_824_000));
+        assert_eq!(
+            spanning.derived_start_month(),
+            Some(YearMonth::new(2020, 11))
+        );
+        assert_eq!(spanning.derived_end_month(), Some(YearMonth::new(2020, 12)));
     }
 }

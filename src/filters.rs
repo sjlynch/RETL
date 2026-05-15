@@ -1,5 +1,5 @@
 //! Filtering helpers and query logic that work on MinimalRecord fast-path fields,
-//! plus optional full-parse checks and record-level date bounds.
+//! plus optional full-parse checks and record-level date/timestamp bounds.
 
 use crate::date::YearMonth;
 use crate::paths::FileKind;
@@ -118,6 +118,14 @@ pub fn matches_minimal(
     if let Some(max_s) = q.max_score {
         match min.score {
             Some(sc) if sc <= max_s => {}
+            _ => return false,
+        }
+    }
+
+    if q.timestamp_bounds.is_active() {
+        match min.created_utc {
+            Some(ts) if q.timestamp_bounds.contains(ts) => {}
+            // Exact timestamp filters reject missing/non-integer created_utc.
             _ => return false,
         }
     }

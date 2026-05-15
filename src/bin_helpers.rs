@@ -662,6 +662,9 @@ macro_rules! plan {
         if let Some(max_score) = query.max_score {
             scan = scan.max_score(max_score);
         }
+        if query.after.is_some() || query.before.is_some() {
+            scan = scan.timestamp_bounds(query.after, query.before);
+        }
         if query.contains_url {
             scan = scan.contains_url(true);
         }
