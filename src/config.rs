@@ -1,5 +1,6 @@
 use crate::date::YearMonth;
 use crate::mem::AdaptiveMemCfg;
+use crate::parents::ParentPayloadSpec;
 use parking_lot::Mutex;
 use serde::Serialize;
 use std::error::Error;
@@ -235,6 +236,11 @@ pub struct ETLOptions {
     /// prior run. Default false to preserve current behavior.
     pub resume: bool,
 
+    /// Parent payload fields attached by the parents pipeline. Defaults to the
+    /// legacy output shape (`body` for comments, `title`/`selftext` for
+    /// submissions).
+    pub parent_payload_spec: ParentPayloadSpec,
+
     /// Opt-in lossy mode for corrupt zstd inputs. The default (`false`) treats
     /// zstd decode errors as fatal so scans/exports cannot silently return
     /// partial results. When `true`, corrupt monthly files are skipped, recorded
@@ -283,6 +289,7 @@ impl Default for ETLOptions {
             inflight_groups: 8,
             adaptive_mem: AdaptiveMemCfg::default(),
             resume: false,
+            parent_payload_spec: ParentPayloadSpec::default(),
             allow_partial: false,
             partial_read_reporter: PartialReadReporter::default(),
             build_error: None,
@@ -461,6 +468,29 @@ impl ETLOptions {
     /// parents helpers).
     pub fn with_resume(mut self, yes: bool) -> Self {
         self.resume = yes;
+        self
+    }
+
+    /// Select top-level parent fields attached by `resolve_parent_maps` /
+    /// `attach_parents_jsonls_parallel`.
+    pub fn with_parent_fields<I, S>(mut self, fields: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.parent_payload_spec = ParentPayloadSpec::from_fields(fields);
+        self
+    }
+
+    /// Attach the full source parent JSON record when resolving parents.
+    pub fn with_parent_full(mut self, yes: bool) -> Self {
+        self.parent_payload_spec = self.parent_payload_spec.with_full_record(yes);
+        self
+    }
+
+    /// Replace the full parent-payload specification.
+    pub fn with_parent_payload_spec(mut self, spec: ParentPayloadSpec) -> Self {
+        self.parent_payload_spec = spec;
         self
     }
 
