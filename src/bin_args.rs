@@ -39,6 +39,8 @@ pub(crate) enum Command {
     /// Inspect discovered corpus months, file counts, and compressed bytes without decoding.
     #[command(alias = "ls", alias = "plan")]
     Describe(DescribeArgs),
+    /// Plan corpus acquisition from a versioned manifest.
+    Corpus(CorpusArgs),
     /// Discover top-level JSON fields and their common types from sampled records.
     Schema(SchemaArgs),
     /// Print a small sample of matching records (defaults to 10 JSONL records on stdout).
@@ -171,6 +173,16 @@ pub(crate) enum SourceArg {
     Both,
 }
 
+impl SourceArg {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            SourceArg::Rc => "rc",
+            SourceArg::Rs => "rs",
+            SourceArg::Both => "both",
+        }
+    }
+}
+
 impl From<SourceArg> for Sources {
     fn from(s: SourceArg) -> Self {
         match s {
@@ -214,6 +226,80 @@ pub(crate) struct DescribeArgs {
     /// Schema output format when --schema is set.
     #[arg(long = "schema-format", visible_alias = "format", value_enum, default_value_t = SchemaFmt::Tsv)]
     pub(crate) schema_format: SchemaFmt,
+
+    /// Compare the requested --start/--end/--source against a corpus manifest.
+    #[arg(long)]
+    pub(crate) expected: bool,
+
+    /// Custom corpus manifest JSON. Implies --expected; omitted means RETL's built-in manifest.
+    #[arg(long = "manifest")]
+    pub(crate) manifest: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct CorpusArgs {
+    #[command(subcommand)]
+    pub(crate) command: CorpusCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum CorpusCommand {
+    /// Emit a desired-vs-local download checklist for RC/RS monthly dumps.
+    Plan(CorpusPlanArgs),
+    /// Print RETL's built-in corpus manifest JSON.
+    Manifest(CorpusManifestArgs),
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct CorpusPlanArgs {
+    /// Destination corpus base dir that will contain comments/ and submissions/.
+    #[arg(long, default_value = "./data")]
+    pub(crate) dest: PathBuf,
+
+    /// Inclusive start month (YYYY-MM).
+    #[arg(long, value_name = "YYYY-MM")]
+    pub(crate) start: YearMonth,
+
+    /// Inclusive end month (YYYY-MM).
+    #[arg(long, value_name = "YYYY-MM")]
+    pub(crate) end: YearMonth,
+
+    /// Source selection: rc (comments), rs (submissions), or both.
+    #[arg(long, value_enum, default_value_t = SourceArg::Both)]
+    pub(crate) source: SourceArg,
+
+    /// Custom corpus manifest JSON. Omit to use RETL's built-in manifest.
+    #[arg(long)]
+    pub(crate) manifest: Option<PathBuf>,
+
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = CorpusPlanFmt::Json)]
+    pub(crate) format: CorpusPlanFmt,
+
+    /// Output destination (default stdout). Use '-' for stdout.
+    #[arg(long, short, default_value = "-")]
+    pub(crate) out: PathBuf,
+
+    /// Only emit available source/month rows whose expected file is missing locally.
+    #[arg(long)]
+    pub(crate) only_missing: bool,
+
+    /// Compute SHA-256 for present files that have manifest checksums. This may read multi-GB files.
+    #[arg(long)]
+    pub(crate) verify_checksums: bool,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct CorpusManifestArgs {
+    /// Output destination (default stdout). Use '-' for stdout.
+    #[arg(long, short, default_value = "-")]
+    pub(crate) out: PathBuf,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug)]
+pub(crate) enum CorpusPlanFmt {
+    Json,
+    Tsv,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -431,6 +517,19 @@ pub(crate) struct IntegrityArgs {
     /// as each failure is discovered.
     #[arg(long)]
     pub(crate) collect: bool,
+
+    /// Before zstd validation, compare the requested --start/--end/--source against a corpus manifest.
+    #[arg(long)]
+    pub(crate) expected: bool,
+
+    /// Custom corpus manifest JSON. Implies --expected; omitted means RETL's built-in manifest.
+    #[arg(long = "manifest")]
+    pub(crate) manifest: Option<PathBuf>,
+
+    /// With --expected/--manifest, compute SHA-256 for present files that have manifest checksums.
+    /// This may read multi-GB files in addition to the zstd integrity pass.
+    #[arg(long)]
+    pub(crate) verify_checksums: bool,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug)]
@@ -580,6 +679,25 @@ mod tests {
                 assert_eq!(args.common.file_concurrency, Some(usize::MAX));
             }
             other => panic!("expected scan command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_accepts_corpus_plan_command() {
+        let cli = Cli::try_parse_from([
+            "retl", "corpus", "plan", "--source", "rc", "--start", "2006-01", "--end", "2006-02",
+        ])
+        .expect("corpus plan should parse");
+
+        match cli.command {
+            Command::Corpus(CorpusArgs {
+                command: CorpusCommand::Plan(args),
+            }) => {
+                assert_eq!(args.source.label(), "rc");
+                assert_eq!(args.start, YearMonth::new(2006, 1));
+                assert_eq!(args.end, YearMonth::new(2006, 2));
+            }
+            other => panic!("expected corpus plan command, got {other:?}"),
         }
     }
 }

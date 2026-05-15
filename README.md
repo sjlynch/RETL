@@ -15,6 +15,7 @@
   - Partitioned per source/month in corpus layout as JSONL or ZST (CLI: `retl export --format partitioned-jsonl` / `--format zst`)
 - 📈 **Analytics helpers**: `count_by_month()`, per‑author counts, “first seen” index
 - 👪 **Parent pipeline**: collect parent IDs → resolve content → attach parent payloads back to records
+- 🗺️ **Corpus acquisition planning** from a versioned manifest (`retl corpus plan`)
 - 🧪 **Integrity checks** for corrupted monthly files (quick or full)
 - 🧵 **Parallel, backpressure‑aware** I/O with file concurrency caps and cooperative throttling
 - 🪟 **Windows‑friendly I/O** with robust retry/backoff on transient errors
@@ -25,6 +26,7 @@
 
 - [Try it in 60 seconds (no corpus needed)](#try-it-in-60-seconds-no-corpus-needed)
 - [Data Layout](#data-layout)
+- [Corpus acquisition workflow](#corpus-acquisition-workflow)
 - [Install](#install)
 - [Command-Line Interface](#command-line-interface)
 - [Quick CLI start](#quick-cli-start)
@@ -96,8 +98,74 @@ File name patterns are enforced at discovery time:
 
 ---
 
-You can browse and download monthly dumps via Academic Torrents:
-https://academictorrents.com/browse.php?search=reddit
+## Corpus acquisition workflow
+
+RETL now includes a manifest-backed acquisition planner so a fresh machine can
+start from an empty `./data` directory without hand-browsing Academic Torrents.
+The built-in manifest is versioned and knows the canonical `comments/RC_*.zst`
+/ `submissions/RS_*.zst` layout, public-corpus start months, known unavailable
+pre-corpus months, and Academic Torrents search URLs. It intentionally does not
+claim byte counts or checksums; pass `--manifest my_corpus_manifest.json` when
+your project maintains verified `compressed_bytes` or `sha256` values.
+
+Plan the desired months and expected paths:
+
+~~~sh
+retl corpus plan \
+  --source both \
+  --start 2006-01 --end 2006-01 \
+  --dest ./data \
+  --format json \
+  --out download_plan.json
+~~~
+
+Each JSON item includes `source`, `month`, `availability`, `file_name`,
+`expected_path`, optional `compressed_bytes` / `sha256`, Academic Torrents
+search fields (`url` / `torrent`), and a `local.status` of `missing`,
+`present`, or `inaccessible`. Use the plan as a machine-readable checklist for
+your download tool, placing files exactly at `expected_path`. For a shell/CSV
+friendly checklist, use `--format tsv`; to emit only files still missing locally,
+add `--only-missing`.
+
+After download, compare the requested manifest range against local files, then
+validate the zstd payloads:
+
+~~~sh
+retl describe --expected --data-dir ./data --source both --start 2006-01 --end 2006-01
+retl integrity --expected --mode full --data-dir ./data --source both --start 2006-01 --end 2006-01
+retl sample --data-dir ./data --source rc --start 2006-01 --end 2006-01 --limit 5
+~~~
+
+If you use a custom manifest, pass the same `--manifest path/to/manifest.json`
+to `corpus plan`, `describe --expected`, and `integrity --expected`. Add
+`--verify-checksums` to `corpus plan` or `integrity --expected` when the
+manifest contains SHA-256 values and you want RETL to read present files and
+compare them.
+
+Minimal custom manifest shape:
+
+~~~json
+{
+  "version": 1,
+  "sources": [{
+    "source": "rc",
+    "directory": "comments",
+    "prefix": "RC",
+    "first_month": "2005-12",
+    "url_template": "https://example.invalid/{file_name}",
+    "files": [{
+      "month": "2006-01",
+      "compressed_bytes": 123456789,
+      "sha256": "<64 lowercase hex chars>"
+    }],
+    "unavailable": [{
+      "start": "2005-01",
+      "end": "2005-11",
+      "reason": "comments begin at 2005-12"
+    }]
+  }]
+}
+~~~
 
 Note on scale & performance:
 The monthly files become very large in later years. It’s normal for broader queries to run longer and consume significant I/O. RETL’s streaming design and throttling aim to keep resource use predictable; tune `.file_concurrency(n)`, `.parallelism(n)`, and `.io_buffers(...)` as appropriate for your hardware and dataset size. Oversized resource knobs are clamped with a warning rather than allowed to create unbounded threads, zstd decoders, or shard files.
@@ -185,6 +253,31 @@ retl describe --data-dir ./data --source both --start 2016-01 --end 2016-12
 ~~~
 
 Aliases: `retl ls`, `retl plan`.
+
+Pass `--expected` (and optionally `--manifest path/to/manifest.json`) with an
+explicit `--start` / `--end` to add a manifest comparison table showing desired
+months, local present/missing counts, unavailable ranges, and known expected
+compressed bytes. This is the quick post-download check before integrity
+validation.
+
+### `corpus plan` — plan downloads and expected layout
+
+`retl corpus plan` is a no-download acquisition workflow: it emits a JSON or TSV
+checklist of source/month files, expected destination paths, optional manifest
+sizes/checksums, known unavailable months, and whether each file is already
+present locally.
+
+~~~sh
+retl corpus plan --source rc --start 2006-01 --end 2006-03 --dest ./data --format tsv
+retl corpus plan --source both --start 2019-01 --end 2019-12 --dest ./data --only-missing --out plan.json
+retl corpus manifest --out reddit_corpus_manifest.v1.json
+~~~
+
+Use `--manifest custom.json` to consume a project-maintained versioned manifest
+with verified `compressed_bytes`, `sha256`, direct URLs, or additional
+unavailable ranges. `--verify-checksums` compares SHA-256 for present files that
+have manifest checksums; it is off by default because later monthly dumps are
+multi-GB.
 
 ### Analyst-facing exports & exploration
 
@@ -358,7 +451,16 @@ retl integrity --mode quick --sample-bytes 65536 --source rc --start 2006-02 --e
 
 # Full: decode every byte (validates trailing checksum)
 retl integrity --mode full --source both --start 2006-01 --end 2006-04
+
+# Manifest preflight + full decode after following a corpus plan
+retl integrity --expected --mode full --source both --start 2006-01 --end 2006-04
 ~~~
+
+`--expected` (or `--manifest path/to/manifest.json`) first compares the requested
+range against the corpus manifest and fails before decoding if an available month
+is missing locally, a manifest size/checksum does not match, or the request
+includes a known-unavailable month. Use `--verify-checksums` with manifests that
+provide SHA-256 values.
 
 Quick mode validates only the first `--sample-bytes` decompressed bytes of each
 file. `--sample-bytes` must be positive (default: 65536); very small samples

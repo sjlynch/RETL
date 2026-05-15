@@ -36,6 +36,8 @@
 //!      and a full `serde_json::Value` parse.
 //!
 //! 2. **Discover & plan**
+//!    - [`CorpusManifest`] / [`CorpusPlanItem`] power the CLI's manifest-backed
+//!      acquisition checklist (`retl corpus plan`) before files exist locally.
 //!    - `discover_sources_checked` / `plan_files_checked` (doc(hidden)) walk
 //!      the corpus and emit [`FileJob`]s honoring the configured sources and
 //!      date bounds while surfacing directory/filename diagnostics.
@@ -120,6 +122,7 @@
 //! contract, backpressure model, taskboard rules) and bench/fuzz commands.
 
 mod config;
+mod corpus_manifest;
 mod date;
 mod kv_shard;
 mod paths;
@@ -157,6 +160,10 @@ mod ndjson;
 pub use crate::config::{
     max_parallelism_limit, ConfigBuildError, ETLOptions, PartialReadReport, PartialReadReporter,
     SkippedFile, Sources, MAX_FILE_CONCURRENCY, MAX_RAYON_THREADS, MAX_SHARDS,
+};
+pub use crate::corpus_manifest::{
+    CorpusAvailability, CorpusLocalStatus, CorpusManifest, CorpusManifestError, CorpusManifestFile,
+    CorpusPlanItem, CorpusSource, CorpusSourceManifest, CorpusUnavailableRange,
 };
 pub use crate::date::YearMonth;
 pub use crate::pipeline::{RedditETL, ScanPlan};

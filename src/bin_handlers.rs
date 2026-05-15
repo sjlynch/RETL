@@ -6,9 +6,10 @@ use retl::{
     create_dir_all_with_backoff, create_new_with_backoff, discover_sources_checked,
     for_each_line_cfg, format_year_month_ranges, missing_month_diagnostics, open_with_backoff,
     plan_files, plan_files_checked, read_line_capped, remove_with_backoff,
-    replace_file_atomic_backoff, total_compressed_size, AggregateBuildReport, ExportFormat,
-    FileKind, IntegrityMode, KeyExtractor, ParentPayloadSpec, RedditETL, Sources,
-    TabularExportOptions, YearMonth, DEFAULT_MAX_LINE_BYTES,
+    replace_file_atomic_backoff, total_compressed_size, AggregateBuildReport, CorpusAvailability,
+    CorpusLocalStatus, CorpusManifest, CorpusPlanItem, ExportFormat, FileKind, IntegrityMode,
+    KeyExtractor, ParentPayloadSpec, RedditETL, Sources, TabularExportOptions, YearMonth,
+    DEFAULT_MAX_LINE_BYTES,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -20,9 +21,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::bin_args::{
-    AggregateArgs, CountArgs, CountMode, DedupeArgs, DescribeArgs, ExportArgs, ExportFmt,
-    FirstSeenArgs, IntegrityArgs, IntegrityModeArg, ParentsArgs, SampleArgs, ScanArgs, SchemaArgs,
-    SchemaFmt, SourceArg,
+    AggregateArgs, CorpusArgs, CorpusCommand, CorpusManifestArgs, CorpusPlanArgs, CorpusPlanFmt,
+    CountArgs, CountMode, DedupeArgs, DescribeArgs, ExportArgs, ExportFmt, FirstSeenArgs,
+    IntegrityArgs, IntegrityModeArg, ParentsArgs, SampleArgs, ScanArgs, SchemaArgs, SchemaFmt,
+    SourceArg,
 };
 use crate::bin_helpers::{
     build_etl, discover_spool_parts, emit_partial_read_report, plan, stream_extract_to_stdout,
@@ -94,8 +96,270 @@ where
     Ok(result)
 }
 
+#[derive(Serialize)]
+struct CorpusPlanDocument {
+    manifest_version: u32,
+    manifest_name: Option<String>,
+    source: String,
+    start: YearMonth,
+    end: YearMonth,
+    dest: PathBuf,
+    summary: CorpusPlanSummary,
+    items: Vec<CorpusPlanItem>,
+    next_steps: Vec<String>,
+}
+
+#[derive(Default, Clone, Debug, Serialize)]
+struct CorpusPlanSummary {
+    total_items: usize,
+    available_items: usize,
+    unavailable_items: usize,
+    local_present: usize,
+    local_missing: usize,
+    local_inaccessible: usize,
+    size_mismatches: usize,
+    checksum_mismatches: usize,
+    known_expected_compressed_bytes: u64,
+}
+
+impl CorpusPlanSummary {
+    fn from_items(items: &[CorpusPlanItem]) -> Self {
+        let mut summary = Self {
+            total_items: items.len(),
+            ..Self::default()
+        };
+        for item in items {
+            match item.availability {
+                CorpusAvailability::Available => summary.available_items += 1,
+                CorpusAvailability::Unavailable => summary.unavailable_items += 1,
+            }
+            if item.availability == CorpusAvailability::Available {
+                if let Some(bytes) = item.compressed_bytes {
+                    summary.known_expected_compressed_bytes = summary
+                        .known_expected_compressed_bytes
+                        .saturating_add(bytes);
+                }
+            }
+            match &item.local {
+                CorpusLocalStatus::Missing => summary.local_missing += 1,
+                CorpusLocalStatus::Inaccessible { .. } => summary.local_inaccessible += 1,
+                CorpusLocalStatus::Present {
+                    size_matches,
+                    sha256_matches,
+                    ..
+                } => {
+                    summary.local_present += 1;
+                    if matches!(size_matches, Some(false)) {
+                        summary.size_mismatches += 1;
+                    }
+                    if matches!(sha256_matches, Some(false)) {
+                        summary.checksum_mismatches += 1;
+                    }
+                }
+            }
+        }
+        summary
+    }
+}
+
+pub(crate) fn run_corpus(args: CorpusArgs) -> Result<()> {
+    match args.command {
+        CorpusCommand::Plan(plan) => run_corpus_plan(plan),
+        CorpusCommand::Manifest(manifest) => run_corpus_manifest(manifest),
+    }
+}
+
+fn run_corpus_plan(args: CorpusPlanArgs) -> Result<()> {
+    let manifest = load_corpus_manifest(args.manifest.as_deref())?;
+    let sources = Sources::from(args.source);
+    let mut items = manifest
+        .plan(
+            sources,
+            args.start,
+            args.end,
+            &args.dest,
+            args.verify_checksums,
+        )
+        .with_context(|| "building corpus acquisition plan")?;
+    if args.only_missing {
+        items.retain(CorpusPlanItem::needs_download);
+    }
+    let summary = CorpusPlanSummary::from_items(&items);
+
+    match args.format {
+        CorpusPlanFmt::Json => {
+            let doc = CorpusPlanDocument {
+                manifest_version: manifest.version,
+                manifest_name: manifest.name.clone(),
+                source: args.source.label().to_string(),
+                start: args.start,
+                end: args.end,
+                dest: args.dest.clone(),
+                summary,
+                items,
+                next_steps: corpus_plan_next_steps(&args),
+            };
+            write_corpus_plan_json(&args.out, &doc)?;
+        }
+        CorpusPlanFmt::Tsv => write_corpus_plan_tsv(&args.out, &items)?,
+    }
+    Ok(())
+}
+
+fn run_corpus_manifest(args: CorpusManifestArgs) -> Result<()> {
+    write_text_or_stdout(&args.out, |w| {
+        w.write_all(CorpusManifest::builtin_json().as_bytes())?;
+        Ok(())
+    })
+}
+
+fn load_corpus_manifest(path: Option<&Path>) -> Result<CorpusManifest> {
+    match path {
+        Some(path) => {
+            let file = open_with_backoff(path, 16, 50)
+                .with_context(|| format!("opening corpus manifest {}", path.display()))?;
+            let reader = BufReader::new(file);
+            CorpusManifest::from_reader(reader)
+                .with_context(|| format!("parsing corpus manifest {}", path.display()))
+        }
+        None => CorpusManifest::builtin().with_context(|| "parsing built-in corpus manifest"),
+    }
+}
+
+fn write_text_or_stdout<T, F>(out: &Path, body: F) -> Result<T>
+where
+    F: FnOnce(&mut dyn Write) -> Result<T>,
+{
+    if out == Path::new("-") {
+        let stdout = io::stdout();
+        let mut w = BufWriter::new(stdout.lock());
+        let result = body(&mut w)?;
+        w.flush()?;
+        Ok(result)
+    } else {
+        write_text_file_atomic(out, body)
+    }
+}
+
+fn write_corpus_plan_json(out: &Path, doc: &CorpusPlanDocument) -> Result<()> {
+    write_text_or_stdout(out, |w| {
+        serde_json::to_writer_pretty(&mut *w, doc)?;
+        writeln!(w)?;
+        Ok(())
+    })
+}
+
+fn write_corpus_plan_tsv(out: &Path, items: &[CorpusPlanItem]) -> Result<()> {
+    write_text_or_stdout(out, |w| {
+        writeln!(
+            w,
+            "source\tmonth\tavailability\tlocal_status\tfile_name\texpected_path\tcompressed_bytes\tactual_bytes\tsize_matches\tsha256\tsha256_matches\turl\ttorrent\tnote"
+        )?;
+        for item in items {
+            let (local_status, actual_bytes, size_matches, sha256_matches) =
+                local_status_cells(&item.local);
+            writeln!(
+                w,
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                item.source.label(),
+                item.month,
+                availability_cell(item.availability),
+                local_status,
+                tsv_cell(&item.file_name),
+                tsv_cell(&item.expected_path.display().to_string()),
+                opt_u64_cell(item.compressed_bytes),
+                actual_bytes.map(|n| n.to_string()).unwrap_or_default(),
+                opt_bool_cell(size_matches),
+                tsv_cell(item.sha256.as_deref().unwrap_or("")),
+                opt_bool_cell(sha256_matches),
+                tsv_cell(item.url.as_deref().unwrap_or("")),
+                tsv_cell(item.torrent.as_deref().unwrap_or("")),
+                tsv_cell(item.note.as_deref().unwrap_or("")),
+            )?;
+        }
+        Ok(())
+    })
+}
+
+fn corpus_plan_next_steps(args: &CorpusPlanArgs) -> Vec<String> {
+    let mut steps = vec![
+        "Download each item with availability=available and local.status=missing to expected_path. RETL does not yet perform direct downloads.".to_string(),
+        format!(
+            "After downloading, run: retl describe --expected --data-dir {} --source {} --start {} --end {}",
+            args.dest.display(),
+            args.source.label(),
+            args.start,
+            args.end
+        ),
+        format!(
+            "Then validate zstd payloads: retl integrity --expected --mode full --data-dir {} --source {} --start {} --end {}",
+            args.dest.display(),
+            args.source.label(),
+            args.start,
+            args.end
+        ),
+    ];
+    if args.manifest.is_some() {
+        steps.push(
+            "Pass the same --manifest path to describe/integrity when you want RETL to use custom sizes or checksums.".to_string(),
+        );
+    }
+    steps
+}
+
+fn local_status_cells(
+    local: &CorpusLocalStatus,
+) -> (&'static str, Option<u64>, Option<bool>, Option<bool>) {
+    match local {
+        CorpusLocalStatus::Missing => ("missing", None, None, None),
+        CorpusLocalStatus::Inaccessible { .. } => ("inaccessible", None, None, None),
+        CorpusLocalStatus::Present {
+            actual_bytes,
+            size_matches,
+            sha256_matches,
+            ..
+        } => (
+            "present",
+            Some(*actual_bytes),
+            *size_matches,
+            *sha256_matches,
+        ),
+    }
+}
+
+fn availability_cell(availability: CorpusAvailability) -> &'static str {
+    match availability {
+        CorpusAvailability::Available => "available",
+        CorpusAvailability::Unavailable => "unavailable",
+    }
+}
+
+fn opt_u64_cell(n: Option<u64>) -> String {
+    n.map(|n| n.to_string()).unwrap_or_default()
+}
+
+fn opt_bool_cell(v: Option<bool>) -> &'static str {
+    match v {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "",
+    }
+}
+
+fn tsv_cell(raw: &str) -> String {
+    raw.chars()
+        .map(|c| match c {
+            '\t' | '\r' | '\n' => ' ',
+            other => other,
+        })
+        .collect()
+}
+
 pub(crate) fn run_describe(args: DescribeArgs) -> Result<()> {
     if args.schema {
+        if args.expected || args.manifest.is_some() {
+            anyhow::bail!("describe --schema cannot be combined with --expected/--manifest");
+        }
         return run_schema(SchemaArgs {
             data_dir: args.data_dir,
             start: args.start,
@@ -163,7 +427,131 @@ pub(crate) fn run_describe(args: DescribeArgs) -> Result<()> {
         "total\t\t{total_files}\t{total_bytes}\t{total_missing}\t-"
     )?;
     w.flush()?;
+
+    if args.expected || args.manifest.is_some() {
+        emit_manifest_describe_comparison(
+            &args.data_dir,
+            args.source,
+            args.start,
+            args.end,
+            args.manifest.as_deref(),
+        )?;
+    }
     Ok(())
+}
+
+#[derive(Default)]
+struct DescribeManifestSummary {
+    desired: usize,
+    available: usize,
+    unavailable: usize,
+    local_present: usize,
+    local_missing: usize,
+    local_inaccessible: usize,
+    size_mismatches: usize,
+    checksum_mismatches: usize,
+    known_expected_compressed_bytes: u64,
+    missing_months: Vec<YearMonth>,
+    unavailable_months: Vec<YearMonth>,
+}
+
+fn emit_manifest_describe_comparison(
+    data_dir: &Path,
+    source: SourceArg,
+    start: Option<YearMonth>,
+    end: Option<YearMonth>,
+    manifest_path: Option<&Path>,
+) -> Result<()> {
+    let (start, end) = required_manifest_range(start, end)?;
+    let manifest = load_corpus_manifest(manifest_path)?;
+    let rows = manifest
+        .plan(Sources::from(source), start, end, data_dir, false)
+        .with_context(|| "building manifest comparison for describe")?;
+    let mut by_source = BTreeMap::<String, DescribeManifestSummary>::new();
+    for item in rows {
+        let entry = by_source
+            .entry(item.source.label().to_string())
+            .or_default();
+        entry.desired += 1;
+        match item.availability {
+            CorpusAvailability::Available => {
+                entry.available += 1;
+                if let Some(bytes) = item.compressed_bytes {
+                    entry.known_expected_compressed_bytes =
+                        entry.known_expected_compressed_bytes.saturating_add(bytes);
+                }
+            }
+            CorpusAvailability::Unavailable => {
+                entry.unavailable += 1;
+                entry.unavailable_months.push(item.month);
+            }
+        }
+        match item.local {
+            CorpusLocalStatus::Missing => {
+                entry.local_missing += 1;
+                if item.availability == CorpusAvailability::Available {
+                    entry.missing_months.push(item.month);
+                }
+            }
+            CorpusLocalStatus::Inaccessible { .. } => entry.local_inaccessible += 1,
+            CorpusLocalStatus::Present {
+                size_matches,
+                sha256_matches,
+                ..
+            } => {
+                entry.local_present += 1;
+                if matches!(size_matches, Some(false)) {
+                    entry.size_mismatches += 1;
+                }
+                if matches!(sha256_matches, Some(false)) {
+                    entry.checksum_mismatches += 1;
+                }
+            }
+        }
+    }
+
+    let stdout = io::stdout();
+    let mut w = BufWriter::new(stdout.lock());
+    writeln!(w)?;
+    writeln!(
+        w,
+        "manifest_source\tdesired\tavailable\tunavailable\tlocal_present\tlocal_missing\tlocal_inaccessible\tsize_mismatches\tchecksum_mismatches\tmissing_months\tunavailable_months\tknown_expected_compressed_bytes"
+    )?;
+    for (source, summary) in by_source {
+        writeln!(
+            w,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            source,
+            summary.desired,
+            summary.available,
+            summary.unavailable,
+            summary.local_present,
+            summary.local_missing,
+            summary.local_inaccessible,
+            summary.size_mismatches,
+            summary.checksum_mismatches,
+            format_year_month_ranges(&summary.missing_months),
+            format_year_month_ranges(&summary.unavailable_months),
+            summary.known_expected_compressed_bytes,
+        )?;
+    }
+    w.flush()?;
+    Ok(())
+}
+
+fn required_manifest_range(
+    start: Option<YearMonth>,
+    end: Option<YearMonth>,
+) -> Result<(YearMonth, YearMonth)> {
+    match (start, end) {
+        (Some(start), Some(end)) if start <= end => Ok((start, end)),
+        (Some(start), Some(end)) => {
+            anyhow::bail!("invalid date range: start {start} is after end {end}")
+        }
+        _ => anyhow::bail!(
+            "manifest comparison requires both --start YYYY-MM and --end YYYY-MM so RETL knows the desired corpus range"
+        ),
+    }
 }
 
 fn describe_kinds(source: SourceArg) -> Vec<FileKind> {
@@ -731,7 +1119,98 @@ pub(crate) fn run_count(args: CountArgs) -> Result<()> {
     Ok(())
 }
 
+fn preflight_expected_corpus(
+    data_dir: &Path,
+    source: SourceArg,
+    start: Option<YearMonth>,
+    end: Option<YearMonth>,
+    manifest_path: Option<&Path>,
+    verify_checksums: bool,
+) -> Result<()> {
+    let (start, end) = required_manifest_range(start, end)?;
+    let manifest = load_corpus_manifest(manifest_path)?;
+    let rows = manifest
+        .plan(
+            Sources::from(source),
+            start,
+            end,
+            data_dir,
+            verify_checksums,
+        )
+        .with_context(|| "building manifest preflight for integrity")?;
+    let problems: Vec<&CorpusPlanItem> = rows
+        .iter()
+        .filter(|item| item.has_local_problem())
+        .collect();
+    if problems.is_empty() {
+        eprintln!(
+            "Manifest preflight OK: {} source/month item(s) available locally for {}..={}",
+            rows.len(),
+            start,
+            end
+        );
+        return Ok(());
+    }
+
+    eprintln!(
+        "Manifest preflight found {} problem(s) before zstd validation:",
+        problems.len()
+    );
+    for item in problems.iter().take(20) {
+        eprintln!(
+            "  {} {} availability={} local={} path={}{}",
+            item.source.label(),
+            item.month,
+            availability_cell(item.availability),
+            local_status_label(&item.local),
+            item.expected_path.display(),
+            item.note
+                .as_ref()
+                .map(|note| format!(" note={note}"))
+                .unwrap_or_default()
+        );
+    }
+    if problems.len() > 20 {
+        eprintln!("  ... {} more problem(s)", problems.len() - 20);
+    }
+    anyhow::bail!(
+        "manifest preflight failed; run `retl corpus plan --dest {} --source {} --start {} --end {}` to inspect missing/unavailable months and expected paths",
+        data_dir.display(),
+        source.label(),
+        start,
+        end
+    )
+}
+
+fn local_status_label(local: &CorpusLocalStatus) -> &'static str {
+    match local {
+        CorpusLocalStatus::Missing => "missing",
+        CorpusLocalStatus::Inaccessible { .. } => "inaccessible",
+        CorpusLocalStatus::Present {
+            size_matches,
+            sha256_matches,
+            ..
+        } if matches!(size_matches, Some(false)) || matches!(sha256_matches, Some(false)) => {
+            "present_mismatch"
+        }
+        CorpusLocalStatus::Present { .. } => "present",
+    }
+}
+
 pub(crate) fn run_integrity(args: IntegrityArgs) -> Result<()> {
+    if args.expected || args.manifest.is_some() {
+        preflight_expected_corpus(
+            &args.common.data_dir,
+            args.common.source,
+            args.common.start,
+            args.common.end,
+            args.manifest.as_deref(),
+            args.verify_checksums,
+        )?;
+    } else if args.verify_checksums {
+        anyhow::bail!("--verify-checksums requires --expected or --manifest");
+    }
+
     let etl = build_etl(&args.common)?;
     let mode = match args.mode {
         IntegrityModeArg::Quick => IntegrityMode::Quick {

@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "name": "RETL built-in Reddit RC/RS corpus filename manifest",
+  "description": "Canonical layout and acquisition search templates for public Reddit monthly RC/RS zstd dumps. The built-in manifest intentionally does not claim compressed sizes or checksums; provide --manifest with a project-maintained JSON manifest when you have verified sizes or SHA-256 values.",
+  "sources": [
+    {
+      "source": "rc",
+      "directory": "comments",
+      "prefix": "RC",
+      "first_month": "2005-12",
+      "url_template": "https://academictorrents.com/browse.php?search={file_name}",
+      "torrent_template": "Academic Torrents search: {file_name}",
+      "unavailable": [
+        {
+          "start": "0000-01",
+          "end": "2005-11",
+          "reason": "Public monthly RC comment dumps begin at 2005-12."
+        }
+      ],
+      "files": []
+    },
+    {
+      "source": "rs",
+      "directory": "submissions",
+      "prefix": "RS",
+      "first_month": "2005-06",
+      "url_template": "https://academictorrents.com/browse.php?search={file_name}",
+      "torrent_template": "Academic Torrents search: {file_name}",
+      "unavailable": [
+        {
+          "start": "0000-01",
+          "end": "2005-05",
+          "reason": "Public monthly RS submission dumps begin at 2005-06."
+        }
+      ],
+      "files": []
+    }
+  ]
+}
