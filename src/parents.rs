@@ -1475,6 +1475,12 @@ fn warn_if_no_comment_shaped_records(diagnostics: ParentAttachDiagnostics) {
     );
 }
 
+fn output_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
 fn load_shard_value<V>(
     eager_values: &HashMap<String, V>,
     shards: Option<&HashMap<YearMonth, PathBuf>>,
@@ -1657,6 +1663,121 @@ impl RedditETL {
                 payload_spec,
             })
         })
+    }
+
+    /// Write resolved parent payloads for direct `t1_...` / `t3_...` IDs as
+    /// JSONL. Each emitted object is the same payload shape used under
+    /// attached records' `parent` key: selected/full parent fields plus RETL's
+    /// `kind` (`comment`/`submission`) and bare `id` metadata. Unresolved IDs
+    /// are counted but omitted from the output.
+    pub fn write_resolved_parent_payloads_jsonl<I, S>(
+        &self,
+        prefixed_ids: I,
+        out: &Path,
+        parents: &ParentMaps,
+    ) -> Result<ParentAttachStats>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let parent_dir = output_parent(out);
+        create_dir_all_with_backoff(parent_dir, 16, 50)
+            .with_context(|| format!("create direct parent output dir {}", parent_dir.display()))?;
+        let staging_dir = ensure_staging_dir(parent_dir)?;
+        sweep_stale_inprogress(parent_dir, true)?;
+
+        let legacy_payload = parents.payload_spec.is_legacy_default();
+        let empty_parent_payloads: HashMap<String, ParentPayload> = HashMap::new();
+        let mut c_cache = WorkerShardCache::<String>::new(COMMENT_SHARD_CACHE_CAP);
+        let mut s_cache = WorkerShardCache::<(String, String)>::new(SUBMISSION_SHARD_CACHE_CAP);
+        let mut c_payload_cache = WorkerShardCache::<ParentPayload>::new(COMMENT_SHARD_CACHE_CAP);
+        let mut s_payload_cache =
+            WorkerShardCache::<ParentPayload>::new(SUBMISSION_SHARD_CACHE_CAP);
+
+        write_jsonl_atomic(
+            &staging_dir,
+            out,
+            self.opts.write_buffer_bytes,
+            |w| -> Result<ParentAttachStats> {
+                let mut stats = ParentAttachStats::default();
+                for raw_id in prefixed_ids {
+                    let raw_id = raw_id.as_ref().trim();
+                    let payload = if let Some(rest) = raw_id.strip_prefix("t1_") {
+                        if legacy_payload {
+                            load_shard_value(
+                                &parents.comments,
+                                parents.comment_shards.as_ref(),
+                                &mut c_cache,
+                                rest,
+                                None,
+                            )?
+                            .map(|body| {
+                                let mut payload = ParentPayload::new();
+                                payload.insert("kind".into(), Value::String("comment".into()));
+                                payload.insert("id".into(), Value::String(rest.to_string()));
+                                payload.insert("body".into(), Value::String(body));
+                                payload
+                            })
+                        } else {
+                            load_shard_value(
+                                &empty_parent_payloads,
+                                parents.comment_shards.as_ref(),
+                                &mut c_payload_cache,
+                                rest,
+                                None,
+                            )?
+                            .map(|mut payload| {
+                                payload.insert("kind".into(), Value::String("comment".into()));
+                                payload.insert("id".into(), Value::String(rest.to_string()));
+                                payload
+                            })
+                        }
+                    } else if let Some(rest) = raw_id.strip_prefix("t3_") {
+                        if legacy_payload {
+                            load_shard_value(
+                                &parents.submissions,
+                                parents.submission_shards.as_ref(),
+                                &mut s_cache,
+                                rest,
+                                None,
+                            )?
+                            .map(|(title, selftext)| {
+                                let mut payload = ParentPayload::new();
+                                payload.insert("kind".into(), Value::String("submission".into()));
+                                payload.insert("id".into(), Value::String(rest.to_string()));
+                                payload.insert("title".into(), Value::String(title));
+                                payload.insert("selftext".into(), Value::String(selftext));
+                                payload
+                            })
+                        } else {
+                            load_shard_value(
+                                &empty_parent_payloads,
+                                parents.submission_shards.as_ref(),
+                                &mut s_payload_cache,
+                                rest,
+                                None,
+                            )?
+                            .map(|mut payload| {
+                                payload.insert("kind".into(), Value::String("submission".into()));
+                                payload.insert("id".into(), Value::String(rest.to_string()));
+                                payload
+                            })
+                        }
+                    } else {
+                        anyhow::bail!("direct parent ID is not prefixed with t1_ or t3_: {raw_id}");
+                    };
+
+                    if let Some(payload) = payload {
+                        serde_json::to_writer(&mut *w, &payload)?;
+                        w.write_all(b"\n")?;
+                        stats.resolved += 1;
+                    } else {
+                        stats.unresolved += 1;
+                    }
+                }
+                Ok(stats)
+            },
+        )
     }
 
     pub fn attach_parents_jsonls_parallel(

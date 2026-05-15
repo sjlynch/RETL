@@ -676,6 +676,53 @@ Collect parent IDs from your spooled JSONL, resolve parent contents by scanning 
 
 **Important:** if the spool is produced with `--whitelist` / `.whitelist_fields(...)`, preserve at least `parent_id` and `link_id` for any spool destined for the parents pipeline. Include `body` too when you want the child comment text retained in the attached output (recommended: `body,parent_id,link_id` alongside your analysis fields). If `parent_id`/`link_id` are dropped, `retl parents` fails fast with an actionable whitelist diagnostic instead of scanning the corpus for a no-op run.
 
+Copy-paste CLI workflow:
+
+~~~sh
+# 1) Export matching comments as monthly spool parts. Keep parent_id/link_id.
+retl export \
+  --data-dir ./data \
+  --source rc \
+  --start 2006-01 --end 2006-01 \
+  --subreddit programming \
+  --include-deleted \
+  --whitelist body,parent_id,link_id,created_utc,id,score,subreddit \
+  --format spool \
+  --out spool \
+  --resume
+
+# 2) Resolve parents from the corpus and attach a `parent` object to each child.
+retl parents \
+  --spool spool \
+  --cache parents_cache \
+  --out spool_with_parents \
+  --data-dir ./data \
+  --window-months 3 \
+  --parent-fields author,body,score,created_utc,subreddit,title,selftext \
+  --resume
+
+# 3) Optional: aggregate the attached spool directly.
+retl aggregate \
+  --spool spool_with_parents \
+  --by subreddit \
+  --out subreddit_counts.tsv
+~~~
+
+Direct parent-ID CLI mode is for IDs you already have from SQL/Python. `--ids-file` reads one ID per non-empty line, `--parent-id` is repeatable, prefixed IDs (`t1_...`/`t3_...`) are validated directly, and bare IDs require `--id-kind comment` or `--id-kind submission`. In this mode `--out` is a JSONL file of resolved parent payload objects (unresolved IDs are omitted but counted in the summary), while `--cache` still stores reusable resolver shards and `--resume` reuses matching cache shards:
+
+~~~sh
+retl parents \
+  --ids-file ids.txt \
+  --parent-id t3_extra_submission \
+  --id-kind comment \
+  --cache parents_cache \
+  --out parents.jsonl \
+  --data-dir ./data \
+  --start 2006-01 --end 2006-03 \
+  --parent-fields author,body,score,created_utc,subreddit,title,selftext \
+  --resume
+~~~
+
 ~~~rust
 use retl::{ParentIds, ParentMaps, RedditETL, Sources, YearMonth};
 use std::path::Path;
@@ -734,7 +781,7 @@ let parents = RedditETL::new()
 
 Note: extract/spool resume entries are fingerprinted by query/config. Parent-cache and attach resume sidecars include the parent ID set, selected parent fields, payload format, corpus file identity, and resolution window, so widening `--parent-fields` rebuilds stale narrow cache shards instead of reusing them.
 
-The `parents` CLI uses `--window-months 3` by default, scanning three extra months on each side of the spool range. Larger windows catch more old cross-month parents, but scan more corpus bytes and create/use more parent-cache shard files; smaller windows are faster and lighter but can leave more parents unresolved.
+In spool mode, the `parents` CLI uses `--window-months 3` by default, scanning three extra months on each side of the spool range. Direct-ID mode instead uses `--start` / `--end` when provided, or scans all discovered months when omitted. Larger windows/ranges catch more old cross-month parents, but scan more corpus bytes and create/use more parent-cache shard files; smaller windows/ranges are faster and lighter but can leave more parents unresolved.
 
 ### Integrity Checks
 

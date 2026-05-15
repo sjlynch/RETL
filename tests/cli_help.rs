@@ -41,8 +41,13 @@ fn describe_help_advertises_discovery_flags() {
 fn parents_help_advertises_required_flags() {
     let assert = retl().args(["parents", "--help"]).assert().success();
     let pred = contains("--spool")
+        .and(contains("--ids-file"))
+        .and(contains("--parent-id"))
+        .and(contains("--id-kind"))
         .and(contains("--cache"))
         .and(contains("--out"))
+        .and(contains("--start"))
+        .and(contains("--end"))
         .and(contains("--window-months"))
         .and(contains("--parent-fields"))
         .and(contains("--parent-full"))

@@ -7,12 +7,12 @@ use retl::{
     for_each_line_cfg, format_year_month_ranges, missing_month_diagnostics, open_with_backoff,
     plan_files, plan_files_checked, read_line_capped, remove_with_backoff,
     replace_file_atomic_backoff, total_compressed_size, AggregateBuildReport, ExportFormat,
-    FileKind, IntegrityMode, KeyExtractor, ParentPayloadSpec, RedditETL, Sources,
+    FileKind, IntegrityMode, KeyExtractor, ParentIds, ParentPayloadSpec, RedditETL, Sources,
     TabularExportOptions, YearMonth, DEFAULT_MAX_LINE_BYTES,
 };
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 #[cfg(test)]
 use std::fs;
 use std::io::{self, BufReader, BufWriter, Write};
@@ -21,8 +21,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::bin_args::{
     AggregateArgs, CountArgs, CountMode, DedupeArgs, DescribeArgs, ExportArgs, ExportFmt,
-    FirstSeenArgs, IntegrityArgs, IntegrityModeArg, ParentsArgs, SampleArgs, ScanArgs, SchemaArgs,
-    SchemaFmt, SourceArg,
+    FirstSeenArgs, IntegrityArgs, IntegrityModeArg, ParentIdKindArg, ParentsArgs, SampleArgs,
+    ScanArgs, SchemaArgs, SchemaFmt, SourceArg,
 };
 use crate::bin_helpers::{
     build_etl, discover_spool_parts, emit_partial_read_report, plan, stream_extract_to_stdout,
@@ -1019,8 +1019,249 @@ fn bail_empty_parent_ids(spool_parts: &[PathBuf]) -> Result<()> {
     );
 }
 
+fn parent_payload_spec_from_args(args: &ParentsArgs) -> ParentPayloadSpec {
+    if args.parent_full {
+        ParentPayloadSpec::full_record()
+    } else if args.parent_fields.is_empty() {
+        ParentPayloadSpec::default()
+    } else {
+        ParentPayloadSpec::from_fields(&args.parent_fields)
+    }
+}
+
+fn ensure_parent_work_dirs(args: &ParentsArgs) -> Result<PathBuf> {
+    create_dir_all_with_backoff(&args.cache, 16, 50)
+        .with_context(|| format!("creating cache dir {}", args.cache.display()))?;
+    create_dir_all_with_backoff(&args.work_dir, 16, 50)
+        .with_context(|| format!("creating work_dir {}", args.work_dir.display()))?;
+    let lib_tmp = args.work_dir.join("lib_tmp");
+    create_dir_all_with_backoff(&lib_tmp, 16, 50)
+        .with_context(|| format!("creating work_dir {}", lib_tmp.display()))?;
+    Ok(lib_tmp)
+}
+
+fn build_parent_etl(
+    args: &ParentsArgs,
+    lib_tmp: &Path,
+    parent_payload_spec: &ParentPayloadSpec,
+    sources: Option<Sources>,
+    start: Option<YearMonth>,
+    end: Option<YearMonth>,
+) -> RedditETL {
+    let mut etl = RedditETL::new()
+        .base_dir(&args.data_dir)
+        .work_dir(lib_tmp)
+        .parent_payload_spec(parent_payload_spec.clone())
+        .progress(!args.no_progress);
+    if let Some(s) = sources {
+        etl = etl.sources(s);
+    }
+    if start.is_some() || end.is_some() {
+        etl = etl.date_range(start, end);
+    }
+    if let Some(p) = args.parallelism {
+        etl = etl.parallelism(p);
+    }
+    if let Some(fc) = args.file_concurrency {
+        etl = etl.file_concurrency(fc);
+    }
+    if let Some(b) = args.inflight_bytes {
+        etl = etl.inflight_bytes(b);
+    }
+    if let Some(g) = args.inflight_groups {
+        etl = etl.inflight_groups(g);
+    }
+    etl
+}
+
+fn validate_parent_bare_id(raw: &str, source: &str) -> Result<String> {
+    let id = raw.trim();
+    if id.is_empty() {
+        anyhow::bail!("empty parent ID in {source}");
+    }
+    if id.chars().any(char::is_whitespace) {
+        anyhow::bail!("parent ID in {source} contains whitespace: {id:?}");
+    }
+    Ok(id.to_string())
+}
+
+fn unsupported_fullname_prefix(id: &str) -> Option<String> {
+    let (prefix, _) = id.split_once('_')?;
+    let bytes = prefix.as_bytes();
+    if bytes.len() == 2 && bytes[0] == b't' && bytes[1].is_ascii_digit() {
+        Some(format!("{prefix}_"))
+    } else {
+        None
+    }
+}
+
+fn direct_parent_kind_prefix(kind: ParentIdKindArg) -> &'static str {
+    match kind {
+        ParentIdKindArg::Comment => "t1_",
+        ParentIdKindArg::Submission => "t3_",
+    }
+}
+
+fn direct_parent_kind_label(kind: ParentIdKindArg) -> &'static str {
+    match kind {
+        ParentIdKindArg::Comment => "comment",
+        ParentIdKindArg::Submission => "submission",
+    }
+}
+
+fn normalize_direct_parent_id(
+    raw: &str,
+    bare_kind: Option<ParentIdKindArg>,
+    source: &str,
+) -> Result<(ParentIdKindArg, String, String)> {
+    let id = raw.trim();
+    if id.is_empty() {
+        anyhow::bail!("empty parent ID in {source}");
+    }
+
+    let (kind, bare) = if let Some(rest) = id.strip_prefix("t1_") {
+        (
+            ParentIdKindArg::Comment,
+            validate_parent_bare_id(rest, source)?,
+        )
+    } else if let Some(rest) = id.strip_prefix("t3_") {
+        (
+            ParentIdKindArg::Submission,
+            validate_parent_bare_id(rest, source)?,
+        )
+    } else {
+        if let Some(prefix) = unsupported_fullname_prefix(id) {
+            anyhow::bail!(
+                "unsupported parent ID prefix `{prefix}` in {source}; expected `t1_`/`t3_` or a bare ID with --id-kind"
+            );
+        }
+        let kind = bare_kind.ok_or_else(|| {
+            anyhow::anyhow!(
+                "bare parent ID `{id}` in {source} requires --id-kind comment or --id-kind submission"
+            )
+        })?;
+        (kind, validate_parent_bare_id(id, source)?)
+    };
+
+    let prefixed = format!("{}{}", direct_parent_kind_prefix(kind), bare);
+    Ok((kind, bare, prefixed))
+}
+
+fn add_direct_parent_id(
+    raw: &str,
+    bare_kind: Option<ParentIdKindArg>,
+    source: &str,
+    ids: &mut ParentIds,
+    ordered_prefixed: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) -> Result<()> {
+    let (kind, bare, prefixed) = normalize_direct_parent_id(raw, bare_kind, source)?;
+    let already_seen = seen.contains(&prefixed);
+    let inserted = match kind {
+        ParentIdKindArg::Comment => ids.insert_t1(&bare),
+        ParentIdKindArg::Submission => ids.insert_t3(&bare),
+    };
+    if !inserted && !already_seen {
+        anyhow::bail!(
+            "invalid {} parent ID `{}` in {source}",
+            direct_parent_kind_label(kind),
+            bare
+        );
+    }
+    if !already_seen {
+        seen.insert(prefixed.clone());
+        ordered_prefixed.push(prefixed);
+    }
+    Ok(())
+}
+
+fn collect_direct_parent_ids(args: &ParentsArgs) -> Result<(ParentIds, Vec<String>)> {
+    let mut ids = ParentIds::new();
+    let mut ordered_prefixed = Vec::new();
+    let mut seen = HashSet::new();
+
+    for path in &args.ids_file {
+        let f = open_with_backoff(path, 16, 50)
+            .with_context(|| format!("opening parent IDs file {}", path.display()))?;
+        let mut r = BufReader::new(f);
+        let mut buf = String::new();
+        let mut line_no = 0_u64;
+        loop {
+            let n = read_line_capped(&mut r, &mut buf, DEFAULT_MAX_LINE_BYTES, path)
+                .with_context(|| format!("reading parent IDs file {}", path.display()))?;
+            if n == 0 {
+                break;
+            }
+            line_no += 1;
+            let trimmed = buf.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let source = format!("{} line {}", path.display(), line_no);
+            add_direct_parent_id(
+                trimmed,
+                args.id_kind,
+                &source,
+                &mut ids,
+                &mut ordered_prefixed,
+                &mut seen,
+            )?;
+        }
+    }
+
+    for (idx, raw) in args.parent_id.iter().enumerate() {
+        let source = format!("--parent-id #{}", idx + 1);
+        add_direct_parent_id(
+            raw,
+            args.id_kind,
+            &source,
+            &mut ids,
+            &mut ordered_prefixed,
+            &mut seen,
+        )?;
+    }
+
+    Ok((ids, ordered_prefixed))
+}
+
+fn direct_resolution_range_label(start: Option<YearMonth>, end: Option<YearMonth>) -> String {
+    match (start, end) {
+        (Some(s), Some(e)) => format!("{s}..={e}"),
+        (Some(s), None) => format!("{s}..=latest discovered month"),
+        (None, Some(e)) => format!("earliest discovered month..={e}"),
+        (None, None) => "all discovered months".to_string(),
+    }
+}
+
 pub(crate) fn run_parents(args: ParentsArgs) -> Result<()> {
-    let (spool_parts, min_ym, max_ym) = discover_spool_parts(&args.spool)?;
+    let has_spool = args.spool.is_some();
+    let has_direct_ids = !args.ids_file.is_empty() || !args.parent_id.is_empty();
+
+    match (has_spool, has_direct_ids) {
+        (true, true) => anyhow::bail!(
+            "choose exactly one parents input mode: --spool <DIR> or --ids-file/--parent-id"
+        ),
+        (false, false) => {
+            anyhow::bail!("parents requires an input mode: --spool <DIR> or --ids-file/--parent-id")
+        }
+        (true, false) => run_parents_spool(args),
+        (false, true) => run_parents_direct(args),
+    }
+}
+
+fn run_parents_spool(args: ParentsArgs) -> Result<()> {
+    if args.start.is_some() || args.end.is_some() {
+        anyhow::bail!("--start/--end are only used with direct parent IDs; spool mode uses --window-months around the discovered spool range");
+    }
+    if args.id_kind.is_some() {
+        anyhow::bail!("--id-kind is only used with --ids-file/--parent-id direct-ID mode");
+    }
+
+    let spool = args
+        .spool
+        .as_ref()
+        .expect("spool mode already validated --spool is present");
+    let (spool_parts, min_ym, max_ym) = discover_spool_parts(spool)?;
 
     let mut wstart = min_ym;
     let mut wend = max_ym;
@@ -1033,63 +1274,40 @@ pub(crate) fn run_parents(args: ParentsArgs) -> Result<()> {
         }
     }
 
-    create_dir_all_with_backoff(&args.cache, 16, 50)
-        .with_context(|| format!("creating cache dir {}", args.cache.display()))?;
     create_dir_all_with_backoff(&args.out, 16, 50)
         .with_context(|| format!("creating output dir {}", args.out.display()))?;
-    create_dir_all_with_backoff(&args.work_dir, 16, 50)
-        .with_context(|| format!("creating work_dir {}", args.work_dir.display()))?;
-    let lib_tmp = args.work_dir.join("lib_tmp");
-    create_dir_all_with_backoff(&lib_tmp, 16, 50)
-        .with_context(|| format!("creating work_dir {}", lib_tmp.display()))?;
+    let lib_tmp = ensure_parent_work_dirs(&args)?;
+    let parent_payload_spec = parent_payload_spec_from_args(&args);
 
-    let parent_payload_spec = if args.parent_full {
-        ParentPayloadSpec::full_record()
-    } else if args.parent_fields.is_empty() {
-        ParentPayloadSpec::default()
-    } else {
-        ParentPayloadSpec::from_fields(&args.parent_fields)
-    };
-
-    let build = |sources: Option<Sources>, range: Option<(YearMonth, YearMonth)>| -> RedditETL {
-        let mut etl = RedditETL::new()
-            .base_dir(&args.data_dir)
-            .work_dir(&lib_tmp)
-            .parent_payload_spec(parent_payload_spec.clone())
-            .progress(!args.no_progress);
-        if let Some(s) = sources {
-            etl = etl.sources(s);
-        }
-        if let Some((s, e)) = range {
-            etl = etl.date_range(Some(s), Some(e));
-        }
-        if let Some(p) = args.parallelism {
-            etl = etl.parallelism(p);
-        }
-        if let Some(fc) = args.file_concurrency {
-            etl = etl.file_concurrency(fc);
-        }
-        if let Some(b) = args.inflight_bytes {
-            etl = etl.inflight_bytes(b);
-        }
-        if let Some(g) = args.inflight_groups {
-            etl = etl.inflight_groups(g);
-        }
-        etl
-    };
-
-    let ids = build(None, None).collect_parent_ids_from_jsonls(spool_parts.clone())?;
+    let ids = build_parent_etl(&args, &lib_tmp, &parent_payload_spec, None, None, None)
+        .collect_parent_ids_from_jsonls(spool_parts.clone())?;
     if ids.is_empty() {
         return bail_empty_parent_ids(&spool_parts);
     }
 
-    let parents = build(Some(Sources::Both), Some((wstart, wend))).resolve_parent_maps(
-        &ids,
-        &args.cache,
+    let parents = build_parent_etl(
+        &args,
+        &lib_tmp,
+        &parent_payload_spec,
+        Some(Sources::Both),
+        Some(wstart),
+        Some(wend),
+    )
+    .resolve_parent_maps(&ids, &args.cache, args.resume)?;
+    let (attached, stats) = build_parent_etl(
+        &args,
+        &lib_tmp,
+        &parent_payload_spec,
+        None,
+        Some(wstart),
+        Some(wend),
+    )
+    .attach_parents_jsonls_parallel_with_stats(
+        spool_parts,
+        &args.out,
+        &parents,
         args.resume,
     )?;
-    let (attached, stats) = build(None, Some((wstart, wend)))
-        .attach_parents_jsonls_parallel_with_stats(spool_parts, &args.out, &parents, args.resume)?;
 
     if stats.total() > 0 && stats.unresolved_rate() > 0.05 {
         tracing::warn!(
@@ -1107,6 +1325,52 @@ pub(crate) fn run_parents(args: ParentsArgs) -> Result<()> {
         args.out.display(),
         wstart,
         wend,
+        stats.resolved,
+        stats.unresolved
+    );
+    Ok(())
+}
+
+fn run_parents_direct(args: ParentsArgs) -> Result<()> {
+    if let (Some(start), Some(end)) = (args.start, args.end) {
+        if start > end {
+            anyhow::bail!("invalid date range: start {start} is after end {end}");
+        }
+    }
+
+    let (ids, ordered_prefixed) = collect_direct_parent_ids(&args)?;
+    if ids.is_empty() || ordered_prefixed.is_empty() {
+        anyhow::bail!("direct parent-ID mode received no usable IDs");
+    }
+
+    let lib_tmp = ensure_parent_work_dirs(&args)?;
+    let parent_payload_spec = parent_payload_spec_from_args(&args);
+    let resolver = build_parent_etl(
+        &args,
+        &lib_tmp,
+        &parent_payload_spec,
+        Some(Sources::Both),
+        args.start,
+        args.end,
+    );
+    let parents = resolver.resolve_parent_maps(&ids, &args.cache, args.resume)?;
+    let stats =
+        resolver.write_resolved_parent_payloads_jsonl(ordered_prefixed, &args.out, &parents)?;
+
+    if stats.total() > 0 && stats.unresolved_rate() > 0.05 {
+        tracing::warn!(
+            resolved = stats.resolved,
+            unresolved = stats.unresolved,
+            unresolved_rate = stats.unresolved_rate(),
+            "more than 5% of direct parent IDs were unresolved; consider --start/--end that cover the parent records or omit the range to scan all discovered months"
+        );
+    }
+
+    eprintln!(
+        "Resolved direct parent IDs to {} (cache {}, range {}; parents resolved={}, unresolved={})",
+        args.out.display(),
+        args.cache.display(),
+        direct_resolution_range_label(args.start, args.end),
         stats.resolved,
         stats.unresolved
     );
