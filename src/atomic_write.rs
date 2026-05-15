@@ -14,6 +14,7 @@
 //! place with a warning.
 
 use anyhow::{Context, Result};
+use serde::Serialize;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -36,6 +37,51 @@ pub const STAGING_DIR_NAME: &str = "_staging";
 pub(crate) const INPROGRESS_EXT: &str = ".inprogress";
 const STAGE_MARKER: &str = ".retl-";
 static STAGE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+type StagePathObserver = std::sync::Arc<dyn Fn(&Path) + Send + Sync + 'static>;
+
+#[cfg(test)]
+static STAGE_PATH_OBSERVER: std::sync::Mutex<Option<StagePathObserver>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) struct StagePathObserverGuard {
+    previous: Option<StagePathObserver>,
+}
+
+#[cfg(test)]
+impl Drop for StagePathObserverGuard {
+    fn drop(&mut self) {
+        let mut slot = STAGE_PATH_OBSERVER
+            .lock()
+            .expect("stage path observer mutex poisoned");
+        *slot = self.previous.take();
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn set_stage_path_observer_for_tests(
+    observer: StagePathObserver,
+) -> StagePathObserverGuard {
+    let mut slot = STAGE_PATH_OBSERVER
+        .lock()
+        .expect("stage path observer mutex poisoned");
+    StagePathObserverGuard {
+        previous: slot.replace(observer),
+    }
+}
+
+#[cfg(test)]
+fn notify_stage_path_for_tests(staged: &Path) {
+    let observer = STAGE_PATH_OBSERVER
+        .lock()
+        .expect("stage path observer mutex poisoned")
+        .clone();
+    if let Some(observer) = observer {
+        observer(staged);
+    }
+}
 
 /// Build the staging directory path for a given output root, creating it.
 pub fn ensure_staging_dir(out_root: &Path) -> Result<PathBuf> {
@@ -179,6 +225,8 @@ where
 
     let file = create_new_with_backoff(&staged, 16, 50)
         .with_context(|| format!("create staged {}", staged.display()))?;
+    #[cfg(test)]
+    notify_stage_path_for_tests(&staged);
     let mut writer = BufWriter::with_capacity(write_buf_bytes, file);
 
     let result = match body(&mut writer) {
@@ -198,8 +246,10 @@ where
     drop(writer); // release file handle before atomic rename (Windows)
 
     if let Some(parent) = final_dest.parent() {
-        create_dir_all_with_backoff(parent, 16, 50)
-            .with_context(|| format!("create dest parent {}", parent.display()))?;
+        if let Err(e) = create_dir_all_with_backoff(parent, 16, 50) {
+            let _ = remove_with_backoff(&staged, 8, 50);
+            return Err(e).with_context(|| format!("create dest parent {}", parent.display()));
+        }
     }
     if let Err(e) = replace_file_atomic_backoff(&staged, final_dest) {
         let _ = remove_with_backoff(&staged, 8, 50);
@@ -230,6 +280,25 @@ where
 {
     stage_and_execute(staging_dir, final_dest, write_buf_bytes, |writer| {
         body(writer)
+    })
+}
+
+/// Atomically write a pretty JSON sidecar/text document followed by a trailing
+/// newline. Stages through the same unique `*.retl-<pid>-<nonce>.inprogress`
+/// path as [`write_jsonl_atomic`].
+pub(crate) fn write_json_pretty_atomic<T>(
+    staging_dir: &Path,
+    final_dest: &Path,
+    write_buf_bytes: usize,
+    value: &T,
+) -> Result<()>
+where
+    T: Serialize + ?Sized,
+{
+    write_jsonl_atomic(staging_dir, final_dest, write_buf_bytes, |w| {
+        serde_json::to_writer_pretty(&mut *w, value)?;
+        w.write_all(b"\n")?;
+        Ok(())
     })
 }
 

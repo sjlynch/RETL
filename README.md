@@ -218,7 +218,7 @@ retl export \
   --out rust_submissions_2020.csv
 ~~~
 
-CSV uses standard doubled-quote escaping and CRLF row endings. TSV uses literal tab separators and refuses values containing tabs; use CSV when fields may contain arbitrary text. Missing whitelisted fields render as empty cells.
+CSV uses standard doubled-quote escaping and CRLF row endings, including quoted multiline cells. TSV uses literal tab separators and refuses values containing tabs or line breaks; use CSV when fields may contain arbitrary Reddit text. Missing whitelisted fields render as empty cells.
 
 ### `scan` — emit unique usernames
 
@@ -270,15 +270,29 @@ Formats:
 * `--format jsonl` → single stitched `.jsonl` file (default).
 * `--format json`  → single `.json` file containing a JSON array (`--pretty`
   field-indents records, matching `aggregate --pretty`).
-* `--format csv` → single RFC4180-style CSV file. Requires `--whitelist` to define the fixed column order; missing fields render as empty cells.
-* `--format tsv` → single tab-separated file. Requires `--whitelist`; values containing literal tabs are rejected with a warning because TSV has no standard escaping.
+* `--format csv` → single RFC4180-style CSV file. Requires `--whitelist` to define the fixed column order; missing fields render as empty cells. `--human-timestamps` and `--resume` are not supported for CSV/TSV.
+* `--format tsv` → single tab-separated file. Requires `--whitelist`; values containing literal tabs or line breaks are rejected with a warning because TSV has no standard escaping.
 * `--format spool` → per-source per-month files (`part_RC_YYYY-MM.jsonl`, `part_RS_YYYY-MM.jsonl`) under the directory passed to `--out`. Use this for the parents-pipeline workflow.
 * `--format zst` → corpus-style partitioned `.zst` output under `<out>/comments/RC_YYYY-MM.zst` and `<out>/submissions/RS_YYYY-MM.zst`.
 * `--format partitioned-jsonl` → the same corpus-style directory layout, but as uncompressed `.jsonl` files.
 
-Export-only modifiers include `--whitelist a,b,c`, `--strict-whitelist`, `--human-timestamps`, `--limit N`, `--zst-level <N>`, and `--resume`. With `--resume`, `jsonl`/`json` exports checkpoint per-month `.part_*.jsonl` files under `--work-dir`; `spool`, `zst`, and `partitioned-jsonl` use `_progress.json` under `--out`. The checkpoint includes a fingerprint of the query and output-affecting config; changing filters, sources, date range, whitelist fields, `--limit`, `--human-timestamps`, or (for ZST) `--zst-level` discards stale parts instead of mixing results from different runs. Partitioned ZST resume validates completed `.zst` outputs with a full decode before skipping them.
+Export-only modifiers include `--whitelist a,b,c`, `--strict-whitelist`, `--limit N`, and, for JSON-family formats (`jsonl`, `json`, `spool`, `zst`, `partitioned-jsonl`), `--human-timestamps` and `--resume`; `--zst-level <N>` applies to `zst`. CSV/TSV reject `--human-timestamps` and `--resume` rather than silently ignoring them. With `--resume`, `jsonl`/`json` exports checkpoint per-month `.part_*.jsonl` files under `--work-dir`; `spool`, `zst`, and `partitioned-jsonl` use `_progress.json` under `--out`. The checkpoint includes a fingerprint of the query and output-affecting config; changing filters, sources, date range, whitelist fields, `--limit`, `--human-timestamps`, or (for ZST) `--zst-level` discards stale parts instead of mixing results from different runs. Partitioned ZST resume validates completed `.zst` outputs with a full decode before skipping them.
 
 Corpus scans and exports are strict by default: zstd decode errors fail the command instead of returning plausible partial results. Pass `--allow-partial` to preserve the explicit lossy mode; skipped file counts and paths are emitted as a JSON object on stderr, and skipped months are not committed to resume manifests.
+
+### `convert` — flatten existing JSONL/spool files
+
+`retl convert` reads already-produced JSONL files (including spool or parent-enriched spool parts) and writes analysis-friendly CSV/TSV without rescanning the raw corpus. Select columns with top-level names (`id`), dotted paths (`parent.author`), or JSON Pointers (`/parent/body`):
+
+~~~sh
+retl convert \
+  --spool spool_with_parents \
+  --format csv \
+  --field id,body,parent.kind,parent.id,parent.author,parent.body \
+  --out comments_with_parent_text.csv
+~~~
+
+Use JSON Pointer syntax for keys containing dots or slashes. TSV conversion has the same limitation as TSV export: cells containing tabs or line breaks fail with the field name and a recommendation to use CSV.
 
 ~~~sh
 # JSONL with a field whitelist and human timestamps
@@ -373,9 +387,10 @@ to buffer the failure list and print it only after all files finish.
 
 Aggregates one or more already-filtered JSONL inputs using the
 `retl::Aggregator` pipeline (each input is processed in parallel; per-input
-shard intermediates land under `--shards-dir`, which defaults to `agg_shards/`
-next to `--out`). `aggregate` does not scan the RC/RS corpus and does not
-accept corpus selectors such as `--data-dir`, `--start`, or `--subreddit`; run
+shard intermediates land in a per-run subdirectory under `--shards-dir`, which
+defaults to `agg_shards/` next to `--out`). `aggregate` does not scan the
+RC/RS corpus and does not accept corpus selectors such as `--data-dir`,
+`--start`, or `--subreddit`; run
 `retl export --format spool ...` first if you need to filter the corpus. Its
 runtime flags are limited to `--parallelism`, `--no-progress`, and
 `--shards-dir`. Use `--spool DIR` to discover `part_RC_YYYY-MM.jsonl` /
@@ -716,6 +731,14 @@ let _out_paths = RedditETL::new()
 ~~~
 
 By default, resolved comments receive a `"parent"` object containing either the parent comment’s body (`t1_...`) or the submission’s title/selftext (`t3_...`). Use `.parent_fields([...])` or CLI `--parent-fields author,body,score,created_utc,subreddit,domain,url,title,selftext` to attach extra top-level parent fields; use `.parent_full(true)` / `--parent-full` to attach the full parent JSON record. `kind` and `id` are always included for resolved parents. If a referenced parent cannot be resolved from the cache/window, `retl` leaves the `"parent"` key absent rather than writing an empty object; the CLI reports resolved/unresolved totals and warns when more than 5% are unresolved.
+
+After attachment, flatten the enriched JSONL directly for DuckDB/spreadsheets:
+
+~~~sh
+retl convert --spool spool_with_parents --format csv \
+  --field id,author,body,parent.kind,parent.id,parent.author,parent.body \
+  --out comments_with_parents.csv
+~~~
 
 If you already have parent IDs from SQL/Python, build `ParentIds` directly instead of writing a fake spool:
 
