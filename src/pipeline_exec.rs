@@ -602,6 +602,16 @@ impl ScanPlan {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
+        if self.etl.opts.human_readable_timestamps {
+            anyhow::bail!(
+                "--human-timestamps is not supported for CSV/TSV export; use --format jsonl/json/spool/zst/partitioned-jsonl or omit the flag"
+            );
+        }
+        if self.etl.opts.resume {
+            anyhow::bail!(
+                "--resume is not supported for CSV/TSV export; use --format jsonl/json/spool/zst/partitioned-jsonl or omit the flag"
+            );
+        }
         let fields = normalize_tabular_fields(fields)?;
         let mut scan = self;
         scan.etl.opts.whitelist_fields = Some(fields.clone());
@@ -702,9 +712,12 @@ impl ScanPlan {
             };
 
             let whitelist = plan.etl.opts.whitelist_fields.clone();
-            let whitelist_tracker = whitelist
-                .as_ref()
-                .map(|_| Arc::new(WhitelistMatchTracker::new(plan.etl.opts.strict_whitelist)));
+            let whitelist_tracker = whitelist.as_ref().map(|fields| {
+                Arc::new(WhitelistMatchTracker::new(
+                    plan.etl.opts.strict_whitelist,
+                    fields.iter().cloned(),
+                ))
+            });
             let record_limit = record_limit_from_with_claimed(plan.limit, resumed_lines);
             let targets_ref = targets.as_ref();
             let bounds = bounds_tuple(plan.etl.opts.start, plan.etl.opts.end);
@@ -749,6 +762,9 @@ impl ScanPlan {
                 },
             )?;
 
+            if let Some(tracker) = &whitelist_tracker {
+                tracker.finalize()?;
+            }
             if let Some(pb) = pb {
                 pb.finish_with_message("done");
             }
@@ -919,9 +935,12 @@ impl ScanPlan {
             };
 
             let whitelist = plan.etl.opts.whitelist_fields.clone();
-            let whitelist_tracker = whitelist
-                .as_ref()
-                .map(|_| Arc::new(WhitelistMatchTracker::new(plan.etl.opts.strict_whitelist)));
+            let whitelist_tracker = whitelist.as_ref().map(|fields| {
+                Arc::new(WhitelistMatchTracker::new(
+                    plan.etl.opts.strict_whitelist,
+                    fields.iter().cloned(),
+                ))
+            });
             let record_limit = record_limit_from_with_claimed(plan.limit, resumed_lines);
             let targets_ref = targets.as_ref();
             let bounds = bounds_tuple(plan.etl.opts.start, plan.etl.opts.end);
@@ -1038,6 +1057,9 @@ impl ScanPlan {
                 },
             )?;
 
+            if let Some(tracker) = &whitelist_tracker {
+                tracker.finalize()?;
+            }
             if let Some(pb) = pb {
                 pb.finish_with_message("done");
             }
@@ -1663,6 +1685,84 @@ fn tabular_part_paths(tmp_dir: &Path, format: TabularFormat) -> Result<Vec<PathB
     Ok(paths)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TabularFieldSelector {
+    TopLevel(String),
+    JsonPointer(String),
+    Dotted(Vec<String>),
+}
+
+impl TabularFieldSelector {
+    fn parse(raw: &str) -> Result<Self> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            anyhow::bail!("CSV/TSV field names must not be empty");
+        }
+        if let Some(pointer) = trimmed.strip_prefix("json:") {
+            validate_tabular_json_pointer(pointer)?;
+            return Ok(Self::JsonPointer(pointer.to_string()));
+        }
+        if trimmed.starts_with('/') {
+            validate_tabular_json_pointer(trimmed)?;
+            return Ok(Self::JsonPointer(trimmed.to_string()));
+        }
+        if trimmed.contains('.') {
+            let parts: Vec<String> = trimmed
+                .split('.')
+                .map(str::trim)
+                .map(str::to_string)
+                .collect();
+            if parts.iter().any(String::is_empty) {
+                anyhow::bail!(
+                    "bad dotted tabular field {trimmed:?}: path segments must not be empty; use JSON Pointer syntax for unusual keys"
+                );
+            }
+            return Ok(Self::Dotted(parts));
+        }
+        Ok(Self::TopLevel(trimmed.to_string()))
+    }
+
+    fn value<'a>(&self, record: &'a Value) -> Option<&'a Value> {
+        match self {
+            Self::TopLevel(key) => record.as_object().and_then(|map| map.get(key)),
+            Self::JsonPointer(pointer) => record.pointer(pointer),
+            Self::Dotted(parts) => {
+                let mut cur = record;
+                for part in parts {
+                    cur = cur.as_object()?.get(part)?;
+                }
+                Some(cur)
+            }
+        }
+    }
+}
+
+fn parse_tabular_field_selectors(fields: &[String]) -> Result<Vec<TabularFieldSelector>> {
+    fields
+        .iter()
+        .map(|field| TabularFieldSelector::parse(field))
+        .collect()
+}
+
+fn validate_tabular_json_pointer(pointer: &str) -> Result<()> {
+    if !pointer.starts_with('/') {
+        anyhow::bail!("JSON Pointer tabular fields must start with '/': {pointer:?}");
+    }
+    let mut chars = pointer.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '~' {
+            match chars.next() {
+                Some('0') | Some('1') => {}
+                other => anyhow::bail!(
+                    "bad JSON Pointer tabular field {pointer:?}: invalid escape near '~{:?}'; use '~0' for '~' and '~1' for '/'",
+                    other
+                ),
+            }
+        }
+    }
+    Ok(())
+}
+
 fn write_csv_cell<W: Write + ?Sized>(out: &mut W, cell: &str) -> Result<()> {
     let quote = cell
         .as_bytes()
@@ -1715,13 +1815,20 @@ fn write_tabular_row<W: Write + ?Sized>(
         }
         TabularFormat::Tsv => {
             for (field, cell) in fields.iter().zip(cells.iter()) {
-                if cell.contains('\t') {
+                if let Some(ch) = cell.chars().find(|ch| matches!(ch, '\t' | '\n' | '\r')) {
+                    let desc = match ch {
+                        '\t' => "tab",
+                        '\n' => "line feed",
+                        '\r' => "carriage return",
+                        _ => unreachable!(),
+                    };
                     tracing::warn!(
                         field,
-                        "refusing to emit TSV value containing a literal tab; use --format csv for robust escaping"
+                        character = desc,
+                        "refusing to emit TSV value containing a tab or line break; use --format csv for robust escaping"
                     );
                     anyhow::bail!(
-                        "TSV export cannot represent a literal tab in field {field:?}; use --format csv"
+                        "TSV export cannot represent a {desc} in field {field:?}; use --format csv"
                     );
                 }
             }
@@ -1737,18 +1844,20 @@ fn write_tabular_row<W: Write + ?Sized>(
     Ok(())
 }
 
-fn tabular_cells_from_value(value: &Value, fields: &[String]) -> Result<(Vec<String>, bool)> {
-    let map = value.as_object();
-    let mut matched_any = false;
-    let mut cells = Vec::with_capacity(fields.len());
-    for field in fields {
-        let field_value = map.and_then(|map| map.get(field));
+fn tabular_cells_from_value(
+    value: &Value,
+    selectors: &[TabularFieldSelector],
+) -> Result<(Vec<String>, Vec<usize>)> {
+    let mut matched_indices = Vec::new();
+    let mut cells = Vec::with_capacity(selectors.len());
+    for (idx, selector) in selectors.iter().enumerate() {
+        let field_value = selector.value(value);
         if field_value.is_some() {
-            matched_any = true;
+            matched_indices.push(idx);
         }
         cells.push(value_to_tabular_cell(field_value)?);
     }
-    Ok((cells, matched_any))
+    Ok((cells, matched_indices))
 }
 
 fn write_tabular_header<W: Write + ?Sized>(
@@ -1789,6 +1898,7 @@ fn stream_tabular_job<W: Write + ?Sized>(
     targets: Option<&Vec<String>>,
     query: &QuerySpec,
     fields: &[String],
+    selectors: &[TabularFieldSelector],
     format: TabularFormat,
     pb: Option<ProgressBar>,
     bounds: Option<DateBounds>,
@@ -1822,12 +1932,19 @@ fn stream_tabular_job<W: Write + ?Sized>(
         claim_record_or_stop(record_limit)?;
         let val: Value = serde_json::from_str(line)
             .map_err(|e| malformed_json_error(&job.path, line_number, e))?;
-        let (cells, matched_any) = tabular_cells_from_value(&val, fields)?;
-        write_tabular_row(writer, fields, &cells, format)?;
+        let (cells, matched_indices) = tabular_cells_from_value(&val, selectors)?;
+        write_tabular_row(writer, fields, &cells, format).with_context(|| {
+            format!(
+                "writing {} row for {} line {}",
+                format.label(),
+                job.path.display(),
+                line_number
+            )
+        })?;
         written += 1;
         if let Some(tracker) = whitelist_tracker {
             tracker.observe(crate::streaming::WhitelistEmission {
-                emitted_empty_projection: !matched_any,
+                matched_fields: &matched_indices,
                 used_slow_path: false,
             })?;
         }
@@ -1861,9 +1978,6 @@ fn stream_tabular_job<W: Write + ?Sized>(
         Err(e) if is_record_limit_reached(&e) => true,
         Err(e) => return Err(e),
     };
-    if let Some(tracker) = whitelist_tracker {
-        tracker.finalize()?;
-    }
     Ok(StreamJobResult { written, complete })
 }
 
@@ -1895,8 +2009,10 @@ fn extract_tabular_common(
         let staging_dir = ensure_staging_dir(&tmp_dir)?;
         sweep_stale_inprogress(&tmp_dir, true)?;
 
+        let selectors = parse_tabular_field_selectors(fields)?;
         let whitelist_tracker = Some(Arc::new(WhitelistMatchTracker::new(
             etl.opts.strict_whitelist,
+            fields.iter().cloned(),
         )));
         let record_limit = record_limit_from(limit);
         let total_bytes = total_compressed_size(&files);
@@ -1932,6 +2048,7 @@ fn extract_tabular_common(
                         targets,
                         query,
                         fields,
+                        &selectors,
                         format,
                         pb.clone(),
                         bounds,
@@ -1957,6 +2074,9 @@ fn extract_tabular_common(
             },
         )?;
 
+        if let Some(tracker) = &whitelist_tracker {
+            tracker.finalize()?;
+        }
         if let Some(pb) = pb {
             pb.finish_with_message("done");
         }
@@ -1965,6 +2085,118 @@ fn extract_tabular_common(
             tracing::warn!(path=%tmp_dir.display(), error=%e, "failed to remove tabular extract scratch dir");
         }
         Ok(())
+    })
+}
+
+/// Convert existing plain JSONL files (including RETL spool/parent-enriched
+/// parts) into a single CSV file using top-level, dotted, or JSON Pointer
+/// field selectors. Missing fields render as empty cells.
+pub fn convert_jsonl_to_csv<I, P, J, S>(
+    inputs: I,
+    out_path: &Path,
+    fields: J,
+    opts: TabularExportOptions,
+) -> Result<u64>
+where
+    I: IntoIterator<Item = P>,
+    P: AsRef<Path>,
+    J: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    convert_jsonl_to_tabular(inputs, out_path, fields, opts, TabularFormat::Csv)
+}
+
+/// Convert existing plain JSONL files (including RETL spool/parent-enriched
+/// parts) into a single TSV file using top-level, dotted, or JSON Pointer
+/// field selectors. Values containing tabs or line breaks are rejected; use
+/// CSV for arbitrary Reddit text fields.
+pub fn convert_jsonl_to_tsv<I, P, J, S>(
+    inputs: I,
+    out_path: &Path,
+    fields: J,
+    opts: TabularExportOptions,
+) -> Result<u64>
+where
+    I: IntoIterator<Item = P>,
+    P: AsRef<Path>,
+    J: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    convert_jsonl_to_tabular(inputs, out_path, fields, opts, TabularFormat::Tsv)
+}
+
+fn convert_jsonl_to_tabular<I, P, J, S>(
+    inputs: I,
+    out_path: &Path,
+    fields: J,
+    opts: TabularExportOptions,
+    format: TabularFormat,
+) -> Result<u64>
+where
+    I: IntoIterator<Item = P>,
+    P: AsRef<Path>,
+    J: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let input_paths: Vec<PathBuf> = inputs
+        .into_iter()
+        .map(|path| path.as_ref().to_path_buf())
+        .collect();
+    if input_paths.is_empty() {
+        anyhow::bail!("convert requires at least one JSONL input file");
+    }
+    let fields = normalize_tabular_fields(fields)?;
+    let selectors = parse_tabular_field_selectors(&fields)?;
+    let parent = out_path.parent().unwrap_or_else(|| Path::new("."));
+    let staging_dir = ensure_staging_dir(parent)?;
+    write_jsonl_atomic(&staging_dir, out_path, 64 * 1024, |out| {
+        let mut written = 0_u64;
+        if opts.header {
+            write_tabular_header(out, &fields, format)?;
+        }
+        for path in &input_paths {
+            let file = open_with_backoff(path, 16, 50)
+                .with_context(|| format!("opening JSONL input {}", path.display()))?;
+            let mut reader = BufReader::with_capacity(256 * 1024, file);
+            let mut line = String::with_capacity(16 * 1024);
+            let mut line_number = 0_u64;
+            loop {
+                let n = crate::ndjson::read_line_capped(
+                    &mut reader,
+                    &mut line,
+                    crate::ndjson::DEFAULT_MAX_LINE_BYTES,
+                    path,
+                )
+                .with_context(|| {
+                    format!(
+                        "reading JSONL input {} near line {}",
+                        path.display(),
+                        line_number + 1
+                    )
+                })?;
+                if n == 0 {
+                    break;
+                }
+                line_number += 1;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let value: Value = serde_json::from_str(&line).with_context(|| {
+                    format!("malformed JSON in {} line {}", path.display(), line_number)
+                })?;
+                let (cells, _matched_indices) = tabular_cells_from_value(&value, &selectors)?;
+                write_tabular_row(out, &fields, &cells, format).with_context(|| {
+                    format!(
+                        "writing {} row for {} line {}",
+                        format.label(),
+                        path.display(),
+                        line_number
+                    )
+                })?;
+                written += 1;
+            }
+        }
+        Ok(written)
     })
 }
 
@@ -2025,9 +2257,12 @@ fn extract_common(
         };
 
         let whitelist = etl.opts.whitelist_fields.clone();
-        let whitelist_tracker = whitelist
-            .as_ref()
-            .map(|_| Arc::new(WhitelistMatchTracker::new(etl.opts.strict_whitelist)));
+        let whitelist_tracker = whitelist.as_ref().map(|fields| {
+            Arc::new(WhitelistMatchTracker::new(
+                etl.opts.strict_whitelist,
+                fields.iter().cloned(),
+            ))
+        });
         let record_limit = record_limit_from_with_claimed(limit, resumed_lines);
 
         let total_bytes = total_compressed_size(&files);
@@ -2132,6 +2367,9 @@ fn extract_common(
             },
         )?;
 
+        if let Some(tracker) = &whitelist_tracker {
+            tracker.finalize()?;
+        }
         if let Some(pb) = pb {
             pb.finish_with_message("done");
         }
@@ -2422,7 +2660,8 @@ mod tests {
             .subreddit("programming")
             .build()
             .unwrap();
-        let fingerprint = build_resume_fingerprint(&plan.etl, &plan.query, "extract").unwrap();
+        let fingerprint =
+            build_resume_fingerprint(&plan.etl, &plan.query, "extract", None).unwrap();
         let tmp_dir = extract_scratch_dir(
             &work_dir,
             "extract_jsonl_q_tmp",
