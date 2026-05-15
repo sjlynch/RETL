@@ -1,3 +1,5 @@
+use crate::config::clamp_shard_count;
+use crate::ndjson::{read_line_capped, DEFAULT_MAX_LINE_BYTES};
 use crate::shard_common;
 use crate::util::{
     create_dir_all_with_backoff, create_with_backoff, open_with_backoff, unique_scratch_dir,
@@ -8,7 +10,7 @@ use parking_lot::Mutex;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 /// Sharded key->i64 writer for large-scale reductions (sum/min, etc.).
@@ -22,7 +24,7 @@ pub struct ShardedKVWriter {
 
 impl ShardedKVWriter {
     pub fn create(work_dir: &Path, prefix: &str, count: usize) -> Result<Self> {
-        let count = count.max(1);
+        let count = clamp_shard_count(count, "ShardedKVWriter::create");
         let run_root = unique_scratch_dir(work_dir, prefix, "kv_shards");
         let dir = run_root.join("shards");
         create_dir_all_with_backoff(&dir, 16, 50)
@@ -168,12 +170,18 @@ enum Reducer {
 fn reduce_shard(input: &Path, output: &Path, reducer: Reducer) -> Result<()> {
     let mut acc: HashMap<String, i64> = HashMap::with_capacity(64_000);
     let mut sum_overflow_warned = false;
-    let r = BufReader::new(
+    let mut r = BufReader::new(
         open_with_backoff(input, 16, 50).with_context(|| format!("open {}", input.display()))?,
     );
-    for (line_idx, line) in r.lines().enumerate() {
-        let line_no = line_idx + 1;
-        let line = line.with_context(|| format!("read {} at line {}", input.display(), line_no))?;
+    let mut line = String::with_capacity(16 * 1024);
+    let mut line_no = 0usize;
+    loop {
+        let n = read_line_capped(&mut r, &mut line, DEFAULT_MAX_LINE_BYTES, input)
+            .with_context(|| format!("read {} at line {}", input.display(), line_no + 1))?;
+        if n == 0 {
+            break;
+        }
+        line_no += 1;
         if line.is_empty() {
             continue;
         }
@@ -253,6 +261,15 @@ mod tests {
     use std::io::Write;
 
     #[test]
+    fn sharded_kv_writer_clamps_huge_shard_count() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let writer = ShardedKVWriter::create(tmp.path(), "huge", usize::MAX)
+            .expect("huge shard count should be clamped before allocation");
+        assert_eq!(writer.count, crate::config::MAX_SHARDS);
+        assert_eq!(writer.shards.len(), crate::config::MAX_SHARDS);
+    }
+
+    #[test]
     fn reduce_shard_errors_on_missing_tab() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let input = tmp.path().join("kv_0000.tmp");
@@ -291,9 +308,14 @@ mod tests {
 
     fn read_kv_tsv(path: &Path) -> HashMap<String, i64> {
         let mut out = HashMap::new();
-        let r = BufReader::new(File::open(path).expect("open output"));
-        for line in r.lines() {
-            let line = line.expect("read line");
+        let mut r = BufReader::new(File::open(path).expect("open output"));
+        let mut line = String::new();
+        loop {
+            let n = read_line_capped(&mut r, &mut line, DEFAULT_MAX_LINE_BYTES, path)
+                .expect("read line");
+            if n == 0 {
+                break;
+            }
             if line.is_empty() {
                 continue;
             }

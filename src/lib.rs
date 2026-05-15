@@ -15,9 +15,11 @@
 //! Public surface, listed in roughly the order data flows through it:
 //!
 //! 1. **Configure**
-//!    - [`ETLOptions`] / [`Sources`] — base dirs, date range, parallelism,
-//!      `file_concurrency` (default `1` to bound peak RAM on giant zstd
-//!      windows), `inflight_bytes` (default 256 MiB; cap on producer→consumer
+//!    - [`ETLOptions`] / [`Sources`] — base dirs, date range,
+//!      `file_concurrency` (default `1`, capped by [`MAX_FILE_CONCURRENCY`] to
+//!      bound peak RAM on giant zstd windows), `shard_count` (capped by
+//!      [`MAX_SHARDS`]), `parallelism` (capped by [`max_parallelism_limit`]),
+//!      `inflight_bytes` (default 256 MiB; cap on producer→consumer
 //!      backpressure), `inflight_groups` (bucketing channel depth),
 //!      `adaptive_mem` thresholds, `resume`, `allow_partial`, IO buffer
 //!      sizes, `zst_level`.
@@ -87,9 +89,9 @@
 //!      skipped by `allow_partial` are intentionally left uncommitted.
 //!
 //! 7. **Verify**
-//!    - [`IntegrityMode::Quick`] / [`IntegrityMode::Full`] +
-//!      `RedditETL::check_corpus_integrity` validate `.zst` files and return a
-//!      materialized failure list.
+//!    - [`IntegrityMode::Quick`] (positive prefix sample) /
+//!      [`IntegrityMode::Full`] + `RedditETL::check_corpus_integrity` validate
+//!      `.zst` files and return a materialized failure list.
 //!    - [`RedditETL::check_corpus_integrity_with_failure_sink`] streams each
 //!      failure to a caller-provided callback during long runs.
 //!    - [`quick_validate_zst`] / [`validate_zst_full`] are the underlying
@@ -152,7 +154,8 @@ mod key_extractor;
 mod ndjson;
 
 pub use crate::config::{
-    ConfigBuildError, ETLOptions, PartialReadReport, PartialReadReporter, SkippedFile, Sources,
+    max_parallelism_limit, ConfigBuildError, ETLOptions, PartialReadReport, PartialReadReporter,
+    SkippedFile, Sources, MAX_FILE_CONCURRENCY, MAX_RAYON_THREADS, MAX_SHARDS,
 };
 pub use crate::date::YearMonth;
 pub use crate::pipeline::{RedditETL, ScanPlan};
@@ -163,7 +166,9 @@ pub use crate::shard::UsernameStream;
 pub use crate::aggregate::{
     AggregateBuildReport, AggregateInputIssue, AggregatePartialReadPolicy, Aggregator,
 };
-pub use crate::parents::{ParentAttachStats, ParentIds, ParentMaps};
+pub use crate::parents::{
+    ParentAttachStats, ParentIds, ParentMaps, ParentPayload, ParentPayloadSpec,
+};
 
 #[doc(hidden)]
 pub use crate::aggregate::{merge_aggregator_shards_parallel, merge_aggregator_shards_serial};

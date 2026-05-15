@@ -2,7 +2,7 @@ use crate::atomic_write::{ensure_staging_dir, write_jsonl_atomic};
 use crate::config::ETLOptions;
 use crate::key_extractor::KeyExtractor;
 use crate::mem::{available_memory_fraction, is_low_memory, AdaptiveMemCfg};
-use crate::ndjson::{NdjsonReader, NdjsonWriter};
+use crate::ndjson::{read_line_capped, NdjsonReader, NdjsonWriter, DEFAULT_MAX_LINE_BYTES};
 use crate::progress::ProgressScope;
 use crate::util::{
     create_dir_all_with_backoff, open_with_backoff, remove_with_backoff, smoothstep_memory_fraction,
@@ -13,7 +13,7 @@ use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::fs;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
@@ -178,6 +178,9 @@ fn run_producer(
     let mut line_number: u64 = 0;
 
     loop {
+        // Reviewed exception to the direct `read_line` audit: `NdjsonReader`
+        // delegates to `read_line_capped(DEFAULT_MAX_LINE_BYTES)` and keeps
+        // the path in its InvalidData error.
         let n = rdr.read_line(&mut buf)?;
         if n == 0 {
             break;
@@ -356,19 +359,20 @@ pub(crate) fn merge_runs_sorted_with_key_stats(
     ) -> Result<Option<HeapItem>> {
         loop {
             let mut s = String::new();
-            let n = reader.read_line(&mut s)?;
+            let n = read_line_capped(reader, &mut s, DEFAULT_MAX_LINE_BYTES, run_path)
+                .with_context(|| {
+                    format!(
+                        "read dedupe run {} near line {}",
+                        run_path.display(),
+                        *line_number + 1
+                    )
+                })?;
             if n == 0 {
                 return Ok(None);
             }
             *read_bytes += n as u64;
             *line_number += 1;
             pb.inc_bytes(n as u64);
-            if s.ends_with('\n') {
-                s.pop();
-                if s.ends_with('\r') {
-                    s.pop();
-                }
-            }
             match key
                 .key_from_line(&s)
                 .map_err(|e| malformed_json_error(run_path, *line_number, e))?

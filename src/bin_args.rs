@@ -8,6 +8,20 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use retl::{Sources, YearMonth};
 use std::path::PathBuf;
 
+const SAMPLE_BYTES_ZERO_ERROR: &str =
+    "--sample-bytes must be > 0; use --mode full for complete validation";
+
+fn parse_positive_sample_bytes(raw: &str) -> Result<u64, String> {
+    let bytes = raw
+        .parse::<u64>()
+        .map_err(|e| format!("invalid byte count: {e}"))?;
+    if bytes == 0 {
+        Err(SAMPLE_BYTES_ZERO_ERROR.to_string())
+    } else {
+        Ok(bytes)
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "retl",
@@ -67,11 +81,11 @@ pub(crate) struct CommonOpts {
     #[arg(long, value_name = "YYYY-MM")]
     pub(crate) end: Option<YearMonth>,
 
-    /// Number of Rayon worker threads (defaults to the global pool).
+    /// Number of Rayon worker threads (defaults to the global pool; clamped to RETL's safe cap).
     #[arg(long)]
     pub(crate) parallelism: Option<usize>,
 
-    /// Number of monthly files processed concurrently.
+    /// Number of monthly files processed concurrently (clamped to protect zstd decoder memory).
     #[arg(long)]
     pub(crate) file_concurrency: Option<usize>,
 
@@ -315,8 +329,9 @@ pub(crate) struct IntegrityArgs {
     /// Validation mode.
     #[arg(long, value_enum, default_value_t = IntegrityModeArg::Quick)]
     pub(crate) mode: IntegrityModeArg,
-    /// Bytes (decompressed) to sample per file in quick mode.
-    #[arg(long, default_value_t = 64 * 1024)]
+    /// Bytes (decompressed) to sample per file in quick mode. Must be positive;
+    /// values below 4096 only validate a tiny prefix and emit a warning.
+    #[arg(long, default_value_t = 64 * 1024, value_parser = parse_positive_sample_bytes)]
     pub(crate) sample_bytes: u64,
     /// Collect failures and print them only after all files finish.
     ///
@@ -334,7 +349,7 @@ pub(crate) enum IntegrityModeArg {
 
 #[derive(Args, Debug, Clone)]
 pub(crate) struct AggregateRuntimeOpts {
-    /// Number of Rayon worker threads (defaults to the global pool).
+    /// Number of Rayon worker threads (defaults to the global pool; clamped to RETL's safe cap).
     #[arg(long)]
     pub(crate) parallelism: Option<usize>,
 
@@ -347,8 +362,12 @@ pub(crate) struct AggregateRuntimeOpts {
 pub(crate) struct AggregateArgs {
     #[command(flatten)]
     pub(crate) runtime: AggregateRuntimeOpts,
-    /// JSONL input files to aggregate.
-    #[arg(required = true, num_args = 1..)]
+    /// Spool directory containing `part_RC_YYYY-MM.jsonl` /
+    /// `part_RS_YYYY-MM.jsonl` files to aggregate.
+    #[arg(long)]
+    pub(crate) spool: Option<PathBuf>,
+    /// JSONL input files to aggregate. Omit when using `--spool`.
+    #[arg(num_args = 1.., value_name = "INPUTS")]
     pub(crate) inputs: Vec<PathBuf>,
     /// Output path. Without `--by`, writes JSON record-count state; with `--by`, writes TSV.
     #[arg(long, short)]
@@ -399,16 +418,25 @@ pub(crate) struct ParentsArgs {
     /// scanning the corpus to resolve parent payloads.
     #[arg(long, default_value_t = 3)]
     pub(crate) window_months: u32,
+    /// Top-level parent fields to attach under `parent` (comma-separated,
+    /// repeatable). Defaults to body,title,selftext for backwards-compatible
+    /// output.
+    #[arg(long = "parent-fields", value_delimiter = ',', value_name = "FIELD")]
+    pub(crate) parent_fields: Vec<String>,
+    /// Attach the full source parent JSON record under `parent` (plus RETL's
+    /// `kind`/`id` metadata). Overrides `--parent-fields`.
+    #[arg(long = "parent-full")]
+    pub(crate) parent_full: bool,
     /// Path to corpus base dir (containing `comments/` and `submissions/`).
     #[arg(long, default_value = "./data")]
     pub(crate) data_dir: PathBuf,
     /// Scratch directory for sharded writers and stitched intermediates.
     #[arg(long, default_value = "./etl_work")]
     pub(crate) work_dir: PathBuf,
-    /// Number of Rayon worker threads (defaults to the global pool).
+    /// Number of Rayon worker threads (defaults to the global pool; clamped to RETL's safe cap).
     #[arg(long)]
     pub(crate) parallelism: Option<usize>,
-    /// Number of monthly files processed concurrently.
+    /// Number of monthly files processed concurrently (clamped to protect zstd decoder memory).
     #[arg(long)]
     pub(crate) file_concurrency: Option<usize>,
     /// Disable progress bars.
@@ -434,4 +462,32 @@ pub(crate) struct FirstSeenArgs {
     /// Output TSV file: `<author>\t<earliest_created_utc>` per line.
     #[arg(long, short)]
     pub(crate) out: PathBuf,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn cli_accepts_huge_resource_flags_for_builder_clamp() {
+        let huge = usize::MAX.to_string();
+        let cli = Cli::try_parse_from([
+            "retl",
+            "scan",
+            "--parallelism",
+            huge.as_str(),
+            "--file-concurrency",
+            huge.as_str(),
+        ])
+        .expect("resource flag parsing should succeed; builders clamp later");
+
+        match cli.command {
+            Command::Scan(args) => {
+                assert_eq!(args.common.parallelism, Some(usize::MAX));
+                assert_eq!(args.common.file_concurrency, Some(usize::MAX));
+            }
+            other => panic!("expected scan command, got {other:?}"),
+        }
+    }
 }

@@ -1,21 +1,24 @@
-use anyhow::{Context, Result};
 use ahash::RandomState;
+use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::hash::{BuildHasher, Hash, Hasher};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "test-utils")]
-use std::sync::{atomic::{AtomicUsize, Ordering as AtomicOrdering}, Arc};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering as AtomicOrdering},
+    Arc,
+};
 
-use crate::config::ETLOptions;
+use crate::config::{clamp_shard_count, ETLOptions};
 use crate::key_extractor::KeyExtractor;
 use crate::mem::{available_memory_fraction, is_low_memory, AdaptiveMemCfg};
+use crate::ndjson::{read_line_capped, DEFAULT_MAX_LINE_BYTES};
 use crate::util::{
-    create_dir_all_with_backoff, create_with_backoff, open_with_backoff,
-    smoothstep_memory_fraction,
+    create_dir_all_with_backoff, create_with_backoff, open_with_backoff, smoothstep_memory_fraction,
 };
 use crate::zstd_jsonl::malformed_json_error;
 
@@ -24,10 +27,10 @@ use crate::zstd_jsonl::malformed_json_error;
 pub struct BucketingCfg {
     /// Shared adaptive-memory policy (soft_low_frac, high_frac, adapt_cooldown_ms).
     pub mem: AdaptiveMemCfg,
-    pub hard_low_frac: f64,       // when below, yield briefly
-    pub backoff_ms: u64,          // sleep when under hard threshold
-    pub micro_min_buf_mb: usize,  // min target buffering when RAM is tight
-    pub micro_max_buf_mb: usize,  // max target buffering when RAM is plentiful
+    pub hard_low_frac: f64,      // when below, yield briefly
+    pub backoff_ms: u64,         // sleep when under hard threshold
+    pub micro_min_buf_mb: usize, // min target buffering when RAM is tight
+    pub micro_max_buf_mb: usize, // max target buffering when RAM is plentiful
     /// Hard cap on bytes inflight between the line-reader producer and the
     /// `on_group` consumer. Caps the per-bucket flush target so the bounded
     /// channel — not the RAM-fraction sampler — is the primary backpressure
@@ -78,8 +81,8 @@ fn stable_index(state: &RandomState, key: &str, parts: usize) -> usize {
 }
 
 /// Shared shard-router used by both Stage 1 (`partition_stage1`) and
-/// Stage 2 (`bucketize_shards`). Creates `shards.max(1)` mutex-guarded
-/// `BufWriter<File>`s named `{file_prefix}_{:04}.jsonl` under `out_dir`,
+/// Stage 2 (`bucketize_shards`). Creates a validated/clamped count of
+/// mutex-guarded `BufWriter<File>`s named `{file_prefix}_{:04}.jsonl` under `out_dir`,
 /// then `par_iter`s over `inputs`, hashing each line's routing key with
 /// `state` + [`stable_index`] and appending the line to the indexed writer.
 /// All writers are flushed before return.
@@ -102,13 +105,13 @@ fn route_lines_to_shards(
     create_dir_all_with_backoff(out_dir, 16, 50)
         .with_context(|| format!("create shard output dir {}", out_dir.display()))?;
 
-    let shard_count = shards.max(1);
+    let shard_count = clamp_shard_count(shards, "bucketing::route_lines_to_shards");
     let mut writers: Vec<Mutex<BufWriter<File>>> = Vec::with_capacity(shard_count);
     let mut paths: Vec<PathBuf> = Vec::with_capacity(shard_count);
     for i in 0..shard_count {
         let p = out_dir.join(format!("{}_{:04}.jsonl", file_prefix, i));
-        let f = create_with_backoff(&p, 16, 50)
-            .with_context(|| format!("create {}", p.display()))?;
+        let f =
+            create_with_backoff(&p, 16, 50).with_context(|| format!("create {}", p.display()))?;
         writers.push(Mutex::new(BufWriter::new(f)));
         paths.push(p);
     }
@@ -121,22 +124,27 @@ fn route_lines_to_shards(
         let mut line = String::with_capacity(16 * 1024);
         let mut line_number: u64 = 0;
         loop {
-            line.clear();
-            let n = r.read_line(&mut line)?;
-            if n == 0 { break; }
-            line_number += 1;
-            // Strip trailing \r?\n so the slice fed to KeyExtractor matches
-            // what extractors see in the rest of the pipeline.
-            if line.ends_with('\n') {
-                line.pop();
-                if line.ends_with('\r') { line.pop(); }
+            let n = read_line_capped(&mut r, &mut line, DEFAULT_MAX_LINE_BYTES, p).with_context(
+                || {
+                    format!(
+                        "read bucketing shard input {} near line {}",
+                        p.display(),
+                        line_number + 1
+                    )
+                },
+            )?;
+            if n == 0 {
+                break;
             }
-            if line.is_empty() { continue; }
+            line_number += 1;
+            if line.is_empty() {
+                continue;
+            }
             if let Some(k) = key
                 .key_from_line(&line)
                 .map_err(|e| malformed_json_error(p, line_number, e))?
             {
-                let idx = stable_index(&state, &k, shards);
+                let idx = stable_index(&state, &k, shard_count);
                 let mut w = writers[idx].lock();
                 w.write_all(line.as_bytes())?;
                 w.write_all(b"\n")?;
@@ -144,7 +152,9 @@ fn route_lines_to_shards(
         }
         Ok(())
     })?;
-    for w in &writers { w.lock().flush()?; }
+    for w in &writers {
+        w.lock().flush()?;
+    }
     Ok(paths)
 }
 
@@ -228,8 +238,7 @@ pub fn process_bucket_streaming<F>(
     cfg: &BucketingCfg,
     mut on_group: F,
     key: &KeyExtractor,
-    #[cfg(feature = "test-utils")]
-    buffered_bytes_metric: Option<Arc<AtomicUsize>>,
+    #[cfg(feature = "test-utils")] buffered_bytes_metric: Option<Arc<AtomicUsize>>,
 ) -> Result<()>
 where
     F: FnMut(&str, Vec<String>) -> Result<()> + Send,
@@ -256,7 +265,8 @@ where
     );
 
     let mb_count = micro_buckets.max(1);
-    let mut maps: Vec<HashMap<String, Vec<String>>> = (0..mb_count).map(|_| HashMap::new()).collect();
+    let mut maps: Vec<HashMap<String, Vec<String>>> =
+        (0..mb_count).map(|_| HashMap::new()).collect();
     let mut mb_bytes: Vec<usize> = vec![0; mb_count];
     let mut total_bytes: usize = 0;
 
@@ -291,15 +301,22 @@ where
         };
 
         let flush_bucket = |idx: usize,
-                                maps: &mut [HashMap<String, Vec<String>>],
-                                mb_bytes: &mut [usize],
-                                total_bytes: &mut usize| -> std::result::Result<(), ()> {
-            if maps[idx].is_empty() { return Ok(()); }
+                            maps: &mut [HashMap<String, Vec<String>>],
+                            mb_bytes: &mut [usize],
+                            total_bytes: &mut usize|
+         -> std::result::Result<(), ()> {
+            if maps[idx].is_empty() {
+                return Ok(());
+            }
             let mut m = HashMap::new();
             std::mem::swap(&mut m, &mut maps[idx]);
             let used = mb_bytes[idx];
             mb_bytes[idx] = 0;
-            if *total_bytes >= used { *total_bytes -= used; } else { *total_bytes = 0; }
+            if *total_bytes >= used {
+                *total_bytes -= used;
+            } else {
+                *total_bytes = 0;
+            }
             for (k, v) in m.into_iter() {
                 send_group(k, v)?;
             }
@@ -307,13 +324,19 @@ where
         };
 
         let flush_largest = |maps: &mut [HashMap<String, Vec<String>>],
-                                 mb_bytes: &mut [usize],
-                                 total_bytes: &mut usize| -> std::result::Result<(), ()> {
-            if maps.is_empty() { return Ok(()); }
+                             mb_bytes: &mut [usize],
+                             total_bytes: &mut usize|
+         -> std::result::Result<(), ()> {
+            if maps.is_empty() {
+                return Ok(());
+            }
             let mut max_idx = 0usize;
             let mut max_val = 0usize;
             for (i, b) in mb_bytes.iter().enumerate() {
-                if *b > max_val { max_val = *b; max_idx = i; }
+                if *b > max_val {
+                    max_val = *b;
+                    max_idx = i;
+                }
             }
             if max_val > 0 {
                 flush_bucket(max_idx, maps, mb_bytes, total_bytes)?;
@@ -328,15 +351,21 @@ where
             let mut line = String::with_capacity(16 * 1024);
             let mut line_number: u64 = 0;
             loop {
-                line.clear();
-                let n = r.read_line(&mut line)?;
-                if n == 0 { break; }
-                line_number += 1;
-                if line.ends_with('\n') {
-                    line.pop();
-                    if line.ends_with('\r') { line.pop(); }
+                let n = read_line_capped(&mut r, &mut line, DEFAULT_MAX_LINE_BYTES, bucket)
+                    .with_context(|| {
+                        format!(
+                            "read bucket {} near line {}",
+                            bucket.display(),
+                            line_number + 1
+                        )
+                    })?;
+                if n == 0 {
+                    break;
                 }
-                if line.is_empty() { continue; }
+                line_number += 1;
+                if line.is_empty() {
+                    continue;
+                }
 
                 let k = match key
                     .key_from_line(&line)

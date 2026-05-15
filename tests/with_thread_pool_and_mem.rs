@@ -10,18 +10,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 #[test]
 fn with_thread_pool_runs_closure_and_returns_value() {
     // A scoped pool of 2 threads still computes the right value.
-    let n = with_thread_pool(Some(2), || {
-        (0..1000u64).into_par_iter().sum::<u64>()
-    });
+    let n = with_thread_pool(Some(2), || (0..1000u64).into_par_iter().sum::<u64>());
     assert_eq!(n, 499_500);
 }
 
 #[test]
 fn with_thread_pool_zero_falls_back_to_global_pool() {
     // Some(0) is documented as "global default pool". Closure must still run.
-    let n = with_thread_pool(Some(0), || {
-        (1..=100u64).into_par_iter().sum::<u64>()
-    });
+    let n = with_thread_pool(Some(0), || (1..=100u64).into_par_iter().sum::<u64>());
     assert_eq!(n, 5050);
 }
 
@@ -32,6 +28,12 @@ fn with_thread_pool_none_runs_on_global_pool() {
     });
     let expected: u64 = (0..50u64).map(|x| x * 2).sum();
     assert_eq!(n, expected);
+}
+
+#[test]
+fn with_thread_pool_huge_request_is_clamped_not_panicked() {
+    let n = with_thread_pool(Some(usize::MAX), || 42usize);
+    assert_eq!(n, 42);
 }
 
 #[test]

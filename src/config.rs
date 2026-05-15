@@ -1,5 +1,6 @@
 use crate::date::YearMonth;
 use crate::mem::AdaptiveMemCfg;
+use crate::parents::ParentPayloadSpec;
 use parking_lot::Mutex;
 use serde::Serialize;
 use std::error::Error;
@@ -24,6 +25,79 @@ impl fmt::Display for ConfigBuildError {
 }
 
 impl Error for ConfigBuildError {}
+
+/// Maximum shard count for open-all-writers sharding layers.
+///
+/// `ShardedWriter`, `ShardedKVWriter`, parent-id shards, and bucketing shard
+/// routers keep one `BufWriter<File>` open per shard. Capping at the historic
+/// default of 256 bounds file-descriptor use and writer-buffer RAM while still
+/// giving enough fan-out for large Reddit corpora.
+pub const MAX_SHARDS: usize = 256;
+
+/// Hard ceiling on scoped Rayon worker threads requested through RETL options.
+///
+/// The effective cap is [`max_parallelism_limit`], which is a conservative
+/// multiple of `std::thread::available_parallelism()` and never exceeds this
+/// hard maximum. Oversized builder/CLI values are clamped with a warning.
+pub const MAX_RAYON_THREADS: usize = 256;
+
+/// Maximum number of monthly zstd files RETL will decode concurrently.
+///
+/// Each in-flight Reddit zstd frame can reserve a multi-GiB decode window, so
+/// `file_concurrency` is intentionally capped below the worker-thread limit.
+pub const MAX_FILE_CONCURRENCY: usize = 8;
+
+/// Effective upper bound for `.parallelism(n)` and `--parallelism`.
+///
+/// RETL allows a small oversubscription factor for I/O-heavy phases but keeps
+/// typos such as `usize::MAX` far away from Rayon/OS thread limits.
+pub fn max_parallelism_limit() -> usize {
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    cpus.saturating_mul(4).clamp(1, MAX_RAYON_THREADS)
+}
+
+pub(crate) fn clamp_shard_count(shards: usize, component: &str) -> usize {
+    let clamped = shards.max(1).min(MAX_SHARDS);
+    if shards > MAX_SHARDS {
+        tracing::warn!(
+            component,
+            requested = shards,
+            max = MAX_SHARDS,
+            "clamping shard count to bound open file handles and writer buffers"
+        );
+    }
+    clamped
+}
+
+pub(crate) fn clamp_parallelism_threads(threads: usize, component: &str) -> usize {
+    let max = max_parallelism_limit();
+    let clamped = threads.max(1).min(max);
+    if threads > max {
+        tracing::warn!(
+            component,
+            requested = threads,
+            max,
+            hard_max = MAX_RAYON_THREADS,
+            "clamping Rayon worker count to a safe process-local limit"
+        );
+    }
+    clamped
+}
+
+pub(crate) fn clamp_file_concurrency(n: usize, component: &str) -> usize {
+    let clamped = n.max(1).min(MAX_FILE_CONCURRENCY);
+    if n > MAX_FILE_CONCURRENCY {
+        tracing::warn!(
+            component,
+            requested = n,
+            max = MAX_FILE_CONCURRENCY,
+            "clamping zstd file concurrency to bound decoder-window memory"
+        );
+    }
+    clamped
+}
 
 /// Data source toggle (comments, submissions, both).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,14 +164,14 @@ pub struct ETLOptions {
     pub sources: Sources,
     pub start: Option<YearMonth>, // inclusive
     pub end: Option<YearMonth>,   // inclusive
-    pub shard_count: usize,       // number of on-disk dedup shards
+    pub shard_count: usize,       // number of on-disk dedup shards, clamped to MAX_SHARDS
     pub whitelist_fields: Option<Vec<String>>,
-    pub strict_whitelist: bool,     // fail instead of warn when whitelisted keys match nothing
-    pub strict_key: bool,           // fail dedupe when matching records lack the requested key
-    pub parallelism: Option<usize>, // Some(N) to set rayon threads, None to use default
-    pub work_dir: Option<PathBuf>,  // if None, create in base_dir/.reddit_etl_work/
-    pub file_concurrency: usize,    // limit number of monthly files processed concurrently
-    pub progress: bool,             // show progress bar
+    pub strict_whitelist: bool, // fail instead of warn when whitelisted keys match nothing
+    pub strict_key: bool,       // fail dedupe when matching records lack the requested key
+    pub parallelism: Option<usize>, // Some(N) to set rayon threads (clamped), None to use default
+    pub work_dir: Option<PathBuf>, // if None, create in base_dir/.reddit_etl_work/
+    pub file_concurrency: usize, // limit monthly files processed concurrently, clamped to MAX_FILE_CONCURRENCY
+    pub progress: bool,          // show progress bar
     pub progress_label: Option<String>, // optional label for progress bar
 
     // IO tuning
@@ -162,6 +236,11 @@ pub struct ETLOptions {
     /// prior run. Default false to preserve current behavior.
     pub resume: bool,
 
+    /// Parent payload fields attached by the parents pipeline. Defaults to the
+    /// legacy output shape (`body` for comments, `title`/`selftext` for
+    /// submissions).
+    pub parent_payload_spec: ParentPayloadSpec,
+
     /// Opt-in lossy mode for corrupt zstd inputs. The default (`false`) treats
     /// zstd decode errors as fatal so scans/exports cannot silently return
     /// partial results. When `true`, corrupt monthly files are skipped, recorded
@@ -189,7 +268,7 @@ impl Default for ETLOptions {
             sources: Sources::Both,
             start: None,
             end: None,
-            shard_count: 256,
+            shard_count: MAX_SHARDS,
             whitelist_fields: None,
             strict_whitelist: false,
             strict_key: false,
@@ -210,6 +289,7 @@ impl Default for ETLOptions {
             inflight_groups: 8,
             adaptive_mem: AdaptiveMemCfg::default(),
             resume: false,
+            parent_payload_spec: ParentPayloadSpec::default(),
             allow_partial: false,
             partial_read_reporter: PartialReadReporter::default(),
             build_error: None,
@@ -250,7 +330,7 @@ impl ETLOptions {
         self
     }
     pub fn with_shard_count(mut self, shards: usize) -> Self {
-        self.shard_count = shards.max(1);
+        self.shard_count = clamp_shard_count(shards, "ETLOptions::with_shard_count");
         self
     }
     pub fn with_whitelist_fields<I, S>(mut self, fields: I) -> Self
@@ -283,7 +363,10 @@ impl ETLOptions {
         self
     }
     pub fn with_parallelism(mut self, threads: usize) -> Self {
-        self.parallelism = Some(threads);
+        self.parallelism = Some(clamp_parallelism_threads(
+            threads,
+            "ETLOptions::with_parallelism",
+        ));
         self
     }
     pub fn with_work_dir(mut self, dir: impl AsRef<Path>) -> Self {
@@ -291,7 +374,7 @@ impl ETLOptions {
         self
     }
     pub fn with_file_concurrency(mut self, n: usize) -> Self {
-        self.file_concurrency = n.max(1);
+        self.file_concurrency = clamp_file_concurrency(n, "ETLOptions::with_file_concurrency");
         self
     }
     pub fn with_progress(mut self, yes: bool) -> Self {
@@ -385,6 +468,29 @@ impl ETLOptions {
     /// parents helpers).
     pub fn with_resume(mut self, yes: bool) -> Self {
         self.resume = yes;
+        self
+    }
+
+    /// Select top-level parent fields attached by `resolve_parent_maps` /
+    /// `attach_parents_jsonls_parallel`.
+    pub fn with_parent_fields<I, S>(mut self, fields: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.parent_payload_spec = ParentPayloadSpec::from_fields(fields);
+        self
+    }
+
+    /// Attach the full source parent JSON record when resolving parents.
+    pub fn with_parent_full(mut self, yes: bool) -> Self {
+        self.parent_payload_spec = self.parent_payload_spec.with_full_record(yes);
+        self
+    }
+
+    /// Replace the full parent-payload specification.
+    pub fn with_parent_payload_spec(mut self, spec: ParentPayloadSpec) -> Self {
+        self.parent_payload_spec = spec;
         self
     }
 
@@ -528,5 +634,29 @@ mod tests {
         // Confirmed against the formula: worst-case peak == declared budget.
         let peak = inflight_worst_case_peak_bytes(opts.inflight_bytes, opts.inflight_groups);
         assert_eq!(peak, opts.inflight_bytes);
+    }
+
+    #[test]
+    fn resource_knobs_clamp_huge_values() {
+        let etl = RedditETL::new()
+            .shard_count(usize::MAX)
+            .parallelism(usize::MAX)
+            .file_concurrency(usize::MAX);
+
+        assert_eq!(etl.opts.shard_count, MAX_SHARDS);
+        assert_eq!(etl.opts.parallelism, Some(max_parallelism_limit()));
+        assert_eq!(etl.opts.file_concurrency, MAX_FILE_CONCURRENCY);
+    }
+
+    #[test]
+    fn resource_knobs_clamp_low_values_to_one() {
+        let opts = ETLOptions::default()
+            .with_shard_count(0)
+            .with_parallelism(0)
+            .with_file_concurrency(0);
+
+        assert_eq!(opts.shard_count, 1);
+        assert_eq!(opts.parallelism, Some(1));
+        assert_eq!(opts.file_concurrency, 1);
     }
 }

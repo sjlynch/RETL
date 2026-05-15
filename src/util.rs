@@ -1,3 +1,5 @@
+use crate::config::clamp_parallelism_threads;
+use crate::ndjson::{read_line_capped, DEFAULT_MAX_LINE_BYTES};
 use crate::query::{normalize_str, QueryBuildError};
 use anyhow::{Context, Result};
 
@@ -47,10 +49,12 @@ pub fn default_bot_authors() -> Vec<String> {
 /// All entries are normalized (lowercase), then the list is sort+dedup. If
 /// `ETL_EXCLUDE_AUTHORS_FILE` is set to a non-blank path, failure to open or
 /// fully read it is fatal because the file is part of the query semantics.
+/// Per-line reads are bounded by [`DEFAULT_MAX_LINE_BYTES`] so an adversarial
+/// exclusions file cannot OOM the process.
 pub(crate) fn try_merge_extra_exclusions(
     target: &mut Vec<String>,
 ) -> std::result::Result<(), QueryBuildError> {
-    use std::io::{BufRead, BufReader};
+    use std::io::BufReader;
 
     let mut extras = Vec::new();
 
@@ -72,18 +76,25 @@ pub(crate) fn try_merge_extra_exclusions(
                     path.display()
                 ))
             })?;
-            let r = BufReader::new(f);
-            for (idx, line) in r.lines().enumerate() {
-                let line_no = idx + 1;
-                let line = line.map_err(|e| {
-                    QueryBuildError::new(format!(
-                        "ETL_EXCLUDE_AUTHORS_FILE {} could not be read at line {line_no}: {e}",
-                        path.display()
-                    ))
-                })?;
-                let n = normalize_str(&line);
-                if !n.is_empty() {
-                    extras.push(n);
+            let mut r = BufReader::new(f);
+            let mut line = String::with_capacity(1024);
+            let mut line_no: usize = 0;
+            loop {
+                line_no += 1;
+                match read_line_capped(&mut r, &mut line, DEFAULT_MAX_LINE_BYTES, &path) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        let n = normalize_str(&line);
+                        if !n.is_empty() {
+                            extras.push(n);
+                        }
+                    }
+                    Err(e) => {
+                        return Err(QueryBuildError::new(format!(
+                            "ETL_EXCLUDE_AUTHORS_FILE {} could not be read at line {line_no}: {e}",
+                            path.display()
+                        )));
+                    }
                 }
             }
         }
@@ -103,7 +114,10 @@ pub(crate) fn try_merge_extra_exclusions(
 // -------- NEW: scoped Rayon thread pool helper --------
 
 /// Run `f` inside a scoped Rayon thread pool sized to `n` threads. If `n` is
-/// `None` (or `Some(0)`), run on the global default pool.
+/// `None` (or `Some(0)`), run on the global default pool. Positive values are
+/// clamped through [`crate::config::max_parallelism_limit`]; if Rayon still
+/// rejects the pool, RETL logs a warning and safely falls back to the global
+/// pool instead of panicking.
 ///
 /// Prefer this over `rayon::ThreadPoolBuilder::build_global()`, which mutates
 /// process-wide state, only succeeds for the first caller, and prevents
@@ -115,11 +129,19 @@ where
 {
     match n {
         Some(k) if k > 0 => {
-            let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(k)
-                .build()
-                .expect("failed to build rayon thread pool");
-            pool.install(f)
+            let clamped = clamp_parallelism_threads(k, "with_thread_pool");
+            match rayon::ThreadPoolBuilder::new().num_threads(clamped).build() {
+                Ok(pool) => pool.install(f),
+                Err(e) => {
+                    tracing::warn!(
+                        requested = k,
+                        clamped,
+                        error = %e,
+                        "failed to build scoped Rayon thread pool; falling back to global pool"
+                    );
+                    f()
+                }
+            }
         }
         _ => f(),
     }
