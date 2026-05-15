@@ -2,9 +2,13 @@
 
 use crate::date::YearMonth;
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
+use anyhow::Context;
 use regex::Regex;
 use serde_json::Value;
+use std::borrow::Cow;
 use std::fmt;
+use std::io::BufReader;
+use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use time::OffsetDateTime;
 
@@ -30,6 +34,101 @@ impl fmt::Display for QueryBuildError {
 }
 
 impl std::error::Error for QueryBuildError {}
+
+/// Source kind encoded by Reddit fullname prefixes accepted by record-ID
+/// filters. `t1_` selects comments and `t3_` selects submissions; unprefixed
+/// IDs remain source-agnostic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecordIdKind {
+    Comment,
+    Submission,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NormalizedRecordId {
+    pub(crate) bare: String,
+    pub(crate) kind: Option<RecordIdKind>,
+}
+
+fn split_record_kind_prefix(s: &str) -> (Option<RecordIdKind>, &str) {
+    let bytes = s.as_bytes();
+    if bytes.len() >= 3 && bytes[2] == b'_' && bytes[0].eq_ignore_ascii_case(&b't') {
+        match bytes[1] {
+            b'1' => return (Some(RecordIdKind::Comment), &s[3..]),
+            b'3' => return (Some(RecordIdKind::Submission), &s[3..]),
+            _ => {}
+        }
+    }
+    (None, s)
+}
+
+fn lowercase_ascii_if_needed(s: &str) -> Cow<'_, str> {
+    if s.bytes().any(|b| b.is_ascii_uppercase()) {
+        Cow::Owned(s.to_lowercase())
+    } else {
+        Cow::Borrowed(s)
+    }
+}
+
+/// Normalize a user-provided Reddit record ID selector.
+///
+/// Inputs are trimmed, `t1_` / `t3_` fullname prefixes are stripped and kept as
+/// kind constraints, and bare IDs are lowercased for Reddit's base36 IDs. Other
+/// prefixes (for example `t5_`) are treated as part of the bare ID so callers do
+/// not accidentally strip unsupported fullname kinds.
+pub(crate) fn normalize_record_id_selector(raw: &str) -> NormalizedRecordId {
+    let trimmed = raw.trim();
+    let (kind, bare) = split_record_kind_prefix(trimmed);
+    let bare = bare.trim();
+    NormalizedRecordId {
+        bare: lowercase_ascii_if_needed(bare).into_owned(),
+        kind,
+    }
+}
+
+fn normalize_record_id_value(raw: &str) -> Cow<'_, str> {
+    let trimmed = raw.trim();
+    let (_kind, bare) = split_record_kind_prefix(trimmed);
+    lowercase_ascii_if_needed(bare.trim())
+}
+
+/// Read a newline-delimited record-ID file.
+///
+/// Each non-empty, non-comment line is one ID selector. Leading/trailing
+/// whitespace is trimmed; blank lines and lines whose first non-whitespace
+/// character is `#` are ignored. Inline comments are not stripped, so put one
+/// bare ID (or `t1_` / `t3_` fullname) per line.
+pub fn read_record_ids_file(path: impl AsRef<Path>) -> anyhow::Result<Vec<String>> {
+    let path = path.as_ref();
+    let file = crate::util::open_with_backoff(path, 16, 50)
+        .with_context(|| format!("open IDs file {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    let mut ids = Vec::new();
+    let mut line_number = 0_u64;
+
+    loop {
+        let next_line = line_number + 1;
+        let read = crate::ndjson::read_line_capped(
+            &mut reader,
+            &mut line,
+            crate::ndjson::DEFAULT_MAX_LINE_BYTES,
+            path,
+        )
+        .with_context(|| format!("read IDs file {} line {}", path.display(), next_line))?;
+        if read == 0 {
+            break;
+        }
+        line_number = next_line;
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        ids.push(trimmed.to_string());
+    }
+
+    Ok(ids)
+}
 
 /// Numeric operator used by [`JsonPointerPredicate::number`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -388,6 +487,14 @@ fn unix_timestamp_to_year_month(ts: i64) -> Option<YearMonth> {
 #[derive(Debug, Default)]
 pub struct QuerySpec {
     pub subreddits: Option<Vec<String>>,
+    /// Bare Reddit record IDs (without `t1_` / `t3_`) that match either source.
+    /// Prefer [`ScanPlan::ids`](crate::ScanPlan::ids) /
+    /// [`ScanPlan::ids_in`](crate::ScanPlan::ids_in) when accepting user input;
+    /// those builders also understand prefixed fullnames and preserve the
+    /// source constraint.
+    pub ids_in: Option<Vec<String>>,
+    pub(crate) comment_ids_in: Option<Vec<String>>,
+    pub(crate) submission_ids_in: Option<Vec<String>>,
     pub authors_in: Option<Vec<String>>,
     pub authors_out: Option<Vec<String>>,
     pub(crate) authors_out_explicit: bool,
@@ -433,6 +540,9 @@ impl Clone for QuerySpec {
         }
         Self {
             subreddits: self.subreddits.clone(),
+            ids_in: self.ids_in.clone(),
+            comment_ids_in: self.comment_ids_in.clone(),
+            submission_ids_in: self.submission_ids_in.clone(),
             authors_in: self.authors_in.clone(),
             authors_out: self.authors_out.clone(),
             authors_out_explicit: self.authors_out_explicit,
@@ -453,7 +563,9 @@ impl Clone for QuerySpec {
 }
 
 impl QuerySpec {
-    /// Normalize to lowercase, then sort + dedup for binary_search-based filters.
+    /// Normalize to lowercase and sort list filters. Most string lists are
+    /// deduplicated; record-ID filters intentionally keep duplicates so
+    /// [`QuerySpec::validate`] can reject accidental repeated IDs.
     pub fn normalize(mut self) -> Self {
         let lower_sort_dedup = |v: &mut Option<Vec<String>>| {
             if let Some(list) = v.as_mut() {
@@ -466,6 +578,7 @@ impl QuerySpec {
         };
 
         lower_sort_dedup(&mut self.subreddits);
+        normalize_id_filters(&mut self);
         lower_sort_dedup(&mut self.authors_in);
         lower_sort_dedup(&mut self.authors_out);
 
@@ -511,6 +624,10 @@ impl QuerySpec {
         self.timestamp_bounds.validate()?;
 
         validate_string_list_filter("subreddits", &self.subreddits)?;
+        validate_id_list_filter("ids_in", &self.ids_in)?;
+        validate_id_list_filter("ids_in", &self.comment_ids_in)?;
+        validate_id_list_filter("ids_in", &self.submission_ids_in)?;
+        validate_id_filter_overlaps(self)?;
         validate_string_list_filter("authors_in", &self.authors_in)?;
         validate_string_list_filter("authors_out", &self.authors_out)?;
         validate_string_list_filter("domains_in", &self.domains_in)?;
@@ -588,6 +705,62 @@ impl QuerySpec {
             .map_or(true, |kws| kws.iter().all(|kw| kw.is_ascii()))
     }
 
+    pub(crate) fn has_unqualified_id_selectors(&self) -> bool {
+        self.ids_in.as_ref().is_some_and(|v| !v.is_empty())
+    }
+
+    pub(crate) fn has_comment_id_selectors(&self) -> bool {
+        self.comment_ids_in.as_ref().is_some_and(|v| !v.is_empty())
+    }
+
+    pub(crate) fn has_submission_id_selectors(&self) -> bool {
+        self.submission_ids_in
+            .as_ref()
+            .is_some_and(|v| !v.is_empty())
+    }
+
+    pub(crate) fn has_id_filters(&self) -> bool {
+        self.has_unqualified_id_selectors()
+            || self.has_comment_id_selectors()
+            || self.has_submission_id_selectors()
+    }
+
+    pub(crate) fn id_source_hint(&self) -> Option<RecordIdKind> {
+        if self.has_unqualified_id_selectors() {
+            return None;
+        }
+        match (
+            self.has_comment_id_selectors(),
+            self.has_submission_id_selectors(),
+        ) {
+            (true, false) => Some(RecordIdKind::Comment),
+            (false, true) => Some(RecordIdKind::Submission),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn id_filter_matches(&self, kind: RecordIdKind, raw_id: Option<&str>) -> bool {
+        if !self.has_id_filters() {
+            return true;
+        }
+        let Some(raw_id) = raw_id else {
+            return false;
+        };
+        let bare = normalize_record_id_value(raw_id);
+        if bare.is_empty() {
+            return false;
+        }
+        sorted_id_list_contains(self.ids_in.as_ref(), &bare)
+            || match kind {
+                RecordIdKind::Comment => {
+                    sorted_id_list_contains(self.comment_ids_in.as_ref(), &bare)
+                }
+                RecordIdKind::Submission => {
+                    sorted_id_list_contains(self.submission_ids_in.as_ref(), &bare)
+                }
+            }
+    }
+
     pub(crate) fn json_predicates_fingerprint(&self) -> Vec<Value> {
         self.json_predicates
             .iter()
@@ -597,6 +770,7 @@ impl QuerySpec {
 
     pub(crate) fn has_selective_filters(&self) -> bool {
         self.subreddits.as_ref().is_some_and(|v| !v.is_empty())
+            || self.has_id_filters()
             || self.authors_in.as_ref().is_some_and(|v| !v.is_empty())
             || self.author_regex.is_some()
             || self.author_regex_pattern.is_some()
@@ -610,6 +784,111 @@ impl QuerySpec {
             || self.contains_url == Some(true)
             || !self.json_predicates.is_empty()
     }
+}
+
+fn sort_id_list(list: &mut Vec<String>) {
+    list.sort();
+}
+
+fn normalize_id_filters(query: &mut QuerySpec) {
+    let had_any_id_field = query.ids_in.is_some()
+        || query.comment_ids_in.is_some()
+        || query.submission_ids_in.is_some();
+
+    let mut ids_any = Vec::new();
+    let mut ids_comments = Vec::new();
+    let mut ids_submissions = Vec::new();
+
+    if let Some(list) = query.ids_in.take() {
+        for raw in list {
+            let normalized = normalize_record_id_selector(&raw);
+            match normalized.kind {
+                Some(RecordIdKind::Comment) => ids_comments.push(normalized.bare),
+                Some(RecordIdKind::Submission) => ids_submissions.push(normalized.bare),
+                None => ids_any.push(normalized.bare),
+            }
+        }
+    }
+    if let Some(list) = query.comment_ids_in.take() {
+        for raw in list {
+            ids_comments.push(normalize_record_id_selector(&raw).bare);
+        }
+    }
+    if let Some(list) = query.submission_ids_in.take() {
+        for raw in list {
+            ids_submissions.push(normalize_record_id_selector(&raw).bare);
+        }
+    }
+
+    sort_id_list(&mut ids_any);
+    sort_id_list(&mut ids_comments);
+    sort_id_list(&mut ids_submissions);
+
+    let all_empty = ids_any.is_empty() && ids_comments.is_empty() && ids_submissions.is_empty();
+    query.ids_in = if !ids_any.is_empty() || (had_any_id_field && all_empty) {
+        Some(ids_any)
+    } else {
+        None
+    };
+    query.comment_ids_in = (!ids_comments.is_empty()).then_some(ids_comments);
+    query.submission_ids_in = (!ids_submissions.is_empty()).then_some(ids_submissions);
+}
+
+fn sorted_id_list_contains(list: Option<&Vec<String>>, needle: &str) -> bool {
+    list.is_some_and(|list| {
+        list.binary_search_by(|candidate| candidate.as_str().cmp(needle))
+            .is_ok()
+    })
+}
+
+fn validate_id_filter_overlaps(query: &QuerySpec) -> Result<(), QueryBuildError> {
+    let Some(any_ids) = query.ids_in.as_ref() else {
+        return Ok(());
+    };
+    for id in any_ids {
+        if sorted_id_list_contains(query.comment_ids_in.as_ref(), id)
+            || sorted_id_list_contains(query.submission_ids_in.as_ref(), id)
+        {
+            return Err(QueryBuildError::new(format!(
+                "ids_in contains duplicate ID '{id}' after normalization"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_id_list_filter(
+    field: &'static str,
+    value: &Option<Vec<String>>,
+) -> Result<(), QueryBuildError> {
+    let Some(list) = value else {
+        return Ok(());
+    };
+    if list.is_empty() {
+        return Err(QueryBuildError::new(format!(
+            "{field} cannot be an empty list; omit {field} to match all"
+        )));
+    }
+    for id in list {
+        if id.trim().is_empty() {
+            return Err(QueryBuildError::new(format!(
+                "{field} contains a blank entry after normalization; blank entries are not allowed"
+            )));
+        }
+    }
+
+    let mut sorted = list.clone();
+    sorted.sort();
+    if let Some(duplicate) = sorted
+        .windows(2)
+        .find_map(|pair| (pair[0] == pair[1]).then(|| pair[0].clone()))
+    {
+        return Err(QueryBuildError::new(format!(
+            "{field} contains duplicate ID '{duplicate}' after normalization"
+        )));
+    }
+
+    Ok(())
 }
 
 #[inline]

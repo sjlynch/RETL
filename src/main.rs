@@ -29,6 +29,7 @@ fn main() -> Result<()> {
         Command::Scan(a) => bin_handlers::run_scan(a),
         Command::Dedupe(a) => bin_handlers::run_dedupe(a),
         Command::Export(a) => bin_handlers::run_export(a),
+        Command::Convert(a) => bin_handlers::run_convert(a),
         Command::Count(a) => bin_handlers::run_count(a),
         Command::Integrity(a) => bin_handlers::run_integrity(a),
         Command::Aggregate(a) => bin_handlers::run_aggregate(a),

@@ -150,6 +150,8 @@ pub(crate) enum Command {
     Dedupe(DedupeArgs),
     /// Export filtered records as JSONL, JSON, spool files, or partitioned corpus files.
     Export(ExportArgs),
+    /// Flatten existing JSONL/spool files into CSV or TSV columns.
+    Convert(ConvertArgs),
     /// Count records by month, or write per-author counts to TSV.
     Count(CountArgs),
     /// Validate `.zst` monthly files (quick sample or full decode).
@@ -218,6 +220,14 @@ pub(crate) struct CommonOpts {
 
 #[derive(Args, Debug, Clone)]
 pub(crate) struct QueryOpts {
+    /// Record ID allow-list entry (repeatable). Accepts bare IDs plus t1_/t3_ fullnames; prefixed IDs constrain comment/submission matching. Blank or duplicate IDs are rejected.
+    #[arg(long = "id", value_name = "ID")]
+    pub(crate) ids: Vec<String>,
+
+    /// Newline-delimited record IDs to include. Blank lines and lines beginning with # are ignored; inline comments are not stripped. Repeatable.
+    #[arg(long = "ids-file", value_name = "PATH")]
+    pub(crate) ids_files: Vec<PathBuf>,
+
     /// Author allow-list entry (repeatable). `--author-in` is an alias. Blank values are rejected.
     #[arg(long = "author", visible_alias = "author-in", value_name = "NAME")]
     pub(crate) authors: Vec<String>,
@@ -380,9 +390,48 @@ pub(crate) struct SampleArgs {
     /// Error if `--whitelist` matches zero fields in sampled records.
     #[arg(long)]
     pub(crate) strict_whitelist: bool,
-    /// Convert `created_utc` to RFC3339 strings on JSON-family exports.
+    /// Convert `created_utc` to RFC3339 strings on JSON-family exports (not csv/tsv).
     #[arg(long)]
     pub(crate) human_timestamps: bool,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug)]
+pub(crate) enum ConvertFmt {
+    /// RFC4180-style CSV with quoted multiline cells.
+    Csv,
+    /// Tab-separated text; tabs and line breaks in values are rejected.
+    Tsv,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct ConvertArgs {
+    /// Scratch directory used when streaming converted output to stdout.
+    #[arg(long, default_value = "./etl_work")]
+    pub(crate) work_dir: PathBuf,
+    /// RETL spool/parent-enriched directory containing part_RC_*.jsonl / part_RS_*.jsonl files.
+    #[arg(long)]
+    pub(crate) spool: Option<PathBuf>,
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = ConvertFmt::Csv)]
+    pub(crate) format: ConvertFmt,
+    /// Output destination (use `-` for stdout).
+    #[arg(long, short)]
+    pub(crate) out: PathBuf,
+    /// Column field selector. Repeatable and comma-separated. Plain names select top-level keys;
+    /// dotted paths (parent.author) traverse objects; JSON Pointers (/parent/body) handle unusual keys.
+    #[arg(
+        long = "field",
+        alias = "fields",
+        value_delimiter = ',',
+        value_name = "FIELD"
+    )]
+    pub(crate) fields: Vec<String>,
+    /// Omit the header row.
+    #[arg(long)]
+    pub(crate) no_header: bool,
+    /// JSONL input files. Omit when using --spool, or combine with --spool to append extra files.
+    #[arg(num_args = 0.., value_name = "INPUTS")]
+    pub(crate) inputs: Vec<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -455,7 +504,7 @@ pub(crate) struct ExportArgs {
     /// Error if `--whitelist` matches zero fields in the first sampled records.
     #[arg(long)]
     pub(crate) strict_whitelist: bool,
-    /// Convert `created_utc` to RFC3339 strings on JSON-family exports.
+    /// Convert `created_utc` to RFC3339 strings on JSON-family exports (not csv/tsv).
     #[arg(long)]
     pub(crate) human_timestamps: bool,
     /// Stop after approximately N records have been emitted.
@@ -472,12 +521,12 @@ pub(crate) struct ExportArgs {
     /// Set to 1 to match the declared `inflight_bytes` budget exactly.
     #[arg(long)]
     pub(crate) inflight_groups: Option<usize>,
-    /// Resume a prior export with the same query/config/corpus. `jsonl`/`json`
-    /// reuse per-month `.part_*.jsonl` files and `_progress.json` in a namespaced
-    /// scratch dir under `--work-dir`; `spool`, `zst`, and `partitioned-jsonl`
-    /// use `_progress.json` under `--out`. Changing filters, corpus paths,
-    /// sources, date range, whitelist, timestamp formatting, or (for ZST)
-    /// zst level invalidates the checkpoint and rebuilds the parts.
+    /// Resume a prior JSON-family export with the same query/config/corpus (not csv/tsv).
+    /// `jsonl`/`json` reuse per-month `.part_*.jsonl` files and `_progress.json`
+    /// in a namespaced scratch dir under `--work-dir`; `spool`, `zst`, and
+    /// `partitioned-jsonl` use `_progress.json` under `--out`. Changing filters,
+    /// corpus paths, sources, date range, whitelist, timestamp formatting, or
+    /// (for ZST) zst level invalidates the checkpoint and rebuilds the parts.
     #[arg(long)]
     pub(crate) resume: bool,
 }
@@ -490,7 +539,7 @@ pub(crate) enum ExportFmt {
     Json,
     /// Single RFC4180-style CSV file (requires --whitelist).
     Csv,
-    /// Single tab-separated file (requires --whitelist; literal tabs in values are rejected).
+    /// Single tab-separated file (requires --whitelist; tabs and line breaks in values are rejected).
     Tsv,
     /// Per-source per-month `part_RC_YYYY-MM.jsonl` / `part_RS_YYYY-MM.jsonl`.
     Spool,
@@ -571,7 +620,8 @@ pub(crate) struct AggregateArgs {
     /// Output path. Without `--by`, writes JSON record-count state; with `--by`, writes TSV.
     #[arg(long, short)]
     pub(crate) out: PathBuf,
-    /// Directory used for per-input aggregate shards (default: alongside `--out`).
+    /// Directory used for per-run aggregate shard namespaces (default:
+    /// alongside `--out`).
     #[arg(long)]
     pub(crate) shards_dir: Option<PathBuf>,
     /// Field-indent the final JSON (only used when `--by` is omitted).

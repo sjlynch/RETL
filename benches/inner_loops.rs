@@ -9,7 +9,7 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use retl::{
     bucketize_shards, for_each_line_cfg, matches_minimal, parse_minimal, partition_stage1,
-    process_bucket_streaming, rewrite_human_timestamps_bytes, BucketingCfg, KeyExtractor,
+    process_bucket_streaming, rewrite_human_timestamps_bytes, BucketingCfg, FileKind, KeyExtractor,
     MinimalRecord, QuerySpec, WhitelistTokenizer,
 };
 use serde_json::Value;
@@ -164,7 +164,7 @@ fn bench_matches_minimal(c: &mut Criterion) {
                 b.iter(|| {
                     let mut hits: u32 = 0;
                     for r in recs.iter() {
-                        if matches_minimal(r, Some(targets), &q) {
+                        if matches_minimal(r, Some(targets), &q, FileKind::Comment) {
                             hits += 1;
                         }
                     }

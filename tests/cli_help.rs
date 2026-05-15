@@ -19,6 +19,7 @@ fn root_help_lists_all_subcommands() {
         .and(contains("scan"))
         .and(contains("dedupe"))
         .and(contains("export"))
+        .and(contains("convert"))
         .and(contains("count"))
         .and(contains("integrity"))
         .and(contains("aggregate"))
@@ -95,6 +96,8 @@ fn scan_help_advertises_common_flags() {
         .and(contains("--no-progress"))
         .and(contains("--source"))
         .and(contains("--subreddit"))
+        .and(contains("--id"))
+        .and(contains("--ids-file"))
         .and(contains("--author"))
         .and(contains("--exclude-author"))
         .and(contains("--exclude-common-bots"))
@@ -128,6 +131,18 @@ fn export_help_advertises_format_and_out() {
         .and(contains("--out"))
         .and(contains("--pretty"))
         .and(contains("Field-indent the JSON array"));
+    assert.stdout(pred);
+}
+
+#[test]
+fn convert_help_advertises_fields_spool_format_and_out() {
+    let assert = retl().args(["convert", "--help"]).assert().success();
+    let pred = contains("--field")
+        .and(contains("--spool"))
+        .and(contains("--format"))
+        .and(contains("csv"))
+        .and(contains("tsv"))
+        .and(contains("--out"));
     assert.stdout(pred);
 }
 
