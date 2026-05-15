@@ -3,11 +3,11 @@
 
 use anyhow::{Context, Result};
 use retl::{
-    create_dir_all_with_backoff, create_new_with_backoff, discover_sources_checked,
-    for_each_line_cfg, format_year_month_ranges, missing_month_diagnostics, open_with_backoff,
-    plan_files, plan_files_checked, read_line_capped, remove_with_backoff,
-    replace_file_atomic_backoff, total_compressed_size, AggregateBuildReport, ExportFormat,
-    FileKind, IntegrityMode, KeyExtractor, ParentPayloadSpec, RedditETL, Sources,
+    convert_jsonl_to_csv, convert_jsonl_to_tsv, create_dir_all_with_backoff,
+    create_new_with_backoff, discover_sources_checked, for_each_line_cfg, format_year_month_ranges,
+    missing_month_diagnostics, open_with_backoff, plan_files, plan_files_checked, read_line_capped,
+    remove_with_backoff, replace_file_atomic_backoff, total_compressed_size, AggregateBuildReport,
+    ExportFormat, FileKind, IntegrityMode, KeyExtractor, ParentPayloadSpec, RedditETL, Sources,
     TabularExportOptions, YearMonth, DEFAULT_MAX_LINE_BYTES,
 };
 use serde::Serialize;
@@ -20,9 +20,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::bin_args::{
-    AggregateArgs, CountArgs, CountMode, DedupeArgs, DescribeArgs, ExportArgs, ExportFmt,
-    FirstSeenArgs, IntegrityArgs, IntegrityModeArg, ParentsArgs, SampleArgs, ScanArgs, SchemaArgs,
-    SchemaFmt, SourceArg,
+    AggregateArgs, ConvertArgs, ConvertFmt, CountArgs, CountMode, DedupeArgs, DescribeArgs,
+    ExportArgs, ExportFmt, FirstSeenArgs, IntegrityArgs, IntegrityModeArg, ParentsArgs, SampleArgs,
+    ScanArgs, SchemaArgs, SchemaFmt, SourceArg,
 };
 use crate::bin_helpers::{
     build_etl, discover_spool_parts, emit_partial_read_report, plan, stream_extract_to_stdout,
@@ -690,6 +690,47 @@ pub(crate) fn run_sample(args: SampleArgs) -> Result<()> {
         }
     }
     emit_partial_read_report(&partial_reporter)?;
+    Ok(())
+}
+
+pub(crate) fn run_convert(args: ConvertArgs) -> Result<()> {
+    if args.fields.iter().all(|field| field.trim().is_empty()) {
+        anyhow::bail!("retl convert requires at least one --field selector");
+    }
+
+    let mut inputs = Vec::new();
+    if let Some(spool) = &args.spool {
+        let (parts, _min, _max) = discover_spool_parts(spool)?;
+        inputs.extend(parts);
+    }
+    inputs.extend(args.inputs.iter().cloned());
+    if inputs.is_empty() {
+        anyhow::bail!("retl convert requires --spool or at least one JSONL input file");
+    }
+
+    let opts = TabularExportOptions {
+        header: !args.no_header,
+    };
+    let fields = args.fields.clone();
+    let to_stdout = args.out == Path::new("-");
+    let write = |path: &Path| -> Result<u64> {
+        match args.format {
+            ConvertFmt::Csv => convert_jsonl_to_csv(&inputs, path, fields.clone(), opts),
+            ConvertFmt::Tsv => convert_jsonl_to_tsv(&inputs, path, fields.clone(), opts),
+        }
+    };
+
+    if to_stdout {
+        let stem = match args.format {
+            ConvertFmt::Csv => "convert.csv",
+            ConvertFmt::Tsv => "convert.tsv",
+        };
+        stream_path_output_to_stdout(&args.work_dir, "convert", stem, |path| {
+            write(path).map(|_| ())
+        })?;
+    } else {
+        write(&args.out)?;
+    }
     Ok(())
 }
 

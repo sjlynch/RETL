@@ -52,6 +52,11 @@ fn cli_rejects_blank_subreddit_before_scanning() {
 }
 
 #[test]
+fn cli_rejects_blank_id_before_scanning() {
+    assert_blank_filter_fails_before_scan(&["--id", "t1_"], "ids_in");
+}
+
+#[test]
 fn cli_rejects_blank_author_before_scanning() {
     assert_blank_filter_fails_before_scan(&["--author", ""], "authors_in");
 }
@@ -69,6 +74,50 @@ fn cli_rejects_blank_domain_before_scanning() {
 #[test]
 fn cli_rejects_blank_keyword_before_scanning() {
     assert_blank_filter_fails_before_scan(&["--keyword", ""], "keywords_any");
+}
+
+#[test]
+fn cli_rejects_blank_keyword_all_before_scanning() {
+    assert_blank_filter_fails_before_scan(&["--keyword-all", ""], "keywords_all");
+}
+
+#[test]
+fn cli_rejects_blank_excluded_keyword_before_scanning() {
+    assert_blank_filter_fails_before_scan(&["--exclude-keyword", ""], "keywords_exclude");
+}
+
+#[test]
+fn cli_rejects_invalid_text_regex_before_scanning() {
+    let base = corrupt_corpus();
+
+    let mut cmd = base_scan_cmd(&base);
+    cmd.args(["--text-regex", "["])
+        .env_remove("ETL_EXCLUDE_AUTHORS")
+        .env_remove("ETL_EXCLUDE_AUTHORS_FILE")
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("text_regex")
+                .and(predicate::str::contains("invalid"))
+                .and(predicate::str::contains("zstd").not()),
+        );
+}
+
+#[test]
+fn cli_rejects_blank_text_regex_before_scanning() {
+    let base = corrupt_corpus();
+
+    let mut cmd = base_scan_cmd(&base);
+    cmd.args(["--text-regex", " "])
+        .env_remove("ETL_EXCLUDE_AUTHORS")
+        .env_remove("ETL_EXCLUDE_AUTHORS_FILE")
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("text_regex")
+                .and(predicate::str::contains("blank regex patterns"))
+                .and(predicate::str::contains("zstd").not()),
+        );
 }
 
 #[test]

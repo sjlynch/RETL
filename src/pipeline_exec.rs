@@ -266,7 +266,7 @@ impl RedditETL {
 
         with_thread_pool(parallelism, || {
             let work_dir = self.ensure_work_dir()?;
-            let files = plan_pipeline_files(&self)?;
+            let files = plan_pipeline_files(&self, None)?;
             tracing::info!("Planned {} files for processing.", files.len());
 
             let shard_writer =
@@ -643,6 +643,16 @@ impl ScanPlan {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
+        if self.etl.opts.human_readable_timestamps {
+            anyhow::bail!(
+                "--human-timestamps is not supported for CSV/TSV export; use --format jsonl/json/spool/zst/partitioned-jsonl or omit the flag"
+            );
+        }
+        if self.etl.opts.resume {
+            anyhow::bail!(
+                "--resume is not supported for CSV/TSV export; use --format jsonl/json/spool/zst/partitioned-jsonl or omit the flag"
+            );
+        }
         let fields = normalize_tabular_fields(fields)?;
         let mut scan = self;
         scan.etl.opts.whitelist_fields = Some(fields.clone());
@@ -686,8 +696,9 @@ impl ScanPlan {
 
             let targets =
                 resolve_target_subs_from(&plan.etl.opts.subreddit, &plan.query.subreddits);
-            let files = plan_pipeline_files(&plan.etl)?;
+            let files = plan_pipeline_files(&plan.etl, Some(&plan.query))?;
             warn_if_unfiltered_undated_query(&plan.etl, &plan.query, &files);
+            let planned_keys = planned_job_keys(&files);
 
             let resume = plan.etl.opts.resume;
             let resume_fingerprint =
@@ -696,10 +707,14 @@ impl ScanPlan {
             // current query/config fingerprint and the file actually on disk,
             // then snapshot surviving keys before any worker mutates the accumulator.
             let (initial_months, completed_keys) = if resume {
-                load_and_validate_manifest(out_dir, &resume_fingerprint)?
+                load_and_validate_manifest(out_dir, &resume_fingerprint, &planned_keys)?
             } else {
+                clear_spool_resume_parts(out_dir)?;
                 (HashMap::new(), HashSet::new())
             };
+            if resume {
+                prune_spool_outputs_except(out_dir, &completed_keys)?;
+            }
 
             let total_bytes = total_compressed_size(&files);
             let pb = if plan.etl.opts.progress {
@@ -743,9 +758,12 @@ impl ScanPlan {
             };
 
             let whitelist = plan.etl.opts.whitelist_fields.clone();
-            let whitelist_tracker = whitelist
-                .as_ref()
-                .map(|_| Arc::new(WhitelistMatchTracker::new(plan.etl.opts.strict_whitelist)));
+            let whitelist_tracker = whitelist.as_ref().map(|fields| {
+                Arc::new(WhitelistMatchTracker::new(
+                    plan.etl.opts.strict_whitelist,
+                    fields.iter().cloned(),
+                ))
+            });
             let record_limit = record_limit_from_with_claimed(plan.limit, resumed_lines);
             let targets_ref = targets.as_ref();
             let bounds = bounds_tuple(plan.etl.opts.start, plan.etl.opts.end);
@@ -790,6 +808,9 @@ impl ScanPlan {
                 },
             )?;
 
+            if let Some(tracker) = &whitelist_tracker {
+                tracker.finalize()?;
+            }
             if let Some(pb) = pb {
                 pb.finish_with_message("done");
             }
@@ -980,7 +1001,7 @@ impl ScanPlan {
         let parallelism = plan.etl.opts.parallelism;
 
         with_thread_pool(parallelism, || {
-            let files = plan_pipeline_files(&plan.etl)?;
+            let files = plan_pipeline_files(&plan.etl, Some(&plan.query))?;
             warn_if_unfiltered_undated_query(&plan.etl, &plan.query, &files);
 
             let comments_dir = out_base_dir.join("comments");
@@ -997,6 +1018,7 @@ impl ScanPlan {
             let staging_dir = ensure_staging_dir(out_base_dir)?;
             sweep_stale_inprogress(out_base_dir, true)?;
 
+            let planned_keys = planned_job_keys(&files);
             let resume = plan.etl.opts.resume;
             let resume_fingerprint = build_resume_fingerprint(
                 &plan.etl,
@@ -1006,10 +1028,19 @@ impl ScanPlan {
                 &files,
             )?;
             let (initial_months, completed_keys) = if resume {
-                load_and_validate_partitioned_manifest(out_base_dir, &resume_fingerprint, format)?
+                load_and_validate_partitioned_manifest(
+                    out_base_dir,
+                    &resume_fingerprint,
+                    format,
+                    &planned_keys,
+                )?
             } else {
+                clear_partitioned_resume_outputs(out_base_dir, format)?;
                 (HashMap::new(), HashSet::new())
             };
+            if resume {
+                prune_partitioned_outputs_except(out_base_dir, format, &completed_keys)?;
+            }
             let resumed_lines = committed_line_count(&initial_months);
             let accumulator = if resume {
                 crate::progress_manifest::save(
@@ -1027,9 +1058,12 @@ impl ScanPlan {
             };
 
             let whitelist = plan.etl.opts.whitelist_fields.clone();
-            let whitelist_tracker = whitelist
-                .as_ref()
-                .map(|_| Arc::new(WhitelistMatchTracker::new(plan.etl.opts.strict_whitelist)));
+            let whitelist_tracker = whitelist.as_ref().map(|fields| {
+                Arc::new(WhitelistMatchTracker::new(
+                    plan.etl.opts.strict_whitelist,
+                    fields.iter().cloned(),
+                ))
+            });
             let record_limit = record_limit_from_with_claimed(plan.limit, resumed_lines);
             let targets_ref = targets.as_ref();
             let bounds = bounds_tuple(plan.etl.opts.start, plan.etl.opts.end);
@@ -1146,6 +1180,9 @@ impl ScanPlan {
                 },
             )?;
 
+            if let Some(tracker) = &whitelist_tracker {
+                tracker.finalize()?;
+            }
             if let Some(pb) = pb {
                 pb.finish_with_message("done");
             }
@@ -1179,7 +1216,26 @@ struct ScanCheckpoint {
     matched_records: u64,
 }
 
-fn plan_pipeline_files(etl: &RedditETL) -> Result<Vec<FileJob>> {
+fn effective_plan_range(
+    etl: &RedditETL,
+    query: Option<&QuerySpec>,
+) -> (Option<YearMonth>, Option<YearMonth>) {
+    let mut start = etl.opts.start;
+    let mut end = etl.opts.end;
+
+    if let Some(bounds) = query.map(|q| q.timestamp_bounds) {
+        if start.is_none() {
+            start = bounds.derived_start_month();
+        }
+        if end.is_none() {
+            end = bounds.derived_end_month();
+        }
+    }
+
+    (start, end)
+}
+
+fn plan_pipeline_files(etl: &RedditETL, query: Option<&QuerySpec>) -> Result<Vec<FileJob>> {
     if let Some(err) = etl.opts.build_error.clone() {
         return Err(err.into());
     }
@@ -1188,15 +1244,16 @@ fn plan_pipeline_files(etl: &RedditETL) -> Result<Vec<FileJob>> {
         &etl.opts.submissions_dir,
         etl.opts.sources,
     )?;
+    let (start, end) = effective_plan_range(etl, query);
     let jobs = plan_files_checked(
         &discovered,
         &etl.opts.comments_dir,
         &etl.opts.submissions_dir,
         etl.opts.sources,
-        etl.opts.start,
-        etl.opts.end,
+        start,
+        end,
     )?;
-    log_missing_month_warnings(&discovered, etl.opts.sources, etl.opts.start, etl.opts.end);
+    log_missing_month_warnings(&discovered, etl.opts.sources, start, end);
     Ok(jobs)
 }
 
@@ -1377,6 +1434,9 @@ fn build_resume_fingerprint(
         "limit": limit,
         "query": {
             "subreddits": query.subreddits.as_ref(),
+            "ids_in": query.ids_in.as_ref(),
+            "comment_ids_in": query.comment_ids_in.as_ref(),
+            "submission_ids_in": query.submission_ids_in.as_ref(),
             "authors_in": query.authors_in.as_ref(),
             "authors_out": query.authors_out.as_ref(),
             "exclude_common_bots": query.exclude_common_bots,
@@ -1384,9 +1444,18 @@ fn build_resume_fingerprint(
             "author_regex_pattern": query.author_regex_pattern.as_ref(),
             "min_score": query.min_score,
             "max_score": query.max_score,
+            "timestamp_bounds": {
+                "created_utc_gte": query.timestamp_bounds.created_utc_gte,
+                "created_utc_lt": query.timestamp_bounds.created_utc_lt,
+            },
             "keywords_any": query.keywords_any.as_ref(),
+            "keywords_all": query.keywords_all.as_ref(),
+            "keywords_exclude": query.keywords_exclude.as_ref(),
+            "text_regex": query.text_regex.as_ref().map(|re| re.as_str()),
+            "text_regex_pattern": query.text_regex_pattern.as_ref(),
             "domains_in": query.domains_in.as_ref(),
             "contains_url": query.contains_url,
+            "no_url": query.no_url,
             "json_predicates": query.json_predicates_fingerprint(),
             "filter_pseudo_users": query.filter_pseudo_users,
         }
@@ -1410,17 +1479,38 @@ fn remove_matching_files(dir: &Path, mut should_remove: impl FnMut(&str) -> bool
             continue;
         };
         if should_remove(name) {
-            if let Err(e) = remove_with_backoff(&path, 8, 50) {
-                tracing::warn!(path=%path.display(), error=%e, "failed to remove stale resume part");
-            }
+            remove_with_backoff(&path, 8, 50)
+                .with_context(|| format!("remove stale RETL-owned output {}", path.display()))?;
         }
     }
     Ok(())
 }
 
+fn planned_job_keys(files: &[FileJob]) -> HashSet<String> {
+    files.iter().map(export_part_key).collect()
+}
+
+fn spool_key_from_part_name(name: &str) -> Option<String> {
+    let (prefix, key_prefix) = if name.starts_with("part_RC_") {
+        ("part_RC_", "RC")
+    } else if name.starts_with("part_RS_") {
+        ("part_RS_", "RS")
+    } else {
+        return None;
+    };
+    let ym = name.strip_prefix(prefix)?.strip_suffix(".jsonl")?;
+    ym.parse::<YearMonth>().ok()?;
+    Some(format!("{key_prefix}_{ym}"))
+}
+
 fn clear_spool_resume_parts(out_dir: &Path) -> Result<()> {
-    remove_matching_files(out_dir, |name| {
-        (name.starts_with("part_RC_") || name.starts_with("part_RS_")) && name.ends_with(".jsonl")
+    remove_matching_files(out_dir, |name| spool_key_from_part_name(name).is_some())
+}
+
+fn prune_spool_outputs_except(out_dir: &Path, keep_keys: &HashSet<String>) -> Result<()> {
+    remove_matching_files(out_dir, |name| match spool_key_from_part_name(name) {
+        Some(key) => !keep_keys.contains(&key),
+        None => false,
     })
 }
 
@@ -1455,6 +1545,7 @@ struct MonthJobCtx<'a> {
 fn load_and_validate_manifest(
     out_dir: &Path,
     fingerprint: &str,
+    planned_keys: &HashSet<String>,
 ) -> Result<(HashMap<String, MonthEntry>, HashSet<String>)> {
     let manifest = crate::progress_manifest::load(out_dir);
     if manifest.fingerprint.as_deref() != Some(fingerprint) && !manifest.months.is_empty() {
@@ -1469,6 +1560,10 @@ fn load_and_validate_manifest(
     }
     let mut keep: HashMap<String, MonthEntry> = HashMap::new();
     for (k, v) in manifest.months {
+        if !planned_keys.contains(&k) {
+            tracing::info!(key=%k, "dropping progress manifest entry outside current spool plan");
+            continue;
+        }
         let final_name = format!("part_{}.jsonl", k);
         let final_path = out_dir.join(&final_name);
         match fs::metadata(&final_path) {
@@ -1627,13 +1722,44 @@ fn partitioned_output_path_for_key(
     )
 }
 
-fn clear_partitioned_resume_outputs(out_base_dir: &Path, format: ExportFormat) -> Result<()> {
+fn partitioned_key_from_output_name(
+    name: &str,
+    key_prefix: &str,
+    format: ExportFormat,
+) -> Option<String> {
+    let prefix = format!("{key_prefix}_");
     let suffix = format!(".{}", partitioned_ext(format));
+    let ym = name.strip_prefix(&prefix)?.strip_suffix(&suffix)?;
+    ym.parse::<YearMonth>().ok()?;
+    Some(format!("{key_prefix}_{ym}"))
+}
+
+fn clear_partitioned_resume_outputs(out_base_dir: &Path, format: ExportFormat) -> Result<()> {
     remove_matching_files(&out_base_dir.join("comments"), |name| {
-        name.starts_with("RC_") && name.ends_with(&suffix)
+        partitioned_key_from_output_name(name, "RC", format).is_some()
     })?;
     remove_matching_files(&out_base_dir.join("submissions"), |name| {
-        name.starts_with("RS_") && name.ends_with(&suffix)
+        partitioned_key_from_output_name(name, "RS", format).is_some()
+    })?;
+    Ok(())
+}
+
+fn prune_partitioned_outputs_except(
+    out_base_dir: &Path,
+    format: ExportFormat,
+    keep_keys: &HashSet<String>,
+) -> Result<()> {
+    remove_matching_files(&out_base_dir.join("comments"), |name| {
+        match partitioned_key_from_output_name(name, "RC", format) {
+            Some(key) => !keep_keys.contains(&key),
+            None => false,
+        }
+    })?;
+    remove_matching_files(&out_base_dir.join("submissions"), |name| {
+        match partitioned_key_from_output_name(name, "RS", format) {
+            Some(key) => !keep_keys.contains(&key),
+            None => false,
+        }
     })?;
     Ok(())
 }
@@ -1680,6 +1806,7 @@ fn load_and_validate_partitioned_manifest(
     out_base_dir: &Path,
     fingerprint: &str,
     format: ExportFormat,
+    planned_keys: &HashSet<String>,
 ) -> Result<(HashMap<String, MonthEntry>, HashSet<String>)> {
     let manifest = crate::progress_manifest::load(out_base_dir);
     if manifest.fingerprint.as_deref() != Some(fingerprint) && !manifest.months.is_empty() {
@@ -1695,6 +1822,10 @@ fn load_and_validate_partitioned_manifest(
 
     let mut keep: HashMap<String, MonthEntry> = HashMap::new();
     for (key, entry) in manifest.months {
+        if !planned_keys.contains(&key) {
+            tracing::info!(key=%key, "dropping partitioned progress entry outside current plan");
+            continue;
+        }
         let Some(path) = partitioned_output_path_for_key(out_base_dir, &key, format) else {
             tracing::info!(key=%key, "dropping unrecognized partitioned progress entry");
             continue;
@@ -1844,7 +1975,7 @@ fn materialize_scan_checkpoint(
     show_progress: bool,
     limit: Option<u64>,
 ) -> Result<ScanCheckpoint> {
-    let files = plan_pipeline_files(etl)?;
+    let files = plan_pipeline_files(etl, Some(query))?;
     warn_if_unfiltered_undated_query(etl, query, &files);
 
     let work_dir = etl.ensure_work_dir()?;
@@ -2040,6 +2171,84 @@ fn tabular_part_paths(tmp_dir: &Path, format: TabularFormat) -> Result<Vec<PathB
     Ok(paths)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TabularFieldSelector {
+    TopLevel(String),
+    JsonPointer(String),
+    Dotted(Vec<String>),
+}
+
+impl TabularFieldSelector {
+    fn parse(raw: &str) -> Result<Self> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            anyhow::bail!("CSV/TSV field names must not be empty");
+        }
+        if let Some(pointer) = trimmed.strip_prefix("json:") {
+            validate_tabular_json_pointer(pointer)?;
+            return Ok(Self::JsonPointer(pointer.to_string()));
+        }
+        if trimmed.starts_with('/') {
+            validate_tabular_json_pointer(trimmed)?;
+            return Ok(Self::JsonPointer(trimmed.to_string()));
+        }
+        if trimmed.contains('.') {
+            let parts: Vec<String> = trimmed
+                .split('.')
+                .map(str::trim)
+                .map(str::to_string)
+                .collect();
+            if parts.iter().any(String::is_empty) {
+                anyhow::bail!(
+                    "bad dotted tabular field {trimmed:?}: path segments must not be empty; use JSON Pointer syntax for unusual keys"
+                );
+            }
+            return Ok(Self::Dotted(parts));
+        }
+        Ok(Self::TopLevel(trimmed.to_string()))
+    }
+
+    fn value<'a>(&self, record: &'a Value) -> Option<&'a Value> {
+        match self {
+            Self::TopLevel(key) => record.as_object().and_then(|map| map.get(key)),
+            Self::JsonPointer(pointer) => record.pointer(pointer),
+            Self::Dotted(parts) => {
+                let mut cur = record;
+                for part in parts {
+                    cur = cur.as_object()?.get(part)?;
+                }
+                Some(cur)
+            }
+        }
+    }
+}
+
+fn parse_tabular_field_selectors(fields: &[String]) -> Result<Vec<TabularFieldSelector>> {
+    fields
+        .iter()
+        .map(|field| TabularFieldSelector::parse(field))
+        .collect()
+}
+
+fn validate_tabular_json_pointer(pointer: &str) -> Result<()> {
+    if !pointer.starts_with('/') {
+        anyhow::bail!("JSON Pointer tabular fields must start with '/': {pointer:?}");
+    }
+    let mut chars = pointer.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '~' {
+            match chars.next() {
+                Some('0') | Some('1') => {}
+                other => anyhow::bail!(
+                    "bad JSON Pointer tabular field {pointer:?}: invalid escape near '~{:?}'; use '~0' for '~' and '~1' for '/'",
+                    other
+                ),
+            }
+        }
+    }
+    Ok(())
+}
+
 fn write_csv_cell<W: Write + ?Sized>(out: &mut W, cell: &str) -> Result<()> {
     let quote = cell
         .as_bytes()
@@ -2092,13 +2301,20 @@ fn write_tabular_row<W: Write + ?Sized>(
         }
         TabularFormat::Tsv => {
             for (field, cell) in fields.iter().zip(cells.iter()) {
-                if cell.contains('\t') {
+                if let Some(ch) = cell.chars().find(|ch| matches!(ch, '\t' | '\n' | '\r')) {
+                    let desc = match ch {
+                        '\t' => "tab",
+                        '\n' => "line feed",
+                        '\r' => "carriage return",
+                        _ => unreachable!(),
+                    };
                     tracing::warn!(
                         field,
-                        "refusing to emit TSV value containing a literal tab; use --format csv for robust escaping"
+                        character = desc,
+                        "refusing to emit TSV value containing a tab or line break; use --format csv for robust escaping"
                     );
                     anyhow::bail!(
-                        "TSV export cannot represent a literal tab in field {field:?}; use --format csv"
+                        "TSV export cannot represent a {desc} in field {field:?}; use --format csv"
                     );
                 }
             }
@@ -2114,18 +2330,20 @@ fn write_tabular_row<W: Write + ?Sized>(
     Ok(())
 }
 
-fn tabular_cells_from_value(value: &Value, fields: &[String]) -> Result<(Vec<String>, bool)> {
-    let map = value.as_object();
-    let mut matched_any = false;
-    let mut cells = Vec::with_capacity(fields.len());
-    for field in fields {
-        let field_value = map.and_then(|map| map.get(field));
+fn tabular_cells_from_value(
+    value: &Value,
+    selectors: &[TabularFieldSelector],
+) -> Result<(Vec<String>, Vec<usize>)> {
+    let mut matched_indices = Vec::new();
+    let mut cells = Vec::with_capacity(selectors.len());
+    for (idx, selector) in selectors.iter().enumerate() {
+        let field_value = selector.value(value);
         if field_value.is_some() {
-            matched_any = true;
+            matched_indices.push(idx);
         }
         cells.push(value_to_tabular_cell(field_value)?);
     }
-    Ok((cells, matched_any))
+    Ok((cells, matched_indices))
 }
 
 fn write_tabular_header<W: Write + ?Sized>(
@@ -2166,6 +2384,7 @@ fn stream_tabular_job<W: Write + ?Sized>(
     targets: Option<&Vec<String>>,
     query: &QuerySpec,
     fields: &[String],
+    selectors: &[TabularFieldSelector],
     format: TabularFormat,
     pb: Option<ProgressBar>,
     bounds: Option<DateBounds>,
@@ -2186,7 +2405,7 @@ fn stream_tabular_job<W: Write + ?Sized>(
                 Err(e) => return Err(malformed_json_error(&job.path, line_number, e)),
             },
         };
-        if !matches_minimal(&min, targets, query) || !within_bounds(&min, bounds) {
+        if !matches_minimal(&min, targets, query, job.kind) || !within_bounds(&min, bounds) {
             return Ok(());
         }
         if query.requires_full_parse() {
@@ -2199,12 +2418,19 @@ fn stream_tabular_job<W: Write + ?Sized>(
         claim_record_or_stop(record_limit)?;
         let val: Value = serde_json::from_str(line)
             .map_err(|e| malformed_json_error(&job.path, line_number, e))?;
-        let (cells, matched_any) = tabular_cells_from_value(&val, fields)?;
-        write_tabular_row(writer, fields, &cells, format)?;
+        let (cells, matched_indices) = tabular_cells_from_value(&val, selectors)?;
+        write_tabular_row(writer, fields, &cells, format).with_context(|| {
+            format!(
+                "writing {} row for {} line {}",
+                format.label(),
+                job.path.display(),
+                line_number
+            )
+        })?;
         written += 1;
         if let Some(tracker) = whitelist_tracker {
             tracker.observe(crate::streaming::WhitelistEmission {
-                emitted_empty_projection: !matched_any,
+                matched_fields: &matched_indices,
                 used_slow_path: false,
             })?;
         }
@@ -2238,9 +2464,6 @@ fn stream_tabular_job<W: Write + ?Sized>(
         Err(e) if is_record_limit_reached(&e) => true,
         Err(e) => return Err(e),
     };
-    if let Some(tracker) = whitelist_tracker {
-        tracker.finalize()?;
-    }
     Ok(StreamJobResult { written, complete })
 }
 
@@ -2257,7 +2480,7 @@ fn extract_tabular_common(
 ) -> Result<()> {
     let parallelism = etl.opts.parallelism;
     with_thread_pool(parallelism, || {
-        let files = plan_pipeline_files(etl)?;
+        let files = plan_pipeline_files(etl, Some(query))?;
         warn_if_unfiltered_undated_query(etl, query, &files);
 
         let work_dir = etl.ensure_work_dir()?;
@@ -2272,8 +2495,10 @@ fn extract_tabular_common(
         let staging_dir = ensure_staging_dir(&tmp_dir)?;
         sweep_stale_inprogress(&tmp_dir, true)?;
 
+        let selectors = parse_tabular_field_selectors(fields)?;
         let whitelist_tracker = Some(Arc::new(WhitelistMatchTracker::new(
             etl.opts.strict_whitelist,
+            fields.iter().cloned(),
         )));
         let record_limit = record_limit_from(limit);
         let total_bytes = total_compressed_size(&files);
@@ -2309,6 +2534,7 @@ fn extract_tabular_common(
                         targets,
                         query,
                         fields,
+                        &selectors,
                         format,
                         pb.clone(),
                         bounds,
@@ -2334,6 +2560,9 @@ fn extract_tabular_common(
             },
         )?;
 
+        if let Some(tracker) = &whitelist_tracker {
+            tracker.finalize()?;
+        }
         if let Some(pb) = pb {
             pb.finish_with_message("done");
         }
@@ -2342,6 +2571,118 @@ fn extract_tabular_common(
             tracing::warn!(path=%tmp_dir.display(), error=%e, "failed to remove tabular extract scratch dir");
         }
         Ok(())
+    })
+}
+
+/// Convert existing plain JSONL files (including RETL spool/parent-enriched
+/// parts) into a single CSV file using top-level, dotted, or JSON Pointer
+/// field selectors. Missing fields render as empty cells.
+pub fn convert_jsonl_to_csv<I, P, J, S>(
+    inputs: I,
+    out_path: &Path,
+    fields: J,
+    opts: TabularExportOptions,
+) -> Result<u64>
+where
+    I: IntoIterator<Item = P>,
+    P: AsRef<Path>,
+    J: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    convert_jsonl_to_tabular(inputs, out_path, fields, opts, TabularFormat::Csv)
+}
+
+/// Convert existing plain JSONL files (including RETL spool/parent-enriched
+/// parts) into a single TSV file using top-level, dotted, or JSON Pointer
+/// field selectors. Values containing tabs or line breaks are rejected; use
+/// CSV for arbitrary Reddit text fields.
+pub fn convert_jsonl_to_tsv<I, P, J, S>(
+    inputs: I,
+    out_path: &Path,
+    fields: J,
+    opts: TabularExportOptions,
+) -> Result<u64>
+where
+    I: IntoIterator<Item = P>,
+    P: AsRef<Path>,
+    J: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    convert_jsonl_to_tabular(inputs, out_path, fields, opts, TabularFormat::Tsv)
+}
+
+fn convert_jsonl_to_tabular<I, P, J, S>(
+    inputs: I,
+    out_path: &Path,
+    fields: J,
+    opts: TabularExportOptions,
+    format: TabularFormat,
+) -> Result<u64>
+where
+    I: IntoIterator<Item = P>,
+    P: AsRef<Path>,
+    J: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let input_paths: Vec<PathBuf> = inputs
+        .into_iter()
+        .map(|path| path.as_ref().to_path_buf())
+        .collect();
+    if input_paths.is_empty() {
+        anyhow::bail!("convert requires at least one JSONL input file");
+    }
+    let fields = normalize_tabular_fields(fields)?;
+    let selectors = parse_tabular_field_selectors(&fields)?;
+    let parent = out_path.parent().unwrap_or_else(|| Path::new("."));
+    let staging_dir = ensure_staging_dir(parent)?;
+    write_jsonl_atomic(&staging_dir, out_path, 64 * 1024, |out| {
+        let mut written = 0_u64;
+        if opts.header {
+            write_tabular_header(out, &fields, format)?;
+        }
+        for path in &input_paths {
+            let file = open_with_backoff(path, 16, 50)
+                .with_context(|| format!("opening JSONL input {}", path.display()))?;
+            let mut reader = BufReader::with_capacity(256 * 1024, file);
+            let mut line = String::with_capacity(16 * 1024);
+            let mut line_number = 0_u64;
+            loop {
+                let n = crate::ndjson::read_line_capped(
+                    &mut reader,
+                    &mut line,
+                    crate::ndjson::DEFAULT_MAX_LINE_BYTES,
+                    path,
+                )
+                .with_context(|| {
+                    format!(
+                        "reading JSONL input {} near line {}",
+                        path.display(),
+                        line_number + 1
+                    )
+                })?;
+                if n == 0 {
+                    break;
+                }
+                line_number += 1;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let value: Value = serde_json::from_str(&line).with_context(|| {
+                    format!("malformed JSON in {} line {}", path.display(), line_number)
+                })?;
+                let (cells, _matched_indices) = tabular_cells_from_value(&value, &selectors)?;
+                write_tabular_row(out, &fields, &cells, format).with_context(|| {
+                    format!(
+                        "writing {} row for {} line {}",
+                        format.label(),
+                        path.display(),
+                        line_number
+                    )
+                })?;
+                written += 1;
+            }
+        }
+        Ok(written)
     })
 }
 
@@ -2361,7 +2702,7 @@ fn extract_common(
     validate_export_whitelist(etl)?;
     let parallelism = etl.opts.parallelism;
     with_thread_pool(parallelism, || {
-        let files = plan_pipeline_files(etl)?;
+        let files = plan_pipeline_files(etl, Some(query))?;
         warn_if_unfiltered_undated_query(etl, query, &files);
 
         let work_dir = etl.ensure_work_dir()?;
@@ -2404,9 +2745,12 @@ fn extract_common(
         };
 
         let whitelist = etl.opts.whitelist_fields.clone();
-        let whitelist_tracker = whitelist
-            .as_ref()
-            .map(|_| Arc::new(WhitelistMatchTracker::new(etl.opts.strict_whitelist)));
+        let whitelist_tracker = whitelist.as_ref().map(|fields| {
+            Arc::new(WhitelistMatchTracker::new(
+                etl.opts.strict_whitelist,
+                fields.iter().cloned(),
+            ))
+        });
         let record_limit = record_limit_from_with_claimed(limit, resumed_lines);
 
         let total_bytes = total_compressed_size(&files);
@@ -2511,6 +2855,9 @@ fn extract_common(
             },
         )?;
 
+        if let Some(tracker) = &whitelist_tracker {
+            tracker.finalize()?;
+        }
         if let Some(pb) = pb {
             pb.finish_with_message("done");
         }
@@ -2565,7 +2912,7 @@ where
         return Ok(());
     }
 
-    let files = plan_pipeline_files(etl)?;
+    let files = plan_pipeline_files(etl, Some(query))?;
     warn_if_unfiltered_undated_query(etl, query, &files);
 
     let pb = if show_progress && etl.opts.progress {
@@ -2599,7 +2946,7 @@ where
                         Err(e) => return Err(malformed_json_error(&job.path, line_number, e)),
                     },
                 };
-                if !matches_minimal(&min, targets_ref, query) {
+                if !matches_minimal(&min, targets_ref, query, kind) {
                     return Ok(());
                 }
                 if !within_bounds(&min, bounds) {
@@ -2751,7 +3098,7 @@ mod tests {
         contents: &str,
         lines: u64,
     ) -> PathBuf {
-        let files = plan_pipeline_files(&plan.etl).unwrap();
+        let files = plan_pipeline_files(&plan.etl, Some(&plan.query)).unwrap();
         let fingerprint = build_resume_fingerprint(
             &plan.etl,
             &plan.query,
@@ -2787,6 +3134,12 @@ mod tests {
                 Some((key.to_string(), value.parse::<i64>().unwrap()))
             })
             .collect()
+    }
+
+    fn spool_fingerprint_for(plan: ScanPlan) -> String {
+        let plan = plan.build().unwrap();
+        let files = plan_pipeline_files(&plan.etl, Some(&plan.query)).unwrap();
+        build_resume_fingerprint(&plan.etl, &plan.query, "spool", plan.limit, &files).unwrap()
     }
 
     #[test]
@@ -2884,6 +3237,74 @@ mod tests {
     }
 
     #[test]
+    fn resume_fingerprint_includes_new_text_and_url_filters() {
+        let base = make_one_comment_corpus();
+        let base_fp = spool_fingerprint_for(one_month_scan(&base));
+
+        let keyword_all_fp = spool_fingerprint_for(one_month_scan(&base).keywords_all(["hello"]));
+        let exclude_keyword_fp =
+            spool_fingerprint_for(one_month_scan(&base).exclude_keywords(["spam"]));
+        let text_regex_fp = spool_fingerprint_for(one_month_scan(&base).text_regex("hello"));
+        let no_url_fp = spool_fingerprint_for(one_month_scan(&base).no_url());
+
+        assert_ne!(base_fp, keyword_all_fp);
+        assert_ne!(base_fp, exclude_keyword_fp);
+        assert_ne!(base_fp, text_regex_fp);
+        assert_ne!(base_fp, no_url_fp);
+    }
+
+    #[test]
+    fn resume_fingerprint_changes_when_timestamp_bounds_change() {
+        let base = make_one_comment_corpus();
+        let plan_a = RedditETL::new()
+            .base_dir(&base)
+            .sources(Sources::Comments)
+            .progress(false)
+            .scan()
+            .created_utc_gte(1_136_073_600)
+            .created_utc_lt(1_136_160_000)
+            .build()
+            .unwrap();
+        let plan_b = RedditETL::new()
+            .base_dir(&base)
+            .sources(Sources::Comments)
+            .progress(false)
+            .scan()
+            .created_utc_gte(1_136_073_601)
+            .created_utc_lt(1_136_160_000)
+            .build()
+            .unwrap();
+
+        let files_a = plan_pipeline_files(&plan_a.etl, Some(&plan_a.query)).unwrap();
+        let files_b = plan_pipeline_files(&plan_b.etl, Some(&plan_b.query)).unwrap();
+        let fp_a =
+            build_resume_fingerprint(&plan_a.etl, &plan_a.query, "extract", plan_a.limit, &files_a)
+                .expect("fingerprint a");
+        let fp_b =
+            build_resume_fingerprint(&plan_b.etl, &plan_b.query, "extract", plan_b.limit, &files_b)
+                .expect("fingerprint b");
+        assert_ne!(fp_a, fp_b);
+    }
+
+    #[test]
+    fn resume_fingerprint_changes_when_record_id_filter_changes() {
+        let base = make_one_comment_corpus();
+        let plan_c1 = one_month_scan(&base).ids(["c1"]).build().unwrap();
+        let plan_c2 = one_month_scan(&base).ids(["c2"]).build().unwrap();
+
+        let files_c1 = plan_pipeline_files(&plan_c1.etl, Some(&plan_c1.query)).unwrap();
+        let files_c2 = plan_pipeline_files(&plan_c2.etl, Some(&plan_c2.query)).unwrap();
+        let fp_c1 =
+            build_resume_fingerprint(&plan_c1.etl, &plan_c1.query, "spool", plan_c1.limit, &files_c1)
+                .unwrap();
+        let fp_c2 =
+            build_resume_fingerprint(&plan_c2.etl, &plan_c2.query, "spool", plan_c2.limit, &files_c2)
+                .unwrap();
+
+        assert_ne!(fp_c1, fp_c2);
+    }
+
+    #[test]
     fn spool_resume_commit_failure_after_publish_returns_error_and_next_run_succeeds() {
         let base = make_one_comment_corpus();
         let out_dir = base.join("spool_manifest_failure");
@@ -2963,6 +3384,49 @@ mod tests {
     }
 
     #[test]
+    fn resume_fingerprint_includes_record_limit() {
+        let base = make_one_comment_corpus();
+        let no_limit_plan = one_month_scan(&base).build().unwrap();
+        let limit_one_plan = one_month_scan(&base).limit(1).build().unwrap();
+        let limit_two_plan = one_month_scan(&base).limit(2).build().unwrap();
+
+        let no_limit_files =
+            plan_pipeline_files(&no_limit_plan.etl, Some(&no_limit_plan.query)).unwrap();
+        let limit_one_files =
+            plan_pipeline_files(&limit_one_plan.etl, Some(&limit_one_plan.query)).unwrap();
+        let limit_two_files =
+            plan_pipeline_files(&limit_two_plan.etl, Some(&limit_two_plan.query)).unwrap();
+
+        let no_limit = build_resume_fingerprint(
+            &no_limit_plan.etl,
+            &no_limit_plan.query,
+            "extract",
+            no_limit_plan.limit,
+            &no_limit_files,
+        )
+        .unwrap();
+        let limit_one = build_resume_fingerprint(
+            &limit_one_plan.etl,
+            &limit_one_plan.query,
+            "extract",
+            limit_one_plan.limit,
+            &limit_one_files,
+        )
+        .unwrap();
+        let limit_two = build_resume_fingerprint(
+            &limit_two_plan.etl,
+            &limit_two_plan.query,
+            "extract",
+            limit_two_plan.limit,
+            &limit_two_files,
+        )
+        .unwrap();
+
+        assert_ne!(no_limit, limit_one);
+        assert_ne!(limit_one, limit_two);
+    }
+
+    #[test]
     fn extract_resume_commit_failure_after_temp_part_publish_returns_error_and_next_run_stitches() {
         let base = make_one_comment_corpus();
         let work_dir = base.join("work_manifest_failure");
@@ -2979,7 +3443,7 @@ mod tests {
             .subreddit("programming")
             .build()
             .unwrap();
-        let files = plan_pipeline_files(&plan.etl).unwrap();
+        let files = plan_pipeline_files(&plan.etl, Some(&plan.query)).unwrap();
         let fingerprint =
             build_resume_fingerprint(&plan.etl, &plan.query, "extract", plan.limit, &files)
                 .unwrap();

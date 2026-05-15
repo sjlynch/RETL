@@ -2,6 +2,7 @@ mod common;
 
 use common::{make_corpus_n_records, write_zst_lines};
 use retl::{RedditETL, Sources};
+use serde_json::json;
 use std::fs;
 use std::io;
 use std::sync::{Arc, Mutex};
@@ -150,6 +151,96 @@ fn strict_whitelist_errors_instead_of_warning() {
         chain.contains("--whitelist matched zero fields on the first 100 records"),
         "unexpected error: {chain}"
     );
+}
+
+#[test]
+fn strict_whitelist_title_passes_when_submissions_are_scanned_after_comments() {
+    let base = common::make_corpus_basic();
+    let out = base.join("both_title.jsonl");
+
+    RedditETL::new()
+        .base_dir(&base)
+        .sources(Sources::Both)
+        .progress(false)
+        .whitelist_fields(["title"])
+        .strict_whitelist(true)
+        .scan()
+        .extract_to_jsonl(&out)
+        .expect("title should be observed in RS files even though RC files are planned first");
+
+    let written = fs::read_to_string(&out).unwrap();
+    assert!(written.contains("\"title\""), "output was {written:?}");
+}
+
+#[test]
+fn mixed_valid_and_typo_whitelist_reports_the_missing_field() {
+    let base = make_corpus_n_records(1);
+    let out = base.join("mixed_typo_whitelist.jsonl");
+    let logs = CaptureLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .with_writer(logs.clone())
+        .finish();
+
+    tracing::subscriber::with_default(subscriber, || {
+        RedditETL::new()
+            .base_dir(&base)
+            .sources(Sources::Comments)
+            .progress(false)
+            .whitelist_fields(["author", "autor_typo"])
+            .scan()
+            .extract_to_jsonl(&out)
+            .unwrap();
+    });
+
+    let logs = logs.contents();
+    assert!(
+        logs.contains("autor_typo") && logs.contains("fields never matched"),
+        "expected field-level typo warning, got logs: {logs:?}"
+    );
+
+    let strict_err = RedditETL::new()
+        .base_dir(&base)
+        .sources(Sources::Comments)
+        .progress(false)
+        .whitelist_fields(["author", "autor_typo"])
+        .strict_whitelist(true)
+        .scan()
+        .extract_to_jsonl(&base.join("mixed_typo_strict.jsonl"))
+        .unwrap_err();
+    let chain = format!("{strict_err:#}");
+    assert!(chain.contains("autor_typo"), "unexpected error: {chain}");
+}
+
+#[test]
+fn tabular_strict_whitelist_counts_field_presence_not_rendered_cell_contents() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.keep();
+    let rc_path = base.join("comments").join("RC_2006-01.zst");
+    fs::create_dir_all(base.join("submissions")).unwrap();
+    write_zst_lines(
+        &rc_path,
+        &[json!({
+            "id":"c1", "author":"alice", "subreddit":"programming",
+            "created_utc":1136073600_i64, "score":1, "distinguished": null,
+            "body":""
+        })
+        .to_string()],
+    );
+    let out = base.join("null_cell.csv");
+
+    RedditETL::new()
+        .base_dir(&base)
+        .sources(Sources::Comments)
+        .progress(false)
+        .strict_whitelist(true)
+        .scan()
+        .extract_to_csv(&out, ["distinguished"], Default::default())
+        .expect("present null field renders empty but must satisfy whitelist validation");
+
+    let csv = fs::read_to_string(&out).unwrap();
+    assert_eq!(csv, "distinguished\r\n\r\n");
 }
 
 /// Build a comment corpus where every record's `created_utc` key is written

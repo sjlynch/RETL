@@ -1,7 +1,9 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use common::{decompress_zst_lines, make_truncated_zst, read_lines, write_zst_lines};
+use common::{
+    decompress_zst_lines, make_corpus_multi_month, make_truncated_zst, read_lines, write_zst_lines,
+};
 use retl::{ExportFormat, RedditETL, Sources, YearMonth};
 use serde_json::{json, Value};
 use std::fs;
@@ -131,6 +133,46 @@ fn assert_partitioned_resume_rebuilds_corrupt_output(format: ExportFormat) {
     };
     assert_eq!(lines.len(), 1);
     assert!(lines[0].contains("jan"), "{lines:?}");
+}
+
+#[test]
+fn non_resume_partitioned_jsonl_rerun_prunes_stale_owned_outputs() {
+    let jan = YearMonth::new(2006, 1);
+    let feb = YearMonth::new(2006, 2);
+    let base = make_corpus_multi_month(&[jan, feb]);
+    let out_dir = base.join("partitioned_reuse_cleanup");
+
+    RedditETL::new()
+        .base_dir(&base)
+        .sources(Sources::Both)
+        .date_range(Some(jan), Some(feb))
+        .progress(false)
+        .scan()
+        .subreddit("programming")
+        .export_partitioned(&out_dir, ExportFormat::Jsonl)
+        .unwrap();
+    assert!(out_dir.join("comments/RC_2006-02.jsonl").exists());
+    assert!(out_dir.join("submissions/RS_2006-02.jsonl").exists());
+    fs::write(out_dir.join("comments/notes.txt"), "do not delete").unwrap();
+
+    RedditETL::new()
+        .base_dir(&base)
+        .sources(Sources::Comments)
+        .date_range(Some(jan), Some(jan))
+        .progress(false)
+        .scan()
+        .subreddit("programming")
+        .export_partitioned(&out_dir, ExportFormat::Jsonl)
+        .unwrap();
+
+    assert!(out_dir.join("comments/RC_2006-01.jsonl").exists());
+    assert!(!out_dir.join("comments/RC_2006-02.jsonl").exists());
+    assert!(!out_dir.join("submissions/RS_2006-01.jsonl").exists());
+    assert!(!out_dir.join("submissions/RS_2006-02.jsonl").exists());
+    assert_eq!(
+        fs::read_to_string(out_dir.join("comments/notes.txt")).unwrap(),
+        "do not delete"
+    );
 }
 
 #[test]

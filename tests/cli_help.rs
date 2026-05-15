@@ -19,6 +19,7 @@ fn root_help_lists_all_subcommands() {
         .and(contains("scan"))
         .and(contains("dedupe"))
         .and(contains("export"))
+        .and(contains("convert"))
         .and(contains("count"))
         .and(contains("integrity"))
         .and(contains("aggregate"))
@@ -96,14 +97,24 @@ fn scan_help_advertises_common_flags() {
         .and(contains("--no-progress"))
         .and(contains("--source"))
         .and(contains("--subreddit"))
+        .and(contains("--id"))
+        .and(contains("--ids-file"))
         .and(contains("--author"))
         .and(contains("--exclude-author"))
         .and(contains("--exclude-common-bots"))
         .and(contains("--author-regex"))
         .and(contains("--keyword"))
+        .and(contains("--keyword-all"))
+        .and(contains("--exclude-keyword"))
+        .and(contains("--text-regex"))
         .and(contains("--min-score"))
         .and(contains("--max-score"))
+        .and(contains("--after"))
+        .and(contains("--before"))
+        .and(contains("inclusive"))
+        .and(contains("exclusive"))
         .and(contains("--contains-url"))
+        .and(contains("--no-url"))
         .and(contains("--domain"))
         .and(contains("--json"))
         .and(contains("--include-deleted"))
@@ -126,6 +137,18 @@ fn export_help_advertises_format_and_out() {
         .and(contains("--out"))
         .and(contains("--pretty"))
         .and(contains("Field-indent the JSON array"));
+    assert.stdout(pred);
+}
+
+#[test]
+fn convert_help_advertises_fields_spool_format_and_out() {
+    let assert = retl().args(["convert", "--help"]).assert().success();
+    let pred = contains("--field")
+        .and(contains("--spool"))
+        .and(contains("--format"))
+        .and(contains("csv"))
+        .and(contains("tsv"))
+        .and(contains("--out"));
     assert.stdout(pred);
 }
 
