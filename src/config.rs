@@ -231,9 +231,9 @@ pub struct ETLOptions {
     /// minimum cooldown between target recomputations.
     pub adaptive_mem: AdaptiveMemCfg,
 
-    /// Opt-in: when true, supported extract/export operations read/write a
-    /// `_progress.json`-style sidecar and skip months already committed by a
-    /// prior run. Default false to preserve current behavior.
+    /// Opt-in: when true, supported extract/export and analytics operations
+    /// read/write a `_progress.json`-style sidecar and skip months already
+    /// committed by a prior run. Default false to preserve current behavior.
     pub resume: bool,
 
     /// Parent payload fields attached by the parents pipeline. Defaults to the
@@ -463,9 +463,9 @@ impl ETLOptions {
         self
     }
 
-    /// Opt in to resumable extract/export runs (`extract_to_jsonl`,
-    /// `extract_to_json`, `extract_spool_monthly`, `export_partitioned`, and
-    /// parents helpers).
+    /// Opt in to resumable extract/export and analytics runs (`scan`/usernames,
+    /// dedupe, count, first-seen, `extract_to_jsonl`, `extract_to_json`,
+    /// `extract_spool_monthly`, `export_partitioned`, and parents helpers).
     pub fn with_resume(mut self, yes: bool) -> Self {
         self.resume = yes;
         self

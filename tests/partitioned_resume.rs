@@ -1,7 +1,9 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use common::{decompress_zst_lines, make_truncated_zst, read_lines, write_zst_lines};
+use common::{
+    decompress_zst_lines, make_corpus_multi_month, make_truncated_zst, read_lines, write_zst_lines,
+};
 use retl::{ExportFormat, RedditETL, Sources, YearMonth};
 use serde_json::{json, Value};
 use std::fs;
@@ -56,8 +58,8 @@ fn setup_one_month_corpus() -> PathBuf {
     base
 }
 
-fn assert_partitioned_resume(format: ExportFormat) {
-    let (base, jan_source, feb_source) = setup_two_month_corpus();
+fn assert_partitioned_resume_after_repair(format: ExportFormat) {
+    let (base, _jan_source, feb_source) = setup_two_month_corpus();
     let out_dir = base.join(match format {
         ExportFormat::Jsonl => "out_jsonl",
         ExportFormat::Zst => "out_zst",
@@ -82,10 +84,11 @@ fn assert_partitioned_resume(format: ExportFormat) {
         .unwrap()
         .contains_key("RC_2006-02"));
 
-    // If resume fails to skip the completed January output, this invalid source
-    // would make the second strict run fail. February is repaired and should be
-    // the only month processed on the resume run.
-    fs::write(&jan_source, b"not a zstd stream").unwrap();
+    // Repairing February changes the selected corpus file identity, so the
+    // resume fingerprint invalidates the prior checkpoint set and rebuilds
+    // from the current corpus instead of mixing stale January output with the
+    // repaired February month. January remains valid, so the strict rerun
+    // succeeds and commits both months.
     write_zst_lines(&feb_source, &[valid_comment("feb", "repaired")]);
 
     run_export(&base, &out_dir, format, false);
@@ -133,13 +136,53 @@ fn assert_partitioned_resume_rebuilds_corrupt_output(format: ExportFormat) {
 }
 
 #[test]
-fn partitioned_jsonl_resume_retries_incomplete_month_and_skips_completed() {
-    assert_partitioned_resume(ExportFormat::Jsonl);
+fn non_resume_partitioned_jsonl_rerun_prunes_stale_owned_outputs() {
+    let jan = YearMonth::new(2006, 1);
+    let feb = YearMonth::new(2006, 2);
+    let base = make_corpus_multi_month(&[jan, feb]);
+    let out_dir = base.join("partitioned_reuse_cleanup");
+
+    RedditETL::new()
+        .base_dir(&base)
+        .sources(Sources::Both)
+        .date_range(Some(jan), Some(feb))
+        .progress(false)
+        .scan()
+        .subreddit("programming")
+        .export_partitioned(&out_dir, ExportFormat::Jsonl)
+        .unwrap();
+    assert!(out_dir.join("comments/RC_2006-02.jsonl").exists());
+    assert!(out_dir.join("submissions/RS_2006-02.jsonl").exists());
+    fs::write(out_dir.join("comments/notes.txt"), "do not delete").unwrap();
+
+    RedditETL::new()
+        .base_dir(&base)
+        .sources(Sources::Comments)
+        .date_range(Some(jan), Some(jan))
+        .progress(false)
+        .scan()
+        .subreddit("programming")
+        .export_partitioned(&out_dir, ExportFormat::Jsonl)
+        .unwrap();
+
+    assert!(out_dir.join("comments/RC_2006-01.jsonl").exists());
+    assert!(!out_dir.join("comments/RC_2006-02.jsonl").exists());
+    assert!(!out_dir.join("submissions/RS_2006-01.jsonl").exists());
+    assert!(!out_dir.join("submissions/RS_2006-02.jsonl").exists());
+    assert_eq!(
+        fs::read_to_string(out_dir.join("comments/notes.txt")).unwrap(),
+        "do not delete"
+    );
 }
 
 #[test]
-fn partitioned_zst_resume_retries_incomplete_month_and_skips_completed() {
-    assert_partitioned_resume(ExportFormat::Zst);
+fn partitioned_jsonl_resume_retries_incomplete_month_after_repair() {
+    assert_partitioned_resume_after_repair(ExportFormat::Jsonl);
+}
+
+#[test]
+fn partitioned_zst_resume_retries_incomplete_month_after_repair() {
+    assert_partitioned_resume_after_repair(ExportFormat::Zst);
 }
 
 #[test]
