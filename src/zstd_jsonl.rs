@@ -50,14 +50,23 @@ where
     Ok(value.and_then(|v| v.as_i64()))
 }
 
+fn de_opt_bool_lossy<'de, D>(deserializer: D) -> std::result::Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|v| v.as_bool()))
+}
+
 /// Minimal line-level schema for fast filtering.
 /// Extra fields are ignored by serde.
 /// NOTE: includes `score` to enable fast numeric filters.
-/// Includes `selftext`, `body`, `title`, `url`, and `parent_id` so keyword/URL
-/// filtering works without a full parse. Includes `domain` (submissions) and
-/// `id` (both kinds). Optional fields are lossy: unexpected JSON types become
-/// `None` instead of making the entire hot-path parse fail, so schema drift in
-/// unused fields does not silently drop otherwise valid records.
+/// Includes `selftext`, `body`, `title`, `url`, `is_self`, and `parent_id` so
+/// keyword/URL filtering works without a full parse. Includes `domain`
+/// (submissions) and `id` (both kinds). Optional fields are lossy: unexpected
+/// JSON types become `None` instead of making the entire hot-path parse fail,
+/// so schema drift in unused fields does not silently drop otherwise valid
+/// records.
 #[derive(Debug, Deserialize)]
 pub struct MinimalRecord {
     #[serde(default, deserialize_with = "de_opt_string_lossy")]
@@ -81,7 +90,9 @@ pub struct MinimalRecord {
     #[serde(default, deserialize_with = "de_opt_string_lossy")]
     pub title: Option<String>, // submissions
     #[serde(default, deserialize_with = "de_opt_string_lossy")]
-    pub url: Option<String>, // submissions (outbound URL on link posts)
+    pub url: Option<String>, // submissions (outbound URL on link posts; permalink on some self posts)
+    #[serde(default, deserialize_with = "de_opt_bool_lossy")]
+    pub is_self: Option<bool>, // submissions (true for self/text posts)
 
     #[allow(dead_code)]
     #[serde(default, deserialize_with = "de_opt_string_lossy")]

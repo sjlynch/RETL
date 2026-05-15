@@ -3,15 +3,15 @@
 
 use anyhow::{Context, Result};
 use retl::{
-    create_dir_all_with_backoff, create_new_with_backoff, discover_sources_checked,
-    discover_upstream_manifests_from_inputs, file_identities, file_identity, for_each_line_cfg,
-    format_year_month_ranges, missing_month_diagnostics, open_with_backoff, path_to_stable_string,
-    plan_files, plan_files_checked, read_line_capped, remove_with_backoff,
-    replace_file_atomic_backoff, total_compressed_size, upstream_manifest_for_directory,
-    write_run_manifest, AggregateBuildReport, CorpusSnapshot, ExportFormat, FileIdentity, FileKind,
-    IntegrityMode, KeyExtractor, ManifestDestination, ParentPayloadSpec, RedditETL,
-    RunManifestInput, RunManifestStart, Sources, TabularExportOptions, YearMonth,
-    DEFAULT_MAX_LINE_BYTES,
+    convert_jsonl_to_csv, convert_jsonl_to_tsv, create_dir_all_with_backoff,
+    create_new_with_backoff, discover_sources_checked, discover_upstream_manifests_from_inputs,
+    file_identities, file_identity, for_each_line_cfg, format_year_month_ranges,
+    missing_month_diagnostics, open_with_backoff, path_to_stable_string, plan_files,
+    plan_files_checked, read_line_capped, remove_with_backoff, replace_file_atomic_backoff,
+    total_compressed_size, upstream_manifest_for_directory, write_run_manifest,
+    AggregateBuildReport, CorpusSnapshot, ExportFormat, FileIdentity, FileKind, IntegrityMode,
+    KeyExtractor, ManifestDestination, ParentPayloadSpec, RedditETL, RunManifestInput,
+    RunManifestStart, Sources, TabularExportOptions, YearMonth, DEFAULT_MAX_LINE_BYTES,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -23,9 +23,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::bin_args::{
-    AggregateArgs, CommonOpts, CountArgs, CountMode, DedupeArgs, DescribeArgs, ExportArgs,
-    ExportFmt, FirstSeenArgs, IntegrityArgs, IntegrityModeArg, ParentsArgs, QueryOpts, SampleArgs,
-    ScanArgs, SchemaArgs, SchemaFmt, SourceArg,
+    AggregateArgs, CommonOpts, ConvertArgs, ConvertFmt, CountArgs, CountMode, DedupeArgs,
+    DescribeArgs, ExportArgs, ExportFmt, FirstSeenArgs, IntegrityArgs, IntegrityModeArg,
+    ParentsArgs, QueryOpts, SampleArgs, ScanArgs, SchemaArgs, SchemaFmt, SourceArg,
 };
 use crate::bin_helpers::{
     build_etl, discover_spool_parts, emit_partial_read_report, plan, stream_extract_to_stdout,
@@ -513,7 +513,10 @@ pub(crate) fn run_schema(args: SchemaArgs) -> Result<()> {
 }
 
 pub(crate) fn run_scan(args: ScanArgs) -> Result<()> {
-    let etl = build_etl(&args.common)?;
+    let mut etl = build_etl(&args.common)?;
+    if args.resume {
+        etl = etl.resume(true);
+    }
     let partial_reporter = etl.partial_read_reporter();
     let mut scan = plan!(etl, args.common, args.query);
     if let Some(limit) = args.limit {
@@ -573,6 +576,9 @@ pub(crate) fn run_dedupe(args: DedupeArgs) -> Result<()> {
     }
     if args.strict_key {
         etl = etl.strict_key(true);
+    }
+    if args.resume {
+        etl = etl.resume(true);
     }
     let partial_reporter = etl.partial_read_reporter();
     let work_dir = args.common.work_dir.clone();
@@ -861,12 +867,56 @@ pub(crate) fn run_sample(args: SampleArgs) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn run_convert(args: ConvertArgs) -> Result<()> {
+    if args.fields.iter().all(|field| field.trim().is_empty()) {
+        anyhow::bail!("retl convert requires at least one --field selector");
+    }
+
+    let mut inputs = Vec::new();
+    if let Some(spool) = &args.spool {
+        let (parts, _min, _max) = discover_spool_parts(spool)?;
+        inputs.extend(parts);
+    }
+    inputs.extend(args.inputs.iter().cloned());
+    if inputs.is_empty() {
+        anyhow::bail!("retl convert requires --spool or at least one JSONL input file");
+    }
+
+    let opts = TabularExportOptions {
+        header: !args.no_header,
+    };
+    let fields = args.fields.clone();
+    let to_stdout = args.out == Path::new("-");
+    let write = |path: &Path| -> Result<u64> {
+        match args.format {
+            ConvertFmt::Csv => convert_jsonl_to_csv(&inputs, path, fields.clone(), opts),
+            ConvertFmt::Tsv => convert_jsonl_to_tsv(&inputs, path, fields.clone(), opts),
+        }
+    };
+
+    if to_stdout {
+        let stem = match args.format {
+            ConvertFmt::Csv => "convert.csv",
+            ConvertFmt::Tsv => "convert.tsv",
+        };
+        stream_path_output_to_stdout(&args.work_dir, "convert", stem, |path| {
+            write(path).map(|_| ())
+        })?;
+    } else {
+        write(&args.out)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn run_count(args: CountArgs) -> Result<()> {
     let author_stdout = matches!(args.mode, CountMode::Author)
         && args.out.as_deref().is_some_and(|p| p == Path::new("-"));
     let mut etl = build_etl(&args.common)?;
     if author_stdout {
         etl = etl.run_manifest(false);
+    }
+    if args.resume {
+        etl = etl.resume(true);
     }
     let partial_reporter = etl.partial_read_reporter();
     let scan = plan!(etl, args.common, args.query);
@@ -928,6 +978,11 @@ pub(crate) fn run_count(args: CountArgs) -> Result<()> {
 }
 
 pub(crate) fn run_integrity(args: IntegrityArgs) -> Result<()> {
+    if args.resume {
+        anyhow::bail!(
+            "retl integrity does not support --resume; it validates corpus files directly. Narrow long runs with --source/--start/--end or use resumable scan/export/count workflows for record processing."
+        );
+    }
     let etl = build_etl(&args.common)?;
     let mode = match args.mode {
         IntegrityModeArg::Quick => IntegrityMode::Quick {
@@ -971,6 +1026,11 @@ pub(crate) fn run_integrity(args: IntegrityArgs) -> Result<()> {
 }
 
 pub(crate) fn run_aggregate(args: AggregateArgs) -> Result<()> {
+    if args.resume {
+        anyhow::bail!(
+            "retl aggregate does not support --resume because it reduces existing JSONL inputs. For resumable corpus filtering, run `retl export --format spool --resume ...` first, then aggregate with `retl aggregate --spool <DIR>`."
+        );
+    }
     let manifest_start = RunManifestStart::now();
     let mut etl = RedditETL::new()
         .progress(!args.runtime.no_progress)
@@ -1234,7 +1294,10 @@ fn write_cli_aggregate_manifest(
 }
 
 pub(crate) fn run_first_seen(args: FirstSeenArgs) -> Result<()> {
-    let etl = build_etl(&args.common)?;
+    let mut etl = build_etl(&args.common)?;
+    if args.resume {
+        etl = etl.resume(true);
+    }
     let partial_reporter = etl.partial_read_reporter();
     let scan = plan!(etl, args.common, args.query);
     scan.build_first_seen_index_to_tsv(&args.out)?;

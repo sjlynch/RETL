@@ -108,71 +108,80 @@ pub(crate) fn claim_record_or_stop(limit: Option<&RecordLimit>) -> Result<()> {
 }
 
 /// One projection emission reported to the [`WhitelistMatchTracker`]. The
-/// tracker keeps the fast and slow paths' counters separate so the zero-match
-/// verdict reflects production semantics (the fast `WhitelistTokenizer` path)
-/// rather than being skewed by tokenizer-fallback lines.
+/// tracker keeps the fast and slow paths' field-presence counters separate so
+/// the verdict reflects production semantics (the fast `WhitelistTokenizer`
+/// path) rather than being skewed by tokenizer-fallback lines.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct WhitelistEmission {
-    /// True when the projected object had no whitelisted fields.
-    pub emitted_empty_projection: bool,
+pub(crate) struct WhitelistEmission<'a> {
+    /// Indices of requested whitelist fields that were present in this record.
+    pub matched_fields: &'a [usize],
     /// True when the slow `serde_json::Value` path produced this emission
     /// (the `WhitelistTokenizer` rejected the line structurally).
     pub used_slow_path: bool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct WhitelistMatchState {
     fast_seen: u64,
-    fast_empty: u64,
     slow_seen: u64,
-    slow_empty: u64,
+    fast_field_seen: Vec<bool>,
+    slow_field_seen: Vec<bool>,
     reported: bool,
 }
 
-/// Shared per-export whitelist sanity checker. It samples accepted records
-/// after filtering and reports once if every sampled record projected to `{}`.
-///
-/// The fast and slow paths are tracked independently — the warning and
-/// `strict_whitelist` failure fire when the fast path (the dominant
-/// production path) accumulates a full empty sample, or at finalization for a
-/// smaller all-empty sample. A stray tokenizer-fallback line cannot suppress a
-/// real zero-match condition nor cause a spurious failure when the fast path is
-/// healthy.
+impl WhitelistMatchState {
+    fn new(field_count: usize) -> Self {
+        Self {
+            fast_seen: 0,
+            slow_seen: 0,
+            fast_field_seen: vec![false; field_count],
+            slow_field_seen: vec![false; field_count],
+            reported: false,
+        }
+    }
+}
+
+/// Shared per-export whitelist sanity checker. It tracks the requested field
+/// names and reports once if any individual field never appears in accepted
+/// records. Fast-path and slow-path observations are kept separate: fast-path
+/// presence decides the warning/error, while slow-path-only matches are called
+/// out explicitly so tokenizer fallback lines cannot hide a real typo.
 #[derive(Debug)]
 pub(crate) struct WhitelistMatchTracker {
     strict: bool,
+    field_names: Vec<String>,
     state: std::sync::Mutex<WhitelistMatchState>,
 }
 
 impl WhitelistMatchTracker {
-    pub(crate) fn new(strict: bool) -> Self {
+    pub(crate) fn new<I, S>(strict: bool, fields: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let field_names: Vec<String> = fields.into_iter().map(Into::into).collect();
+        let state = WhitelistMatchState::new(field_names.len());
         Self {
             strict,
-            state: std::sync::Mutex::new(WhitelistMatchState::default()),
+            field_names,
+            state: std::sync::Mutex::new(state),
         }
     }
 
-    pub(crate) fn observe(&self, emission: WhitelistEmission) -> Result<()> {
+    pub(crate) fn observe(&self, emission: WhitelistEmission<'_>) -> Result<()> {
         let mut state = self
             .state
             .lock()
             .map_err(|_| anyhow!("whitelist validation state lock poisoned"))?;
 
         if emission.used_slow_path {
-            if state.slow_seen < WHITELIST_ZERO_MATCH_SAMPLE {
-                state.slow_seen += 1;
-                if emission.emitted_empty_projection {
-                    state.slow_empty += 1;
-                }
-            }
-        } else if state.fast_seen < WHITELIST_ZERO_MATCH_SAMPLE {
+            state.slow_seen += 1;
+            mark_fields_seen(&mut state.slow_field_seen, emission.matched_fields);
+        } else {
             state.fast_seen += 1;
-            if emission.emitted_empty_projection {
-                state.fast_empty += 1;
-            }
+            mark_fields_seen(&mut state.fast_field_seen, emission.matched_fields);
         }
-
-        Self::report_if_zero_match(&mut state, self.strict, false)
+        Ok(())
     }
 
     pub(crate) fn finalize(&self) -> Result<()> {
@@ -180,59 +189,87 @@ impl WhitelistMatchTracker {
             .state
             .lock()
             .map_err(|_| anyhow!("whitelist validation state lock poisoned"))?;
-        Self::report_if_zero_match(&mut state, self.strict, true)
+        self.report_missing_fields(&mut state)
     }
 
-    fn report_if_zero_match(
-        state: &mut WhitelistMatchState,
-        strict: bool,
-        final_check: bool,
-    ) -> Result<()> {
-        if state.reported || state.fast_seen == 0 {
+    fn report_missing_fields(&self, state: &mut WhitelistMatchState) -> Result<()> {
+        if state.reported || state.fast_seen == 0 || self.field_names.is_empty() {
             return Ok(());
         }
-        let fast_sample_full = state.fast_seen == WHITELIST_ZERO_MATCH_SAMPLE;
-        if !(fast_sample_full || final_check) {
-            return Ok(());
-        }
-        let fast_all_empty = state.fast_empty == state.fast_seen;
-        if !fast_all_empty {
+
+        let missing: Vec<usize> = state
+            .fast_field_seen
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, seen)| (!*seen).then_some(idx))
+            .collect();
+        if missing.is_empty() {
             return Ok(());
         }
 
         state.reported = true;
-        let slow_matched = state.slow_seen.saturating_sub(state.slow_empty);
-        let msg = if fast_sample_full {
-            if slow_matched > 0 {
+        let slow_only: Vec<usize> = missing
+            .iter()
+            .copied()
+            .filter(|idx| state.slow_field_seen.get(*idx).copied().unwrap_or(false))
+            .collect();
+        let missing_names = join_field_names(&self.field_names, missing.iter().copied());
+        let all_missing = missing.len() == self.field_names.len();
+        let mut msg = if all_missing {
+            if state.fast_seen >= WHITELIST_ZERO_MATCH_SAMPLE {
                 format!(
-                    "--whitelist matched zero fields on the first {} fast-path records \
-                     ({} slow-path emissions matched and were excluded from this check); {}",
-                    WHITELIST_ZERO_MATCH_SAMPLE, slow_matched, WHITELIST_ZERO_MATCH_HINT
+                    "--whitelist matched zero fields on the first {} records; fields never matched: {}; {}",
+                    WHITELIST_ZERO_MATCH_SAMPLE, missing_names, WHITELIST_ZERO_MATCH_HINT
                 )
             } else {
                 format!(
-                    "--whitelist matched zero fields on the first {} records; {}",
-                    WHITELIST_ZERO_MATCH_SAMPLE, WHITELIST_ZERO_MATCH_HINT
+                    "--whitelist matched zero fields on all {} records; fields never matched: {}; {}",
+                    state.fast_seen, missing_names, WHITELIST_ZERO_MATCH_HINT
                 )
             }
-        } else if slow_matched > 0 {
-            format!(
-                "--whitelist matched zero fields on all {} fast-path records \
-                 ({} slow-path emissions matched and were excluded from this check); {}",
-                state.fast_seen, slow_matched, WHITELIST_ZERO_MATCH_HINT
-            )
         } else {
+            let observed_names = join_field_names(
+                &self.field_names,
+                state
+                    .fast_field_seen
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, seen)| (*seen).then_some(idx)),
+            );
             format!(
-                "--whitelist matched zero fields on all {} records; {}",
-                state.fast_seen, WHITELIST_ZERO_MATCH_HINT
+                "--whitelist fields never matched any fast-path records: {}; observed fields: {}; {}",
+                missing_names, observed_names, WHITELIST_ZERO_MATCH_HINT
             )
         };
-        if strict {
+        if !slow_only.is_empty() {
+            msg.push_str(&format!(
+                " Fields matched only on slow-path emissions and were excluded from this check: {}.",
+                join_field_names(&self.field_names, slow_only.into_iter())
+            ));
+        }
+        if self.strict {
             return Err(anyhow!(msg));
         }
         tracing::warn!("{}", msg);
         Ok(())
     }
+}
+
+fn mark_fields_seen(seen: &mut [bool], matched_fields: &[usize]) {
+    for idx in matched_fields {
+        if let Some(slot) = seen.get_mut(*idx) {
+            *slot = true;
+        }
+    }
+}
+
+fn join_field_names(fields: &[String], indices: impl Iterator<Item = usize>) -> String {
+    let mut names: Vec<&str> = indices
+        .filter_map(|idx| fields.get(idx).map(String::as_str))
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names.join(", ")
 }
 
 /// Append `buf` followed by a newline to `writer` and bump the running record count.
@@ -402,11 +439,12 @@ fn write_with_whitelist<W: Write + ?Sized>(
     fields: &[String],
     tokenizer: &WhitelistTokenizer,
     tokenizer_buf: &mut String,
+    matched_indices: &mut Vec<usize>,
     human_timestamps: bool,
     written: &mut u64,
     path: &std::path::Path,
     line_number: u64,
-) -> Result<WhitelistEmission> {
+) -> Result<bool> {
     // Preferred path: the streaming tokenizer copies raw value bytes verbatim
     // and never builds a `serde_json::Value`. If it rejects a structurally
     // surprising line, fall back to the slow Value path so correctness on odd
@@ -416,59 +454,63 @@ fn write_with_whitelist<W: Write + ?Sized>(
         // timestamp keys' integer values to RFC3339 in one walk over the raw
         // line bytes. Replaces the older tokenize_into →
         // rewrite_human_timestamps_bytes chain.
-        tokenizer.tokenize_and_rewrite_timestamps_into(line, tokenizer_buf)
+        tokenizer.tokenize_and_rewrite_timestamps_into_with_matches(
+            line,
+            tokenizer_buf,
+            matched_indices,
+        )
     } else {
-        tokenizer.tokenize_into(line, tokenizer_buf)
+        tokenizer.tokenize_into_with_matches(line, tokenizer_buf, matched_indices)
     };
 
     if tok_result.is_ok() {
-        let emitted_empty_projection = tokenizer_buf == "{}";
         write_and_count(writer, tokenizer_buf.as_bytes(), written)?;
-        return Ok(WhitelistEmission {
-            emitted_empty_projection,
-            used_slow_path: false,
-        });
+        return Ok(false);
     }
 
-    let emitted_empty_projection = write_via_value(
+    write_via_value(
         writer,
         line,
         Some(fields),
+        Some(matched_indices),
         human_timestamps,
         written,
         path,
         line_number,
     )?;
-    Ok(WhitelistEmission {
-        emitted_empty_projection,
-        used_slow_path: true,
-    })
+    Ok(true)
 }
 
 fn write_via_value<W: Write + ?Sized>(
     writer: &mut W,
     line: &str,
     whitelist: Option<&[String]>,
+    mut matched_indices: Option<&mut Vec<usize>>,
     human_timestamps: bool,
     written: &mut u64,
     path: &std::path::Path,
     line_number: u64,
-) -> Result<bool> {
+) -> Result<()> {
+    if let Some(indices) = matched_indices.as_mut() {
+        indices.clear();
+    }
     let val: Value =
         serde_json::from_str(line).map_err(|e| malformed_json_error(path, line_number, e))?;
-    let (mut out_val, emitted_empty_projection) = if let Some(fields) = whitelist {
+    let mut out_val = if let Some(fields) = whitelist {
         let mut obj = Map::new();
         if let Some(map) = val.as_object() {
-            for k in fields {
+            for (idx, k) in fields.iter().enumerate() {
                 if let Some(v) = map.get(k) {
                     obj.insert(k.clone(), v.clone());
+                    if let Some(indices) = matched_indices.as_mut() {
+                        indices.push(idx);
+                    }
                 }
             }
         }
-        let is_empty = obj.is_empty();
-        (Value::Object(obj), is_empty)
+        Value::Object(obj)
     } else {
-        (val, false)
+        val
     };
 
     if human_timestamps {
@@ -478,7 +520,7 @@ fn write_via_value<W: Write + ?Sized>(
     serde_json::to_writer(&mut *writer, &out_val)?;
     writer.write_all(b"\n")?;
     *written += 1;
-    Ok(emitted_empty_projection)
+    Ok(())
 }
 
 #[doc(hidden)]
@@ -490,14 +532,16 @@ pub fn project_whitelist_line_for_tests(
 ) -> Result<String> {
     let tokenizer = WhitelistTokenizer::new(fields.iter().map(|s| s.as_str()));
     let mut tokenizer_buf = String::new();
+    let mut matched_indices = Vec::new();
     let mut out = Vec::new();
     let mut written = 0_u64;
-    let _emission = write_with_whitelist(
+    let _used_slow_path = write_with_whitelist(
         &mut out,
         line,
         fields,
         &tokenizer,
         &mut tokenizer_buf,
+        &mut matched_indices,
         false,
         &mut written,
         path,
@@ -573,6 +617,7 @@ pub(crate) fn stream_job_with_partial_policy<W: Write + ?Sized>(
     let mut written: u64 = 0;
     let mut ts_buf = String::new();
     let mut tok_buf = String::new();
+    let mut matched_indices = Vec::new();
 
     // Build the streaming tokenizer once per file so the small key-set is
     // hashed exactly once and the buffers above are reused across every line.
@@ -601,7 +646,7 @@ pub(crate) fn stream_job_with_partial_policy<W: Write + ?Sized>(
                 Err(e) => return Err(malformed_json_error(&job.path, line_number, e)),
             },
         };
-        if !matches_minimal(&min, targets, query) {
+        if !matches_minimal(&min, targets, query, job.kind) {
             return Ok(());
         }
         if !within_bounds(&min, bounds) {
@@ -623,19 +668,23 @@ pub(crate) fn stream_job_with_partial_policy<W: Write + ?Sized>(
                 write_with_timestamps(writer, line, &mut ts_buf, &mut written)
             }
             StreamWritePath::Whitelist { fields, tokenizer } => {
-                let emission = write_with_whitelist(
+                let used_slow_path = write_with_whitelist(
                     writer,
                     line,
                     fields,
                     tokenizer,
                     &mut tok_buf,
+                    &mut matched_indices,
                     human_timestamps,
                     &mut written,
                     &job.path,
                     line_number,
                 )?;
                 if let Some(tracker) = whitelist_tracker {
-                    tracker.observe(emission)?;
+                    tracker.observe(WhitelistEmission {
+                        matched_fields: &matched_indices,
+                        used_slow_path,
+                    })?;
                 }
                 Ok(())
             }
@@ -670,10 +719,6 @@ pub(crate) fn stream_job_with_partial_policy<W: Write + ?Sized>(
         Err(e) if is_record_limit_reached(&e) => true,
         Err(e) => return Err(e),
     };
-
-    if let Some(tracker) = whitelist_tracker {
-        tracker.finalize()?;
-    }
 
     Ok(StreamJobResult { written, complete })
 }
@@ -816,42 +861,41 @@ mod tests {
     }
 
     #[test]
-    fn whitelist_slow_path_reports_empty_projection_independent_of_tokenizer_buffer() {
+    fn whitelist_slow_path_reports_field_presence_independent_of_tokenizer_buffer() {
         let fields = vec!["id".to_string()];
         let tokenizer = WhitelistTokenizer::new(fields.iter().map(|s| s.as_str()));
         let mut tokenizer_buf = String::new();
+        let mut matched_indices = Vec::new();
         let mut out = Vec::new();
         let mut written = 0_u64;
 
-        let fast = write_with_whitelist(
+        let fast_used_slow_path = write_with_whitelist(
             &mut out,
             r#"{"id":"kept","subreddit":"programming","author":"a"}"#,
             &fields,
             &tokenizer,
             &mut tokenizer_buf,
+            &mut matched_indices,
             false,
             &mut written,
             std::path::Path::new("test.jsonl"),
             1,
         )
         .unwrap();
-        assert!(
-            !fast.emitted_empty_projection,
-            "sanity: first projection contains id"
-        );
-        assert!(!fast.used_slow_path);
+        assert_eq!(matched_indices, vec![0], "sanity: projection contains id");
+        assert!(!fast_used_slow_path);
         assert!(tokenizer_buf.contains("kept"));
 
         // Top-level arrays are valid JSON so the slow Value path can project
-        // them, but the byte tokenizer rejects them. The emitted object is
-        // empty because there is no top-level object containing `id`; this
-        // must be computed from the slow path, not from tokenizer_buf.
-        let slow = write_with_whitelist(
+        // them, but there is no top-level object containing `id`. This must be
+        // computed from the slow path, not from tokenizer_buf.
+        let slow_used_slow_path = write_with_whitelist(
             &mut out,
             r#"[{"id":"not-a-top-level-object"}]"#,
             &fields,
             &tokenizer,
             &mut tokenizer_buf,
+            &mut matched_indices,
             false,
             &mut written,
             std::path::Path::new("test.jsonl"),
@@ -859,11 +903,11 @@ mod tests {
         )
         .unwrap();
         assert!(
-            slow.emitted_empty_projection,
-            "slow-path array projection should be reported as empty"
+            matched_indices.is_empty(),
+            "slow-path array projection should report no top-level id match"
         );
         assert!(
-            slow.used_slow_path,
+            slow_used_slow_path,
             "top-level array must take the Value slow path"
         );
         assert_eq!(written, 2);
@@ -871,76 +915,85 @@ mod tests {
 
     #[test]
     fn strict_whitelist_ignores_slow_path_only_emissions() {
-        // A run where 100% of slow-path emissions are empty but the fast path
-        // is never sampled must NOT trip the strict_whitelist verdict. The
-        // tracker's threshold is fast_seen, so slow-path-only activity leaves
-        // the verdict deferred.
+        // A run where 100% of emissions are slow-path must NOT trip the
+        // strict_whitelist verdict because fast-path presence is the production
+        // signal used by the checker.
         let fields = vec!["not_present".to_string()];
         let tokenizer = WhitelistTokenizer::new(fields.iter().map(|s| s.as_str()));
-        let tracker = WhitelistMatchTracker::new(true);
+        let tracker = WhitelistMatchTracker::new(true, fields.iter().cloned());
         let mut tokenizer_buf = String::new();
+        let mut matched_indices = Vec::new();
         let mut out = Vec::new();
         let mut written = 0_u64;
 
         for i in 0..(WHITELIST_ZERO_MATCH_SAMPLE * 2) {
-            let emission = write_with_whitelist(
+            let used_slow_path = write_with_whitelist(
                 &mut out,
                 r#"[{"id":"slow"}]"#,
                 &fields,
                 &tokenizer,
                 &mut tokenizer_buf,
+                &mut matched_indices,
                 false,
                 &mut written,
                 std::path::Path::new("test.jsonl"),
                 i + 1,
             )
             .unwrap();
-            assert!(emission.used_slow_path);
-            assert!(emission.emitted_empty_projection);
+            assert!(used_slow_path);
+            assert!(matched_indices.is_empty());
             tracker
-                .observe(emission)
+                .observe(WhitelistEmission {
+                    matched_fields: &matched_indices,
+                    used_slow_path,
+                })
                 .expect("slow-path emissions must not trip strict_whitelist");
         }
+        tracker
+            .finalize()
+            .expect("slow-path-only emissions must not trip strict_whitelist");
     }
 
     #[test]
-    fn strict_whitelist_fires_on_fast_path_empty_projection_sample() {
-        // Mirror image of the test above: a fully empty fast-path sample DOES
-        // trip the verdict, regardless of slow-path activity in between.
+    fn strict_whitelist_fires_on_fast_path_empty_projection_at_finalize() {
         let fields = vec!["not_present".to_string()];
         let tokenizer = WhitelistTokenizer::new(fields.iter().map(|s| s.as_str()));
-        let tracker = WhitelistMatchTracker::new(true);
+        let tracker = WhitelistMatchTracker::new(true, fields.iter().cloned());
         let mut tokenizer_buf = String::new();
+        let mut matched_indices = Vec::new();
         let mut out = Vec::new();
         let mut written = 0_u64;
-        let mut err = None;
 
         for i in 0..WHITELIST_ZERO_MATCH_SAMPLE {
-            // All fast-path empty projections.
-            let emission = write_with_whitelist(
+            let used_slow_path = write_with_whitelist(
                 &mut out,
                 r#"{"id":"fast","subreddit":"programming","author":"a"}"#,
                 &fields,
                 &tokenizer,
                 &mut tokenizer_buf,
+                &mut matched_indices,
                 false,
                 &mut written,
                 std::path::Path::new("test.jsonl"),
                 i + 1,
             )
             .unwrap();
-            assert!(!emission.used_slow_path);
-            if let Err(e) = tracker.observe(emission) {
-                err = Some(e);
-                break;
-            }
+            assert!(!used_slow_path);
+            assert!(matched_indices.is_empty());
+            tracker
+                .observe(WhitelistEmission {
+                    matched_fields: &matched_indices,
+                    used_slow_path,
+                })
+                .expect("observe only records field presence; finalization reports misses");
         }
 
-        let msg = err
-            .expect("strict tracker must error after a full fast-path empty sample")
+        let msg = tracker
+            .finalize()
+            .expect_err("strict tracker must error at finalization for fast-path misses")
             .to_string();
         assert!(
-            msg.contains("--whitelist matched zero fields"),
+            msg.contains("--whitelist matched zero fields") && msg.contains("not_present"),
             "unexpected error: {msg}"
         );
     }
@@ -952,8 +1005,9 @@ mod tests {
         // the tracker into a false warning.
         let fields = vec!["id".to_string()];
         let tokenizer = WhitelistTokenizer::new(fields.iter().map(|s| s.as_str()));
-        let tracker = WhitelistMatchTracker::new(true);
+        let tracker = WhitelistMatchTracker::new(true, fields.iter().cloned());
         let mut tokenizer_buf = String::new();
+        let mut matched_indices = Vec::new();
         let mut out = Vec::new();
         let mut written = 0_u64;
 
@@ -963,12 +1017,13 @@ mod tests {
             } else {
                 r#"[{"id":"slow"}]"#
             };
-            let emission = write_with_whitelist(
+            let used_slow_path = write_with_whitelist(
                 &mut out,
                 line,
                 &fields,
                 &tokenizer,
                 &mut tokenizer_buf,
+                &mut matched_indices,
                 false,
                 &mut written,
                 std::path::Path::new("test.jsonl"),
@@ -976,8 +1031,14 @@ mod tests {
             )
             .unwrap();
             tracker
-                .observe(emission)
+                .observe(WhitelistEmission {
+                    matched_fields: &matched_indices,
+                    used_slow_path,
+                })
                 .expect("healthy fast-path emissions must not trigger strict_whitelist");
         }
+        tracker
+            .finalize()
+            .expect("healthy fast-path emissions must not trigger strict_whitelist");
     }
 }

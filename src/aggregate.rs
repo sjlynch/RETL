@@ -9,10 +9,7 @@ use crate::run_manifest::{
     discover_upstream_manifests_from_inputs, file_identities, maybe_write_run_manifest,
     ManifestDestination, RunManifestInput, RunManifestStart,
 };
-use crate::util::{
-    create_dir_all_with_backoff, open_with_backoff, read_dir_with_backoff, remove_with_backoff,
-    with_thread_pool,
-};
+use crate::util::{create_dir_all_with_backoff, open_with_backoff, with_thread_pool};
 use anyhow::{Context, Result};
 use indicatif::ProgressBar;
 use rayon::prelude::*;
@@ -114,29 +111,6 @@ impl AggregateBuildReport {
     }
 }
 
-fn aggregate_artifact_name(path: &Path) -> Option<&str> {
-    path.file_name().and_then(|s| s.to_str()).filter(|name| {
-        name.starts_with("agg_") && (name.ends_with(".json") || name.ends_with(".json.inprogress"))
-    })
-}
-
-fn clear_aggregate_artifacts(shards_dir: &Path) -> Result<()> {
-    if !shards_dir.exists() {
-        return Ok(());
-    }
-
-    for entry in read_dir_with_backoff(shards_dir, 16, 50)? {
-        if !entry.file_type()?.is_file() {
-            continue;
-        }
-        let path = entry.path();
-        if aggregate_artifact_name(&path).is_some() {
-            remove_with_backoff(&path, 16, 50)?;
-        }
-    }
-    Ok(())
-}
-
 fn aggregate_run_token() -> String {
     let counter = AGGREGATE_RUN_COUNTER.fetch_add(1, Ordering::Relaxed);
     let nanos = SystemTime::now()
@@ -152,21 +126,26 @@ fn output_parent(path: &Path) -> &Path {
         .unwrap_or_else(|| Path::new("."))
 }
 
-fn shard_name_for_input(shards_dir: &Path, run_token: &str, index: usize, input: &Path) -> PathBuf {
+fn aggregate_run_dir(shards_dir: &Path, run_token: &str) -> PathBuf {
+    shards_dir.join(format!("run_{run_token}"))
+}
+
+fn shard_name_for_input(run_dir: &Path, run_token: &str, index: usize, input: &Path) -> PathBuf {
     let stem = input.file_stem().and_then(|s| s.to_str()).unwrap_or("part");
     // Common case: part_YYYY-MM. Keep the human-readable stem, but prefix it
     // with the run token and input index so same-basename inputs from different
-    // directories — and concurrent aggregate runs sharing a shards dir — never
-    // race on the same shard or temp path.
+    // directories are distinct. The enclosing per-run directory isolates live
+    // artifacts from other aggregate jobs sharing the same caller-provided
+    // shards_dir.
     let stem = stem.strip_prefix("part_").unwrap_or(stem);
-    shards_dir.join(format!("agg_{run_token}_{index:06}_{stem}.json"))
+    run_dir.join(format!("agg_{run_token}_{index:06}_{stem}.json"))
 }
 
-fn shard_names_for_inputs(shards_dir: &Path, run_token: &str, inputs: &[PathBuf]) -> Vec<PathBuf> {
+fn shard_names_for_inputs(run_dir: &Path, run_token: &str, inputs: &[PathBuf]) -> Vec<PathBuf> {
     inputs
         .iter()
         .enumerate()
-        .map(|(index, input)| shard_name_for_input(shards_dir, run_token, index, input))
+        .map(|(index, input)| shard_name_for_input(run_dir, run_token, index, input))
         .collect()
 }
 
@@ -415,7 +394,8 @@ where
 
 impl RedditETL {
     /// Build per-file aggregation shards in parallel, then merge into `final_out`.
-    /// - Always rebuilds shards (aggregate has no resume behavior).
+    /// - Always rebuilds shards in a fresh per-run directory under `shards_dir`
+    ///   (aggregate has no resume behavior).
     /// - `pretty == true` field-indents the final JSON output (shards are compact).
     /// - Mid-file JSONL read errors are strict by default: the partial input is
     ///   reported and not merged. Use
@@ -490,8 +470,9 @@ impl RedditETL {
         Ok(report)
     }
 
-    /// Build per-file aggregation shards in parallel, merge them, and return
-    /// the merged aggregate state to the caller instead of publishing JSON.
+    /// Build per-file aggregation shards in a fresh per-run directory under
+    /// `shards_dir`, merge them, and return the merged aggregate state to the
+    /// caller instead of publishing JSON.
     ///
     /// Uses [`AggregatePartialReadPolicy::Strict`], so partial reads are
     /// reported but not merged.
@@ -542,10 +523,12 @@ impl RedditETL {
     {
         create_dir_all_with_backoff(shards_dir, 16, 50)
             .with_context(|| format!("creating shards_dir {}", shards_dir.display()))?;
-        clear_aggregate_artifacts(shards_dir)?;
-        let staging_dir = ensure_staging_dir(shards_dir)?;
         let run_token = aggregate_run_token();
-        let shard_paths = shard_names_for_inputs(shards_dir, &run_token, &inputs);
+        let run_dir = aggregate_run_dir(shards_dir, &run_token);
+        create_dir_all_with_backoff(&run_dir, 16, 50)
+            .with_context(|| format!("creating aggregate run directory {}", run_dir.display()))?;
+        let staging_dir = ensure_staging_dir(&run_dir)?;
+        let shard_paths = shard_names_for_inputs(&run_dir, &run_token, &inputs);
 
         with_thread_pool(self.opts.parallelism, || {
             let BuildOutcome { shards, report } = build_aggregate_shards_with::<A, F>(

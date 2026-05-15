@@ -19,7 +19,7 @@
 //! On any structural surprise the tokenizer returns [`TokenizerError::Malformed`]
 //! and the caller falls back to the slow path so we never regress correctness.
 
-use ahash::AHashSet;
+use ahash::{AHashMap, AHashSet};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
@@ -48,6 +48,7 @@ pub enum TokenizerError {
 /// same instance — and the same output `String` buffer — across every line.
 pub struct WhitelistTokenizer {
     keys: AHashSet<Vec<u8>>,
+    key_indices: AHashMap<Vec<u8>, Vec<usize>>,
 }
 
 impl WhitelistTokenizer {
@@ -56,18 +57,38 @@ impl WhitelistTokenizer {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        let keys: AHashSet<Vec<u8>> = fields
-            .into_iter()
-            .map(|s| s.as_ref().as_bytes().to_vec())
-            .collect();
-        Self { keys }
+        let mut keys = AHashSet::new();
+        let mut key_indices: AHashMap<Vec<u8>, Vec<usize>> = AHashMap::new();
+        for (idx, field) in fields.into_iter().enumerate() {
+            let key = field.as_ref().as_bytes().to_vec();
+            keys.insert(key.clone());
+            key_indices.entry(key).or_default().push(idx);
+        }
+        Self { keys, key_indices }
     }
 
     /// Walk `line` and append a compact JSON object containing the whitelisted
     /// fields to `out`. `out` is cleared on entry. On error `out` is left empty
     /// and the caller should use the slow path.
     pub fn tokenize_into(&self, line: &str, out: &mut String) -> Result<(), TokenizerError> {
-        self.tokenize_with(line, out, |_key, raw, out| {
+        self.tokenize_with(line, out, None, |_key, raw, out| {
+            // SAFETY: bytes are a sub-slice of the original `&str`, which is
+            // valid UTF-8. `from_utf8_unchecked` avoids re-validating.
+            out.push_str(unsafe { std::str::from_utf8_unchecked(raw) });
+        })
+    }
+
+    /// Like [`tokenize_into`], and also records the requested-field indices
+    /// whose top-level keys were present in this line. `matched_indices` is
+    /// cleared on entry and contains indices into the field list used to build
+    /// this tokenizer on success.
+    pub(crate) fn tokenize_into_with_matches(
+        &self,
+        line: &str,
+        out: &mut String,
+        matched_indices: &mut Vec<usize>,
+    ) -> Result<(), TokenizerError> {
+        self.tokenize_with(line, out, Some(matched_indices), |_key, raw, out| {
             // SAFETY: bytes are a sub-slice of the original `&str`, which is
             // valid UTF-8. `from_utf8_unchecked` avoids re-validating.
             out.push_str(unsafe { std::str::from_utf8_unchecked(raw) });
@@ -94,25 +115,23 @@ impl WhitelistTokenizer {
         line: &str,
         out: &mut String,
     ) -> Result<(), TokenizerError> {
-        self.tokenize_with(line, out, |key, raw, out| {
-            if is_timestamp_key(key) {
-                // Plain ASCII slice; from_utf8 is essentially a length check.
-                if let Ok(s) = std::str::from_utf8(raw) {
-                    if let Ok(n) = s.parse::<i64>() {
-                        if let Ok(dt) = OffsetDateTime::from_unix_timestamp(n) {
-                            if let Ok(formatted) = dt.format(&Rfc3339) {
-                                out.push('"');
-                                out.push_str(&formatted);
-                                out.push('"');
-                                return;
-                            }
-                        }
-                    }
-                }
-            }
-            // SAFETY: bytes are a sub-slice of the original `&str`, valid UTF-8.
-            out.push_str(unsafe { std::str::from_utf8_unchecked(raw) });
-        })
+        self.tokenize_with(line, out, None, emit_timestamp_rewritten_value)
+    }
+
+    /// Like [`tokenize_and_rewrite_timestamps_into`], and also records the
+    /// requested-field indices whose top-level keys were present in this line.
+    pub(crate) fn tokenize_and_rewrite_timestamps_into_with_matches(
+        &self,
+        line: &str,
+        out: &mut String,
+        matched_indices: &mut Vec<usize>,
+    ) -> Result<(), TokenizerError> {
+        self.tokenize_with(
+            line,
+            out,
+            Some(matched_indices),
+            emit_timestamp_rewritten_value,
+        )
     }
 
     /// Shared parser body for the two public methods. Walks `line` once,
@@ -126,16 +145,30 @@ impl WhitelistTokenizer {
         &self,
         line: &str,
         out: &mut String,
+        mut matched_indices: Option<&mut Vec<usize>>,
         emit_value: F,
     ) -> Result<(), TokenizerError>
     where
         F: Fn(&[u8], &[u8], &mut String),
     {
         out.clear();
+        if let Some(indices) = matched_indices.as_mut() {
+            indices.clear();
+        }
+        macro_rules! malformed {
+            () => {{
+                out.clear();
+                if let Some(indices) = matched_indices.as_mut() {
+                    indices.clear();
+                }
+                return Err(TokenizerError::Malformed);
+            }};
+        }
+
         let bytes = line.as_bytes();
         let mut i = skip_ws(bytes, 0);
         if i >= bytes.len() || bytes[i] != b'{' {
-            return Err(TokenizerError::Malformed);
+            malformed!();
         }
         i += 1;
         out.push('{');
@@ -150,8 +183,7 @@ impl WhitelistTokenizer {
         loop {
             i = skip_ws(bytes, i);
             if i >= bytes.len() {
-                out.clear();
-                return Err(TokenizerError::Malformed);
+                malformed!();
             }
             if bytes[i] == b'}' {
                 i += 1;
@@ -159,8 +191,7 @@ impl WhitelistTokenizer {
             }
             if !first_pair {
                 if bytes[i] != b',' {
-                    out.clear();
-                    return Err(TokenizerError::Malformed);
+                    malformed!();
                 }
                 i += 1;
                 i = skip_ws(bytes, i);
@@ -169,16 +200,14 @@ impl WhitelistTokenizer {
 
             // Key string.
             if i >= bytes.len() || bytes[i] != b'"' {
-                out.clear();
-                return Err(TokenizerError::Malformed);
+                malformed!();
             }
             let key_quoted_start = i;
             let key_content_start = i + 1;
             let (key_content_end, key_has_escape) = match scan_string_body(bytes, i + 1) {
                 Some(v) => v,
                 None => {
-                    out.clear();
-                    return Err(TokenizerError::Malformed);
+                    malformed!();
                 }
             };
             let key_quoted_end = key_content_end + 1; // includes closing quote
@@ -187,8 +216,7 @@ impl WhitelistTokenizer {
             // ':' separator.
             i = skip_ws(bytes, i);
             if i >= bytes.len() || bytes[i] != b':' {
-                out.clear();
-                return Err(TokenizerError::Malformed);
+                malformed!();
             }
             i += 1;
             i = skip_ws(bytes, i);
@@ -198,8 +226,7 @@ impl WhitelistTokenizer {
             let value_end = match skip_value(bytes, i) {
                 Some(e) => e,
                 None => {
-                    out.clear();
-                    return Err(TokenizerError::Malformed);
+                    malformed!();
                 }
             };
             i = value_end;
@@ -220,13 +247,13 @@ impl WhitelistTokenizer {
                         m
                     }
                     Err(_) => {
-                        out.clear();
-                        return Err(TokenizerError::Malformed);
+                        malformed!();
                     }
                 }
             } else {
                 decoded_key = None;
-                self.keys.contains(&bytes[key_content_start..key_content_end])
+                self.keys
+                    .contains(&bytes[key_content_start..key_content_end])
             };
 
             if matched {
@@ -246,6 +273,12 @@ impl WhitelistTokenizer {
                     None => &bytes[key_content_start..key_content_end],
                 };
 
+                if let Some(indices_out) = matched_indices.as_mut() {
+                    if let Some(indices) = self.key_indices.get(canonical_key) {
+                        indices_out.extend(indices.iter().copied());
+                    }
+                }
+
                 emit_value(canonical_key, &bytes[value_start..value_end], out);
             }
         }
@@ -255,13 +288,32 @@ impl WhitelistTokenizer {
         // single top-level object.
         let tail = skip_ws(bytes, i);
         if tail != bytes.len() {
-            out.clear();
-            return Err(TokenizerError::Malformed);
+            malformed!();
         }
 
         out.push('}');
         Ok(())
     }
+}
+
+fn emit_timestamp_rewritten_value(key: &[u8], raw: &[u8], out: &mut String) {
+    if is_timestamp_key(key) {
+        // Plain ASCII slice; from_utf8 is essentially a length check.
+        if let Ok(s) = std::str::from_utf8(raw) {
+            if let Ok(n) = s.parse::<i64>() {
+                if let Ok(dt) = OffsetDateTime::from_unix_timestamp(n) {
+                    if let Ok(formatted) = dt.format(&Rfc3339) {
+                        out.push('"');
+                        out.push_str(&formatted);
+                        out.push('"');
+                        return;
+                    }
+                }
+            }
+        }
+    }
+    // SAFETY: bytes are a sub-slice of the original `&str`, valid UTF-8.
+    out.push_str(unsafe { std::str::from_utf8_unchecked(raw) });
 }
 
 #[inline]
@@ -546,14 +598,20 @@ mod tests {
 
     #[test]
     fn fused_rewrites_all_three_timestamp_keys() {
-        let line = r#"{"created_utc":1136074600,"retrieved_on":1234567890,"edited":1136074800,"id":"x"}"#;
+        let line =
+            r#"{"created_utc":1136074600,"retrieved_on":1234567890,"edited":1136074800,"id":"x"}"#;
         let fields = ["created_utc", "retrieved_on", "edited", "id"];
         let tok = WhitelistTokenizer::new(fields);
         let mut out = String::new();
         tok.tokenize_and_rewrite_timestamps_into(line, &mut out)
             .unwrap();
         let expected = two_pass(line, &fields);
-        assert!(equal_as_json(&out, &expected), "out={} expected={}", out, expected);
+        assert!(
+            equal_as_json(&out, &expected),
+            "out={} expected={}",
+            out,
+            expected
+        );
         // And explicitly: the integer must have become a quoted RFC3339 string.
         let got: Value = serde_json::from_str(&out).unwrap();
         assert!(got.get("created_utc").unwrap().is_string());

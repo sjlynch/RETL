@@ -10,6 +10,7 @@ use retl::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -117,30 +118,202 @@ impl MetricSpec {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+enum MetricNumber {
+    Int(i128),
+    Float(f64),
+}
+
+impl MetricNumber {
+    fn format(self, format: NumberFormat) -> String {
+        match self {
+            Self::Int(n) => n.to_string(),
+            Self::Float(n) => format_number(n, format),
+        }
+    }
+
+    fn sort_value(self) -> MetricSortValue {
+        match self {
+            Self::Int(n) => MetricSortValue::Int(n),
+            Self::Float(n) => MetricSortValue::Float(n),
+        }
+    }
+
+    fn cmp_numeric(&self, other: &Self) -> Ordering {
+        match (*self, *other) {
+            (Self::Int(a), Self::Int(b)) => a.cmp(&b),
+            (Self::Float(a), Self::Float(b)) => a.total_cmp(&b),
+            (Self::Int(a), Self::Float(b)) => cmp_i128_f64(a, b),
+            (Self::Float(a), Self::Int(b)) => cmp_i128_f64(b, a).reverse(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+enum NumericSum {
+    Int(i128),
+    Float(f64),
+}
+
+impl Default for NumericSum {
+    fn default() -> Self {
+        Self::Int(0)
+    }
+}
+
+impl NumericSum {
+    fn add_number(&mut self, n: MetricNumber) {
+        match (*self, n) {
+            (Self::Int(sum), MetricNumber::Int(n)) => {
+                *self = sum
+                    .checked_add(n)
+                    .map(Self::Int)
+                    .unwrap_or_else(|| Self::Float(sum as f64 + n as f64));
+            }
+            (Self::Int(sum), MetricNumber::Float(n)) => {
+                *self = Self::Float(sum as f64 + n);
+            }
+            (Self::Float(sum), MetricNumber::Int(n)) => {
+                *self = Self::Float(sum + n as f64);
+            }
+            (Self::Float(sum), MetricNumber::Float(n)) => {
+                *self = Self::Float(sum + n);
+            }
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        match other {
+            Self::Int(n) => self.add_number(MetricNumber::Int(n)),
+            Self::Float(n) => self.add_number(MetricNumber::Float(n)),
+        }
+    }
+
+    fn format_sum(self, format: NumberFormat) -> String {
+        match self {
+            Self::Int(n) => n.to_string(),
+            Self::Float(n) => format_number(n, format),
+        }
+    }
+
+    fn format_avg(self, count: u64, format: NumberFormat) -> String {
+        debug_assert!(count > 0);
+        match self {
+            Self::Int(sum) => format_integer_average(sum, count),
+            Self::Float(sum) => format_number(sum / count as f64, format),
+        }
+    }
+
+    fn sort_sum(self) -> MetricSortValue {
+        match self {
+            Self::Int(n) => MetricSortValue::Int(n),
+            Self::Float(n) => MetricSortValue::Float(n),
+        }
+    }
+
+    fn sort_avg(self, count: u64) -> MetricSortValue {
+        debug_assert!(count > 0);
+        match self {
+            Self::Int(sum) => MetricSortValue::Ratio {
+                numerator: sum,
+                denominator: count,
+            },
+            Self::Float(sum) => MetricSortValue::Float(sum / count as f64),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum MetricSortValue {
+    Int(i128),
+    Float(f64),
+    Ratio { numerator: i128, denominator: u64 },
+}
+
+impl MetricSortValue {
+    fn cmp_numeric(&self, other: &Self) -> Ordering {
+        match (*self, *other) {
+            (Self::Int(a), Self::Int(b)) => a.cmp(&b),
+            (Self::Float(a), Self::Float(b)) => a.total_cmp(&b),
+            (
+                Self::Ratio {
+                    numerator: a_num,
+                    denominator: a_den,
+                },
+                Self::Ratio {
+                    numerator: b_num,
+                    denominator: b_den,
+                },
+            ) => cmp_i128_ratios(a_num, a_den, b_num, b_den),
+            (
+                Self::Ratio {
+                    numerator,
+                    denominator,
+                },
+                Self::Int(n),
+            ) => cmp_i128_ratios(numerator, denominator, n, 1),
+            (
+                Self::Int(n),
+                Self::Ratio {
+                    numerator,
+                    denominator,
+                },
+            ) => cmp_i128_ratios(n, 1, numerator, denominator),
+            (Self::Int(a), Self::Float(b)) => cmp_i128_f64(a, b),
+            (Self::Float(a), Self::Int(b)) => cmp_i128_f64(b, a).reverse(),
+            (Self::Float(a), other) => a.total_cmp(&other.as_f64_lossy()),
+            (other, Self::Float(b)) => other.as_f64_lossy().total_cmp(&b),
+        }
+    }
+
+    fn as_f64_lossy(self) -> f64 {
+        match self {
+            Self::Int(n) => n as f64,
+            Self::Float(n) => n,
+            Self::Ratio {
+                numerator,
+                denominator,
+            } => numerator as f64 / denominator as f64,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct MetricState {
     count: u64,
-    sum: f64,
-    min: Option<f64>,
-    max: Option<f64>,
+    sum: NumericSum,
+    min: Option<MetricNumber>,
+    max: Option<MetricNumber>,
 }
 
 impl MetricState {
-    fn ingest_number(&mut self, n: f64) {
+    fn ingest_number(&mut self, n: MetricNumber) {
         self.count += 1;
-        self.sum += n;
-        self.min = Some(self.min.map_or(n, |old| old.min(n)));
-        self.max = Some(self.max.map_or(n, |old| old.max(n)));
+        self.sum.add_number(n);
+        self.min = Some(
+            self.min
+                .map_or(n, |old| if n.cmp_numeric(&old).is_lt() { n } else { old }),
+        );
+        self.max = Some(
+            self.max
+                .map_or(n, |old| if n.cmp_numeric(&old).is_gt() { n } else { old }),
+        );
     }
 
     fn merge(&mut self, other: Self) {
         self.count += other.count;
-        self.sum += other.sum;
+        self.sum.merge(other.sum);
         if let Some(n) = other.min {
-            self.min = Some(self.min.map_or(n, |old| old.min(n)));
+            self.min = Some(
+                self.min
+                    .map_or(n, |old| if n.cmp_numeric(&old).is_lt() { n } else { old }),
+            );
         }
         if let Some(n) = other.max {
-            self.max = Some(self.max.map_or(n, |old| old.max(n)));
+            self.max = Some(
+                self.max
+                    .map_or(n, |old| if n.cmp_numeric(&old).is_gt() { n } else { old }),
+            );
         }
     }
 }
@@ -172,27 +345,32 @@ impl GroupMetricAgg {
         scientific: bool,
     ) -> Vec<(String, String)> {
         let number_format = NumberFormat::from_scientific(scientific);
-        let mut rows: Vec<(String, String, f64)> = self
+        let mut rows: Vec<(String, String, MetricSortValue)> = self
             .groups
             .iter()
             .filter_map(|(key, state)| {
                 let (display, sort_value) = match self.metric.kind {
-                    MetricKind::Count => (state.count.to_string(), state.count as f64),
-                    MetricKind::Sum => (format_number(state.sum, number_format), state.sum),
+                    MetricKind::Count => (
+                        state.count.to_string(),
+                        MetricSortValue::Int(state.count as i128),
+                    ),
+                    MetricKind::Sum => (state.sum.format_sum(number_format), state.sum.sort_sum()),
                     MetricKind::Avg => {
                         if state.count == 0 {
                             return None;
                         }
-                        let avg = state.sum / state.count as f64;
-                        (format_number(avg, number_format), avg)
+                        (
+                            state.sum.format_avg(state.count, number_format),
+                            state.sum.sort_avg(state.count),
+                        )
                     }
                     MetricKind::Min => {
                         let n = state.min?;
-                        (format_number(n, number_format), n)
+                        (n.format(number_format), n.sort_value())
                     }
                     MetricKind::Max => {
                         let n = state.max?;
-                        (format_number(n, number_format), n)
+                        (n.format(number_format), n.sort_value())
                     }
                 };
                 Some((key.clone(), display, sort_value))
@@ -200,7 +378,7 @@ impl GroupMetricAgg {
             .collect();
 
         if let Some(limit) = top {
-            rows.sort_by(|a, b| b.2.total_cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+            rows.sort_by(|a, b| b.2.cmp_numeric(&a.2).then_with(|| a.0.cmp(&b.0)));
             rows.truncate(limit);
         }
 
@@ -227,7 +405,7 @@ impl Aggregator for GroupMetricAgg {
         let Some(pointer) = &self.metric.pointer else {
             return;
         };
-        let Some(n) = record.pointer(pointer).and_then(value_to_f64) else {
+        let Some(n) = record.pointer(pointer).and_then(value_to_metric_number) else {
             return;
         };
         self.groups.entry(key).or_default().ingest_number(n);
@@ -271,13 +449,34 @@ fn value_to_key(v: &Value) -> Option<String> {
     }
 }
 
-fn value_to_f64(v: &Value) -> Option<f64> {
-    let n = match v {
-        Value::Number(n) => n.as_f64()?,
-        Value::String(s) => s.parse::<f64>().ok()?,
-        _ => return None,
-    };
-    n.is_finite().then_some(n)
+fn value_to_metric_number(v: &Value) -> Option<MetricNumber> {
+    match v {
+        Value::Number(n) => metric_number_from_str(&n.to_string()),
+        Value::String(s) => metric_number_from_str(s),
+        _ => None,
+    }
+}
+
+fn metric_number_from_str(raw: &str) -> Option<MetricNumber> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if is_plain_integer_literal(s) {
+        if let Ok(n) = s.parse::<i128>() {
+            return Some(MetricNumber::Int(n));
+        }
+    }
+    let n = s.parse::<f64>().ok()?;
+    n.is_finite().then_some(MetricNumber::Float(n))
+}
+
+fn is_plain_integer_literal(s: &str) -> bool {
+    let digits = s
+        .strip_prefix('-')
+        .or_else(|| s.strip_prefix('+'))
+        .unwrap_or(s);
+    !digits.is_empty() && digits.as_bytes().iter().all(u8::is_ascii_digit)
 }
 
 #[cfg(test)]
@@ -336,6 +535,30 @@ mod tests {
         let rendered = format_number(2.5, NumberFormat::Decimal);
         assert_eq!(rendered, "2.5");
         assert!(!rendered.contains('e') && !rendered.contains('E'));
+    }
+
+    #[test]
+    fn format_integer_average_uses_documented_precision() {
+        let rendered = format_integer_average(1, 7);
+        assert_eq!(rendered, "0.142857142857142857");
+        assert!(!rendered.contains('e') && !rendered.contains('E'));
+    }
+
+    #[test]
+    fn metric_number_parses_large_integer_strings_exactly() {
+        assert_eq!(
+            metric_number_from_str("9007199254740993"),
+            Some(MetricNumber::Int(9_007_199_254_740_993))
+        );
+    }
+
+    #[test]
+    fn value_to_metric_number_reads_large_json_integer_exactly() {
+        let value: Value = serde_json::from_str("90071992547409931234").unwrap();
+        assert_eq!(
+            value_to_metric_number(&value),
+            Some(MetricNumber::Int(90_071_992_547_409_931_234_i128))
+        );
     }
 
     #[test]
@@ -405,37 +628,144 @@ impl NumberFormat {
 }
 
 fn format_number(n: f64, format: NumberFormat) -> String {
-    if format == NumberFormat::Scientific || !n.is_finite() {
+    if !n.is_finite() {
         return n.to_string();
     }
 
-    // All integers that fit in f64's exact integer range should be rendered as
-    // plain decimal digits. This keeps score sums (which originate as integer
-    // JSON numbers) friendly to awk/pandas/spreadsheets up to 1e15+.
-    const MAX_EXACT_INTEGER: f64 = 9_007_199_254_740_992.0; // 2^53
-    if n.fract() == 0.0 && n.abs() < MAX_EXACT_INTEGER {
-        return normalize_negative_zero(format!("{n:.0}"));
-    }
-
-    // For non-integers, use a stable fixed-precision decimal representation
-    // and trim cosmetic zeroes. This avoids f64::to_string's scientific
-    // notation for typical aggregate averages/min/max values while keeping the
-    // TSV compact enough for quick inspection.
-    let s = format!("{n:.6}");
-    let s = trim_decimal_zeros(s);
-    normalize_negative_zero(s)
+    let rendered = n.to_string();
+    let rendered = if format == NumberFormat::Decimal {
+        expand_exponent_notation(&rendered).unwrap_or(rendered)
+    } else {
+        rendered
+    };
+    normalize_negative_zero(rendered)
 }
 
-fn trim_decimal_zeros(mut s: String) -> String {
-    if let Some(dot) = s.find('.') {
-        while s.ends_with('0') {
-            s.pop();
+const INTEGER_AVERAGE_FRACTIONAL_DIGITS: usize = 18;
+
+fn format_integer_average(sum: i128, count: u64) -> String {
+    debug_assert!(count > 0);
+    let denom = count as u128;
+    let negative = sum.is_negative();
+    let abs_sum = sum.unsigned_abs();
+    let mut integer = abs_sum / denom;
+    let mut rem = abs_sum % denom;
+    if rem == 0 {
+        let mut out = String::new();
+        if negative {
+            out.push('-');
         }
-        if s.len() == dot + 1 {
-            s.pop();
+        out.push_str(&integer.to_string());
+        return normalize_negative_zero(out);
+    }
+
+    let mut digits = Vec::with_capacity(INTEGER_AVERAGE_FRACTIONAL_DIGITS);
+    for _ in 0..INTEGER_AVERAGE_FRACTIONAL_DIGITS {
+        rem *= 10;
+        digits.push((rem / denom) as u8);
+        rem %= denom;
+    }
+
+    if rem * 2 >= denom {
+        let mut carry = true;
+        for digit in digits.iter_mut().rev() {
+            if *digit == 9 {
+                *digit = 0;
+            } else {
+                *digit += 1;
+                carry = false;
+                break;
+            }
+        }
+        if carry {
+            integer += 1;
         }
     }
-    s
+
+    while digits.last() == Some(&0) {
+        digits.pop();
+    }
+
+    let mut out = String::new();
+    if negative {
+        out.push('-');
+    }
+    out.push_str(&integer.to_string());
+    if !digits.is_empty() {
+        out.push('.');
+        for digit in digits {
+            out.push(char::from(b'0' + digit));
+        }
+    }
+    normalize_negative_zero(out)
+}
+
+fn expand_exponent_notation(s: &str) -> Option<String> {
+    let e = s.find('e').or_else(|| s.find('E'))?;
+    let exponent: i32 = s[e + 1..].parse().ok()?;
+    let mut mantissa = &s[..e];
+    let sign = if let Some(rest) = mantissa.strip_prefix('-') {
+        mantissa = rest;
+        "-"
+    } else if let Some(rest) = mantissa.strip_prefix('+') {
+        mantissa = rest;
+        ""
+    } else {
+        ""
+    };
+
+    let integer_digits = mantissa.find('.').unwrap_or(mantissa.len());
+    let digits: String = mantissa.chars().filter(|&ch| ch != '.').collect();
+    if digits.is_empty() {
+        return None;
+    }
+
+    let decimal_pos = integer_digits as i32 + exponent;
+    let mut out = String::new();
+    out.push_str(sign);
+    if decimal_pos <= 0 {
+        out.push_str("0.");
+        for _ in 0..decimal_pos.unsigned_abs() {
+            out.push('0');
+        }
+        out.push_str(&digits);
+    } else if decimal_pos as usize >= digits.len() {
+        out.push_str(&digits);
+        for _ in 0..(decimal_pos as usize - digits.len()) {
+            out.push('0');
+        }
+    } else {
+        let split = decimal_pos as usize;
+        out.push_str(&digits[..split]);
+        out.push('.');
+        out.push_str(&digits[split..]);
+    }
+    Some(normalize_negative_zero(out))
+}
+
+fn cmp_i128_ratios(a_num: i128, a_den: u64, b_num: i128, b_den: u64) -> Ordering {
+    debug_assert!(a_den > 0 && b_den > 0);
+    match (
+        a_num.checked_mul(b_den as i128),
+        b_num.checked_mul(a_den as i128),
+    ) {
+        (Some(a), Some(b)) => a.cmp(&b),
+        _ => (a_num as f64 / a_den as f64).total_cmp(&(b_num as f64 / b_den as f64)),
+    }
+}
+
+fn cmp_i128_f64(i: i128, f: f64) -> Ordering {
+    if f.is_nan() {
+        return Ordering::Equal;
+    }
+    if f.is_infinite() {
+        return if f.is_sign_positive() {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        };
+    }
+    (i as f64).total_cmp(&f)
 }
 
 fn normalize_negative_zero(s: String) -> String {
@@ -642,6 +972,13 @@ macro_rules! plan {
         if !common.subreddits.is_empty() {
             scan = scan.subreddits(common.subreddits.iter().map(String::as_str));
         }
+        if !query.ids.is_empty() || !query.ids_files.is_empty() {
+            let mut id_selectors = query.ids.clone();
+            for ids_file in &query.ids_files {
+                id_selectors.extend(retl::read_record_ids_file(ids_file)?);
+            }
+            scan = scan.ids_in(id_selectors.iter().map(String::as_str));
+        }
         if !query.authors.is_empty() {
             scan = scan.authors_in(query.authors.iter().map(String::as_str));
         }
@@ -657,14 +994,29 @@ macro_rules! plan {
         if !query.keywords.is_empty() {
             scan = scan.keywords_any(query.keywords.iter().map(String::as_str));
         }
+        if !query.keywords_all.is_empty() {
+            scan = scan.keywords_all(query.keywords_all.iter().map(String::as_str));
+        }
+        if !query.exclude_keywords.is_empty() {
+            scan = scan.exclude_keywords(query.exclude_keywords.iter().map(String::as_str));
+        }
+        if let Some(text_regex) = &query.text_regex {
+            scan = scan.text_regex(text_regex.as_str());
+        }
         if let Some(min_score) = query.min_score {
             scan = scan.min_score(min_score);
         }
         if let Some(max_score) = query.max_score {
             scan = scan.max_score(max_score);
         }
+        if query.after.is_some() || query.before.is_some() {
+            scan = scan.timestamp_bounds(query.after, query.before);
+        }
         if query.contains_url {
             scan = scan.contains_url(true);
+        }
+        if query.no_url {
+            scan = scan.no_url();
         }
         if !query.domains.is_empty() {
             scan = scan.domains_in(query.domains.iter().map(String::as_str));
