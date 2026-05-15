@@ -3,11 +3,11 @@
 
 use anyhow::{Context, Result};
 use retl::{
-    create_dir_all_with_backoff, create_new_with_backoff, discover_sources_checked,
-    for_each_line_cfg, format_year_month_ranges, missing_month_diagnostics, open_with_backoff,
-    plan_files, plan_files_checked, read_line_capped, remove_with_backoff,
-    replace_file_atomic_backoff, total_compressed_size, AggregateBuildReport, ExportFormat,
-    FileKind, IntegrityMode, KeyExtractor, ParentPayloadSpec, RedditETL, Sources,
+    create_dir_all_with_backoff, create_new_with_backoff, create_with_backoff,
+    discover_sources_checked, for_each_line_cfg, format_year_month_ranges,
+    missing_month_diagnostics, open_with_backoff, plan_files, plan_files_checked, read_line_capped,
+    remove_with_backoff, replace_file_atomic_backoff, total_compressed_size, AggregateBuildReport,
+    ExportFormat, FileKind, IntegrityMode, KeyExtractor, ParentPayloadSpec, RedditETL, Sources,
     TabularExportOptions, YearMonth, DEFAULT_MAX_LINE_BYTES,
 };
 use serde::Serialize;
@@ -21,8 +21,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::bin_args::{
     AggregateArgs, CountArgs, CountMode, DedupeArgs, DescribeArgs, ExportArgs, ExportFmt,
-    FirstSeenArgs, IntegrityArgs, IntegrityModeArg, ParentsArgs, SampleArgs, ScanArgs, SchemaArgs,
-    SchemaFmt, SourceArg,
+    FirstSeenArgs, IntegrityArgs, IntegrityModeArg, ParentsArgs, QuickstartArgs, SampleArgs,
+    ScanArgs, SchemaArgs, SchemaFmt, SourceArg,
 };
 use crate::bin_helpers::{
     build_etl, discover_spool_parts, emit_partial_read_report, plan, stream_extract_to_stdout,
@@ -31,6 +31,8 @@ use crate::bin_helpers::{
 
 const CLI_TEXT_WRITE_BUF_BYTES: usize = 64 * 1024;
 const QUICK_SAMPLE_WARN_BELOW_BYTES: u64 = 4096;
+const QUICKSTART_SAMPLE_JSONL: &str = include_str!("../benches/data/sample.jsonl");
+const QUICKSTART_ZST_LEVEL: i32 = 3;
 static CLI_STAGE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn output_parent(path: &Path) -> &Path {
@@ -193,6 +195,101 @@ fn available_range(map: &BTreeMap<YearMonth, PathBuf>) -> String {
         (Some(first), Some(last)) => format!("{first}..={last}"),
         _ => "<none>".to_string(),
     }
+}
+
+pub(crate) fn run_quickstart(args: QuickstartArgs) -> Result<()> {
+    let data_dir = prepare_quickstart_sample_corpus(&args.out_dir)?;
+    let work_dir = args.out_dir.join("etl_work");
+    create_dir_all_with_backoff(&work_dir, 16, 50)
+        .with_context(|| format!("creating quickstart work dir {}", work_dir.display()))?;
+
+    let base = RedditETL::new()
+        .base_dir(&data_dir)
+        .work_dir(&work_dir)
+        .parallelism(1)
+        .file_concurrency(1)
+        .progress(false)
+        .sources(Sources::Both);
+
+    let counts = base
+        .clone()
+        .scan()
+        .subreddit("programming")
+        .count_by_month()?;
+
+    let mut authors = Vec::new();
+    base.scan()
+        .subreddit("programming")
+        .for_each_username(|u| authors.push(u.to_string()))?;
+    authors.sort();
+
+    let stdout = io::stdout();
+    let mut w = BufWriter::new(stdout.lock());
+    writeln!(
+        w,
+        "Prepared sample corpus from benches/data/sample.jsonl under {}",
+        data_dir.display()
+    )?;
+    writeln!(w, "Feature demo: subreddit=programming, source=RC+RS")?;
+    for (ym, n) in counts {
+        writeln!(w, "{ym}\t{n} records")?;
+    }
+    writeln!(
+        w,
+        "Found {} unique authors: {}",
+        authors.len(),
+        authors.join(", ")
+    )?;
+    writeln!(
+        w,
+        "Next: retl sample --data-dir {} --source both --subreddit programming --limit 3",
+        data_dir.display()
+    )?;
+    w.flush()?;
+    Ok(())
+}
+
+fn prepare_quickstart_sample_corpus(out_dir: &Path) -> Result<PathBuf> {
+    let data_dir = out_dir.join("data");
+    let comments_dir = data_dir.join("comments");
+    let submissions_dir = data_dir.join("submissions");
+    create_dir_all_with_backoff(&comments_dir, 16, 50)
+        .with_context(|| format!("creating comments dir {}", comments_dir.display()))?;
+    create_dir_all_with_backoff(&submissions_dir, 16, 50)
+        .with_context(|| format!("creating submissions dir {}", submissions_dir.display()))?;
+
+    let mut comments = Vec::new();
+    let mut submissions = Vec::new();
+    for line in QUICKSTART_SAMPLE_JSONL
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+    {
+        let value: Value = serde_json::from_str(line).context("parse sample JSONL line")?;
+        if value.get("body").is_some() {
+            comments.push(line.to_owned());
+        } else if value.get("title").is_some() {
+            submissions.push(line.to_owned());
+        }
+    }
+
+    write_quickstart_zst_lines(&comments_dir.join("RC_2020-01.zst"), &comments)?;
+    write_quickstart_zst_lines(&submissions_dir.join("RS_2020-01.zst"), &submissions)?;
+
+    Ok(data_dir)
+}
+
+fn write_quickstart_zst_lines(path: &Path, lines: &[String]) -> Result<()> {
+    let file = create_with_backoff(path, 16, 50)
+        .with_context(|| format!("creating quickstart sample {}", path.display()))?;
+    let mut enc =
+        zstd::stream::write::Encoder::new(file, QUICKSTART_ZST_LEVEL).context("zstd encoder")?;
+    enc.include_checksum(true).context("enable zstd checksum")?;
+    for line in lines {
+        enc.write_all(line.as_bytes())?;
+        enc.write_all(b"\n")?;
+    }
+    enc.finish().context("finish zstd frame")?;
+    Ok(())
 }
 
 #[derive(Debug)]

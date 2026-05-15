@@ -19,6 +19,7 @@ fn root_help_lists_all_subcommands() {
         .and(contains("scan"))
         .and(contains("dedupe"))
         .and(contains("export"))
+        .and(contains("quickstart"))
         .and(contains("count"))
         .and(contains("integrity"))
         .and(contains("aggregate"))
@@ -35,6 +36,24 @@ fn describe_help_advertises_discovery_flags() {
         .and(contains("--start"))
         .and(contains("--end"));
     assert.stdout(pred);
+}
+
+#[test]
+fn quickstart_help_advertises_out_dir() {
+    let assert = retl().args(["quickstart", "--help"]).assert().success();
+    assert.stdout(contains("--out-dir"));
+}
+
+#[test]
+fn quickstart_runs_without_corpus() {
+    let dir = tempfile::tempdir().unwrap();
+    retl()
+        .arg("quickstart")
+        .arg("--out-dir")
+        .arg(dir.path())
+        .assert()
+        .success()
+        .stdout(contains("Feature demo").and(contains("Found 4 unique authors")));
 }
 
 #[test]

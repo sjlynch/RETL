@@ -1,8 +1,8 @@
 //! `retl` — command-line interface to the RETL toolkit.
 //!
 //! Subcommands map onto existing builder methods on `retl::RedditETL` /
-//! `retl::ScanPlan`. The original demo binary lives at
-//! `examples/quickstart.rs` (`cargo run --example quickstart`).
+//! `retl::ScanPlan`. `retl quickstart` embeds the same tiny no-corpus demo
+//! fixture as `examples/quickstart.rs` for installed-binary smoke tests.
 //!
 //! The binary is split across three sibling modules to keep this file thin:
 //!
@@ -26,6 +26,7 @@ fn main() -> Result<()> {
         Command::Describe(a) => bin_handlers::run_describe(a),
         Command::Schema(a) => bin_handlers::run_schema(a),
         Command::Sample(a) => bin_handlers::run_sample(a),
+        Command::Quickstart(a) => bin_handlers::run_quickstart(a),
         Command::Scan(a) => bin_handlers::run_scan(a),
         Command::Dedupe(a) => bin_handlers::run_dedupe(a),
         Command::Export(a) => bin_handlers::run_export(a),

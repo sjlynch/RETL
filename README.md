@@ -48,29 +48,31 @@
 
 ## Try it in 60 seconds (no corpus needed)
 
-You can verify a fresh checkout without downloading the multi-GB Reddit corpus.
-This builds the release CLI binary, then runs the `quickstart` example against
-the committed `benches/data/sample.jsonl` fixture. The example writes a tiny
-Reddit-style `.zst` corpus under `target/retl_quickstart_sample/data` and runs
-real RETL scans over it.
+After installing a release binary, verify it without downloading the multi-GB
+Reddit corpus. `retl quickstart` writes a tiny Reddit-style `.zst` corpus from
+the embedded `benches/data/sample.jsonl` fixture and runs real RETL scans over
+it.
 
 ~~~sh
-cargo build --release
-cargo run --release --example quickstart
+retl --help
+retl quickstart
 ~~~
 
 Expected output:
 
 ~~~text
-Prepared sample corpus from benches/data/sample.jsonl under target/retl_quickstart_sample/data
+Prepared sample corpus from benches/data/sample.jsonl under ./retl_quickstart_sample/data
 Feature demo: subreddit=programming, source=RC+RS
 2019-12	2 records
 2020-01	3 records
 Found 4 unique authors: alice, cory, kate, quinn
+Next: retl sample --data-dir ./retl_quickstart_sample/data --source both --subreddit programming --limit 3
 ~~~
 
-If that works and you already have monthly Reddit dumps, continue with the
-full [Quick Start](#quick-start).
+From a source checkout you can run the same installed-binary path with
+`cargo run --release -- quickstart` (the library example remains available as
+`cargo run --release --example quickstart`). If that works and you already have
+monthly Reddit dumps, continue with the full [Quick Start](#quick-start).
 
 ---
 
@@ -104,7 +106,45 @@ The monthly files become very large in later years. It’s normal for broader qu
 
 ## Install
 
-### As a library (recommended)
+### CLI binary (no Rust toolchain)
+
+Download the latest prebuilt `retl` binary from GitHub Releases and verify it
+with the no-corpus quickstart:
+
+~~~sh
+# Linux x86_64
+curl -L https://github.com/sjlynch/retl/releases/latest/download/retl-x86_64-unknown-linux-gnu.tar.gz \
+  | tar xz
+sudo install -m 0755 retl /usr/local/bin/retl
+retl --help
+retl quickstart
+~~~
+
+~~~sh
+# macOS x86_64
+curl -L https://github.com/sjlynch/retl/releases/latest/download/retl-x86_64-apple-darwin.tar.gz \
+  | tar xz
+sudo install -m 0755 retl /usr/local/bin/retl
+retl --help
+retl quickstart
+~~~
+
+~~~powershell
+# Windows x86_64 (PowerShell)
+$dest = "$env:LOCALAPPDATA\retl\bin"
+New-Item -ItemType Directory -Force $dest | Out-Null
+Invoke-WebRequest https://github.com/sjlynch/retl/releases/latest/download/retl-x86_64-pc-windows-msvc.zip -OutFile "$env:TEMP\retl.zip"
+Expand-Archive -Force "$env:TEMP\retl.zip" $dest
+$env:Path = "$dest;$env:Path"
+retl.exe --help
+retl.exe quickstart
+~~~
+
+Release CI builds those archives on Windows/macOS/Linux, extracts each archive,
+and smoke-tests the packaged binary with `retl --help`, `retl quickstart`, and
+`retl sample` against the generated fixture.
+
+### As a library
 
 Add RETL to your Cargo.toml via Git:
 
@@ -113,17 +153,18 @@ Add RETL to your Cargo.toml via Git:
 retl = { git = "https://github.com/sjlynch/retl", branch = "main" }
 ~~~
 
-> This repository currently sets `publish = false` in `Cargo.toml`, so installing from crates.io is not expected.
+> This repository currently sets `publish = false` in `Cargo.toml`, so installing from crates.io is not expected. The Git dependency path remains the supported library path.
 
-### Build the CLI binary
+### Build the CLI binary from source
 
 This repo ships a `retl` binary (`src/main.rs`) that exposes the most common
-ETL operations as subcommands. The original demo lives at
+ETL operations as subcommands. The original library demo lives at
 `examples/quickstart.rs`.
 
 ~~~sh
 cargo build --release
 ./target/release/retl --help
+./target/release/retl quickstart
 ~~~
 
 For copy-pasteable per-subcommand invocations, see
@@ -168,6 +209,19 @@ By default, scans exclude records whose `author` is `[deleted]`, `[removed]`, or
 ### Date ranges and missing months
 
 When `--start` or `--end` is set, RETL filters individual records by the same inclusive month bounds it uses for file planning. Records without `created_utc` are dropped while any date bound is active. If files are missing inside the requested range (for example Jan and Mar exist but Feb is absent), corpus-scanning commands emit a warning and `retl describe` reports the missing month list. Discovery errors (for example a `comments/` path that is a file or cannot be read) fail fast with the directory name; filenames like `RC_2024-00.zst` or `RS_2024-99.zst` are warned and skipped because their months are invalid.
+
+### `quickstart` — verify an install without a corpus
+
+Creates a tiny local corpus under `./retl_quickstart_sample/data` (override with
+`--out-dir`) from RETL's embedded sample fixture, then runs a count and username
+scan over it:
+
+~~~sh
+retl quickstart
+retl sample --data-dir ./retl_quickstart_sample/data --source both --subreddit programming --limit 3
+~~~
+
+Alias: `retl demo`.
 
 ### `describe` — inspect the discovered corpus
 

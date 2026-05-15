@@ -44,6 +44,9 @@ pub(crate) enum Command {
     /// Print a small sample of matching records (defaults to 10 JSONL records on stdout).
     #[command(alias = "preview", alias = "head")]
     Sample(SampleArgs),
+    /// Generate and scan a built-in tiny corpus so new installs can verify RETL without Reddit dumps.
+    #[command(alias = "demo")]
+    Quickstart(QuickstartArgs),
     /// Scan and emit unique usernames matching the query selection.
     Scan(ScanArgs),
     /// Emit distinct keys (author, subreddit, or JSON pointer) matching the query selection.
@@ -62,6 +65,17 @@ pub(crate) enum Command {
     /// Build a per-author "first-seen" timestamp index TSV.
     #[command(name = "first-seen")]
     FirstSeen(FirstSeenArgs),
+}
+
+// -----------------------------------------------------------------------------
+// Self-contained smoke/demo subcommands.
+// -----------------------------------------------------------------------------
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct QuickstartArgs {
+    /// Directory where the generated tiny corpus and scratch files are written.
+    #[arg(long = "out-dir", default_value = "./retl_quickstart_sample")]
+    pub(crate) out_dir: PathBuf,
 }
 
 // -----------------------------------------------------------------------------
