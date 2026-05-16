@@ -140,115 +140,11 @@ pub fn for_each_line_cfg(
     )
 }
 
-/// Like [`for_each_line_cfg`] but returns `Ok(false)` when a zstd decode error
-/// was tolerated after zero or more lines had already been delivered.
-#[allow(dead_code)]
-pub fn for_each_line_cfg_status(
-    path: &Path,
-    read_buf_bytes: usize,
-    on_line: impl FnMut(&str) -> Result<()>,
-) -> Result<bool> {
-    for_each_line_with_opts_status(
-        path,
-        LineStreamOpts {
-            read_buf_bytes: Some(read_buf_bytes),
-            partial_read_policy: PartialReadPolicy::AllowPartial,
-            ..Default::default()
-        },
-        on_line,
-    )
-}
-
-/// Like [`for_each_line_cfg`] but reports skip events to the caller and
-/// deliberately allows corrupt zstd files to be skipped.
-#[allow(dead_code)]
-pub fn for_each_line_cfg_with_skip(
-    path: &Path,
-    read_buf_bytes: usize,
-    mut on_skip: impl FnMut(&Path, &anyhow::Error),
-    on_line: impl FnMut(&str) -> Result<()>,
-) -> Result<()> {
-    for_each_line_with_opts(
-        path,
-        LineStreamOpts {
-            read_buf_bytes: Some(read_buf_bytes),
-            on_skip: Some(&mut on_skip),
-            partial_read_policy: PartialReadPolicy::AllowPartial,
-            ..Default::default()
-        },
-        on_line,
-    )
-}
-
-/// Like [`for_each_line_cfg`] but additionally calls
-/// `on_progress(delta_bytes_read)` after each line and at EOF.
-///
-/// In strict mode, corruption is returned as an error. Use the status/with-skip
-/// variants or [`LineStreamOpts::partial_read_policy`] to opt into lossy skips.
-#[allow(dead_code)]
-pub fn for_each_line_with_progress_cfg(
-    path: &Path,
-    read_buf_bytes: usize,
-    mut on_progress: impl FnMut(u64),
-    on_line: impl FnMut(&str) -> Result<()>,
-) -> Result<()> {
-    for_each_line_with_opts(
-        path,
-        LineStreamOpts {
-            read_buf_bytes: Some(read_buf_bytes),
-            progress: Some(&mut on_progress),
-            ..Default::default()
-        },
-        on_line,
-    )
-}
-
-/// Like [`for_each_line_with_progress_cfg`] but returns `Ok(false)` when a
-/// zstd decode error was tolerated.
-#[allow(dead_code)]
-pub fn for_each_line_with_progress_cfg_status(
-    path: &Path,
-    read_buf_bytes: usize,
-    mut on_progress: impl FnMut(u64),
-    on_line: impl FnMut(&str) -> Result<()>,
-) -> Result<bool> {
-    for_each_line_with_opts_status(
-        path,
-        LineStreamOpts {
-            read_buf_bytes: Some(read_buf_bytes),
-            progress: Some(&mut on_progress),
-            partial_read_policy: PartialReadPolicy::AllowPartial,
-            ..Default::default()
-        },
-        on_line,
-    )
-}
-
-/// Progress-aware streaming **without** the per-line memory throttle.
+/// Progress-aware allow-partial streaming **without** the per-line memory
+/// throttle. Returns `Ok(false)` when a zstd decode error was tolerated.
 ///
 /// Useful for stages that briefly use more RAM (e.g., building parent
 /// caches) where the backoff would otherwise dominate runtime.
-#[allow(dead_code)]
-pub fn for_each_line_with_progress_cfg_no_throttle(
-    path: &Path,
-    read_buf_bytes: usize,
-    mut on_progress: impl FnMut(u64),
-    on_line: impl FnMut(&str) -> Result<()>,
-) -> Result<()> {
-    for_each_line_with_opts(
-        path,
-        LineStreamOpts {
-            read_buf_bytes: Some(read_buf_bytes),
-            progress: Some(&mut on_progress),
-            throttle: false,
-            ..Default::default()
-        },
-        on_line,
-    )
-}
-
-/// Like [`for_each_line_with_progress_cfg_no_throttle`] but returns
-/// `Ok(false)` when a zstd decode error was tolerated.
 pub fn for_each_line_with_progress_cfg_no_throttle_status(
     path: &Path,
     read_buf_bytes: usize,
@@ -261,28 +157,6 @@ pub fn for_each_line_with_progress_cfg_no_throttle_status(
             read_buf_bytes: Some(read_buf_bytes),
             progress: Some(&mut on_progress),
             throttle: false,
-            partial_read_policy: PartialReadPolicy::AllowPartial,
-            ..Default::default()
-        },
-        on_line,
-    )
-}
-
-/// Like [`for_each_line_with_progress_cfg`] but reports skip events to the caller.
-#[allow(dead_code)]
-pub fn for_each_line_with_progress_cfg_with_skip(
-    path: &Path,
-    read_buf_bytes: usize,
-    mut on_skip: impl FnMut(&Path, &anyhow::Error),
-    mut on_progress: impl FnMut(u64),
-    on_line: impl FnMut(&str) -> Result<()>,
-) -> Result<()> {
-    for_each_line_with_opts(
-        path,
-        LineStreamOpts {
-            read_buf_bytes: Some(read_buf_bytes),
-            progress: Some(&mut on_progress),
-            on_skip: Some(&mut on_skip),
             partial_read_policy: PartialReadPolicy::AllowPartial,
             ..Default::default()
         },
