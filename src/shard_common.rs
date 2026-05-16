@@ -10,7 +10,12 @@
 //! label seeds**.
 
 use ahash::RandomState;
+use anyhow::{Context, Result};
+use parking_lot::Mutex;
+use std::fs::File;
 use std::hash::{BuildHasher, Hash, Hasher};
+use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
 
 /// Construct a deterministic [`RandomState`] for a given module label.
 ///
@@ -49,4 +54,34 @@ pub(crate) fn shard_index(state: &RandomState, key: &str, count: usize) -> usize
     let mut hasher = state.build_hasher();
     key.hash(&mut hasher);
     (hasher.finish() as usize) % count
+}
+
+pub(crate) type LineShardWriters = Vec<Mutex<BufWriter<File>>>;
+
+/// Create deterministic line-oriented shard scratch files under `dir`.
+///
+/// Callers supply the filename pattern so on-disk layouts remain owned by the
+/// username/KV/parent-ID formats while file creation/backoff and mutex wrapping
+/// stay in one auditable helper.
+pub(crate) fn create_line_shard_writers(
+    dir: &Path,
+    count: usize,
+    mut file_name: impl FnMut(usize) -> String,
+    context_label: &str,
+) -> Result<LineShardWriters> {
+    let mut writers = Vec::with_capacity(count);
+    for i in 0..count {
+        let path: PathBuf = dir.join(file_name(i));
+        let file = crate::util::create_with_default_backoff(&path)
+            .with_context(|| format!("create {context_label} {}", path.display()))?;
+        writers.push(Mutex::new(BufWriter::new(file)));
+    }
+    Ok(writers)
+}
+
+pub(crate) fn flush_line_shard_writers(writers: &LineShardWriters) -> Result<()> {
+    for writer in writers {
+        writer.lock().flush()?;
+    }
+    Ok(())
 }

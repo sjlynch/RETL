@@ -1,5 +1,4 @@
 use crate::ndjson::{read_line_capped, DEFAULT_MAX_LINE_BYTES};
-use crate::util::{open_with_backoff, remove_dir_all_with_backoff};
 use anyhow::Result;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -52,7 +51,7 @@ impl UsernameStream {
     fn cleanup_scratch(&mut self) {
         self.reader = None;
         for root in std::mem::take(&mut self.cleanup_roots) {
-            if let Err(e) = remove_dir_all_with_backoff(&root, 8, 50) {
+            if let Err(e) = crate::util::remove_dir_all_with_short_backoff(&root) {
                 tracing::warn!(path=%root.display(), error=%e, "UsernameStream: failed to remove scratch dir");
             }
         }
@@ -67,7 +66,7 @@ impl UsernameStream {
         }
         let path = self.files[self.current_idx].clone();
         self.current_idx += 1;
-        match open_with_backoff(&path, 16, 50) {
+        match crate::util::open_with_default_backoff(&path) {
             Ok(f) => {
                 self.reader = Some(BufReader::new(f));
                 self.current_file_errors = 0;

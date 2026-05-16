@@ -45,8 +45,8 @@
 //!    - `discover_sources_checked` / `plan_files_checked` (doc(hidden)) walk
 //!      the corpus and emit [`FileJob`]s honoring the configured sources and
 //!      date bounds while surfacing directory/filename diagnostics.
-//!    - [`for_each_file_limited`](crate::concurrency::for_each_file_limited)
-//!      drives the per-file fan-out under a scoped Rayon pool.
+//!    - [`for_each_file_limited`] drives the per-file fan-out under a scoped
+//!      Rayon pool.
 //!
 //! 3. **Decode & filter (hot loop)**
 //!    - [`MinimalRecord`] + [`parse_minimal`] — line-level fast-path schema.
@@ -62,8 +62,8 @@
 //!      `allow_partial` only when lossy skipped-file reporting is acceptable.
 //!
 //! 4. **Emit**
-//!    - [`stream_job`](crate::streaming::stream_job) drives the per-file
-//!      scan + write; [`apply_human_timestamps`] rewrites unix epochs to
+//!    - `stream_job` drives the per-file scan + write; [`apply_human_timestamps`]
+//!      rewrites unix epochs to
 //!      RFC3339 when enabled.
 //!    - [`ShardedWriter`] (per-month spool) and [`ShardedKVWriter`]
 //!      (per-author shards) handle on-disk fan-out.
@@ -73,7 +73,7 @@
 //!      used by stitch and dedupe.
 //!
 //! 5. **Reduce**
-//!    - [`bucketize_shard`] / [`process_bucket_streaming`] / [`partition_stage1`]
+//!    - `bucketize_shard` / [`process_bucket_streaming`] / [`partition_stage1`]
 //!      perform the bucketing stage that feeds dedupe.
 //!    - [`build_runs_sorted`] / [`merge_runs_sorted`] (driven by
 //!      [`DedupeCfg`] + [`KeyExtractor`]) produce sorted, de-duplicated runs.
@@ -89,9 +89,9 @@
 //!      `<dir>/_staging/<file>.retl-<pid>-<nonce>.inprogress`, then
 //!      promoted to its final path via
 //!      [`replace_file_atomic_backoff`]. Library code never writes to a final
-//!      path directly. See [`crate::atomic_write`] for the staging contract.
+//!      path directly. See `crate::atomic_write` for the staging contract.
 //!    - The optional resume manifest at `<out_dir>/_progress.json` (see
-//!      [`progress_manifest`](crate::progress_manifest)) records each
+//!      `progress_manifest`) records each
 //!      committed month so a crashed run can skip what already landed. Exports
 //!      store manifests next to their outputs; analytics helpers store matched
 //!      per-month JSONL checkpoints under `work_dir/scan_checkpoints/`. Months
@@ -229,8 +229,13 @@ pub use crate::partition::{PartitionWriters, MAX_PARTITIONS};
 
 //export robust file ops from util so binaries can import from crate root.
 pub use crate::util::{
-    create_dir_all_with_backoff, create_new_with_backoff, create_with_backoff, open_with_backoff,
-    read_dir_with_backoff, remove_with_backoff, replace_file_atomic_backoff,
+    create_dir_all_with_backoff, create_dir_all_with_default_backoff, create_new_with_backoff,
+    create_new_with_default_backoff, create_with_backoff, create_with_default_backoff,
+    open_with_backoff, open_with_default_backoff, output_parent, read_dir_with_backoff,
+    read_dir_with_default_backoff, remove_dir_all_with_backoff,
+    remove_dir_all_with_default_backoff, remove_dir_all_with_short_backoff, remove_with_backoff,
+    remove_with_default_backoff, remove_with_short_backoff, replace_file_atomic_backoff,
+    DEFAULT_BACKOFF_DELAY_MS, DEFAULT_BACKOFF_TRIES, SHORT_BACKOFF_TRIES,
 };
 
 // Scoped rayon pool + opt-in tracing init for binaries.

@@ -17,9 +17,7 @@ use crate::config::{clamp_shard_count, ETLOptions};
 use crate::key_extractor::KeyExtractor;
 use crate::mem::{available_memory_fraction, is_low_memory, AdaptiveMemCfg};
 use crate::ndjson::{read_line_capped, DEFAULT_MAX_LINE_BYTES};
-use crate::util::{
-    create_dir_all_with_backoff, create_with_backoff, open_with_backoff, smoothstep_memory_fraction,
-};
+use crate::util::smoothstep_memory_fraction;
 use crate::zstd_jsonl::malformed_json_error;
 
 /// Adaptive streaming configuration used during micro-bucket processing.
@@ -102,7 +100,7 @@ fn route_lines_to_shards(
     use std::fs::File;
     use std::io::{BufReader, BufWriter};
 
-    create_dir_all_with_backoff(out_dir, 16, 50)
+    crate::util::create_dir_all_with_default_backoff(out_dir)
         .with_context(|| format!("create shard output dir {}", out_dir.display()))?;
 
     let shard_count = clamp_shard_count(shards, "bucketing::route_lines_to_shards");
@@ -110,14 +108,15 @@ fn route_lines_to_shards(
     let mut paths: Vec<PathBuf> = Vec::with_capacity(shard_count);
     for i in 0..shard_count {
         let p = out_dir.join(format!("{}_{:04}.jsonl", file_prefix, i));
-        let f =
-            create_with_backoff(&p, 16, 50).with_context(|| format!("create {}", p.display()))?;
+        let f = crate::util::create_with_default_backoff(&p)
+            .with_context(|| format!("create {}", p.display()))?;
         writers.push(Mutex::new(BufWriter::new(f)));
         paths.push(p);
     }
 
     inputs.par_iter().try_for_each(|p| -> Result<()> {
-        let f = open_with_backoff(p, 16, 50).with_context(|| format!("open {}", p.display()))?;
+        let f = crate::util::open_with_default_backoff(p)
+            .with_context(|| format!("open {}", p.display()))?;
         let mut r = BufReader::new(f);
         // Reusable line buffer — avoids the per-line String allocation from
         // `BufReader::lines()` (mirrors `zstd_jsonl::for_each_line_attempt`).
@@ -244,7 +243,7 @@ where
     F: FnMut(&str, Vec<String>) -> Result<()> + Send,
 {
     // Open the input bucket; skip gracefully if missing.
-    let file = match open_with_backoff(bucket, 16, 50) {
+    let file = match crate::util::open_with_default_backoff(bucket) {
         Ok(f) => f,
         Err(e) => {
             if e.kind() == std::io::ErrorKind::NotFound {

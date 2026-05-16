@@ -4,9 +4,7 @@ use crate::key_extractor::KeyExtractor;
 use crate::mem::{available_memory_fraction, is_low_memory, AdaptiveMemCfg};
 use crate::ndjson::{read_line_capped, NdjsonReader, NdjsonWriter, DEFAULT_MAX_LINE_BYTES};
 use crate::progress::ProgressScope;
-use crate::util::{
-    create_dir_all_with_backoff, open_with_backoff, remove_with_backoff, smoothstep_memory_fraction,
-};
+use crate::util::{remove_with_backoff, smoothstep_memory_fraction};
 use crate::zstd_jsonl::malformed_json_error;
 use anyhow::{Context, Result};
 use std::cmp::Ordering;
@@ -98,7 +96,7 @@ pub(crate) fn build_runs_sorted_with_key_stats(
     cfg: &DedupeCfg,
     key_extractions_failed: Option<&AtomicU64>,
 ) -> Result<Vec<PathBuf>> {
-    create_dir_all_with_backoff(runs_dir, 16, 50)
+    crate::util::create_dir_all_with_default_backoff(runs_dir)
         .with_context(|| format!("create runs dir {}", runs_dir.display()))?;
 
     let total_in_bytes = fs::metadata(input).map(|m| m.len()).unwrap_or(0);
@@ -391,7 +389,8 @@ pub(crate) fn merge_runs_sorted_with_key_stats(
 
     let mut readers: Vec<(BufReader<File>, u64, u64)> = Vec::with_capacity(runs.len()); // (reader, bytes_read, lines_read)
     for p in runs {
-        let f = open_with_backoff(p, 16, 50).with_context(|| format!("open {}", p.display()))?;
+        let f = crate::util::open_with_default_backoff(p)
+            .with_context(|| format!("open {}", p.display()))?;
         readers.push((BufReader::with_capacity(cfg.read_buf_bytes, f), 0, 0));
     }
 

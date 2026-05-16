@@ -3,15 +3,11 @@ pub use crate::username_stream::UsernameStream;
 use crate::config::clamp_shard_count;
 use crate::ndjson::{read_line_capped, DEFAULT_MAX_LINE_BYTES};
 use crate::shard_common;
-use crate::util::{
-    create_dir_all_with_backoff, create_with_backoff, open_with_backoff, unique_scratch_dir,
-};
+use crate::util::unique_scratch_dir;
 use ahash::RandomState;
 use anyhow::{Context, Result};
-use parking_lot::Mutex;
 use rayon::prelude::*;
 use std::collections::HashSet;
-use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
@@ -19,7 +15,7 @@ use std::path::{Path, PathBuf};
 pub struct ShardedWriter {
     run_root: PathBuf,
     base_dir: PathBuf,
-    shards: Vec<Mutex<BufWriter<File>>>,
+    shards: shard_common::LineShardWriters,
     count: usize,
     state: RandomState, // seeded for deterministic sharding
 }
@@ -29,16 +25,15 @@ impl ShardedWriter {
         let count = clamp_shard_count(count, "ShardedWriter::create");
         let run_root = unique_scratch_dir(work_dir, prefix, "shards");
         let shards_dir = run_root.join("shards");
-        create_dir_all_with_backoff(&shards_dir, 16, 50)
+        crate::util::create_dir_all_with_default_backoff(&shards_dir)
             .with_context(|| format!("create shard scratch dir {}", shards_dir.display()))?;
 
-        let mut shards = Vec::with_capacity(count);
-        for i in 0..count {
-            let path = shards_dir.join(format!("shard_{:04}.tmp", i));
-            let file = create_with_backoff(&path, 16, 50)
-                .with_context(|| format!("create shard scratch {}", path.display()))?;
-            shards.push(Mutex::new(BufWriter::new(file)));
-        }
+        let shards = shard_common::create_line_shard_writers(
+            &shards_dir,
+            count,
+            |i| format!("shard_{i:04}.tmp"),
+            "shard scratch",
+        )?;
 
         let state = shard_common::seeded_state("usernames");
 
@@ -69,10 +64,7 @@ impl ShardedWriter {
     }
 
     pub fn flush_all(&self) -> Result<()> {
-        for w in &self.shards {
-            w.lock().flush()?;
-        }
-        Ok(())
+        shard_common::flush_line_shard_writers(&self.shards)
     }
 
     /// Deduplicate each shard independently and return ordered deduped files.
@@ -96,7 +88,7 @@ impl ShardedWriter {
         drop(shards); // ensure writers are closed
 
         let dedup_dir = run_root.join(format!("{prefix}_dedup"));
-        create_dir_all_with_backoff(&dedup_dir, 16, 50)
+        crate::util::create_dir_all_with_default_backoff(&dedup_dir)
             .with_context(|| format!("create dedup scratch dir {}", dedup_dir.display()))?;
 
         let shard_paths: Vec<PathBuf> = (0..count)
@@ -123,11 +115,11 @@ impl ShardedWriter {
 }
 
 fn dedup_single_shard(input: &Path, output: &Path) -> Result<()> {
-    let in_file = open_with_backoff(input, 16, 50)
+    let in_file = crate::util::open_with_default_backoff(input)
         .with_context(|| format!("open shard for dedup: {}", input.display()))?;
     let mut reader = BufReader::new(in_file);
 
-    let out_file = create_with_backoff(output, 16, 50)
+    let out_file = crate::util::create_with_default_backoff(output)
         .with_context(|| format!("create dedup output: {}", output.display()))?;
     let mut writer = BufWriter::new(out_file);
 
@@ -158,7 +150,7 @@ fn dedup_single_shard(input: &Path, output: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::util::{inject_retriable_io_errors_for_file_name_tests, TestIoOp};
+    use crate::util::{inject_retriable_io_errors_for_file_name_tests, open_with_backoff, TestIoOp};
     use std::io::Read;
 
     #[test]

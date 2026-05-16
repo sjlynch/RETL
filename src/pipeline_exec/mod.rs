@@ -1,0 +1,14 @@
+include!("types.rs");
+include!("limits.rs");
+include!("dedupe_keys.rs");
+include!("entry_points.rs");
+include!("scan.rs");
+include!("fingerprint.rs");
+include!("spool.rs");
+include!("partitioned.rs");
+include!("extract.rs");
+include!("checkpoint.rs");
+include!("tabular.rs");
+include!("extract_common.rs");
+include!("scan_records.rs");
+include!("tests.rs");

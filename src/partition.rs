@@ -7,7 +7,7 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use crate::atomic_write::{ensure_staging_dir, unique_inprogress_path};
-use crate::util::{create_dir_all_with_backoff, create_new_with_backoff, replace_file_atomic_backoff};
+use crate::util::replace_file_atomic_backoff;
 
 /// Upper bound on the number of partitions a single `PartitionWriters` will
 /// open at once. Each partition owns a live `BufWriter<File>` for the lifetime
@@ -70,7 +70,7 @@ impl PartitionWriters {
                 "PartitionWriters: clamping parts to MAX_PARTITIONS to bound file-descriptor and buffer use"
             );
         }
-        create_dir_all_with_backoff(dir, 16, 50)
+        crate::util::create_dir_all_with_default_backoff(dir)
             .with_context(|| format!("create partition dir {}", dir.display()))?;
         let staging = ensure_staging_dir(dir)?;
 
@@ -81,7 +81,7 @@ impl PartitionWriters {
         for i in 0..parts {
             let final_p = dir.join(format!("{}_part_{:06}.ndjson", stem, i));
             let tmp = unique_inprogress_path(&staging, &final_p)?;
-            let f = create_new_with_backoff(&tmp, 16, 50)
+            let f = crate::util::create_new_with_default_backoff(&tmp)
                 .with_context(|| format!("create {}", tmp.display()))?;
             writers.push(Mutex::new(BufWriter::with_capacity(write_buf, f)));
             tmp_paths.push(tmp);

@@ -1,15 +1,11 @@
 use crate::config::clamp_shard_count;
 use crate::ndjson::{read_line_capped, DEFAULT_MAX_LINE_BYTES};
 use crate::shard_common;
-use crate::util::{
-    create_dir_all_with_backoff, create_with_backoff, open_with_backoff, unique_scratch_dir,
-};
+use crate::util::unique_scratch_dir;
 use ahash::RandomState;
 use anyhow::{Context, Result};
-use parking_lot::Mutex;
 use rayon::prelude::*;
 use std::collections::HashMap;
-use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
@@ -17,7 +13,7 @@ use std::path::{Path, PathBuf};
 pub struct ShardedKVWriter {
     run_root: PathBuf,
     base_dir: PathBuf,
-    shards: Vec<Mutex<BufWriter<File>>>,
+    shards: shard_common::LineShardWriters,
     count: usize,
     state: RandomState,
 }
@@ -27,15 +23,14 @@ impl ShardedKVWriter {
         let count = clamp_shard_count(count, "ShardedKVWriter::create");
         let run_root = unique_scratch_dir(work_dir, prefix, "kv_shards");
         let dir = run_root.join("shards");
-        create_dir_all_with_backoff(&dir, 16, 50)
+        crate::util::create_dir_all_with_default_backoff(&dir)
             .with_context(|| format!("create kv shard scratch dir {}", dir.display()))?;
-        let mut shards = Vec::with_capacity(count);
-        for i in 0..count {
-            let p = dir.join(format!("kv_{:04}.tmp", i));
-            let file = create_with_backoff(&p, 16, 50)
-                .with_context(|| format!("create kv shard scratch {}", p.display()))?;
-            shards.push(Mutex::new(BufWriter::new(file)));
-        }
+        let shards = shard_common::create_line_shard_writers(
+            &dir,
+            count,
+            |i| format!("kv_{i:04}.tmp"),
+            "kv shard scratch",
+        )?;
         let state = shard_common::seeded_state("kv");
         Ok(Self {
             run_root,
@@ -66,10 +61,7 @@ impl ShardedKVWriter {
     }
 
     pub fn flush_all(&self) -> Result<()> {
-        for w in &self.shards {
-            w.lock().flush()?;
-        }
-        Ok(())
+        shard_common::flush_line_shard_writers(&self.shards)
     }
 
     /// Reduce all shards by summing per-key values.
@@ -130,7 +122,7 @@ impl ShardedKVWriter {
         drop(shards);
 
         let out_dir = run_root.join(format!("{prefix}_{suffix}"));
-        create_dir_all_with_backoff(&out_dir, 16, 50)
+        crate::util::create_dir_all_with_default_backoff(&out_dir)
             .with_context(|| format!("create kv reduce dir {}", out_dir.display()))?;
 
         // Compute shard input paths from moved fields (no further `self` usage).
@@ -171,7 +163,8 @@ fn reduce_shard(input: &Path, output: &Path, reducer: Reducer) -> Result<()> {
     let mut acc: HashMap<String, i64> = HashMap::with_capacity(64_000);
     let mut sum_overflow_warned = false;
     let mut r = BufReader::new(
-        open_with_backoff(input, 16, 50).with_context(|| format!("open {}", input.display()))?,
+        crate::util::open_with_default_backoff(input)
+            .with_context(|| format!("open {}", input.display()))?,
     );
     let mut line = String::with_capacity(16 * 1024);
     let mut line_no = 0usize;
@@ -242,7 +235,7 @@ fn reduce_shard(input: &Path, output: &Path, reducer: Reducer) -> Result<()> {
     rows.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
 
     let mut w = BufWriter::new(
-        create_with_backoff(output, 16, 50)
+        crate::util::create_with_default_backoff(output)
             .with_context(|| format!("create {}", output.display()))?,
     );
     for (k, v) in rows {
@@ -258,6 +251,7 @@ fn reduce_shard(input: &Path, output: &Path, reducer: Reducer) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::File;
     use std::io::Write;
 
     #[test]

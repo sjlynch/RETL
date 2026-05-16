@@ -9,7 +9,6 @@
 
 use crate::atomic_write::{ensure_staging_dir, write_jsonl_atomic};
 use crate::ndjson::{read_line_capped, DEFAULT_MAX_LINE_BYTES};
-use crate::util::{open_with_backoff, read_dir_with_backoff};
 use anyhow::Result;
 use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -36,7 +35,7 @@ pub fn stitch_tmp_parts(tmp_dir: &Path, out_path: &Path, write_buf: usize) -> Re
     let parts = list_tmp_parts(tmp_dir)?;
     write_atomic(out_path, write_buf, |out| {
         for path in &parts {
-            let mut r = BufReader::new(open_with_backoff(path, 16, 50)?);
+            let mut r = BufReader::new(crate::util::open_with_default_backoff(path)?);
             std::io::copy(&mut r, out)?;
         }
         Ok(())
@@ -71,7 +70,7 @@ pub fn stitch_tmp_parts_to_json_array(
 
         let mut buf = String::with_capacity(STITCH_BUF_BYTES);
         for path in &parts {
-            let mut r = BufReader::new(open_with_backoff(path, 16, 50)?);
+            let mut r = BufReader::new(crate::util::open_with_default_backoff(path)?);
             loop {
                 let n = read_line_capped(&mut r, &mut buf, DEFAULT_MAX_LINE_BYTES, path)?;
                 if n == 0 {
@@ -106,7 +105,7 @@ fn stitch_tmp_parts_to_json_array_pretty(
 
         let mut buf = String::with_capacity(STITCH_BUF_BYTES);
         for path in &parts {
-            let mut r = BufReader::new(open_with_backoff(path, 16, 50)?);
+            let mut r = BufReader::new(crate::util::open_with_default_backoff(path)?);
             loop {
                 let n = read_line_capped(&mut r, &mut buf, DEFAULT_MAX_LINE_BYTES, path)?;
                 if n == 0 {
@@ -143,7 +142,7 @@ fn stitch_tmp_parts_to_json_array_pretty(
 
 fn jsonl_part_paths(tmp_dir: &Path) -> Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
-    for entry in read_dir_with_backoff(tmp_dir, 16, 50)? {
+    for entry in crate::util::read_dir_with_default_backoff(tmp_dir)? {
         let path = entry.path();
         if !path.is_file() {
             continue;
@@ -169,7 +168,7 @@ pub fn concat_tsvs(parts: &Vec<PathBuf>, out_path: &Path, write_buf: usize) -> R
     paths.sort();
     write_atomic(out_path, write_buf, |out| {
         for p in paths {
-            let mut r = BufReader::new(open_with_backoff(&p, 16, 50)?);
+            let mut r = BufReader::new(crate::util::open_with_default_backoff(&p)?);
             std::io::copy(&mut r, out)?;
         }
         Ok(())

@@ -3,7 +3,7 @@ use crate::paths::{
     discover_sources_checked, log_missing_month_warnings, plan_files_checked, FileJob,
 };
 use crate::progress::make_count_progress;
-use crate::util::{open_with_backoff, with_thread_pool};
+use crate::util::with_thread_pool;
 use crate::RedditETL;
 use anyhow::{Context, Result};
 use std::io::{self, Read};
@@ -26,7 +26,7 @@ pub fn quick_validate_zst(path: &Path, max_decompressed_bytes: u64) -> Result<()
         anyhow::bail!(ZERO_SAMPLE_BYTES_ERROR);
     }
 
-    let file = open_with_backoff(path, 16, 50)?;
+    let file = crate::util::open_with_default_backoff(path)?;
     let mut decoder = Decoder::new(file)?;
     decoder.window_log_max(ZSTD_WINDOW_LOG_MAX)?;
     let mut limited = decoder.take(max_decompressed_bytes);
@@ -44,7 +44,7 @@ pub fn quick_validate_zst(path: &Path, max_decompressed_bytes: u64) -> Result<()
 /// is needed. (Bit-flips inside compressed payloads typically also fail
 /// earlier with a frame/entropy decode error.)
 pub fn validate_zst_full(path: &Path) -> Result<()> {
-    let file = open_with_backoff(path, 16, 50)?;
+    let file = crate::util::open_with_default_backoff(path)?;
     let mut decoder = Decoder::new(file)?;
     decoder.window_log_max(ZSTD_WINDOW_LOG_MAX)?;
     io::copy(&mut decoder, &mut io::sink())?;

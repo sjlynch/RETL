@@ -22,10 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use zstd::stream::write::Encoder as ZstdEncoder;
 
-use crate::util::{
-    create_dir_all_with_backoff, create_new_with_backoff, read_dir_with_backoff,
-    remove_with_backoff, replace_file_atomic_backoff,
-};
+use crate::util::replace_file_atomic_backoff;
 
 /// Directory used to stage `*.inprogress` files under an output root.
 pub const STAGING_DIR_NAME: &str = "_staging";
@@ -86,7 +83,7 @@ fn notify_stage_path_for_tests(staged: &Path) {
 /// Build the staging directory path for a given output root, creating it.
 pub fn ensure_staging_dir(out_root: &Path) -> Result<PathBuf> {
     let dir = out_root.join(STAGING_DIR_NAME);
-    create_dir_all_with_backoff(&dir, 16, 50)
+    crate::util::create_dir_all_with_default_backoff(&dir)
         .with_context(|| format!("create staging dir {}", dir.display()))?;
     Ok(dir)
 }
@@ -153,7 +150,7 @@ pub fn sweep_stale_inprogress(out_root: &Path, delete: bool) -> Result<usize> {
         return Ok(0);
     }
     let mut count = 0usize;
-    for entry in read_dir_with_backoff(&dir, 16, 50)
+    for entry in crate::util::read_dir_with_default_backoff(&dir)
         .with_context(|| format!("read_dir {}", dir.display()))?
     {
         let path = entry.path();
@@ -189,7 +186,7 @@ pub fn sweep_stale_inprogress(out_root: &Path, delete: bool) -> Result<usize> {
             continue;
         }
 
-        match remove_with_backoff(&path, 8, 50) {
+        match crate::util::remove_with_short_backoff(&path) {
             Ok(_) => {
                 tracing::info!(path=%path.display(), owner_pid, "swept stale .inprogress");
                 count += 1;
@@ -219,11 +216,11 @@ fn stage_and_execute<T, F>(
 where
     F: FnOnce(&mut BufWriter<File>) -> Result<T>,
 {
-    create_dir_all_with_backoff(staging_dir, 16, 50)
+    crate::util::create_dir_all_with_default_backoff(staging_dir)
         .with_context(|| format!("create staging dir {}", staging_dir.display()))?;
     let staged = unique_inprogress_path(staging_dir, final_dest)?;
 
-    let file = create_new_with_backoff(&staged, 16, 50)
+    let file = crate::util::create_new_with_default_backoff(&staged)
         .with_context(|| format!("create staged {}", staged.display()))?;
     #[cfg(test)]
     notify_stage_path_for_tests(&staged);
@@ -233,26 +230,26 @@ where
         Ok(v) => v,
         Err(e) => {
             drop(writer);
-            let _ = remove_with_backoff(&staged, 8, 50);
+            let _ = crate::util::remove_with_short_backoff(&staged);
             return Err(e).with_context(|| format!("write staged {}", staged.display()));
         }
     };
 
     if let Err(e) = writer.flush() {
         drop(writer);
-        let _ = remove_with_backoff(&staged, 8, 50);
+        let _ = crate::util::remove_with_short_backoff(&staged);
         return Err(e).with_context(|| format!("flush staged {}", staged.display()));
     }
     drop(writer); // release file handle before atomic rename (Windows)
 
     if let Some(parent) = final_dest.parent() {
-        if let Err(e) = create_dir_all_with_backoff(parent, 16, 50) {
-            let _ = remove_with_backoff(&staged, 8, 50);
+        if let Err(e) = crate::util::create_dir_all_with_default_backoff(parent) {
+            let _ = crate::util::remove_with_short_backoff(&staged);
             return Err(e).with_context(|| format!("create dest parent {}", parent.display()));
         }
     }
     if let Err(e) = replace_file_atomic_backoff(&staged, final_dest) {
-        let _ = remove_with_backoff(&staged, 8, 50);
+        let _ = crate::util::remove_with_short_backoff(&staged);
         return Err(e).with_context(|| {
             format!(
                 "publish staged {} -> {}",

@@ -1,4 +1,4 @@
-use crate::util::{create_with_backoff, open_with_backoff, replace_file_atomic_backoff};
+use crate::util::replace_file_atomic_backoff;
 use anyhow::{Context, Result};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
@@ -35,12 +35,8 @@ impl NdjsonReader {
     /// Open with an explicit per-line byte cap. Use this when the caller
     /// knows the input may contain unusually large records and wants to
     /// raise (or tighten) the default 16 MiB ceiling.
-    pub fn open_with_max(
-        path: &Path,
-        buf_bytes: usize,
-        max_line_bytes: usize,
-    ) -> io::Result<Self> {
-        let f = open_with_backoff(path, 16, 50)?;
+    pub fn open_with_max(path: &Path, buf_bytes: usize, max_line_bytes: usize) -> io::Result<Self> {
+        let f = crate::util::open_with_default_backoff(path)?;
         Ok(Self {
             rdr: BufReader::with_capacity(buf_bytes.max(8 * 1024), f),
             path: path.to_path_buf(),
@@ -119,8 +115,7 @@ pub fn read_line_capped<R: BufRead>(
         return Ok(0);
     }
     let raw_len = bytes.len();
-    let s = String::from_utf8(bytes)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let s = String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     buf.push_str(&s);
     if buf.ends_with('\n') {
         buf.pop();
@@ -140,8 +135,11 @@ pub struct NdjsonWriter {
 
 impl NdjsonWriter {
     pub fn create(path: &Path, buf_bytes: usize) -> io::Result<Self> {
-        let f = create_with_backoff(path, 16, 50)?;
-        Ok(Self { path: path.to_path_buf(), w: Some(BufWriter::with_capacity(buf_bytes.max(8 * 1024), f)) })
+        let f = crate::util::create_with_default_backoff(path)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            w: Some(BufWriter::with_capacity(buf_bytes.max(8 * 1024), f)),
+        })
     }
 
     #[inline]
@@ -164,7 +162,8 @@ impl NdjsonWriter {
     /// Use when the writer was created on a temp location.
     pub fn finish_atomic(mut self, final_path: &Path) -> Result<()> {
         if let Some(mut w) = self.w.take() {
-            w.flush().with_context(|| format!("flush {}", self.path.display()))?;
+            w.flush()
+                .with_context(|| format!("flush {}", self.path.display()))?;
         }
         replace_file_atomic_backoff(&self.path, final_path)
     }
@@ -191,7 +190,7 @@ pub fn for_each_jsonl_line_cfg(
     read_buf_bytes: usize,
     mut on_line: impl FnMut(&str) -> Result<()>,
 ) -> Result<Option<io::Error>> {
-    let f = open_with_backoff(path, 16, 50)?;
+    let f = crate::util::open_with_default_backoff(path)?;
     let mut reader = BufReader::with_capacity(read_buf_bytes.max(8 * 1024), f);
     let mut buf = String::with_capacity(16 * 1024);
     let mut read_error = None;

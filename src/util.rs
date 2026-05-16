@@ -11,7 +11,9 @@ static INIT_ONCE: std::sync::Once = std::sync::Once::new();
 pub fn init_tracing_for_binary() {
     INIT_ONCE.call_once(|| {
         let env_filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
-        let _ = tracing_subscriber::fmt().with_env_filter(env_filter).try_init();
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .try_init();
     });
 }
 
@@ -70,7 +72,7 @@ pub(crate) fn try_merge_extra_exclusions(
     if let Some(path_os) = std::env::var_os("ETL_EXCLUDE_AUTHORS_FILE") {
         let path = std::path::PathBuf::from(path_os);
         if !path.to_string_lossy().trim().is_empty() {
-            let f = open_with_backoff(&path, 16, 50).map_err(|e| {
+            let f = open_with_default_backoff(&path).map_err(|e| {
                 QueryBuildError::new(format!(
                     "ETL_EXCLUDE_AUTHORS_FILE {} cannot be opened: {e}",
                     path.display()
@@ -157,18 +159,74 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::sleep;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// Default retry count for Windows-friendly file operations.
+///
+/// These retry budgets cover transient filter-driver, antivirus, sharing, USB,
+/// and removable-volume failures matched by the retry classifier (Win32 error
+/// codes 5, 21, 32, 33, 225, 433, 1006, 1117, and 1224). Keep the values stable
+/// unless all atomic-write/backoff call sites are intentionally retuned.
+pub const DEFAULT_BACKOFF_TRIES: usize = 16;
+
+/// Short retry count for best-effort cleanup/removal paths.
+pub const SHORT_BACKOFF_TRIES: usize = 8;
+
+/// Default linear backoff delay, in milliseconds, between retry attempts.
+pub const DEFAULT_BACKOFF_DELAY_MS: u64 = 50;
+
+const FNV1A_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+const FNV1A_PRIME: u64 = 0x00000100000001B3;
+
+pub(crate) fn fnv1a_offset_basis() -> u64 {
+    FNV1A_OFFSET_BASIS
+}
+
+pub(crate) fn fnv1a_update(hash: &mut u64, bytes: &[u8]) {
+    for byte in bytes {
+        *hash ^= u64::from(*byte);
+        *hash = hash.wrapping_mul(FNV1A_PRIME);
+    }
+}
+
+pub(crate) fn stable_fnv1a_hex(bytes: &[u8]) -> String {
+    let mut hash = FNV1A_OFFSET_BASIS;
+    fnv1a_update(&mut hash, bytes);
+    format!("fnv1a64:{hash:016x}")
+}
+
+pub(crate) fn system_time_parts(t: SystemTime) -> (i64, u32) {
+    match t.duration_since(UNIX_EPOCH) {
+        Ok(d) => (
+            i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
+            d.subsec_nanos(),
+        ),
+        Err(e) => {
+            let d = e.duration();
+            (
+                -i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
+                d.subsec_nanos(),
+            )
+        }
+    }
+}
+
+pub fn output_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
 // Named Windows error codes commonly seen on filter-driver / sharing /
 // removable-volume hiccups. Used by `is_retriable_io_error` below; named so
 // the retry classification reads as documentation rather than a wall of magic
 // integers. Values match the Win32 `ERROR_*` constants of the same name.
-const WIN_ERR_ACCESS_DENIED: i32 = 5;       // ERROR_ACCESS_DENIED — often AV/share
-const WIN_ERR_NOT_READY: i32 = 21;          // ERROR_NOT_READY — device not ready
-const WIN_ERR_SHARING_VIOLATION: i32 = 32;  // ERROR_SHARING_VIOLATION
-const WIN_ERR_LOCK_VIOLATION: i32 = 33;     // ERROR_LOCK_VIOLATION
-const WIN_ERR_VIRUS_INFECTED: i32 = 225;    // ERROR_VIRUS_INFECTED — AV/PUA blocked
-const WIN_ERR_NO_SUCH_DEVICE: i32 = 433;    // ERROR_NO_SUCH_DEVICE
-const WIN_ERR_FILE_INVALID: i32 = 1006;     // ERROR_FILE_INVALID — volume changed
-const WIN_ERR_IO_DEVICE: i32 = 1117;        // ERROR_IO_DEVICE
+const WIN_ERR_ACCESS_DENIED: i32 = 5; // ERROR_ACCESS_DENIED — often AV/share
+const WIN_ERR_NOT_READY: i32 = 21; // ERROR_NOT_READY — device not ready
+const WIN_ERR_SHARING_VIOLATION: i32 = 32; // ERROR_SHARING_VIOLATION
+const WIN_ERR_LOCK_VIOLATION: i32 = 33; // ERROR_LOCK_VIOLATION
+const WIN_ERR_VIRUS_INFECTED: i32 = 225; // ERROR_VIRUS_INFECTED — AV/PUA blocked
+const WIN_ERR_NO_SUCH_DEVICE: i32 = 433; // ERROR_NO_SUCH_DEVICE
+const WIN_ERR_FILE_INVALID: i32 = 1006; // ERROR_FILE_INVALID — volume changed
+const WIN_ERR_IO_DEVICE: i32 = 1117; // ERROR_IO_DEVICE
 const WIN_ERR_USER_MAPPED_FILE: i32 = 1224; // ERROR_USER_MAPPED_FILE
 
 static SCRATCH_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -225,13 +283,16 @@ where
             Ok(v) => return Ok(v),
             Err(e) if is_retriable_io_error(&e) => {
                 last_err = Some(e);
-                sleep(Duration::from_millis(delay_ms.saturating_mul((i + 1) as u64)));
+                sleep(Duration::from_millis(
+                    delay_ms.saturating_mul((i + 1) as u64),
+                ));
                 continue;
             }
             Err(e) => return Err(e),
         }
     }
-    Err(last_err.unwrap_or_else(|| io::Error::new(io::ErrorKind::Other, "with_backoff: retries exhausted")))
+    Err(last_err
+        .unwrap_or_else(|| io::Error::new(io::ErrorKind::Other, "with_backoff: retries exhausted")))
 }
 
 #[cfg(test)]
@@ -351,6 +412,7 @@ fn maybe_inject_retriable_io_error_for_tests(op: TestIoOp, path: &Path) -> io::R
 }
 
 /// Open a file with retries/backoff for transient errors.
+/// Prefer [`open_with_default_backoff`] unless a caller needs a custom budget.
 pub fn open_with_backoff(path: &Path, tries: usize, delay_ms: u64) -> io::Result<File> {
     with_backoff(tries, delay_ms, || {
         #[cfg(test)]
@@ -359,7 +421,12 @@ pub fn open_with_backoff(path: &Path, tries: usize, delay_ms: u64) -> io::Result
     })
 }
 
+pub fn open_with_default_backoff(path: &Path) -> io::Result<File> {
+    open_with_backoff(path, DEFAULT_BACKOFF_TRIES, DEFAULT_BACKOFF_DELAY_MS)
+}
+
 /// Create or truncate a file with retries/backoff for transient errors.
+/// Prefer [`create_with_default_backoff`] unless a caller needs a custom budget.
 pub fn create_with_backoff(path: &Path, tries: usize, delay_ms: u64) -> io::Result<File> {
     with_backoff(tries, delay_ms, || {
         #[cfg(test)]
@@ -368,7 +435,12 @@ pub fn create_with_backoff(path: &Path, tries: usize, delay_ms: u64) -> io::Resu
     })
 }
 
+pub fn create_with_default_backoff(path: &Path) -> io::Result<File> {
+    create_with_backoff(path, DEFAULT_BACKOFF_TRIES, DEFAULT_BACKOFF_DELAY_MS)
+}
+
 /// Create a single directory with retries/backoff for transient errors.
+/// Prefer [`create_dir_with_default_backoff`] unless a caller needs a custom budget.
 pub(crate) fn create_dir_with_backoff(path: &Path, tries: usize, delay_ms: u64) -> io::Result<()> {
     with_backoff(tries, delay_ms, || {
         #[cfg(test)]
@@ -377,13 +449,22 @@ pub(crate) fn create_dir_with_backoff(path: &Path, tries: usize, delay_ms: u64) 
     })
 }
 
+pub(crate) fn create_dir_with_default_backoff(path: &Path) -> io::Result<()> {
+    create_dir_with_backoff(path, DEFAULT_BACKOFF_TRIES, DEFAULT_BACKOFF_DELAY_MS)
+}
+
 /// Recursively create directories with retries/backoff for transient errors.
+/// Prefer [`create_dir_all_with_default_backoff`] unless a caller needs a custom budget.
 pub fn create_dir_all_with_backoff(path: &Path, tries: usize, delay_ms: u64) -> io::Result<()> {
     with_backoff(tries, delay_ms, || {
         #[cfg(test)]
         maybe_inject_retriable_io_error_for_tests(TestIoOp::CreateDirAll, path)?;
         fs::create_dir_all(path)
     })
+}
+
+pub fn create_dir_all_with_default_backoff(path: &Path) -> io::Result<()> {
+    create_dir_all_with_backoff(path, DEFAULT_BACKOFF_TRIES, DEFAULT_BACKOFF_DELAY_MS)
 }
 
 /// Read a directory with retries/backoff for transient errors.
@@ -402,11 +483,16 @@ pub fn read_dir_with_backoff(
     })
 }
 
+pub fn read_dir_with_default_backoff(path: &Path) -> io::Result<Vec<fs::DirEntry>> {
+    read_dir_with_backoff(path, DEFAULT_BACKOFF_TRIES, DEFAULT_BACKOFF_DELAY_MS)
+}
+
 /// Create a brand-new file with retries/backoff for transient errors.
 ///
 /// Unlike [`create_with_backoff`], this uses `create_new(true)` so an
 /// unexpected path collision returns `AlreadyExists` instead of truncating an
 /// existing staged file.
+/// Prefer [`create_new_with_default_backoff`] unless a caller needs a custom budget.
 pub fn create_new_with_backoff(path: &Path, tries: usize, delay_ms: u64) -> io::Result<File> {
     with_backoff(tries, delay_ms, || {
         fs::OpenOptions::new()
@@ -416,8 +502,13 @@ pub fn create_new_with_backoff(path: &Path, tries: usize, delay_ms: u64) -> io::
     })
 }
 
+pub fn create_new_with_default_backoff(path: &Path) -> io::Result<File> {
+    create_new_with_backoff(path, DEFAULT_BACKOFF_TRIES, DEFAULT_BACKOFF_DELAY_MS)
+}
+
 /// Remove a file with retries/backoff for transient errors.
-/// Succeeds if the file doesn't exist.
+/// Succeeds if the file doesn't exist. Prefer [`remove_with_default_backoff`]
+/// or [`remove_with_short_backoff`] unless a caller needs a custom budget.
 pub fn remove_with_backoff(path: &Path, tries: usize, delay_ms: u64) -> Result<()> {
     with_backoff(tries, delay_ms, || match fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -427,15 +518,33 @@ pub fn remove_with_backoff(path: &Path, tries: usize, delay_ms: u64) -> Result<(
     .with_context(|| format!("remove {}", path.display()))
 }
 
+pub fn remove_with_default_backoff(path: &Path) -> Result<()> {
+    remove_with_backoff(path, DEFAULT_BACKOFF_TRIES, DEFAULT_BACKOFF_DELAY_MS)
+}
+
+pub fn remove_with_short_backoff(path: &Path) -> Result<()> {
+    remove_with_backoff(path, SHORT_BACKOFF_TRIES, DEFAULT_BACKOFF_DELAY_MS)
+}
+
 /// Recursively remove a scratch directory with retries/backoff.
-/// Succeeds if the directory doesn't exist.
-pub(crate) fn remove_dir_all_with_backoff(path: &Path, tries: usize, delay_ms: u64) -> Result<()> {
+/// Succeeds if the directory doesn't exist. Prefer
+/// [`remove_dir_all_with_default_backoff`] or [`remove_dir_all_with_short_backoff`]
+/// unless a caller needs a custom budget.
+pub fn remove_dir_all_with_backoff(path: &Path, tries: usize, delay_ms: u64) -> Result<()> {
     with_backoff(tries, delay_ms, || match fs::remove_dir_all(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
     })
     .with_context(|| format!("remove_dir_all {}", path.display()))
+}
+
+pub fn remove_dir_all_with_default_backoff(path: &Path) -> Result<()> {
+    remove_dir_all_with_backoff(path, DEFAULT_BACKOFF_TRIES, DEFAULT_BACKOFF_DELAY_MS)
+}
+
+pub fn remove_dir_all_with_short_backoff(path: &Path) -> Result<()> {
+    remove_dir_all_with_backoff(path, SHORT_BACKOFF_TRIES, DEFAULT_BACKOFF_DELAY_MS)
 }
 
 /// Rename a file with retries/backoff for transient errors.
@@ -466,7 +575,6 @@ pub(crate) fn smoothstep_memory_fraction(free: f64, soft_low: f64, high: f64) ->
     let scale = ((free - soft_low) / span).clamp(0.0, 1.0);
     scale * scale * (3.0 - 2.0 * scale)
 }
-
 
 /// Atomically replace `dest` with `tmp` (Windows-friendly).
 ///
