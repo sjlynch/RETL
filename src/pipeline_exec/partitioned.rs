@@ -130,6 +130,244 @@ fn validate_partitioned_resume_output(
     Ok(())
 }
 
+impl ScanPlan {
+    /// Export corpus back to partitioned JSONL or ZST by month/kinds with query filters.
+    /// This lives on ScanPlan (advanced query mode).
+    ///
+    /// Each output is staged as a unique
+    /// `<out_base_dir>/_staging/<file>.*.inprogress`, finalized (zstd frame
+    /// closed with checksum, or buffer flushed) and atomically renamed onto its
+    /// final path. Stale `*.inprogress` from a crashed prior run are swept on
+    /// entry only when their owner PID is no longer live.
+    pub fn export_partitioned(self, out_base_dir: &Path, format: ExportFormat) -> Result<()> {
+        let plan = self.build()?;
+        log_pseudo_user_filter(&plan.query);
+        validate_export_whitelist(&plan.etl)?;
+        let targets = resolve_target_subs_from(&plan.etl.opts.subreddit, &plan.query.subreddits);
+        let parallelism = plan.etl.opts.parallelism;
+
+        with_thread_pool(parallelism, || {
+            let manifest_start = RunManifestStart::now();
+            let files = plan_pipeline_files(&plan.etl, Some(&plan.query))?;
+            warn_if_unfiltered_undated_query(&plan.etl, &plan.query, &files);
+
+            let comments_dir = out_base_dir.join("comments");
+            let submissions_dir = out_base_dir.join("submissions");
+            crate::util::create_dir_all_with_default_backoff(&comments_dir).with_context(|| {
+                format!("creating comments export dir {}", comments_dir.display())
+            })?;
+            crate::util::create_dir_all_with_default_backoff(&submissions_dir).with_context(|| {
+                format!(
+                    "creating submissions export dir {}",
+                    submissions_dir.display()
+                )
+            })?;
+            let staging_dir = ensure_staging_dir(out_base_dir)?;
+            sweep_stale_inprogress(out_base_dir, true)?;
+
+            let planned_keys = planned_job_keys(&files);
+            let resume = plan.etl.opts.resume;
+            let resume_fingerprint = build_resume_fingerprint(
+                &plan.etl,
+                &plan.query,
+                partitioned_resume_operation(format),
+                plan.limit,
+                &files,
+            )?;
+            let (initial_months, completed_keys) = if resume {
+                load_and_validate_partitioned_manifest(
+                    out_base_dir,
+                    &resume_fingerprint,
+                    format,
+                    &planned_keys,
+                )?
+            } else {
+                clear_partitioned_resume_outputs(out_base_dir, format)?;
+                (HashMap::new(), HashSet::new())
+            };
+            if resume {
+                prune_partitioned_outputs_except(out_base_dir, format, &completed_keys)?;
+            }
+            let resumed_lines = committed_line_count(&initial_months);
+            let output_records = AtomicU64::new(resumed_lines);
+            let output_files = AtomicU64::new(completed_keys.len() as u64);
+            let accumulator = if resume {
+                crate::progress_manifest::save(
+                    out_base_dir,
+                    &initial_months,
+                    Some(&resume_fingerprint),
+                )?;
+                Some(ManifestAccumulator::new(
+                    out_base_dir,
+                    initial_months,
+                    Some(resume_fingerprint.clone()),
+                ))
+            } else {
+                None
+            };
+
+            let whitelist = plan.etl.opts.whitelist_fields.clone();
+            let whitelist_tracker = whitelist.as_ref().map(|fields| {
+                Arc::new(WhitelistMatchTracker::new(
+                    plan.etl.opts.strict_whitelist,
+                    fields.iter().cloned(),
+                ))
+            });
+            let record_limit = record_limit_from_with_claimed(plan.limit, resumed_lines);
+            let targets_ref = targets.as_ref();
+            let bounds = bounds_tuple(plan.etl.opts.start, plan.etl.opts.end);
+            let total_bytes = total_compressed_size(&files);
+            let pb = if plan.etl.opts.progress {
+                Some(make_progress_bar_labeled(
+                    total_bytes,
+                    plan.etl.opts.progress_label.as_deref(),
+                ))
+            } else {
+                None
+            };
+            let read_buf = plan.etl.opts.read_buffer_bytes;
+            let write_buf = plan.etl.opts.write_buffer_bytes;
+            let human_ts = plan.etl.opts.human_readable_timestamps;
+            let zst_level = plan.etl.opts.zst_level;
+
+            crate::concurrency::for_each_file_limited(
+                &files,
+                plan.etl.opts.file_concurrency,
+                |job| -> Result<()> {
+                    let key = export_part_key(job);
+                    let out_path = partitioned_output_path(out_base_dir, job, format);
+
+                    if record_limit
+                        .as_ref()
+                        .is_some_and(|limit| limit.is_exhausted())
+                    {
+                        return Ok(());
+                    }
+
+                    if resume && completed_keys.contains(&key) {
+                        if let Some(pb) = &pb {
+                            let sz = fs::metadata(&job.path).map(|m| m.len()).unwrap_or(0);
+                            pb.inc(sz);
+                        }
+                        return Ok(());
+                    }
+
+                    let written_result = match format {
+                        ExportFormat::Jsonl => {
+                            write_jsonl_atomic(&staging_dir, &out_path, write_buf, |w| {
+                                let result = stream_job_with_partial_policy(
+                                    job,
+                                    w,
+                                    targets_ref,
+                                    &plan.query,
+                                    &whitelist,
+                                    pb.clone(),
+                                    bounds,
+                                    read_buf,
+                                    human_ts,
+                                    whitelist_tracker.as_deref(),
+                                    plan.etl.opts.allow_partial,
+                                    Some(&plan.etl.opts.partial_read_reporter),
+                                    record_limit.as_deref(),
+                                )?;
+                                complete_stream_job(job, result)
+                            })
+                        }
+                        ExportFormat::Zst => {
+                            write_zst_atomic(&staging_dir, &out_path, zst_level, write_buf, |w| {
+                                let result = stream_job_with_partial_policy(
+                                    job,
+                                    w,
+                                    targets_ref,
+                                    &plan.query,
+                                    &whitelist,
+                                    pb.clone(),
+                                    bounds,
+                                    read_buf,
+                                    human_ts,
+                                    whitelist_tracker.as_deref(),
+                                    plan.etl.opts.allow_partial,
+                                    Some(&plan.etl.opts.partial_read_reporter),
+                                    record_limit.as_deref(),
+                                )?;
+                                complete_stream_job(job, result)
+                            })
+                        }
+                    };
+
+                    let written = match written_result {
+                        Ok(n) => n,
+                        Err(e) if plan.etl.opts.allow_partial && is_partial_scan_error(&e) => {
+                            tracing::warn!(path=%job.path.display(), error=%e, "Skipping partitioned export month after zstd decode error; staged output was discarded");
+                            return Ok(());
+                        }
+                        Err(e) => return Err(e),
+                    };
+
+                    output_records.fetch_add(written, Ordering::Relaxed);
+                    if written == 0 {
+                        let _ = crate::util::remove_with_short_backoff(&out_path);
+                    } else {
+                        output_files.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if let Some(acc) = &accumulator {
+                        let size = if written == 0 {
+                            0
+                        } else {
+                            fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0)
+                        };
+                        acc.commit(
+                            key,
+                            MonthEntry {
+                                size,
+                                lines: written,
+                                sha256: None,
+                            },
+                        )
+                        .context(
+                            "failed to durably update partitioned export progress manifest after publishing partition",
+                        )?;
+                    }
+                    Ok(())
+                },
+            )?;
+
+            if let Some(tracker) = &whitelist_tracker {
+                tracker.finalize()?;
+            }
+            if let Some(pb) = pb {
+                pb.finish_with_message("done");
+            }
+            ensure_resume_manifest_durable(accumulator.as_ref(), "partitioned export")?;
+            let manifest = scan_manifest_input(
+                manifest_start,
+                "scan.export_partitioned",
+                partitioned_resume_operation(format),
+                &plan.etl,
+                &plan.query,
+                &files,
+                plan.limit,
+                manifest_counts(&[
+                    ("records_written", output_records.load(Ordering::Relaxed)),
+                    ("partition_files", output_files.load(Ordering::Relaxed)),
+                ]),
+                Some(resume_fingerprint.clone()),
+                resume.then(|| crate::progress_manifest::manifest_path(out_base_dir)),
+                serde_json::json!({
+                    "partition_format": partitioned_ext(format),
+                    "zst_level": (format == ExportFormat::Zst).then_some(plan.etl.opts.zst_level),
+                }),
+            );
+            maybe_write_run_manifest(
+                plan.etl.opts.emit_manifest,
+                manifest,
+                ManifestDestination::Directory(out_base_dir.to_path_buf()),
+            )?;
+            Ok(())
+        })
+    }
+}
+
 fn load_and_validate_partitioned_manifest(
     out_base_dir: &Path,
     fingerprint: &str,

@@ -65,6 +65,42 @@ fn validate_jsonl_part(path: &Path) -> Result<MonthEntry> {
     })
 }
 
+impl ScanPlan {
+    pub fn extract_to_jsonl(self, out_path: &Path) -> Result<()> {
+        let plan = self.build()?;
+        log_pseudo_user_filter(&plan.query);
+        let targets = resolve_target_subs_from(&plan.etl.opts.subreddit, &plan.query.subreddits);
+        extract_common(
+            &plan.etl,
+            &plan.query,
+            targets.as_ref(),
+            "extract_jsonl_q_tmp",
+            out_path,
+            Finalize::Jsonl,
+            "jsonl",
+            "scan.extract_to_jsonl",
+            plan.limit,
+        )
+    }
+
+    pub fn extract_to_json(self, out_path: &Path, pretty: bool) -> Result<()> {
+        let plan = self.build()?;
+        log_pseudo_user_filter(&plan.query);
+        let targets = resolve_target_subs_from(&plan.etl.opts.subreddit, &plan.query.subreddits);
+        extract_common(
+            &plan.etl,
+            &plan.query,
+            targets.as_ref(),
+            "extract_json_q_tmp",
+            out_path,
+            Finalize::JsonArray { pretty },
+            "json",
+            "scan.extract_to_json",
+            plan.limit,
+        )
+    }
+}
+
 fn count_text_lines(path: &Path) -> Result<u64> {
     let file = crate::util::open_with_default_backoff(path)
         .with_context(|| format!("opening output to count lines {}", path.display()))?;

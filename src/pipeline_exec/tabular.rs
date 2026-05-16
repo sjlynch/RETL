@@ -1,22 +1,6 @@
-
-fn normalize_tabular_fields<I, S>(fields: I) -> Result<Vec<String>>
-where
-    I: IntoIterator<Item = S>,
-    S: Into<String>,
-{
-    let fields: Vec<String> = fields
-        .into_iter()
-        .filter_map(|field| {
-            let field = field.into();
-            let field = field.trim();
-            (!field.is_empty()).then(|| field.to_string())
-        })
-        .collect();
-    if fields.is_empty() {
-        anyhow::bail!("CSV/TSV export requires at least one whitelisted field");
-    }
-    Ok(fields)
-}
+// Orchestration for tabular (CSV/TSV) exports. The actual field-selector
+// parsing and row-writing helpers live in `tabular_format/{selector,writer}.rs`
+// and are spliced into this module by `mod.rs`.
 
 fn tabular_part_path(tmp_dir: &Path, key: &str, format: TabularFormat) -> PathBuf {
     tmp_dir.join(format!(".part_{}{}", key, format.row_suffix()))
@@ -41,189 +25,6 @@ fn tabular_part_paths(tmp_dir: &Path, format: TabularFormat) -> Result<Vec<PathB
     }
     paths.sort();
     Ok(paths)
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum TabularFieldSelector {
-    TopLevel(String),
-    JsonPointer(String),
-    Dotted(Vec<String>),
-}
-
-impl TabularFieldSelector {
-    fn parse(raw: &str) -> Result<Self> {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            anyhow::bail!("CSV/TSV field names must not be empty");
-        }
-        if let Some(pointer) = trimmed.strip_prefix("json:") {
-            validate_tabular_json_pointer(pointer)?;
-            return Ok(Self::JsonPointer(pointer.to_string()));
-        }
-        if trimmed.starts_with('/') {
-            validate_tabular_json_pointer(trimmed)?;
-            return Ok(Self::JsonPointer(trimmed.to_string()));
-        }
-        if trimmed.contains('.') {
-            let parts: Vec<String> = trimmed
-                .split('.')
-                .map(str::trim)
-                .map(str::to_string)
-                .collect();
-            if parts.iter().any(String::is_empty) {
-                anyhow::bail!(
-                    "bad dotted tabular field {trimmed:?}: path segments must not be empty; use JSON Pointer syntax for unusual keys"
-                );
-            }
-            return Ok(Self::Dotted(parts));
-        }
-        Ok(Self::TopLevel(trimmed.to_string()))
-    }
-
-    fn value<'a>(&self, record: &'a Value) -> Option<&'a Value> {
-        match self {
-            Self::TopLevel(key) => record.as_object().and_then(|map| map.get(key)),
-            Self::JsonPointer(pointer) => record.pointer(pointer),
-            Self::Dotted(parts) => {
-                let mut cur = record;
-                for part in parts {
-                    cur = cur.as_object()?.get(part)?;
-                }
-                Some(cur)
-            }
-        }
-    }
-}
-
-fn parse_tabular_field_selectors(fields: &[String]) -> Result<Vec<TabularFieldSelector>> {
-    fields
-        .iter()
-        .map(|field| TabularFieldSelector::parse(field))
-        .collect()
-}
-
-fn validate_tabular_json_pointer(pointer: &str) -> Result<()> {
-    if !pointer.starts_with('/') {
-        anyhow::bail!("JSON Pointer tabular fields must start with '/': {pointer:?}");
-    }
-    let mut chars = pointer.chars();
-    while let Some(ch) = chars.next() {
-        if ch == '~' {
-            match chars.next() {
-                Some('0') | Some('1') => {}
-                other => anyhow::bail!(
-                    "bad JSON Pointer tabular field {pointer:?}: invalid escape near '~{:?}'; use '~0' for '~' and '~1' for '/'",
-                    other
-                ),
-            }
-        }
-    }
-    Ok(())
-}
-
-fn write_csv_cell<W: Write + ?Sized>(out: &mut W, cell: &str) -> Result<()> {
-    let quote = cell
-        .as_bytes()
-        .iter()
-        .any(|b| matches!(b, b',' | b'"' | b'\n' | b'\r'));
-    if !quote {
-        out.write_all(cell.as_bytes())?;
-        return Ok(());
-    }
-    out.write_all(b"\"")?;
-    for b in cell.as_bytes() {
-        if *b == b'"' {
-            out.write_all(b"\"\"")?;
-        } else {
-            out.write_all(&[*b])?;
-        }
-    }
-    out.write_all(b"\"")?;
-    Ok(())
-}
-
-fn value_to_tabular_cell(value: Option<&Value>) -> Result<String> {
-    let Some(value) = value else {
-        return Ok(String::new());
-    };
-    match value {
-        Value::Null => Ok(String::new()),
-        Value::String(s) => Ok(s.clone()),
-        Value::Bool(b) => Ok(b.to_string()),
-        Value::Number(n) => Ok(n.to_string()),
-        Value::Array(_) | Value::Object(_) => Ok(serde_json::to_string(value)?),
-    }
-}
-
-fn write_tabular_row<W: Write + ?Sized>(
-    out: &mut W,
-    fields: &[String],
-    cells: &[String],
-    format: TabularFormat,
-) -> Result<()> {
-    match format {
-        TabularFormat::Csv => {
-            for (i, cell) in cells.iter().enumerate() {
-                if i > 0 {
-                    out.write_all(b",")?;
-                }
-                write_csv_cell(out, cell)?;
-            }
-            out.write_all(b"\r\n")?;
-        }
-        TabularFormat::Tsv => {
-            for (field, cell) in fields.iter().zip(cells.iter()) {
-                if let Some(ch) = cell.chars().find(|ch| matches!(ch, '\t' | '\n' | '\r')) {
-                    let desc = match ch {
-                        '\t' => "tab",
-                        '\n' => "line feed",
-                        '\r' => "carriage return",
-                        _ => unreachable!(),
-                    };
-                    tracing::warn!(
-                        field,
-                        character = desc,
-                        "refusing to emit TSV value containing a tab or line break; use --format csv for robust escaping"
-                    );
-                    anyhow::bail!(
-                        "TSV export cannot represent a {desc} in field {field:?}; use --format csv"
-                    );
-                }
-            }
-            for (i, cell) in cells.iter().enumerate() {
-                if i > 0 {
-                    out.write_all(b"\t")?;
-                }
-                out.write_all(cell.as_bytes())?;
-            }
-            out.write_all(b"\n")?;
-        }
-    }
-    Ok(())
-}
-
-fn tabular_cells_from_value(
-    value: &Value,
-    selectors: &[TabularFieldSelector],
-) -> Result<(Vec<String>, Vec<usize>)> {
-    let mut matched_indices = Vec::new();
-    let mut cells = Vec::with_capacity(selectors.len());
-    for (idx, selector) in selectors.iter().enumerate() {
-        let field_value = selector.value(value);
-        if field_value.is_some() {
-            matched_indices.push(idx);
-        }
-        cells.push(value_to_tabular_cell(field_value)?);
-    }
-    Ok((cells, matched_indices))
-}
-
-fn write_tabular_header<W: Write + ?Sized>(
-    out: &mut W,
-    fields: &[String],
-    format: TabularFormat,
-) -> Result<()> {
-    write_tabular_row(out, fields, fields, format)
 }
 
 fn stitch_tabular_parts(
@@ -468,6 +269,78 @@ fn extract_tabular_common(
         }
         Ok(())
     })
+}
+
+impl ScanPlan {
+    /// Export matching records as CSV. `fields` is the fixed top-level schema;
+    /// missing fields render as empty cells.
+    pub fn extract_to_csv<I, S>(
+        self,
+        out_path: &Path,
+        fields: I,
+        opts: TabularExportOptions,
+    ) -> Result<()>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.extract_to_tabular(out_path, fields, opts, TabularFormat::Csv)
+    }
+
+    /// Export matching records as TSV. `fields` is the fixed top-level schema;
+    /// missing fields render as empty cells. Values containing a literal tab
+    /// are rejected because TSV has no standard escaping convention.
+    pub fn extract_to_tsv<I, S>(
+        self,
+        out_path: &Path,
+        fields: I,
+        opts: TabularExportOptions,
+    ) -> Result<()>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.extract_to_tabular(out_path, fields, opts, TabularFormat::Tsv)
+    }
+
+    fn extract_to_tabular<I, S>(
+        self,
+        out_path: &Path,
+        fields: I,
+        opts: TabularExportOptions,
+        format: TabularFormat,
+    ) -> Result<()>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        if self.etl.opts.human_readable_timestamps {
+            anyhow::bail!(
+                "--human-timestamps is not supported for CSV/TSV export; use --format jsonl/json/spool/zst/partitioned-jsonl or omit the flag"
+            );
+        }
+        if self.etl.opts.resume {
+            anyhow::bail!(
+                "--resume is not supported for CSV/TSV export; use --format jsonl/json/spool/zst/partitioned-jsonl or omit the flag"
+            );
+        }
+        let fields = normalize_tabular_fields(fields)?;
+        let mut scan = self;
+        scan.etl.opts.whitelist_fields = Some(fields.clone());
+        let plan = scan.build()?;
+        log_pseudo_user_filter(&plan.query);
+        let targets = resolve_target_subs_from(&plan.etl.opts.subreddit, &plan.query.subreddits);
+        extract_tabular_common(
+            &plan.etl,
+            &plan.query,
+            targets.as_ref(),
+            out_path,
+            &fields,
+            opts,
+            format,
+            plan.limit,
+        )
+    }
 }
 
 /// Convert existing plain JSONL files (including RETL spool/parent-enriched

@@ -205,3 +205,188 @@ fn ensure_resume_manifest_durable(
     }
     Ok(())
 }
+
+impl ScanPlan {
+    /// Spool per-month outputs for later parent attachment + aggregation.
+    /// Writes **separate** files per source to avoid clobbering:
+    ///   - comments → `part_RC_YYYY-MM.jsonl`
+    ///   - submissions → `part_RS_YYYY-MM.jsonl`
+    ///
+    /// Each month is staged as a unique `<out_dir>/_staging/<file>.*.inprogress`
+    /// then atomically renamed onto the final path so a crashed run never
+    /// publishes a partial file. On entry, leftover `*.inprogress` files from
+    /// a prior crashed run are swept only when their owner PID is no longer live.
+    ///
+    /// Returns `(vector_of_paths, total_records_written)`.
+    pub fn extract_spool_monthly(self, out_dir: &Path) -> Result<(Vec<PathBuf>, u64)> {
+        let plan = self.build()?;
+        log_pseudo_user_filter(&plan.query);
+        validate_export_whitelist(&plan.etl)?;
+        let parallelism = plan.etl.opts.parallelism;
+
+        with_thread_pool(parallelism, || {
+            let manifest_start = RunManifestStart::now();
+            crate::util::create_dir_all_with_default_backoff(out_dir)
+                .with_context(|| format!("creating spool dir {}", out_dir.display()))?;
+            let staging_dir = ensure_staging_dir(out_dir)?;
+            sweep_stale_inprogress(out_dir, true)?;
+
+            let targets =
+                resolve_target_subs_from(&plan.etl.opts.subreddit, &plan.query.subreddits);
+            let files = plan_pipeline_files(&plan.etl, Some(&plan.query))?;
+            warn_if_unfiltered_undated_query(&plan.etl, &plan.query, &files);
+            let planned_keys = planned_job_keys(&files);
+
+            let resume = plan.etl.opts.resume;
+            let resume_fingerprint =
+                build_resume_fingerprint(&plan.etl, &plan.query, "spool", plan.limit, &files)?;
+            // Resume manifest: load on entry, validate each entry against the
+            // current query/config fingerprint and the file actually on disk,
+            // then snapshot surviving keys before any worker mutates the accumulator.
+            let (initial_months, completed_keys) = if resume {
+                load_and_validate_manifest(out_dir, &resume_fingerprint, &planned_keys)?
+            } else {
+                clear_spool_resume_parts(out_dir)?;
+                (HashMap::new(), HashSet::new())
+            };
+            if resume {
+                prune_spool_outputs_except(out_dir, &completed_keys)?;
+            }
+
+            let total_bytes = total_compressed_size(&files);
+            let pb = if plan.etl.opts.progress {
+                Some(make_progress_bar_labeled(
+                    total_bytes,
+                    plan.etl.opts.progress_label.as_deref(),
+                ))
+            } else {
+                None
+            };
+
+            let total_written = AtomicU64::new(0);
+            let parts = Mutex::new(Vec::<PathBuf>::new());
+
+            // Pre-seed `parts` with already-completed months so the returned
+            // list reflects the full set of published outputs (resumed + new).
+            if resume {
+                let mut guard = parts.lock().unwrap();
+                for key in &completed_keys {
+                    guard.push(out_dir.join(format!("part_{}.jsonl", key)));
+                }
+            }
+
+            let resumed_lines = committed_line_count(&initial_months);
+            let total_output_lines = AtomicU64::new(resumed_lines);
+
+            // Persist the (pruned) manifest before any work, so a crash mid-
+            // prune cannot resurrect entries we already know are stale.
+            let accumulator = if resume {
+                crate::progress_manifest::save(
+                    out_dir,
+                    &initial_months,
+                    Some(&resume_fingerprint),
+                )?;
+                Some(ManifestAccumulator::new(
+                    out_dir,
+                    initial_months,
+                    Some(resume_fingerprint.clone()),
+                ))
+            } else {
+                None
+            };
+
+            let whitelist = plan.etl.opts.whitelist_fields.clone();
+            let whitelist_tracker = whitelist.as_ref().map(|fields| {
+                Arc::new(WhitelistMatchTracker::new(
+                    plan.etl.opts.strict_whitelist,
+                    fields.iter().cloned(),
+                ))
+            });
+            let record_limit = record_limit_from_with_claimed(plan.limit, resumed_lines);
+            let targets_ref = targets.as_ref();
+            let bounds = bounds_tuple(plan.etl.opts.start, plan.etl.opts.end);
+            let read_buf = plan.etl.opts.read_buffer_bytes;
+            let write_buf = plan.etl.opts.write_buffer_bytes;
+            let human_ts = plan.etl.opts.human_readable_timestamps;
+
+            crate::concurrency::for_each_file_limited(
+                &files,
+                plan.etl.opts.file_concurrency,
+                |job| -> Result<()> {
+                    let ctx = MonthJobCtx {
+                        out_dir,
+                        staging_dir: &staging_dir,
+                        targets: targets_ref,
+                        query: &plan.query,
+                        whitelist: &whitelist,
+                        pb: pb.as_ref(),
+                        bounds,
+                        read_buf,
+                        write_buf,
+                        human_ts,
+                        whitelist_tracker: whitelist_tracker.as_deref(),
+                        record_limit: record_limit.as_deref(),
+                        resume,
+                        completed_keys: &completed_keys,
+                        allow_partial: plan.etl.opts.allow_partial,
+                        partial_reporter: Some(&plan.etl.opts.partial_read_reporter),
+                    };
+                    let outcome = process_month(job, &ctx)?;
+
+                    if let Some(month) = outcome {
+                        total_written.fetch_add(month.lines, Ordering::Relaxed);
+                        total_output_lines.fetch_add(month.lines, Ordering::Relaxed);
+                        parts.lock().unwrap().push(month.out_path.clone());
+                        if let Some(acc) = &accumulator {
+                            commit_entry_to_manifest(acc, month).context(
+                                "failed to durably update resume progress manifest after publishing spool output",
+                            )?;
+                        }
+                    }
+                    Ok(())
+                },
+            )?;
+
+            if let Some(tracker) = &whitelist_tracker {
+                tracker.finalize()?;
+            }
+            if let Some(pb) = pb {
+                pb.finish_with_message("done");
+            }
+            ensure_resume_manifest_durable(accumulator.as_ref(), "spool")?;
+
+            let mut list = parts.into_inner().unwrap();
+            list.sort();
+            list.dedup();
+            let manifest = scan_manifest_input(
+                manifest_start,
+                "scan.extract_spool_monthly",
+                "spool-jsonl-directory",
+                &plan.etl,
+                &plan.query,
+                &files,
+                plan.limit,
+                manifest_counts(&[
+                    (
+                        "records_written",
+                        total_output_lines.load(Ordering::Relaxed),
+                    ),
+                    ("part_files", list.len() as u64),
+                    (
+                        "records_written_this_run",
+                        total_written.load(Ordering::Relaxed),
+                    ),
+                ]),
+                Some(resume_fingerprint.clone()),
+                resume.then(|| crate::progress_manifest::manifest_path(out_dir)),
+                serde_json::json!({}),
+            );
+            maybe_write_run_manifest(
+                plan.etl.opts.emit_manifest,
+                manifest,
+                ManifestDestination::Directory(out_dir.to_path_buf()),
+            )?;
+            Ok((list, total_written.load(Ordering::Relaxed)))
+        })
+    }
+}
