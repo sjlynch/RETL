@@ -5,7 +5,7 @@ include!("fingerprint_types.rs");
 include!("ids.rs");
 include!("resolver.rs");
 include!("attach.rs");
-include!("fingerprint.rs");
+include!("fingerprint/mod.rs");
 include!("resolver_tail.rs");
 include!("impls.rs");
 include!("tests.rs");
