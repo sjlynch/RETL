@@ -9,7 +9,7 @@ mod tests {
         let out = dir.path().join("out.txt");
         fs::write(&out, "old\n").unwrap();
 
-        let res: Result<()> = write_text_file_atomic(&out, |w| {
+        let res: Result<()> = write_text_atomic(&out, CLI_TEXT_WRITE_BUF_BYTES, |w| {
             writeln!(w, "new")?;
             anyhow::bail!("synthetic write failure")
         });

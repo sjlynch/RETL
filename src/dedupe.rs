@@ -1,4 +1,4 @@
-use crate::atomic_write::{ensure_staging_dir, write_jsonl_atomic};
+use crate::atomic_write::write_at_path_atomic;
 use crate::config::ETLOptions;
 use crate::key_extractor::KeyExtractor;
 use crate::mem::{available_memory_fraction, is_low_memory, AdaptiveMemCfg};
@@ -295,17 +295,9 @@ pub(crate) fn merge_runs_sorted_with_key_stats(
     // (e.g. `out/x.txt` and `out/x.json`) cannot collide on a shared sibling
     // temp, and so crashed runs leave staged leftovers that `sweep_stale_inprogress`
     // can recover.
-    let parent_dir = output
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-    let staging_dir = ensure_staging_dir(&parent_dir)
-        .with_context(|| format!("ensure staging dir under {}", parent_dir.display()))?;
-
     if runs.is_empty() {
         // Nothing to write — still publish an empty file atomically.
-        write_jsonl_atomic(&staging_dir, output, cfg.write_buf_bytes, |_w| Ok(()))?;
+        write_at_path_atomic(output, cfg.write_buf_bytes, |_w| Ok(()))?;
         return Ok(());
     }
 
@@ -394,8 +386,7 @@ pub(crate) fn merge_runs_sorted_with_key_stats(
         readers.push((BufReader::with_capacity(cfg.read_buf_bytes, f), 0, 0));
     }
 
-    write_jsonl_atomic(
-        &staging_dir,
+    write_at_path_atomic(
         output,
         cfg.write_buf_bytes,
         |out_buf| -> Result<()> {

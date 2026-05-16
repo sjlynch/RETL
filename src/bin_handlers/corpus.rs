@@ -140,7 +140,7 @@ where
         w.flush()?;
         Ok(result)
     } else {
-        write_text_file_atomic(out, body)
+        write_text_atomic(out, CLI_TEXT_WRITE_BUF_BYTES, body)
     }
 }
 

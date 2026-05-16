@@ -166,7 +166,6 @@ impl RedditETL {
         let parent_dir = output_parent(out);
         crate::util::create_dir_all_with_default_backoff(parent_dir)
             .with_context(|| format!("create direct parent output dir {}", parent_dir.display()))?;
-        let staging_dir = ensure_staging_dir(parent_dir)?;
         sweep_stale_inprogress(parent_dir, true)?;
 
         let legacy_payload = parents.payload_spec.is_legacy_default();
@@ -177,8 +176,7 @@ impl RedditETL {
         let mut s_payload_cache =
             WorkerShardCache::<ParentPayload>::new(SUBMISSION_SHARD_CACHE_CAP);
 
-        write_jsonl_atomic(
-            &staging_dir,
+        write_at_path_atomic(
             out,
             self.opts.write_buffer_bytes,
             |w| -> Result<ParentAttachStats> {

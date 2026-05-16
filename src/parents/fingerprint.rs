@@ -383,26 +383,17 @@ fn write_resolver_fingerprint_atomic(
     fingerprint: &ResolverFingerprint,
     write_buf_bytes: usize,
 ) -> Result<()> {
-    let sidecar_parent = sidecar_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-    let staging_dir = ensure_staging_dir(&sidecar_parent).with_context(|| {
+    write_at_path_atomic(sidecar_path, write_buf_bytes, |w| {
+        serde_json::to_writer_pretty(&mut *w, fingerprint)?;
+        w.write_all(b"\n")?;
+        Ok(())
+    })
+    .with_context(|| {
         format!(
-            "ensure resolver sidecar staging dir under {}",
-            sidecar_parent.display()
+            "write resolver fingerprint sidecar {}",
+            sidecar_path.display()
         )
-    })?;
-
-    write_json_pretty_atomic(&staging_dir, sidecar_path, write_buf_bytes, fingerprint).with_context(
-        || {
-            format!(
-                "write resolver fingerprint sidecar {}",
-                sidecar_path.display()
-            )
-        },
-    )
+    })
 }
 
 fn attach_fingerprint_matches(sidecar_path: &Path, expected: &AttachFingerprint) -> bool {

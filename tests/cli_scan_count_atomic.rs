@@ -154,7 +154,7 @@ fn scan_out_publish_failure_does_not_replace_existing_directory() {
         .arg(&out_dir)
         .assert()
         .failure()
-        .stderr(predicate::str::contains("publishing staged output"));
+        .stderr(predicate::str::contains("publish staged"));
 
     assert!(
         out_dir.is_dir(),
@@ -195,7 +195,7 @@ fn count_month_out_publish_failure_does_not_replace_existing_directory() {
         .arg(&out_dir)
         .assert()
         .failure()
-        .stderr(predicate::str::contains("publishing staged output"));
+        .stderr(predicate::str::contains("publish staged"));
 
     assert!(
         out_dir.is_dir(),

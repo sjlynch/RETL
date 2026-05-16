@@ -280,6 +280,42 @@ where
     })
 }
 
+/// Derive the staging directory from `final_dest.parent()` and atomically
+/// publish `body`'s output at `final_dest`. Convenience wrapper around
+/// `write_jsonl_atomic` for call sites that don't already carry a staging-dir
+/// handle (use `write_jsonl_atomic` / `write_zst_atomic` directly when you do,
+/// e.g. inside a per-shard loop that pre-derives one staging dir).
+pub fn write_at_path_atomic<T, F>(
+    final_dest: &Path,
+    write_buf_bytes: usize,
+    body: F,
+) -> Result<T>
+where
+    F: FnOnce(&mut dyn Write) -> Result<T>,
+{
+    let parent = final_dest
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let staging_dir = ensure_staging_dir(parent)?;
+    write_jsonl_atomic(&staging_dir, final_dest, write_buf_bytes, body)
+}
+
+/// Convenience wrapper for CLI-style atomic text writes that don't already
+/// carry a staging-dir handle. Identical to `write_at_path_atomic`; named for
+/// caller clarity at sites that emit plain text/JSON rather than newline-
+/// delimited records.
+pub fn write_text_atomic<T, F>(
+    final_dest: &Path,
+    write_buf_bytes: usize,
+    body: F,
+) -> Result<T>
+where
+    F: FnOnce(&mut dyn Write) -> Result<T>,
+{
+    write_at_path_atomic(final_dest, write_buf_bytes, body)
+}
+
 /// Atomically write a pretty JSON sidecar/text document followed by a trailing
 /// newline. Stages through the same unique `*.retl-<pid>-<nonce>.inprogress`
 /// path as [`write_jsonl_atomic`].

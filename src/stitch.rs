@@ -1,31 +1,19 @@
 //! Output stitching helpers: merge per-file JSONL parts, build a single JSON array,
 //! and concatenate TSV shards. Also provides a helper for temp part filenames.
 //!
-//! All stitched outputs route through `atomic_write::write_jsonl_atomic` (staging
-//! under `<dest-parent>/_staging`, then atomic rename) so a crashed run cannot
-//! leave a partial stitched file at the published path. The staging directory
-//! shares the destination's filesystem so the rename is atomic on Windows and
-//! POSIX.
+//! All stitched outputs route through `atomic_write::write_at_path_atomic`
+//! (staging under `<dest-parent>/_staging`, then atomic rename) so a crashed
+//! run cannot leave a partial stitched file at the published path. The
+//! staging directory shares the destination's filesystem so the rename is
+//! atomic on Windows and POSIX.
 
-use crate::atomic_write::{ensure_staging_dir, write_jsonl_atomic};
+use crate::atomic_write::write_at_path_atomic;
 use crate::ndjson::{read_line_capped, DEFAULT_MAX_LINE_BYTES};
 use anyhow::Result;
-use std::io::{BufReader, Write};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
 const STITCH_BUF_BYTES: usize = 16 * 1024;
-
-/// Stage a unique `.inprogress` file in `<dest-parent>/_staging`, run `body`,
-/// then atomically replace `out_path`. Thin wrapper around `write_jsonl_atomic`
-/// for the stitch call sites that don't carry an explicit staging dir.
-fn write_atomic<F>(out_path: &Path, write_buf: usize, body: F) -> Result<()>
-where
-    F: FnOnce(&mut dyn Write) -> Result<()>,
-{
-    let parent = out_path.parent().unwrap_or_else(|| Path::new("."));
-    let staging_dir = ensure_staging_dir(parent)?;
-    write_jsonl_atomic(&staging_dir, out_path, write_buf, body)
-}
 
 fn list_tmp_parts(dir: &Path) -> Result<Vec<PathBuf>> {
     jsonl_part_paths(dir)
@@ -33,7 +21,7 @@ fn list_tmp_parts(dir: &Path) -> Result<Vec<PathBuf>> {
 
 pub fn stitch_tmp_parts(tmp_dir: &Path, out_path: &Path, write_buf: usize) -> Result<()> {
     let parts = list_tmp_parts(tmp_dir)?;
-    write_atomic(out_path, write_buf, |out| {
+    write_at_path_atomic(out_path, write_buf, |out| {
         for path in &parts {
             let mut r = BufReader::new(crate::util::open_with_default_backoff(path)?);
             std::io::copy(&mut r, out)?;
@@ -63,7 +51,7 @@ pub fn stitch_tmp_parts_to_json_array(
     }
 
     let parts = list_tmp_parts(tmp_dir)?;
-    write_atomic(out_path, write_buf, |out| {
+    write_at_path_atomic(out_path, write_buf, |out| {
         let mut first = true;
 
         out.write_all(b"[")?;
@@ -98,7 +86,7 @@ fn stitch_tmp_parts_to_json_array_pretty(
     write_buf: usize,
 ) -> Result<()> {
     let parts = list_tmp_parts(tmp_dir)?;
-    write_atomic(out_path, write_buf, |out| {
+    write_at_path_atomic(out_path, write_buf, |out| {
         let mut first = true;
 
         out.write_all(b"[\n")?;
@@ -166,7 +154,7 @@ fn jsonl_part_paths(tmp_dir: &Path) -> Result<Vec<PathBuf>> {
 pub fn concat_tsvs(parts: &Vec<PathBuf>, out_path: &Path, write_buf: usize) -> Result<()> {
     let mut paths = parts.clone();
     paths.sort();
-    write_atomic(out_path, write_buf, |out| {
+    write_at_path_atomic(out_path, write_buf, |out| {
         for p in paths {
             let mut r = BufReader::new(crate::util::open_with_default_backoff(&p)?);
             std::io::copy(&mut r, out)?;
@@ -179,6 +167,7 @@ pub fn concat_tsvs(parts: &Vec<PathBuf>, out_path: &Path, write_buf: usize) -> R
 mod tests {
     use super::*;
     use std::fs;
+    use std::io::Write;
 
     /// A temp part containing invalid UTF-8 must cause stitching to return
     /// `Err` instead of silently truncating the JSON array. Regression test

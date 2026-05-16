@@ -26,7 +26,7 @@ pub(crate) fn run_count(args: CountArgs) -> Result<()> {
                 w.flush()?;
             } else {
                 let path = args.out.as_ref().expect("checked to_stdout").clone();
-                write_text_file_atomic(&path, |w| {
+                write_text_atomic(&path, CLI_TEXT_WRITE_BUF_BYTES, |w| {
                     for (ym, n) in &counts {
                         writeln!(w, "{ym}\t{n}")?;
                     }

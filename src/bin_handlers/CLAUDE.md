@@ -8,4 +8,4 @@
 - `parents.rs`/`parents_helpers.rs`: parent-ID direct and spool workflows.
 - Handlers do not initialize tracing; `src/main.rs` calls `retl::init_tracing_for_binary()` once.
 - Start `RunManifestStart::now()` at the top of handlers that emit manifests so wall time covers the full operation.
-- Atomic CLI text writes use `common.rs::write_text_file_atomic`; do not write final output paths directly.
+- Atomic CLI text writes route through `retl::write_text_atomic` (a thin wrapper over the library's `write_at_path_atomic` so staged leftovers carry the `.retl-<pid>-<nonce>` marker and are sweepable); do not write final output paths directly.
