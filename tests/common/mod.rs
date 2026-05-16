@@ -1,5 +1,9 @@
 #![allow(dead_code)]
 
+pub mod cli;
+pub mod parents;
+pub mod spool;
+
 use serde_json::json;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
