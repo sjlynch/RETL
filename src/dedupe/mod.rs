@@ -8,6 +8,7 @@ pub use cfg::DedupeCfg;
 pub use merge::merge_runs_sorted;
 pub use runs::build_runs_sorted;
 
+pub(crate) use cfg::BYTES_PER_MB;
 pub(crate) use merge::merge_runs_sorted_with_key_stats;
 pub(crate) use runs::build_runs_sorted_with_key_stats;
 

@@ -1,7 +1,7 @@
 use crate::config::ETLOptions;
 use crate::mem::AdaptiveMemCfg;
 
-pub(super) const BYTES_PER_MB: usize = 1024 * 1024;
+pub(crate) const BYTES_PER_MB: usize = 1024 * 1024;
 
 /// Configuration for the generic dedupe engine.
 #[derive(Clone, Debug)]
