@@ -1,3 +1,8 @@
+//! Validation tests that genuinely need a fresh subprocess for env-var
+//! isolation. The other 10 tests in this file were converted to in-process
+//! calls into `run_scan` under `src/bin_handlers/tests.rs` (no binary spawn,
+//! same assertions on validation messages).
+
 use assert_cmd::Command;
 use predicates::prelude::*;
 use std::fs;
@@ -30,96 +35,10 @@ fn base_scan_cmd(base: &tempfile::TempDir) -> Command {
     cmd
 }
 
-fn assert_blank_filter_fails_before_scan(extra_args: &[&str], field: &str) {
-    let base = corrupt_corpus();
-
-    let mut cmd = base_scan_cmd(&base);
-    cmd.args(extra_args)
-        .env_remove("ETL_EXCLUDE_AUTHORS")
-        .env_remove("ETL_EXCLUDE_AUTHORS_FILE")
-        .assert()
-        .failure()
-        .stderr(
-            predicate::str::contains(field)
-                .and(predicate::str::contains("blank entries are not allowed"))
-                .and(predicate::str::contains("zstd").not()),
-        );
-}
-
-#[test]
-fn cli_rejects_blank_subreddit_before_scanning() {
-    assert_blank_filter_fails_before_scan(&["--subreddit", " "], "subreddits");
-}
-
-#[test]
-fn cli_rejects_blank_id_before_scanning() {
-    assert_blank_filter_fails_before_scan(&["--id", "t1_"], "ids_in");
-}
-
-#[test]
-fn cli_rejects_blank_author_before_scanning() {
-    assert_blank_filter_fails_before_scan(&["--author", ""], "authors_in");
-}
-
-#[test]
-fn cli_rejects_blank_excluded_author_before_scanning() {
-    assert_blank_filter_fails_before_scan(&["--exclude-author", "\t"], "authors_out");
-}
-
-#[test]
-fn cli_rejects_blank_domain_before_scanning() {
-    assert_blank_filter_fails_before_scan(&["--domain", " "], "domains_in");
-}
-
-#[test]
-fn cli_rejects_blank_keyword_before_scanning() {
-    assert_blank_filter_fails_before_scan(&["--keyword", ""], "keywords_any");
-}
-
-#[test]
-fn cli_rejects_blank_keyword_all_before_scanning() {
-    assert_blank_filter_fails_before_scan(&["--keyword-all", ""], "keywords_all");
-}
-
-#[test]
-fn cli_rejects_blank_excluded_keyword_before_scanning() {
-    assert_blank_filter_fails_before_scan(&["--exclude-keyword", ""], "keywords_exclude");
-}
-
-#[test]
-fn cli_rejects_invalid_text_regex_before_scanning() {
-    let base = corrupt_corpus();
-
-    let mut cmd = base_scan_cmd(&base);
-    cmd.args(["--text-regex", "["])
-        .env_remove("ETL_EXCLUDE_AUTHORS")
-        .env_remove("ETL_EXCLUDE_AUTHORS_FILE")
-        .assert()
-        .failure()
-        .stderr(
-            predicate::str::contains("text_regex")
-                .and(predicate::str::contains("invalid"))
-                .and(predicate::str::contains("zstd").not()),
-        );
-}
-
-#[test]
-fn cli_rejects_blank_text_regex_before_scanning() {
-    let base = corrupt_corpus();
-
-    let mut cmd = base_scan_cmd(&base);
-    cmd.args(["--text-regex", " "])
-        .env_remove("ETL_EXCLUDE_AUTHORS")
-        .env_remove("ETL_EXCLUDE_AUTHORS_FILE")
-        .assert()
-        .failure()
-        .stderr(
-            predicate::str::contains("text_regex")
-                .and(predicate::str::contains("blank regex patterns"))
-                .and(predicate::str::contains("zstd").not()),
-        );
-}
-
+/// Needs a fresh subprocess because it sets `ETL_EXCLUDE_AUTHORS_FILE` to a
+/// path with non-UTF8 content and asserts the resulting error mentions
+/// `line 1`. The env-mutation can't safely happen inside an in-process test
+/// because cargo runs tests in parallel within a process.
 #[test]
 fn cli_exclude_common_bots_invalid_file_fails_before_scanning() {
     let base = corrupt_corpus();

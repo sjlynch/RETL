@@ -11,6 +11,9 @@
 //! `serde_json::Number`'s float-vs-int representation distinction (which is
 //! orthogonal to whitelisting correctness).
 
+#[path = "common/mod.rs"]
+mod common;
+
 use proptest::prelude::*;
 use retl::{rewrite_human_timestamps_bytes, WhitelistTokenizer};
 use serde_json::{json, Map, Value};
@@ -98,11 +101,12 @@ fn slow_path(line: &str, fields: &[String]) -> String {
 // ---------------------------------------------------------------------------
 
 proptest! {
+    // Default 32 cases per run for daily iteration; the tokenizer is cheap so
+    // we can afford a few times more cases than the heavyweight pipeline
+    // properties. Bump with `RETL_PROPTEST_CASES=256 cargo test` before
+    // merging tokenizer changes.
     #![proptest_config(ProptestConfig {
-        // Modest case count so test time stays reasonable; the generator covers
-        // the structural variants (leaves / nested arrays / nested objects /
-        // empty whitelist / whitelist that doesn't intersect the keys).
-        cases: 256,
+        cases: common::proptest_cases(32),
         ..ProptestConfig::default()
     })]
 
@@ -206,8 +210,9 @@ fn record_with_maybe_timestamps() -> impl Strategy<Value = (Vec<String>, Value)>
 }
 
 proptest! {
+    // Default 32 cases; bump via `RETL_PROPTEST_CASES` for thorough runs.
     #![proptest_config(ProptestConfig {
-        cases: 256,
+        cases: common::proptest_cases(32),
         ..ProptestConfig::default()
     })]
 

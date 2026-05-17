@@ -12,6 +12,9 @@
 //!    pipeline on its own output is a no-op (and the keys in the output are
 //!    unique).
 
+#[path = "common/mod.rs"]
+mod common;
+
 use proptest::prelude::*;
 use retl::{
     build_runs_sorted, merge_runs_sorted, DedupeCfg, ExportFormat, KeyExtractor, RedditETL,
@@ -293,8 +296,12 @@ fn run_export(records: &[TestRecord], q: &GenQuery, fmt: OutFormat) -> Vec<Value
 // ---------------------------------------------------------------------------
 
 proptest! {
+    // Each case runs a full RedditETL pipeline end-to-end (zstd encode +
+    // extract/export). Default 8 cases per run for daily iteration; bump with
+    // `RETL_PROPTEST_CASES=128 cargo test --test properties` before merging
+    // changes to the streaming/export hot path.
     #![proptest_config(ProptestConfig {
-        cases: 64,
+        cases: common::proptest_cases(8),
         ..ProptestConfig::default()
     })]
 
@@ -391,8 +398,11 @@ fn run_dedupe_pipeline(lines: &[String], dir: &Path, label: &str) -> Vec<String>
 }
 
 proptest! {
+    // Each case runs build_runs_sorted + merge_runs_sorted twice over a
+    // generated input. Default 8 cases per run for daily iteration; bump with
+    // `RETL_PROPTEST_CASES=128 cargo test --test properties`.
     #![proptest_config(ProptestConfig {
-        cases: 64,
+        cases: common::proptest_cases(8),
         ..ProptestConfig::default()
     })]
 

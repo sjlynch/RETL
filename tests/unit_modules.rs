@@ -111,14 +111,16 @@ fn count_lines(path: &std::path::Path) -> usize {
         .count()
 }
 
-#[test]
-fn bucketing_partition_stage1_routes_all_records_and_is_deterministic() {
-    let dir = tempfile::tempdir().unwrap();
-
-    // Build ~3K records with ~750 distinct authors.
-    let mut lines: Vec<String> = Vec::with_capacity(3000);
-    for i in 0..3000 {
-        let author = format!("user_{:04}", i % 750);
+/// Build `n` records over ~`n/4` distinct authors. The author keying scheme
+/// matches what the bucketing/dedupe stress tests originally used at much
+/// larger N — keeping the shape identical means a `#[ignore]`'d wide-N twin
+/// run can exercise the same code path at 10×/30× scale without forking the
+/// fixture builder.
+fn bucketing_synthetic_records(n: usize) -> Vec<String> {
+    let distinct = (n / 4).max(1);
+    let mut lines = Vec::with_capacity(n);
+    for i in 0..n {
+        let author = format!("user_{:05}", i % distinct);
         lines.push(
             serde_json::json!({
                 "author": author,
@@ -129,32 +131,37 @@ fn bucketing_partition_stage1_routes_all_records_and_is_deterministic() {
             .to_string(),
         );
     }
+    lines
+}
+
+/// Drive `partition_stage1` twice over `n_records` synthetic NDJSON records
+/// and assert:
+///   - both runs produce `shards` shard files
+///   - per-run totals equal `n_records`
+///   - the (key → shard) mapping is identical across runs (key determinism)
+///
+/// Used by the daily-fast test (`n_records=200`) and the `#[ignore]`d
+/// wide-N stress variant.
+fn assert_partition_stage1_determinism(n_records: usize, shards: usize) {
+    let dir = tempfile::tempdir().unwrap();
+    let lines = bucketing_synthetic_records(n_records);
     let in_path = dir.path().join("in.ndjson");
     write_ndjson(&in_path, &lines);
 
-    // Run partition twice; bytes/line counts and per-shard totals must match exactly.
-    fn run(in_path: &std::path::Path, out: &std::path::Path) -> Vec<PathBuf> {
+    fn run(in_path: &std::path::Path, out: &std::path::Path, shards: usize) -> Vec<PathBuf> {
         let key = KeyExtractor::author_lowercase_fast();
-        partition_stage1(
-            std::slice::from_ref(&in_path.to_path_buf()),
-            out,
-            8,
-            &key,
-        )
-        .unwrap()
+        partition_stage1(std::slice::from_ref(&in_path.to_path_buf()), out, shards, &key).unwrap()
     }
-    let a = run(&in_path, &dir.path().join("a"));
-    let b = run(&in_path, &dir.path().join("b"));
-    assert_eq!(a.len(), 8);
-    assert_eq!(b.len(), 8);
+    let a = run(&in_path, &dir.path().join("a"), shards);
+    let b = run(&in_path, &dir.path().join("b"), shards);
+    assert_eq!(a.len(), shards);
+    assert_eq!(b.len(), shards);
 
-    // Total written == input
     let total_a: usize = a.iter().map(|p| count_lines(p)).sum();
     let total_b: usize = b.iter().map(|p| count_lines(p)).sum();
-    assert_eq!(total_a, 3000);
-    assert_eq!(total_b, 3000);
+    assert_eq!(total_a, n_records);
+    assert_eq!(total_b, n_records);
 
-    // Determinism: every key lands in the same shard across runs.
     let mut author_to_shard: HashMap<String, usize> = HashMap::new();
     for (i, p) in a.iter().enumerate() {
         for line in BufReader::new(File::open(p).unwrap()).lines().flatten() {
@@ -180,13 +187,38 @@ fn bucketing_partition_stage1_routes_all_records_and_is_deterministic() {
 }
 
 #[test]
-fn bucketing_process_bucket_streaming_drives_adaptive_flush_with_10k_records() {
-    let dir = tempfile::tempdir().unwrap();
+fn bucketing_partition_stage1_routes_all_records_and_is_deterministic() {
+    // Daily-fast scale: 200 records / ~50 distinct authors / 8 shards is
+    // plenty to put multiple keys per shard and exercise the determinism
+    // invariant on a non-trivial mapping. Wide-N coverage is the `#[ignore]`d
+    // stress variant at the bottom of this file.
+    assert_partition_stage1_determinism(200, 8);
+}
 
-    // ~10K records to force the flush branch when target_bytes is tiny.
-    let mut lines: Vec<String> = Vec::with_capacity(10_000);
-    for i in 0..10_000 {
-        let author = format!("user_{:05}", i % 1000);
+/// Drive `process_bucket_streaming` with `n_records` synthetic records over
+/// `n_keys` distinct keys (so each key has `n_records / n_keys` rows by
+/// construction). Asserts:
+///   - at least `n_keys` group flushes (each key seen at least once)
+///   - strictly more than `n_keys` flushes (tight buffer forces partial flush
+///     of the same key) — this is the adaptive-branch invariant
+///   - total ingested rows equal `n_records`
+///   - every key sees exactly `n_records / n_keys` records
+///
+/// The numerical invariants don't care about absolute scale — they just need
+/// `n_records > n_keys` so flushes can happen mid-key. 1100/110 is plenty;
+/// the original 10000/1000 was overkill. The `#[ignore]`d wide-N stress at
+/// the bottom of this file exercises the original scale.
+fn assert_process_bucket_streaming_adaptive(n_records: usize, n_keys: usize) {
+    assert!(
+        n_records % n_keys == 0,
+        "test helper requires n_records divisible by n_keys"
+    );
+    let per_key = n_records / n_keys;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut lines: Vec<String> = Vec::with_capacity(n_records);
+    for i in 0..n_records {
+        let author = format!("user_{:05}", i % n_keys);
         lines.push(
             serde_json::json!({
                 "author": author,
@@ -200,19 +232,18 @@ fn bucketing_process_bucket_streaming_drives_adaptive_flush_with_10k_records() {
     let bucket = dir.path().join("bucket_0000.jsonl");
     write_ndjson(&bucket, &lines);
 
-    // Force adaptive flushes by setting a very tight buffer target.
-    // micro_min_buf_mb=0 and micro_max_buf_mb=0 means ~0-byte target — flush every line group.
+    // Force adaptive flushes by setting a ~0-byte target buffer.
     let cfg = BucketingCfg {
         mem: retl::AdaptiveMemCfg {
-            soft_low_frac: 0.999, // pretend we're "low" so the soft-low branch triggers too
+            soft_low_frac: 0.999, // pretend we're "low" so soft-low branch fires
             high_frac: 1.0,
-            adapt_cooldown_ms: 1, // re-evaluate fast
+            adapt_cooldown_ms: 1,
         },
-        hard_low_frac: 0.0,   // never trigger the hard backoff sleep
+        hard_low_frac: 0.0,
         backoff_ms: 0,
         micro_min_buf_mb: 0,
         micro_max_buf_mb: 0,
-        inflight_bytes: 0,    // disable cap; let tight buffer drive flushes
+        inflight_bytes: 0,
         inflight_groups: 8,
     };
 
@@ -229,47 +260,46 @@ fn bucketing_process_bucket_streaming_drives_adaptive_flush_with_10k_records() {
             Ok(())
         },
         &key,
-        // The `test-utils` feature adds a buffered-bytes metric arg used by
-        // tests/backpressure_bucketing.rs. This test doesn't observe that
-        // metric, but must still pass `None` when the feature is enabled.
         #[cfg(feature = "test-utils")]
         None,
     )
     .unwrap();
 
-    // 1000 distinct keys; with adaptive flushes a key may be flushed multiple times,
-    // so groups_seen >= 1000 — and in this aggressive config, strictly greater.
     assert!(
-        groups_seen >= 1000,
-        "expected at least 1000 group flushes; got {}",
-        groups_seen
+        groups_seen >= n_keys,
+        "expected at least {n_keys} group flushes; got {groups_seen}"
     );
     assert!(
-        groups_seen > 1000,
-        "tight buffer should force >1 flush per key (sanity for adaptive branch); got {}",
-        groups_seen
+        groups_seen > n_keys,
+        "tight buffer should force >1 flush per key (adaptive-branch sanity); got {groups_seen}"
     );
 
-    // No matter how many partial flushes happened, totals must match input counts.
-    assert_eq!(totals.len(), 1000);
+    assert_eq!(totals.len(), n_keys);
     let sum: usize = totals.values().sum();
-    assert_eq!(sum, 10_000);
-    // Each key should have ~10 records (10000 / 1000), exactly 10 by our construction.
+    assert_eq!(sum, n_records);
     for v in totals.values() {
-        assert_eq!(*v, 10);
+        assert_eq!(*v, per_key);
     }
 }
 
 #[test]
-fn bucketing_bucketize_shard_splits_into_n_buckets() {
-    let dir = tempfile::tempdir().unwrap();
+fn bucketing_process_bucket_streaming_drives_adaptive_flush() {
+    // Daily-fast scale: 1100 records / 110 keys / 10 per key. The
+    // adaptive-branch invariants don't strengthen with N — see the
+    // `#[ignore]`d wide-N stress variant for the original 10K/1000/10 scale.
+    assert_process_bucket_streaming_adaptive(1100, 110);
+}
 
-    let mut lines: Vec<String> = Vec::with_capacity(2000);
-    for i in 0..2000 {
-        let author = format!("u{:04}", i % 200);
-        lines.push(
-            serde_json::json!({"author": author, "id": format!("x{}", i)}).to_string(),
-        );
+/// Drive `bucketize_shards` over `n_records` records spread across `n_buckets`
+/// output partitions and assert: bucket count and total row count are exact.
+/// Daily test uses 200 records; the wide-N stress variant uses 2000.
+fn assert_bucketize_shard_splits(n_records: usize, n_buckets: usize) {
+    let dir = tempfile::tempdir().unwrap();
+    let distinct = (n_records / 10).max(1);
+    let mut lines: Vec<String> = Vec::with_capacity(n_records);
+    for i in 0..n_records {
+        let author = format!("u{:04}", i % distinct);
+        lines.push(serde_json::json!({"author": author, "id": format!("x{}", i)}).to_string());
     }
     let shard = dir.path().join("stage1_0000.jsonl");
     write_ndjson(&shard, &lines);
@@ -278,50 +308,61 @@ fn bucketing_bucketize_shard_splits_into_n_buckets() {
     let buckets = bucketize_shards(
         std::slice::from_ref(&shard),
         &dir.path().join("buckets"),
-        4,
+        n_buckets,
         &key,
     )
     .unwrap();
 
-    assert_eq!(buckets.len(), 4);
+    assert_eq!(buckets.len(), n_buckets);
     let total: usize = buckets.iter().map(|p| count_lines(p)).sum();
-    assert_eq!(total, 2000);
+    assert_eq!(total, n_records);
+}
+
+#[test]
+fn bucketing_bucketize_shard_splits_into_n_buckets() {
+    assert_bucketize_shard_splits(200, 4);
 }
 
 // ---------- dedupe ----------
 
-#[test]
-fn dedupe_build_and_merge_groups_by_key_in_sorted_order() {
+/// Drive build_runs_sorted + merge_runs_sorted with `n_keys` distinct authors
+/// each duplicated `dupes_per_key` times, asserting:
+///   - tight memory target produces ≥ 2 runs (so the k-way merge actually runs)
+///   - keys within each run are sorted (the in-run invariant)
+///   - merge callback receives exactly `dupes_per_key` group entries per key
+///   - merge output has one line per distinct key, globally sorted, unique
+///
+/// Daily-fast scale is 20 keys × 3 dupes = 60 records; wide-N stress at the
+/// bottom of this file uses the original 600 × 3.
+fn assert_dedupe_groups_by_key(n_keys: usize, dupes_per_key: usize) {
+    let n_records = n_keys * dupes_per_key;
     let dir = tempfile::tempdir().unwrap();
-
-    // Three duplicate entries per author across ~600 authors == 1800 records.
     let in_path = dir.path().join("dedupe_in.ndjson");
-    let mut lines = Vec::with_capacity(1800);
-    for i in 0..1800 {
-        let author = format!("user_{:04}", i % 600);
-        lines.push(
-            serde_json::json!({"author": author, "id": format!("c{}", i)}).to_string(),
-        );
+    let mut lines = Vec::with_capacity(n_records);
+    for i in 0..n_records {
+        let author = format!("user_{:04}", i % n_keys);
+        lines.push(serde_json::json!({"author": author, "id": format!("c{}", i)}).to_string());
     }
     write_ndjson(&in_path, &lines);
 
-    // Tight memory target -> multiple runs -> merge has real work.
     let cfg = DedupeCfg {
-        mem: retl::AdaptiveMemCfg { soft_low_frac: 0.999, high_frac: 1.0, adapt_cooldown_ms: 1 },
+        mem: retl::AdaptiveMemCfg {
+            soft_low_frac: 0.999,
+            high_frac: 1.0,
+            adapt_cooldown_ms: 1,
+        },
         min_buf_mb: 0,
         max_buf_mb: 0,
         read_buf_bytes: 8 * 1024,
         write_buf_bytes: 8 * 1024,
-        inflight_bytes: 0, // disable cap so test's tight target_bytes drives flushes
+        inflight_bytes: 0,
     };
     let runs_dir = dir.path().join("runs");
     let key = KeyExtractor::author_lowercase_fast();
     let runs = build_runs_sorted(&in_path, &runs_dir, &key, &cfg).unwrap();
 
-    // With buf_mb=0 and 1800 records, we expect many runs (>= 2 to make merge meaningful).
     assert!(runs.len() >= 2, "expected multiple runs, got {}", runs.len());
 
-    // Each run's keys must be sorted within the run.
     for run in &runs {
         let mut seen_keys: Vec<String> = Vec::new();
         for line in BufReader::new(File::open(run).unwrap()).lines().flatten() {
@@ -333,16 +374,21 @@ fn dedupe_build_and_merge_groups_by_key_in_sorted_order() {
         }
         let mut sorted = seen_keys.clone();
         sorted.sort();
-        assert_eq!(seen_keys, sorted, "keys not sorted within run {}", run.display());
+        assert_eq!(
+            seen_keys,
+            sorted,
+            "keys not sorted within run {}",
+            run.display()
+        );
     }
 
-    // Merge: the callback receives all lines for one key as a group; we emit a
-    // single output line per key. Verify keys appear once and globally sorted.
     let out = dir.path().join("merged.ndjson");
     merge_runs_sorted(&runs, &out, &key, &cfg, |k, group, w| {
-        // Each key has exactly 3 records (1800 / 600 distinct = 3).
-        assert_eq!(group.len(), 3, "expected 3 dupes per key for {}", k);
-        // Emit only the key as a single line (we're testing the merge plumbing).
+        assert_eq!(
+            group.len(),
+            dupes_per_key,
+            "expected {dupes_per_key} dupes per key for {k}"
+        );
         w.write_all(k.as_bytes())?;
         w.write_all(b"\n")?;
         Ok(())
@@ -354,13 +400,20 @@ fn dedupe_build_and_merge_groups_by_key_in_sorted_order() {
         .filter_map(|l| l.ok())
         .filter(|s| !s.is_empty())
         .collect();
-    assert_eq!(merged.len(), 600, "one output line per distinct key");
+    assert_eq!(merged.len(), n_keys, "one output line per distinct key");
     let mut sorted = merged.clone();
     sorted.sort();
     assert_eq!(merged, sorted, "merge output must be globally key-sorted");
-    // No duplicates in output keys.
     let unique: BTreeSet<&String> = merged.iter().collect();
     assert_eq!(unique.len(), merged.len());
+}
+
+#[test]
+fn dedupe_build_and_merge_groups_by_key_in_sorted_order() {
+    // Daily-fast scale: 20 keys × 3 dupes = 60 records. With buf_mb=0 even
+    // this tiny input produces multiple runs, so the k-way merge invariants
+    // still fire. Wide-N stress is the `#[ignore]`d variant below.
+    assert_dedupe_groups_by_key(20, 3);
 }
 
 #[test]
@@ -529,20 +582,21 @@ fn merge_runs_sorted_concurrent_writes_share_dir_with_distinct_stems() {
 
 // ---------- kv_shard ----------
 
-#[test]
-fn kv_shard_sum_reduces_per_key_totals() {
+/// Drive ShardedKVWriter.reduce_sum with `n_keys` distinct keys, each written
+/// `rounds` times with values 1..=rounds. Per-key sum must equal the triangle
+/// number `rounds*(rounds+1)/2`. Daily-fast scale is 60×5; wide-N stress
+/// uses 600×5.
+fn assert_kv_shard_sum(n_keys: usize, rounds: i64, n_buckets: usize) {
+    let expected_sum: i64 = rounds * (rounds + 1) / 2;
     let dir = tempfile::tempdir().unwrap();
-    let kv = ShardedKVWriter::create(dir.path(), "sumtest", 4).unwrap();
-
-    // 600 distinct keys, each written 5 times with values 1..=5 -> sum == 15 per key.
-    for round in 1..=5i64 {
-        for i in 0..600 {
+    let kv = ShardedKVWriter::create(dir.path(), "sumtest", n_buckets).unwrap();
+    for round in 1..=rounds {
+        for i in 0..n_keys {
             kv.write_kv(&format!("k_{:04}", i), round).unwrap();
         }
     }
     let shards = kv.reduce_sum("sumtest").unwrap();
-    assert_eq!(shards.len(), 4);
-
+    assert_eq!(shards.len(), n_buckets);
     let mut totals: HashMap<String, i64> = HashMap::new();
     for p in shards {
         for line in BufReader::new(File::open(&p).unwrap()).lines().flatten() {
@@ -550,10 +604,16 @@ fn kv_shard_sum_reduces_per_key_totals() {
             totals.insert(k.to_string(), v.parse().unwrap());
         }
     }
-    assert_eq!(totals.len(), 600);
+    assert_eq!(totals.len(), n_keys);
     for v in totals.values() {
-        assert_eq!(*v, 15);
+        assert_eq!(*v, expected_sum);
     }
+}
+
+#[test]
+fn kv_shard_sum_reduces_per_key_totals() {
+    // 60 keys × 5 rounds is plenty; wide-N stress uses 600 × 5.
+    assert_kv_shard_sum(60, 5, 4);
 }
 
 #[test]
@@ -581,4 +641,27 @@ fn kv_shard_min_picks_smallest_value_per_key() {
         let i: i64 = k.trim_start_matches("k_").parse().unwrap();
         assert_eq!(*v, i, "min for {} should be {}, got {}", k, i, v);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Wide-N stress variants (`#[ignore]`d for daily iteration).
+//
+// The four bucketing/dedupe/kv tests above each run a `assert_*` helper at a
+// daily-fast scale (~60-1100 records). The same invariants don't strengthen
+// at large N — but the original 3K/10K/2K/1800/600×5 scales did sometimes
+// catch perf regressions or memory-buffering pathologies that smaller inputs
+// missed. This single `#[ignore]`d test re-exercises every helper at the
+// original full scale; run before merging perf-sensitive changes with:
+//
+//     cargo test --test unit_modules -- --ignored --nocapture
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "wide-N stress; run with --ignored before perf-sensitive merges"]
+fn stress_bucketing_dedupe_kv_at_original_scale() {
+    assert_partition_stage1_determinism(3000, 8);
+    assert_process_bucket_streaming_adaptive(10_000, 1000);
+    assert_bucketize_shard_splits(2000, 4);
+    assert_dedupe_groups_by_key(600, 3);
+    assert_kv_shard_sum(600, 5, 4);
 }

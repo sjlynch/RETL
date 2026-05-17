@@ -5,9 +5,11 @@ pub mod parents;
 pub mod spool;
 
 use serde_json::json;
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 /// Write a compressed `.zst` file containing the provided JSONL lines.
 /// This mirrors the corpus's RC_/RS_ monthly files but with tiny content.
@@ -19,6 +21,51 @@ pub fn write_zst_lines(path: &Path, lines: &[String]) {
         writeln!(&mut enc, "{}", l).unwrap();
     }
     enc.finish().unwrap();
+}
+
+/// Return the proptest case count to use for a property, honoring the
+/// `RETL_PROPTEST_CASES` env var if set.
+///
+/// Daily iteration uses small case counts so the property suites don't
+/// dominate `cargo test` wall time; pre-merge / release runs set
+/// `RETL_PROPTEST_CASES` to a much larger number for thorough exploration.
+/// Override beats `default_for_iteration` when the user wants to dial up
+/// exploration explicitly.
+pub fn proptest_cases(default_for_iteration: u32) -> u32 {
+    std::env::var("RETL_PROPTEST_CASES")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(default_for_iteration)
+}
+
+/// Encode JSONL lines as a zstd byte buffer (no file I/O). Used by the cached
+/// corpus builders below so the dominant cost (zstd encoding at level 3) is
+/// amortized across every test in a binary instead of paid per call.
+fn encode_zst_bytes(lines: &[String]) -> Vec<u8> {
+    let mut buf: Vec<u8> = Vec::with_capacity(256);
+    {
+        let mut enc = zstd::stream::write::Encoder::new(&mut buf, 3).unwrap();
+        for l in lines {
+            writeln!(&mut enc, "{}", l).unwrap();
+        }
+        enc.finish().unwrap();
+    }
+    buf
+}
+
+/// Materialize a cached corpus into a fresh tempdir. Files are routed by
+/// relative path under the returned base. Always called with paths whose
+/// parent dirs are `comments` or `submissions`.
+fn materialize_corpus(files: &[(PathBuf, Vec<u8>)]) -> PathBuf {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.keep();
+    for (rel, bytes) in files {
+        let full = base.join(rel);
+        fs::create_dir_all(full.parent().unwrap()).unwrap();
+        fs::write(&full, bytes).unwrap();
+    }
+    base
 }
 
 /// Read a JSONL file into a vector of `serde_json::Value` (skips empty lines).
@@ -49,54 +96,50 @@ pub fn read_lines(path: &Path) -> Vec<String> {
 ///
 /// All timestamps are in Jan 2006 to keep tests small and deterministic.
 pub fn make_corpus_basic() -> PathBuf {
-    let dir = tempfile::tempdir().unwrap();
-    let base = dir.keep();
-
-    // Submissions (RS_2006-01): s1 (bob), s2 (AutoModerator on nytimes.com)
-    let rs_2006_01 = base.join("submissions").join("RS_2006-01.zst");
-    let rs_lines = vec![
-        json!({
-            "archived": false, "author":"bob", "created_utc":1136073600,
-            "domain":"example.com", "id":"s1", "is_self":false, "is_video":false,
-            "num_comments":10, "over_18":false, "score":183, "selftext":"",
-            "title":"Rust news", "subreddit":"programming", "subreddit_id":"t5_x",
-            "url":"http://example.com/x"
-        }).to_string(),
-        json!({
-            "archived": false, "author":"AutoModerator", "created_utc":1136073601,
-            "domain":"nytimes.com", "id":"s2", "is_self":false, "is_video":false,
-            "num_comments":1, "over_18":false, "score":1, "selftext":"",
-            "title":"Meta: rules", "subreddit":"programming", "subreddit_id":"t5_x",
-            "url":"http://reddit.com/rules"
-        }).to_string(),
-    ];
-    write_zst_lines(&rs_2006_01, &rs_lines);
-
-    // Comments (RC_2006-01): c1 (alice -> s1), c2 (charlie -> c1), c3 ([deleted])
-    let rc_2006_01 = base.join("comments").join("RC_2006-01.zst");
-    let rc_lines = vec![
-        json!({
-            "controversiality":0, "body":"I love Rust http://rust-lang.org", "subreddit_id":"t5_x",
-            "link_id":"t3_s1", "stickied":false, "subreddit":"programming", "score":2,
-            "ups":2, "author":"alice", "id":"c1", "edited":false, "parent_id":"t3_s1",
-            "gilded":0, "distinguished":null, "created_utc":1136074600, "retrieved_on":1136075600
-        }).to_string(),
-        json!({
-            "controversiality":0, "body":"reply to alice", "subreddit_id":"t5_x",
-            "link_id":"t3_s1", "stickied":false, "subreddit":"programming", "score":5,
-            "ups":5, "author":"charlie", "id":"c2", "edited":false, "parent_id":"t1_c1",
-            "gilded":0, "distinguished":null, "created_utc":1136074700, "retrieved_on":1136075700
-        }).to_string(),
-        json!({
-            "controversiality":0, "body":"[deleted msg]", "subreddit_id":"t5_x",
-            "link_id":"t3_s1", "stickied":false, "subreddit":"programming", "score":0,
-            "ups":0, "author":"[deleted]", "id":"c3", "edited":false, "parent_id":"t3_s1",
-            "gilded":0, "distinguished":null, "created_utc":1136074800, "retrieved_on":1136075800
-        }).to_string(),
-    ];
-    write_zst_lines(&rc_2006_01, &rc_lines);
-
-    base
+    static CACHE: OnceLock<Vec<(PathBuf, Vec<u8>)>> = OnceLock::new();
+    let files = CACHE.get_or_init(|| {
+        let rs_lines = vec![
+            json!({
+                "archived": false, "author":"bob", "created_utc":1136073600,
+                "domain":"example.com", "id":"s1", "is_self":false, "is_video":false,
+                "num_comments":10, "over_18":false, "score":183, "selftext":"",
+                "title":"Rust news", "subreddit":"programming", "subreddit_id":"t5_x",
+                "url":"http://example.com/x"
+            }).to_string(),
+            json!({
+                "archived": false, "author":"AutoModerator", "created_utc":1136073601,
+                "domain":"nytimes.com", "id":"s2", "is_self":false, "is_video":false,
+                "num_comments":1, "over_18":false, "score":1, "selftext":"",
+                "title":"Meta: rules", "subreddit":"programming", "subreddit_id":"t5_x",
+                "url":"http://reddit.com/rules"
+            }).to_string(),
+        ];
+        let rc_lines = vec![
+            json!({
+                "controversiality":0, "body":"I love Rust http://rust-lang.org", "subreddit_id":"t5_x",
+                "link_id":"t3_s1", "stickied":false, "subreddit":"programming", "score":2,
+                "ups":2, "author":"alice", "id":"c1", "edited":false, "parent_id":"t3_s1",
+                "gilded":0, "distinguished":null, "created_utc":1136074600, "retrieved_on":1136075600
+            }).to_string(),
+            json!({
+                "controversiality":0, "body":"reply to alice", "subreddit_id":"t5_x",
+                "link_id":"t3_s1", "stickied":false, "subreddit":"programming", "score":5,
+                "ups":5, "author":"charlie", "id":"c2", "edited":false, "parent_id":"t1_c1",
+                "gilded":0, "distinguished":null, "created_utc":1136074700, "retrieved_on":1136075700
+            }).to_string(),
+            json!({
+                "controversiality":0, "body":"[deleted msg]", "subreddit_id":"t5_x",
+                "link_id":"t3_s1", "stickied":false, "subreddit":"programming", "score":0,
+                "ups":0, "author":"[deleted]", "id":"c3", "edited":false, "parent_id":"t3_s1",
+                "gilded":0, "distinguished":null, "created_utc":1136074800, "retrieved_on":1136075800
+            }).to_string(),
+        ];
+        vec![
+            (PathBuf::from("submissions").join("RS_2006-01.zst"), encode_zst_bytes(&rs_lines)),
+            (PathBuf::from("comments").join("RC_2006-01.zst"), encode_zst_bytes(&rc_lines)),
+        ]
+    });
+    materialize_corpus(files)
 }
 
 /// Build a second, **corrupt** monthly file (RC_2006-02.zst) alongside the basic corpus
@@ -208,60 +251,75 @@ use retl::YearMonth;
 /// Records carry `created_utc` aligned to the first day of the named month so
 /// record-level `within_bounds` checks match plan-level filenames.
 pub fn make_corpus_multi_month(months: &[YearMonth]) -> PathBuf {
-    let dir = tempfile::tempdir().unwrap();
-    let base = dir.keep();
+    static CACHE: OnceLock<Mutex<HashMap<Vec<(u16, u8)>, Vec<(PathBuf, Vec<u8>)>>>> =
+        OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
 
-    for ym in months {
-        let label = format!("{:04}-{:02}", ym.year, ym.month);
-        // Compute a unix timestamp at the start of this month (UTC).
-        let ts = ym_to_epoch_first_day(ym.year, ym.month);
+    let key: Vec<(u16, u8)> = months.iter().map(|ym| (ym.year, ym.month)).collect();
 
-        // Submissions: one human, one bot
-        let rs_path = base.join("submissions").join(format!("RS_{}.zst", label));
-        let rs_lines = vec![
-            json!({
-                "archived": false, "author": format!("user_{}", label),
-                "created_utc": ts, "domain":"example.com", "id": format!("s_{}", label),
-                "is_self":false, "is_video":false, "num_comments":1, "over_18":false,
-                "score":10, "selftext":"", "title":"hi", "subreddit":"programming",
-                "subreddit_id":"t5_x", "url":"http://example.com/x"
-            }).to_string(),
-            json!({
-                "archived": false, "author":"AutoModerator",
-                "created_utc": ts + 1, "domain":"reddit.com", "id": format!("sb_{}", label),
-                "is_self":false, "is_video":false, "num_comments":1, "over_18":false,
-                "score":1, "selftext":"", "title":"meta", "subreddit":"programming",
-                "subreddit_id":"t5_x", "url":"http://reddit.com/rules"
-            }).to_string(),
-        ];
-        write_zst_lines(&rs_path, &rs_lines);
+    // Compute (and cache) the encoded payloads under a brief lock, then drop
+    // the lock before file I/O. The clone is cheap (~handful of small Vecs).
+    let files: Vec<(PathBuf, Vec<u8>)> = {
+        let mut map = cache.lock().unwrap();
+        map.entry(key)
+            .or_insert_with(|| {
+                let mut out = Vec::with_capacity(months.len() * 2);
+                for ym in months {
+                    let label = format!("{:04}-{:02}", ym.year, ym.month);
+                    let ts = ym_to_epoch_first_day(ym.year, ym.month);
 
-        // Comments: same human author + a unique commenter for the month
-        let rc_path = base.join("comments").join(format!("RC_{}.zst", label));
-        let rc_lines = vec![
-            json!({
-                "controversiality":0, "body":"hi", "subreddit_id":"t5_x",
-                "link_id": format!("t3_s_{}", label), "stickied":false,
-                "subreddit":"programming", "score":2, "ups":2,
-                "author": format!("user_{}", label), "id": format!("c1_{}", label),
-                "edited":false, "parent_id": format!("t3_s_{}", label),
-                "gilded":0, "distinguished":null,
-                "created_utc": ts + 100, "retrieved_on": ts + 200
-            }).to_string(),
-            json!({
-                "controversiality":0, "body":"yo", "subreddit_id":"t5_x",
-                "link_id": format!("t3_s_{}", label), "stickied":false,
-                "subreddit":"programming", "score":3, "ups":3,
-                "author": format!("commenter_{}", label), "id": format!("c2_{}", label),
-                "edited":false, "parent_id": format!("t3_s_{}", label),
-                "gilded":0, "distinguished":null,
-                "created_utc": ts + 200, "retrieved_on": ts + 300
-            }).to_string(),
-        ];
-        write_zst_lines(&rc_path, &rc_lines);
-    }
+                    let rs_lines = vec![
+                        json!({
+                            "archived": false, "author": format!("user_{}", label),
+                            "created_utc": ts, "domain":"example.com", "id": format!("s_{}", label),
+                            "is_self":false, "is_video":false, "num_comments":1, "over_18":false,
+                            "score":10, "selftext":"", "title":"hi", "subreddit":"programming",
+                            "subreddit_id":"t5_x", "url":"http://example.com/x"
+                        }).to_string(),
+                        json!({
+                            "archived": false, "author":"AutoModerator",
+                            "created_utc": ts + 1, "domain":"reddit.com", "id": format!("sb_{}", label),
+                            "is_self":false, "is_video":false, "num_comments":1, "over_18":false,
+                            "score":1, "selftext":"", "title":"meta", "subreddit":"programming",
+                            "subreddit_id":"t5_x", "url":"http://reddit.com/rules"
+                        }).to_string(),
+                    ];
+                    out.push((
+                        PathBuf::from("submissions").join(format!("RS_{}.zst", label)),
+                        encode_zst_bytes(&rs_lines),
+                    ));
 
-    base
+                    let rc_lines = vec![
+                        json!({
+                            "controversiality":0, "body":"hi", "subreddit_id":"t5_x",
+                            "link_id": format!("t3_s_{}", label), "stickied":false,
+                            "subreddit":"programming", "score":2, "ups":2,
+                            "author": format!("user_{}", label), "id": format!("c1_{}", label),
+                            "edited":false, "parent_id": format!("t3_s_{}", label),
+                            "gilded":0, "distinguished":null,
+                            "created_utc": ts + 100, "retrieved_on": ts + 200
+                        }).to_string(),
+                        json!({
+                            "controversiality":0, "body":"yo", "subreddit_id":"t5_x",
+                            "link_id": format!("t3_s_{}", label), "stickied":false,
+                            "subreddit":"programming", "score":3, "ups":3,
+                            "author": format!("commenter_{}", label), "id": format!("c2_{}", label),
+                            "edited":false, "parent_id": format!("t3_s_{}", label),
+                            "gilded":0, "distinguished":null,
+                            "created_utc": ts + 200, "retrieved_on": ts + 300
+                        }).to_string(),
+                    ];
+                    out.push((
+                        PathBuf::from("comments").join(format!("RC_{}.zst", label)),
+                        encode_zst_bytes(&rc_lines),
+                    ));
+                }
+                out
+            })
+            .clone()
+    };
+
+    materialize_corpus(&files)
 }
 
 /// Build a single-month corpus (RC_2006-01.zst) with `n` synthetic comment records
@@ -269,40 +327,49 @@ pub fn make_corpus_multi_month(months: &[YearMonth]) -> PathBuf {
 /// has interesting groups; ids are unique. Used to drive bucketing's adaptive flush
 /// threshold and to stress dedupe with non-trivial run sizes.
 pub fn make_corpus_n_records(n: usize) -> PathBuf {
-    let dir = tempfile::tempdir().unwrap();
-    let base = dir.keep();
-    let rc_path = base.join("comments").join("RC_2006-01.zst");
+    static CACHE: OnceLock<Mutex<HashMap<usize, Vec<(PathBuf, Vec<u8>)>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
 
-    let distinct = (n / 4).max(1);
-    let ts0: i64 = 1136073600; // 2006-01-01 00:00:00 UTC
-
-    let mut lines: Vec<String> = Vec::with_capacity(n);
-    for i in 0..n {
-        let author = format!("user_{:05}", i % distinct);
-        lines.push(
-            json!({
-                "controversiality":0,
-                "body": format!("body line {}", i),
-                "subreddit_id":"t5_x",
-                "link_id":"t3_s1",
-                "stickied":false,
-                "subreddit":"programming",
-                "score": (i as i64) % 100,
-                "ups": (i as i64) % 100,
-                "author": author,
-                "id": format!("rc{:08}", i),
-                "edited":false,
-                "parent_id":"t3_s1",
-                "gilded":0,
-                "distinguished":null,
-                "created_utc": ts0 + (i as i64),
-                "retrieved_on": ts0 + (i as i64) + 100
+    let files: Vec<(PathBuf, Vec<u8>)> = {
+        let mut map = cache.lock().unwrap();
+        map.entry(n)
+            .or_insert_with(|| {
+                let distinct = (n / 4).max(1);
+                let ts0: i64 = 1136073600; // 2006-01-01 00:00:00 UTC
+                let mut lines: Vec<String> = Vec::with_capacity(n);
+                for i in 0..n {
+                    let author = format!("user_{:05}", i % distinct);
+                    lines.push(
+                        json!({
+                            "controversiality":0,
+                            "body": format!("body line {}", i),
+                            "subreddit_id":"t5_x",
+                            "link_id":"t3_s1",
+                            "stickied":false,
+                            "subreddit":"programming",
+                            "score": (i as i64) % 100,
+                            "ups": (i as i64) % 100,
+                            "author": author,
+                            "id": format!("rc{:08}", i),
+                            "edited":false,
+                            "parent_id":"t3_s1",
+                            "gilded":0,
+                            "distinguished":null,
+                            "created_utc": ts0 + (i as i64),
+                            "retrieved_on": ts0 + (i as i64) + 100
+                        })
+                        .to_string(),
+                    );
+                }
+                vec![(
+                    PathBuf::from("comments").join("RC_2006-01.zst"),
+                    encode_zst_bytes(&lines),
+                )]
             })
-            .to_string(),
-        );
-    }
-    write_zst_lines(&rc_path, &lines);
-    base
+            .clone()
+    };
+
+    materialize_corpus(&files)
 }
 
 /// Compute a unix timestamp for the first day of a (year, month) at 00:00:00 UTC.

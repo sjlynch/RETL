@@ -22,10 +22,48 @@ use std::sync::OnceLock;
 /// bench binary doesn't depend on cwd.
 const SAMPLE_JSONL: &str = include_str!("data/sample.jsonl");
 
+/// Returns `true` when the developer asked for fast bench iteration via
+/// `RETL_BENCH_QUICK=1` (or any non-empty value). Quick mode shrinks fixtures
+/// and applies smaller sample counts to every Criterion group so a full
+/// bench run finishes in seconds rather than minutes — useful when iterating
+/// on a perf change and only the *shape* of the throughput numbers matters.
+///
+/// Pair with Criterion's own dial for an end-to-end fast loop, e.g.:
+///
+/// ```sh
+/// RETL_BENCH_QUICK=1 cargo bench --bench inner_loops -- \
+///     --quick --sample-size 10 --warm-up-time 1 --measurement-time 2 --noplot
+/// ```
+///
+/// Drop the env var (and `--quick`) to restore full fidelity for baseline
+/// captures and pre-merge regression checks.
+fn quick_mode() -> bool {
+    std::env::var_os("RETL_BENCH_QUICK")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+}
+
 /// Replication factor when materializing the .zst fixture. Keeps the fixture
 /// big enough that streaming dominates per-iter overhead but small enough to
-/// stay snappy (~tens of MB compressed).
-const ZST_REPLICAS: usize = 1000;
+/// stay snappy (~tens of MB compressed). Quick mode drops to ~30× smaller.
+fn zst_replicas() -> usize {
+    if quick_mode() {
+        30
+    } else {
+        1000
+    }
+}
+
+/// Criterion sample size used by `Criterion::default()` if not overridden via
+/// `--sample-size`. In quick mode we tighten this for every group; defaults to
+/// 10 (Criterion's documented minimum) when quick.
+fn quick_sample_size() -> Option<usize> {
+    if quick_mode() {
+        Some(10)
+    } else {
+        None
+    }
+}
 
 fn lines() -> &'static Vec<&'static str> {
     static LINES: OnceLock<Vec<&'static str>> = OnceLock::new();
@@ -76,18 +114,21 @@ fn lines_with_no_ts() -> &'static Vec<String> {
 }
 
 /// Materialize a precomputed .zst by replicating the fixture lines. Built
-/// once across the run; reused on subsequent invocations.
+/// once across the run; reused on subsequent invocations. The replica count
+/// is keyed into the file name so the quick-mode fixture and the full-mode
+/// fixture coexist in the temp dir and either can be reused independently.
 fn zst_fixture_path() -> &'static PathBuf {
     static PATH: OnceLock<PathBuf> = OnceLock::new();
     PATH.get_or_init(|| {
+        let replicas = zst_replicas();
         let dir = std::env::temp_dir().join("retl-bench-fixtures");
         fs::create_dir_all(&dir).expect("create bench fixture dir");
-        let path = dir.join(format!("inner_loops_sample_x{ZST_REPLICAS}.zst"));
+        let path = dir.join(format!("inner_loops_sample_x{replicas}.zst"));
         if !path.exists() {
             let f = fs::File::create(&path).expect("create zst fixture");
             let mut enc = zstd::stream::write::Encoder::new(f, 3).expect("zstd encoder");
             enc.include_checksum(true).expect("include_checksum");
-            for _ in 0..ZST_REPLICAS {
+            for _ in 0..replicas {
                 for line in lines() {
                     enc.write_all(line.as_bytes()).expect("zstd write line");
                     enc.write_all(b"\n").expect("zstd write newline");
@@ -105,10 +146,13 @@ fn bench_for_each_line_cfg(c: &mut Criterion) {
         .iter()
         .map(|l| l.len() as u64 + 1) // +1 for newline
         .sum::<u64>()
-        * ZST_REPLICAS as u64;
+        * zst_replicas() as u64;
 
     let mut group = c.benchmark_group("for_each_line_cfg");
     group.throughput(Throughput::Bytes(total_uncompressed_bytes));
+    if let Some(n) = quick_sample_size() {
+        group.sample_size(n);
+    }
 
     for &buf_bytes in &[16 * 1024usize, 64 * 1024, 256 * 1024] {
         group.bench_with_input(
@@ -139,6 +183,9 @@ fn bench_matches_minimal(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("matches_minimal");
     group.throughput(Throughput::Elements(recs.len() as u64));
+    if let Some(n) = quick_sample_size() {
+        group.sample_size(n);
+    }
 
     for &n_targets in &[1usize, 10, 100] {
         // Build a target list whose first entry IS one of the fixture's
@@ -181,6 +228,9 @@ fn bench_rewrite_human_timestamps_bytes(c: &mut Criterion) {
     let none = lines_with_no_ts();
 
     let mut group = c.benchmark_group("rewrite_human_timestamps_bytes");
+    if let Some(n) = quick_sample_size() {
+        group.sample_size(n);
+    }
 
     let with_bytes: u64 = with.iter().map(|s| s.len() as u64).sum();
     group.throughput(Throughput::Bytes(with_bytes));
@@ -234,6 +284,9 @@ fn bench_whitelist_with_timestamps(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("whitelist_with_timestamps");
     group.throughput(Throughput::Bytes(total_bytes));
+    if let Some(n) = quick_sample_size() {
+        group.sample_size(n);
+    }
 
     group.bench_function("two_pass", |b| {
         let mut tok_buf = String::with_capacity(4 * 1024);
@@ -285,26 +338,35 @@ fn bench_whitelist_with_timestamps(c: &mut Criterion) {
 // improvement on these benches.
 // ---------------------------------------------------------------------------
 
-/// Replication factor for the bucketing fixtures. Bigger than ZST_REPLICAS
+/// Replication factor for the bucketing fixtures. Bigger than the zst path
 /// since these benches run plain NDJSON (no decompression overhead) so we
-/// need more rows for the per-line work to dominate.
-const BUCKETING_REPLICAS: usize = 1500;
+/// need more rows for the per-line work to dominate. Quick mode drops to
+/// ~30× smaller.
+fn bucketing_replicas() -> usize {
+    if quick_mode() {
+        50
+    } else {
+        1500
+    }
+}
 
-/// Materialize a plain NDJSON fixture (fixture lines replicated `BUCKETING_REPLICAS`
+/// Materialize a plain NDJSON fixture (fixture lines replicated `bucketing_replicas`
 /// times) at a stable temp path. Built once per process; reused by every bucketing
-/// bench. Returns `(path, total_bytes)`.
+/// bench. Returns `(path, total_bytes)`. The replica count is keyed into the
+/// file name so quick-mode and full-mode fixtures coexist in the temp dir.
 fn ndjson_fixture() -> &'static (PathBuf, u64) {
     static F: OnceLock<(PathBuf, u64)> = OnceLock::new();
     F.get_or_init(|| {
+        let replicas = bucketing_replicas();
         let dir = std::env::temp_dir().join("retl-bench-fixtures");
         fs::create_dir_all(&dir).expect("create bench fixture dir");
-        let path = dir.join(format!("inner_loops_bucketing_x{BUCKETING_REPLICAS}.jsonl"));
+        let path = dir.join(format!("inner_loops_bucketing_x{replicas}.jsonl"));
         let bytes_per_pass: u64 = lines().iter().map(|l| l.len() as u64 + 1).sum();
-        let total = bytes_per_pass * BUCKETING_REPLICAS as u64;
+        let total = bytes_per_pass * replicas as u64;
         if !path.exists() {
             let f = fs::File::create(&path).expect("create ndjson fixture");
             let mut w = std::io::BufWriter::with_capacity(1 << 20, f);
-            for _ in 0..BUCKETING_REPLICAS {
+            for _ in 0..replicas {
                 for line in lines() {
                     w.write_all(line.as_bytes()).expect("write line");
                     w.write_all(b"\n").expect("write newline");

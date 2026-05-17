@@ -56,6 +56,22 @@ strip = true
 panic = "abort"
 incremental = false
 
+# Tests are dominated by zstd encode/decode, serde_json::from_str, and
+# aho-corasick automaton work — all of which run dramatically faster at
+# opt-level >= 2. The crate's own compile cost is small relative to those
+# deps (which are cached across runs), so the wall-time win is large while
+# the incremental rebuild cost barely moves.
+[profile.test]
+opt-level = 2
+debug = 1
+incremental = true
+
+# Keep iterative dev builds quick but lift the most expensive dep code
+# (serde_json::Value parsing, regex/aho-corasick) out of opt-level 0.
+[profile.dev]
+opt-level = 1
+debug = 1
+
 [dev-dependencies]
 tempfile = "3"
 serial_test = "3"
