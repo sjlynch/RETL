@@ -137,9 +137,16 @@ fn collect_schema(args: &SchemaArgs) -> Result<Vec<SchemaRow>> {
 }
 
 pub(crate) fn run_schema(args: SchemaArgs) -> Result<()> {
-    let rows = collect_schema(&args)?;
     let stdout = io::stdout();
     let mut w = BufWriter::new(stdout.lock());
+    run_schema_to(args, &mut w)?;
+    w.flush()?;
+    Ok(())
+}
+
+/// `run_schema` with an explicit writer for in-process tests.
+pub(crate) fn run_schema_to(args: SchemaArgs, w: &mut dyn Write) -> Result<()> {
+    let rows = collect_schema(&args)?;
     match args.format {
         SchemaFmt::Tsv => {
             writeln!(
@@ -159,10 +166,9 @@ pub(crate) fn run_schema(args: SchemaArgs) -> Result<()> {
             }
         }
         SchemaFmt::Json => {
-            serde_json::to_writer_pretty(&mut w, &rows)?;
+            serde_json::to_writer_pretty(&mut *w, &rows)?;
             writeln!(w)?;
         }
     }
-    w.flush()?;
     Ok(())
 }

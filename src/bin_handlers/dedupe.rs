@@ -1,5 +1,14 @@
 
 pub(crate) fn run_dedupe(args: DedupeArgs) -> Result<()> {
+    let stdout = io::stdout();
+    let mut w = stdout.lock();
+    run_dedupe_to(args, &mut w)
+}
+
+/// `run_dedupe` with an explicit writer for in-process tests. Only the
+/// `--out -` branch consumes the writer; file-out routes through
+/// `dedupe_keys_to_lines_with_stats(&key, &args.out)` directly.
+pub(crate) fn run_dedupe_to(args: DedupeArgs, w: &mut dyn Write) -> Result<()> {
     let key = parse_dedupe_key(&args.key)?;
     let mut etl = build_etl(&args.common)?;
     if args.out == Path::new("-") {
@@ -34,9 +43,7 @@ pub(crate) fn run_dedupe(args: DedupeArgs) -> Result<()> {
         let copy_result = (|| -> Result<()> {
             let mut f = retl::open_with_default_backoff(&tmp_path)
                 .with_context(|| format!("opening dedupe tempfile {}", tmp_path.display()))?;
-            let stdout = io::stdout();
-            let mut w = stdout.lock();
-            io::copy(&mut f, &mut w).context("streaming dedupe output to stdout")?;
+            io::copy(&mut f, w).context("streaming dedupe output to stdout")?;
             w.flush()?;
             Ok(())
         })();

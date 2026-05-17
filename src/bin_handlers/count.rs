@@ -1,5 +1,16 @@
 
 pub(crate) fn run_count(args: CountArgs) -> Result<()> {
+    let stdout = io::stdout();
+    let mut w = BufWriter::new(stdout.lock());
+    let r = run_count_to(args, &mut w);
+    w.flush()?;
+    r
+}
+
+/// `run_count` with an explicit writer for in-process tests. Writer is used
+/// only on the `--mode month` to-stdout branch; file-out and author-counts
+/// branches route through their own writers.
+pub(crate) fn run_count_to(args: CountArgs, w: &mut dyn Write) -> Result<()> {
     let author_stdout = matches!(args.mode, CountMode::Author)
         && args.out.as_deref().is_some_and(|p| p == Path::new("-"));
     let mut etl = build_etl(&args.common)?;
@@ -18,12 +29,9 @@ pub(crate) fn run_count(args: CountArgs) -> Result<()> {
             let counts = scan.count_by_month()?;
             let to_stdout = args.out.as_deref().map_or(true, |p| p == Path::new("-"));
             if to_stdout {
-                let stdout = io::stdout();
-                let mut w = stdout.lock();
                 for (ym, n) in &counts {
                     writeln!(w, "{ym}\t{n}")?;
                 }
-                w.flush()?;
             } else {
                 let path = args.out.as_ref().expect("checked to_stdout").clone();
                 write_text_atomic(&path, CLI_TEXT_WRITE_BUF_BYTES, |w| {

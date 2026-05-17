@@ -1,14 +1,38 @@
+//! Export-handler tests that genuinely need a subprocess.
+//!
+//! The 4 stdout-warning tests below depend on `tracing_subscriber` writing to
+//! stdout, which is process-global state that's hard to capture in-process
+//! without per-test subscriber dances. The remaining cli_export tests
+//! (error-paths, file-output, schema, dedupe, convert) moved into
+//! `src/bin_handlers/tests.rs` and now run in-process.
+//!
+//! The single `cli_keyword_score_url_filters_export_and_count` test stays a
+//! spawn because it exercises BOTH `retl export` and `retl count` in
+//! succession against the same work_dir and verifies the cross-subcommand
+//! manifest interaction.
+//!
+//! `count_author_out_dash` and `sample_defaults_to_ten_jsonl_records` stay
+//! spawns because they assert on stdout produced by the streaming-to-stdout
+//! shim (`stream_extract_to_stdout` / count.rs's stdout branch via a temp
+//! file), which is awkward to capture in-process without rewiring those
+//! shims.
+
 #[path = "common/mod.rs"]
 mod common;
 
 use assert_cmd::Command;
-use common::{decompress_zst_lines, make_corpus_basic, read_jsonl_values, read_lines};
+use common::{make_corpus_basic, read_jsonl_values, read_lines};
 use predicates::prelude::*;
-use std::collections::BTreeSet;
 
 fn retl() -> Command {
     Command::cargo_bin("retl").expect("retl binary should be built")
 }
+
+// ---------------------------------------------------------------------------
+// `tracing::warn!`-to-stdout assertions (4 tests). The default
+// tracing-subscriber fmt destination is stdout; capturing it in-process needs
+// per-test subscriber wiring, so these stay as subprocess spawns.
+// ---------------------------------------------------------------------------
 
 #[test]
 fn cli_unfiltered_undated_export_warns_before_scan() {
@@ -82,6 +106,46 @@ fn cli_json_pointer_filter_suppresses_full_corpus_warning() {
 }
 
 #[test]
+fn cli_domain_filter_warns_when_comments_are_included() {
+    let base = make_corpus_basic();
+    let cwd = tempfile::tempdir().unwrap();
+    let work_dir = cwd.path().join("work");
+    let out = cwd.path().join("domain_counts.tsv");
+
+    retl()
+        .arg("count")
+        .arg("--data-dir")
+        .arg(&base)
+        .arg("--work-dir")
+        .arg(&work_dir)
+        .args([
+            "--start",
+            "2006-01",
+            "--end",
+            "2006-01",
+            "--domain",
+            "example.com",
+            "--no-progress",
+            "--out",
+        ])
+        .arg(&out)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "domains_in filters Reddit's submission-only `domain` field",
+        ));
+
+    assert_eq!(read_lines(&out), vec!["2006-01\t1"]);
+}
+
+// ---------------------------------------------------------------------------
+// Cross-subcommand interaction (export → count against the same work_dir).
+// Stays a spawn so we exercise the real binary path through both handlers,
+// which guards against work_dir / manifest sharing regressions that an
+// in-process test of either handler alone wouldn't catch.
+// ---------------------------------------------------------------------------
+
+#[test]
 fn cli_keyword_score_url_filters_export_and_count() {
     let base = make_corpus_basic();
     let cwd = tempfile::tempdir().unwrap();
@@ -147,101 +211,12 @@ fn cli_keyword_score_url_filters_export_and_count() {
     assert_eq!(read_lines(&out_counts), vec!["2006-01\t2"]);
 }
 
-#[test]
-fn cli_author_allow_and_deny_filters_dedupe() {
-    let base = make_corpus_basic();
-    let cwd = tempfile::tempdir().unwrap();
-    let work_dir = cwd.path().join("work");
-    let out = cwd.path().join("authors.txt");
-
-    retl()
-        .arg("dedupe")
-        .arg("--data-dir")
-        .arg(&base)
-        .arg("--work-dir")
-        .arg(&work_dir)
-        .args([
-            "--start",
-            "2006-01",
-            "--end",
-            "2006-01",
-            "--author",
-            "alice",
-            "--author-in",
-            "bob",
-            "--exclude-author",
-            "AutoModerator",
-            "--key",
-            "author",
-            "--no-progress",
-            "--out",
-        ])
-        .arg(&out)
-        .assert()
-        .success();
-
-    assert_eq!(read_lines(&out), vec!["alice", "bob"]);
-}
-
-#[test]
-fn cli_invalid_author_regex_errors_before_scan() {
-    let base = make_corpus_basic();
-    let cwd = tempfile::tempdir().unwrap();
-    let work_dir = cwd.path().join("work");
-
-    retl()
-        .arg("count")
-        .arg("--data-dir")
-        .arg(&base)
-        .arg("--work-dir")
-        .arg(&work_dir)
-        .args(["--author-regex", "[", "--no-progress"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("author_regex"));
-}
-
-#[test]
-fn cli_domain_filter_warns_when_comments_are_included() {
-    let base = make_corpus_basic();
-    let cwd = tempfile::tempdir().unwrap();
-    let work_dir = cwd.path().join("work");
-    let out = cwd.path().join("domain_counts.tsv");
-
-    retl()
-        .arg("count")
-        .arg("--data-dir")
-        .arg(&base)
-        .arg("--work-dir")
-        .arg(&work_dir)
-        .args([
-            "--start",
-            "2006-01",
-            "--end",
-            "2006-01",
-            "--domain",
-            "example.com",
-            "--no-progress",
-            "--out",
-        ])
-        .arg(&out)
-        .assert()
-        .success()
-        .stdout(predicate::str::contains(
-            "domains_in filters Reddit's submission-only `domain` field",
-        ));
-
-    assert_eq!(read_lines(&out), vec!["2006-01\t1"]);
-}
-
-#[test]
-fn count_rejects_export_only_whitelist_flag() {
-    retl()
-        .args(["count", "--whitelist", "author"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("--whitelist"));
-}
+// ---------------------------------------------------------------------------
+// stdout-streaming tests that route through `stream_extract_to_stdout` /
+// the count.rs stdout temp-file dance. Stays a spawn until those shims
+// accept a `&mut dyn Write` (or until a per-test stdout-capture utility
+// lives in tests/common).
+// ---------------------------------------------------------------------------
 
 #[test]
 fn count_author_out_dash_streams_stdout_without_dash_file() {
@@ -265,204 +240,6 @@ fn count_author_out_dash_streams_stdout_without_dash_file() {
         !cwd.path().join("-").exists(),
         "count --mode author --out - must not create a literal '-' file"
     );
-}
-
-#[test]
-fn export_format_zst_writes_partitioned_decodable_corpus() {
-    let base = make_corpus_basic();
-    let cwd = tempfile::tempdir().unwrap();
-    let work_dir = cwd.path().join("work");
-    let out_dir = cwd.path().join("mini_corpus");
-
-    retl()
-        .arg("export")
-        .arg("--data-dir")
-        .arg(&base)
-        .arg("--work-dir")
-        .arg(&work_dir)
-        .args([
-            "--start",
-            "2006-01",
-            "--end",
-            "2006-01",
-            "--subreddit",
-            "programming",
-            "--include-deleted",
-            "--format",
-            "zst",
-            "--zst-level",
-            "1",
-            "--whitelist",
-            "id,author,created_utc,subreddit",
-            "--human-timestamps",
-            "--no-progress",
-            "--out",
-        ])
-        .arg(&out_dir)
-        .assert()
-        .success();
-
-    let rc = out_dir.join("comments").join("RC_2006-01.zst");
-    assert!(rc.exists(), "RC zst not found at {}", rc.display());
-
-    let lines = decompress_zst_lines(&rc);
-    assert_eq!(lines.len(), 3, "comments (RC) should have 3 lines");
-
-    let allowed: BTreeSet<&str> = ["id", "author", "created_utc", "subreddit"]
-        .into_iter()
-        .collect();
-    for line in lines {
-        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
-        let obj = value.as_object().expect("exported records are objects");
-        assert!(
-            obj.keys().all(|k| allowed.contains(k.as_str())),
-            "non-whitelisted key leaked into {obj:?}"
-        );
-        assert!(
-            obj.get("created_utc").is_some_and(|v| v.is_string()),
-            "created_utc should be human-readable in {obj:?}"
-        );
-    }
-}
-
-#[test]
-fn export_csv_rejects_unsupported_human_timestamps_and_resume_flags() {
-    let cwd = tempfile::tempdir().unwrap();
-
-    retl()
-        .arg("export")
-        .arg("--data-dir")
-        .arg(cwd.path().join("missing_data"))
-        .args([
-            "--format",
-            "csv",
-            "--whitelist",
-            "id",
-            "--human-timestamps",
-            "--no-progress",
-            "--out",
-        ])
-        .arg(cwd.path().join("out.csv"))
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains(
-            "--human-timestamps is not supported",
-        ));
-
-    retl()
-        .arg("export")
-        .arg("--data-dir")
-        .arg(cwd.path().join("missing_data"))
-        .args([
-            "--format",
-            "tsv",
-            "--whitelist",
-            "id",
-            "--resume",
-            "--no-progress",
-            "--out",
-        ])
-        .arg(cwd.path().join("out.tsv"))
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("--resume is not supported"));
-
-    retl()
-        .arg("sample")
-        .arg("--data-dir")
-        .arg(cwd.path().join("missing_data"))
-        .args([
-            "--format",
-            "csv",
-            "--whitelist",
-            "id",
-            "--human-timestamps",
-            "--no-progress",
-            "--out",
-        ])
-        .arg(cwd.path().join("sample.csv"))
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains(
-            "--human-timestamps is not supported",
-        ));
-}
-
-#[test]
-fn convert_cli_flattens_parent_enriched_jsonl_to_csv() {
-    let cwd = tempfile::tempdir().unwrap();
-    let input = cwd.path().join("with_parent.jsonl");
-    std::fs::write(
-        &input,
-        r#"{"id":"c1","body":"child","parent":{"kind":"t1","id":"p1","body":"parent","author":"bob"}}
-"#,
-    )
-    .unwrap();
-    let out = cwd.path().join("parents.csv");
-
-    retl()
-        .arg("convert")
-        .arg("--format")
-        .arg("csv")
-        .arg("--field")
-        .arg("id,body,parent.kind,parent.id,parent.body,parent.author")
-        .arg("--out")
-        .arg(&out)
-        .arg(&input)
-        .assert()
-        .success();
-
-    let csv = std::fs::read_to_string(&out).unwrap();
-    assert_eq!(
-        csv,
-        "id,body,parent.kind,parent.id,parent.body,parent.author\r\nc1,child,t1,p1,parent,bob\r\n"
-    );
-}
-
-#[test]
-fn export_csv_requires_whitelist_and_renders_header_and_rows() {
-    let base = make_corpus_basic();
-    let cwd = tempfile::tempdir().unwrap();
-    let out = cwd.path().join("submissions.csv");
-
-    retl()
-        .arg("export")
-        .arg("--data-dir")
-        .arg(&base)
-        .args([
-            "--source",
-            "rs",
-            "--format",
-            "csv",
-            "--whitelist",
-            "author,title,score",
-            "--no-progress",
-            "--out",
-        ])
-        .arg(&out)
-        .assert()
-        .success();
-
-    let csv = std::fs::read_to_string(&out).unwrap();
-    assert!(csv.starts_with("author,title,score\r\n"), "{csv:?}");
-    assert!(csv.contains("bob,Rust news,183\r\n"), "{csv:?}");
-
-    retl()
-        .arg("export")
-        .arg("--data-dir")
-        .arg(&base)
-        .args([
-            "--source",
-            "rs",
-            "--format",
-            "csv",
-            "--no-progress",
-            "--out",
-        ])
-        .arg(cwd.path().join("bad.csv"))
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("requires --whitelist"));
 }
 
 #[test]

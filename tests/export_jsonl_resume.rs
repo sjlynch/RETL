@@ -326,7 +326,13 @@ fn concurrent_jsonl_extracts_share_work_dir_without_interference() {
     let root = tempfile::tempdir().unwrap().keep();
     let base = root.join("corpus");
     let months: Vec<_> = (1..=12).map(|month| YearMonth::new(2006, month)).collect();
-    let per_subreddit = 1_000;
+    // 200 records × 2 subreddits × 12 months = 4.8 K records per side, enough
+    // that the first extract takes long enough for `wait_for_part_before_output`
+    // to observe a `.part_*.jsonl` before the second thread starts (the race
+    // window the test was designed to exercise). The former 1_000 inflated the
+    // race window beyond what the invariant requires and dominated this test's
+    // wall time (~8-10 s of the 11 s single-test runtime).
+    let per_subreddit = 200;
     write_dual_subreddit_corpus(&base, &months, per_subreddit);
 
     let work_dir = root.join("work");

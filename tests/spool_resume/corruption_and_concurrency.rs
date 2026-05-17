@@ -62,17 +62,20 @@ fn corrupt_zstd_month_is_not_recorded_complete_and_resume_retries_after_repair()
 
 #[test]
 fn concurrent_manifest_commits_record_all_months() {
-    let months: Vec<_> = (1..=12).map(|m| YearMonth::new(2006, m)).collect();
+    // 6 months × 2 sources = 12 monthly shards. With file_concurrency(8) all
+    // 8 worker slots stay saturated for most of the run, which is what
+    // exercises the concurrent manifest-commit codepath. The original 12
+    // months / 24 shards didn't strengthen the invariant (the manifest must
+    // still record *every* shard regardless of count) but doubled the wall
+    // time of this test.
+    let months: Vec<_> = (1..=6).map(|m| YearMonth::new(2006, m)).collect();
     let base = make_corpus_multi_month(&months);
     let out_dir = base.join("spool_concurrent_manifest");
 
     RedditETL::new()
         .base_dir(&base)
         .sources(Sources::Both)
-        .date_range(
-            Some(YearMonth::new(2006, 1)),
-            Some(YearMonth::new(2006, 12)),
-        )
+        .date_range(Some(YearMonth::new(2006, 1)), Some(YearMonth::new(2006, 6)))
         .progress(false)
         .file_concurrency(8)
         .resume(true)
@@ -84,5 +87,5 @@ fn concurrent_manifest_commits_record_all_months() {
     let manifest: Value =
         serde_json::from_slice(&fs::read(out_dir.join("_progress.json")).unwrap()).unwrap();
     let months_obj = manifest["months"].as_object().unwrap();
-    assert_eq!(months_obj.len(), 24, "all RC/RS months must be committed");
+    assert_eq!(months_obj.len(), 12, "all RC/RS months must be committed");
 }

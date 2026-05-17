@@ -1,17 +1,32 @@
 
 pub(crate) fn run_describe(args: DescribeArgs) -> Result<()> {
+    let stdout = io::stdout();
+    let mut w = BufWriter::new(stdout.lock());
+    run_describe_to(args, &mut w)?;
+    w.flush()?;
+    Ok(())
+}
+
+/// `run_describe` with an explicit writer so in-process tests can capture the
+/// TSV output without spawning the `retl` binary. `main.rs` calls
+/// `run_describe`; tests call this with a `&mut Vec<u8>` and assert on the
+/// captured bytes.
+pub(crate) fn run_describe_to(args: DescribeArgs, w: &mut dyn Write) -> Result<()> {
     if args.schema {
         if args.expected || args.manifest.is_some() {
             anyhow::bail!("describe --schema cannot be combined with --expected/--manifest");
         }
-        return run_schema(SchemaArgs {
-            data_dir: args.data_dir,
-            start: args.start,
-            end: args.end,
-            source: args.source,
-            sample_per_month: args.schema_sample,
-            format: args.schema_format,
-        });
+        return run_schema_to(
+            SchemaArgs {
+                data_dir: args.data_dir,
+                start: args.start,
+                end: args.end,
+                source: args.source,
+                sample_per_month: args.schema_sample,
+                format: args.schema_format,
+            },
+            w,
+        );
     }
 
     if let (Some(start), Some(end)) = (args.start, args.end) {
@@ -54,8 +69,6 @@ pub(crate) fn run_describe(args: DescribeArgs) -> Result<()> {
     let total_bytes: u64 = rows.iter().map(|(_, _, _, bytes, _, _)| *bytes).sum();
     let total_missing: usize = rows.iter().map(|(_, _, _, _, missing, _)| *missing).sum();
 
-    let stdout = io::stdout();
-    let mut w = BufWriter::new(stdout.lock());
     writeln!(
         w,
         "source\tavailable\tfiles_in_range\tcompressed_bytes\tmissing_month_count\tmissing_months"
@@ -70,7 +83,6 @@ pub(crate) fn run_describe(args: DescribeArgs) -> Result<()> {
         w,
         "total\t\t{total_files}\t{total_bytes}\t{total_missing}\t-"
     )?;
-    w.flush()?;
 
     if args.expected || args.manifest.is_some() {
         emit_manifest_describe_comparison(
@@ -79,6 +91,7 @@ pub(crate) fn run_describe(args: DescribeArgs) -> Result<()> {
             args.start,
             args.end,
             args.manifest.as_deref(),
+            w,
         )?;
     }
     Ok(())
@@ -105,6 +118,7 @@ fn emit_manifest_describe_comparison(
     start: Option<YearMonth>,
     end: Option<YearMonth>,
     manifest_path: Option<&Path>,
+    w: &mut dyn Write,
 ) -> Result<()> {
     let (start, end) = required_manifest_range(start, end)?;
     let manifest = load_corpus_manifest(manifest_path)?;
@@ -154,8 +168,6 @@ fn emit_manifest_describe_comparison(
         }
     }
 
-    let stdout = io::stdout();
-    let mut w = BufWriter::new(stdout.lock());
     writeln!(w)?;
     writeln!(
         w,
@@ -179,7 +191,6 @@ fn emit_manifest_describe_comparison(
             summary.known_expected_compressed_bytes,
         )?;
     }
-    w.flush()?;
     Ok(())
 }
 

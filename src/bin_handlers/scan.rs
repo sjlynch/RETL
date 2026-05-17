@@ -1,5 +1,16 @@
 
 pub(crate) fn run_scan(args: ScanArgs) -> Result<()> {
+    let stdout = io::stdout();
+    let mut w = BufWriter::new(stdout.lock());
+    let r = run_scan_to(args, &mut w);
+    w.flush()?;
+    r
+}
+
+/// `run_scan` with an explicit writer for in-process tests. The writer is
+/// only consumed by the stdout branch (when `--out` is unset); the file-out
+/// branch routes through `write_text_atomic` and ignores `w`.
+pub(crate) fn run_scan_to(args: ScanArgs, w: &mut dyn Write) -> Result<()> {
     let mut etl = build_etl(&args.common)?;
     if args.resume {
         etl = etl.resume(true);
@@ -36,13 +47,10 @@ pub(crate) fn run_scan(args: ScanArgs) -> Result<()> {
             )?;
         }
         None => {
-            let stdout = io::stdout();
-            let mut w = BufWriter::new(stdout.lock());
             scan.try_for_each_username(|u| {
                 writeln!(w, "{u}")?;
                 Ok(())
             })?;
-            w.flush()?;
         }
     }
     emit_partial_read_report(&partial_reporter)?;
