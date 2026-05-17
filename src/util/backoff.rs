@@ -67,8 +67,9 @@ where
     // lets tests that deliberately trigger a non-recoverable failure (e.g.
     // publishing onto a directory) skip the full multi-second retry budget
     // while still exercising the production code path verbatim. Zero overhead
-    // in non-test builds.
-    #[cfg(test)]
+    // in production builds: the TLS read is absent unless either `cfg(test)`
+    // (lib unit tests) or `feature = "test-utils"` (integration tests) is on.
+    #[cfg(any(test, feature = "test-utils"))]
     let (tries, delay_ms) = test_backoff_override(tries, delay_ms);
 
     let tries = tries.max(1);
@@ -90,7 +91,7 @@ where
         .unwrap_or_else(|| io::Error::new(io::ErrorKind::Other, "with_backoff: retries exhausted")))
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 thread_local! {
     /// Test-only per-thread cap on `(tries, delay_ms)` consulted by
     /// `with_backoff`. `None` means "use the caller's budget unchanged."
@@ -98,7 +99,7 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 fn test_backoff_override(tries: usize, delay_ms: u64) -> (usize, u64) {
     TEST_BACKOFF_BUDGET.with(|cell| {
         cell.get()
@@ -111,18 +112,30 @@ fn test_backoff_override(tries: usize, delay_ms: u64) -> (usize, u64) {
 /// `(max_tries, max_delay_ms)`. Used by tests that deliberately drive a
 /// non-recoverable failure and don't want to wait out the full ~10–20 s
 /// production retry budget. Resets on drop.
-#[cfg(test)]
-pub(crate) struct TestBackoffBudgetGuard;
+///
+/// Available under either `cfg(test)` (the crate's own lib unit tests) or
+/// `feature = "test-utils"` (so integration tests in `tests/` can also opt
+/// in). Production builds without the feature compile this out entirely.
+#[cfg(any(test, feature = "test-utils"))]
+pub struct TestBackoffBudgetGuard;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 impl Drop for TestBackoffBudgetGuard {
     fn drop(&mut self) {
         TEST_BACKOFF_BUDGET.with(|cell| cell.set(None));
     }
 }
 
-#[cfg(test)]
-pub(crate) fn cap_backoff_budget_for_test(
+/// Cap the per-thread `with_backoff` budget for the lifetime of the returned
+/// guard. Used by tests that drive a deliberately non-recoverable failure
+/// (e.g. publishing onto a directory) — without the cap, the production
+/// 20-try × 50 ms linear backoff burns ~10–20 s before the failure surfaces.
+///
+/// The cap is *clamped*, not replaced: callers using a smaller production
+/// budget keep theirs. Available under `cfg(test)` (lib unit tests) or
+/// `feature = "test-utils"` (integration tests opting in).
+#[cfg(any(test, feature = "test-utils"))]
+pub fn cap_backoff_budget_for_test(
     max_tries: usize,
     max_delay_ms: u64,
 ) -> TestBackoffBudgetGuard {

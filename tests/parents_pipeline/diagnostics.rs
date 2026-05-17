@@ -37,7 +37,16 @@ fn resolve_parent_maps_propagates_cache_write_failure() {
     write_parent_ref_spool(&spool, "t1_p1");
     let ids = collect_parent_ids_for_test(&base, &work_dir, &spool);
 
+    // Pre-creating a directory at the cache file destination forces the
+    // atomic-publish rename to fail with ERROR_ACCESS_DENIED, which is
+    // correctly retriable in production (AV / sharing hiccups). Under
+    // `--features test-utils` we cap the budget to 1 try / 0 ms delay so
+    // the test surfaces the failure immediately instead of waiting out
+    // ~10–20 s of retries. The "write parent shard" assertion is
+    // independent of retry timing.
     fs::create_dir_all(cache_dir.join("comments").join("RC_2006-01.json")).unwrap();
+    #[cfg(feature = "test-utils")]
+    let _backoff_cap = retl::cap_backoff_budget_for_test(1, 0);
     let err = match RedditETL::new()
         .base_dir(&base)
         .work_dir(&work_dir)

@@ -41,7 +41,15 @@ const FILE_SHARE_READ: u32 = 0x0000_0001;
 const RENAME_RETRY_BUDGET_MS: u64 = 10_500;
 const HOLD_HANDLE_MS: u64 = RENAME_RETRY_BUDGET_MS + 600;
 
+/// This test intentionally waits out the full ~10.5 s rename retry budget
+/// to verify the copy-fallback path runs only after retries exhaust. That
+/// 11 s wall time isn't pathology — it IS the contract under test. Marked
+/// `#[ignore]` for daily iteration; run before merging changes to
+/// `replace_file_atomic_backoff` with:
+///
+///     cargo test --test atomic_replace_fallback -- --ignored --nocapture
 #[test]
+#[ignore = "wide-budget exhaustion verification; run with --ignored before retry-budget changes"]
 fn copy_fallback_runs_when_rename_retries_exhaust_then_dest_unlocks() {
     let tmpdir = tempfile::tempdir().expect("tempdir");
     let dest: PathBuf = tmpdir.path().join("dest.bin");

@@ -220,6 +220,14 @@ pub use crate::mem::{
 #[doc(hidden)]
 pub use crate::mem::set_available_memory_fraction_for_tests;
 
+// Test-only retry-budget cap. Lets integration tests opt out of the full
+// production `with_backoff` budget when they deliberately trigger a
+// non-recoverable failure (e.g. publishing onto a directory) — saves
+// ~10–20 s per such test. Strictly gated.
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub use crate::util::{cap_backoff_budget_for_test, TestBackoffBudgetGuard};
+
 // Expose integrity checker mode, and (optionally) direct zstd validators.
 pub use crate::integrity::IntegrityMode;
 pub use crate::zstd_jsonl::{quick_validate_zst, validate_zst_full};

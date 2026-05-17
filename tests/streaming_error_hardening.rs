@@ -218,6 +218,18 @@ fn spool_publish_failure_is_fatal_and_does_not_commit_manifest() {
     let final_part = out_dir.join("part_RC_2006-01.jsonl");
     fs::create_dir_all(&final_part).unwrap();
 
+    // The blocker is a directory at the publish destination, which makes
+    // `rename` return ERROR_ACCESS_DENIED — correctly classified retriable
+    // (for production AV / sharing hiccups) but means the test waits out
+    // ~10–20 s of retry budget here for no extra signal. Under
+    // `--features test-utils` we cap the budget to 1 try / 0 ms delay so
+    // the failure surfaces immediately; the invariants below ("publish
+    // failure is fatal", "manifest is not committed") are independent of
+    // how long the failure took. Without the feature the test still runs
+    // and passes, just slowly.
+    #[cfg(feature = "test-utils")]
+    let _backoff_cap = retl::cap_backoff_budget_for_test(1, 0);
+
     let err = RedditETL::new()
         .base_dir(&base)
         .sources(Sources::Comments)
@@ -247,34 +259,10 @@ fn spool_publish_failure_is_fatal_and_does_not_commit_manifest() {
     }
 }
 
-#[test]
-fn cli_spool_publish_failure_exits_nonzero() {
-    let base = make_corpus_basic();
-    let cwd = tempfile::tempdir().unwrap();
-    let out_dir = cwd.path().join("spool");
-    fs::create_dir_all(out_dir.join("part_RC_2006-01.jsonl")).unwrap();
-
-    retl()
-        .arg("export")
-        .arg("--data-dir")
-        .arg(&base)
-        .arg("--work-dir")
-        .arg(cwd.path().join("work"))
-        .args([
-            "--source",
-            "rc",
-            "--start",
-            "2006-01",
-            "--end",
-            "2006-01",
-            "--format",
-            "spool",
-            "--no-progress",
-            "--resume",
-            "--out",
-        ])
-        .arg(&out_dir)
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("part_RC_2006-01.jsonl"));
-}
+// Former `cli_spool_publish_failure_exits_nonzero` moved to
+// `src/bin_handlers/tests.rs::export_spool_publish_failure_surfaces_helpful_error`
+// — calling `run_export` in-process exercises the same handler logic and
+// asserts on the returned `anyhow::Error`'s Display, which is what would
+// have been written to stderr and surfaced as a non-zero exit. The
+// in-process version uses `cap_backoff_budget_for_test` so the failure
+// surfaces in microseconds instead of ~21 s of retry-budget exhaustion.

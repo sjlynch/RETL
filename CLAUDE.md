@@ -110,39 +110,51 @@ re-run that month. Format/version live in `src/progress_manifest.rs`.
 must not initialize tracing — the binary owns the subscriber. `main.rs` and
 `examples/quickstart.rs` call it once at startup; nothing else should.
 
-## Taskboard rules (Lattice)
-
-When `$LATTICE_API_URL` is set, "the board" means the Lattice taskboard, not
-Claude Code's task list:
-
-- Create/update tasks via `POST $LATTICE_API_URL/api/tasks/batch`. Do not
-  invent endpoints; check `/api/tasks/...` for what's supported.
-- Lattice routes parallel tasks into separate worktrees; **multiple tasks
-  editing the same lines of the same file conflict at merge time**. When
-  splitting work, partition by file (or by clearly disjoint regions).
-- A task's worktree gets a `LATTICE_TASK.md` with its instructions. Read
-  that first; resume in place if a prior session committed partial work.
-- Lattice merges via `git merge`, so always commit before ending a session.
-- `PATCH /api/tasks/<id>` with `{"description": "..."}` to summarize what
-  actually changed once the task lands in "Ready to Merge".
-
 ## Build, test, bench, fuzz
 
 ```sh
 cargo build --release
-cargo test
+cargo test                              # ~95 s warm (default features)
+cargo test --features test-utils        # ~60 s warm (recommended daily)
 cargo doc --no-deps --open
 
-cargo bench --bench inner_loops      # criterion harness, defends ahash /
-                                     # byte-rewrite hot loops vs regressions
+# Bench: full fidelity for baselines.
+cargo bench --bench inner_loops
 cargo bench --bench inner_loops -- --save-baseline <name>
 cargo bench --bench inner_loops -- --baseline <name>
+
+# Bench: fast iteration loop (~5x faster, lower precision).
+RETL_BENCH_QUICK=1 cargo bench --bench inner_loops -- \
+    --quick --sample-size 10 --warm-up-time 1 --measurement-time 2 --noplot
+
+# Property-test depth knobs (default is small for fast iteration).
+RETL_PROPTEST_CASES=128 cargo test --test properties
+RETL_PROPTEST_CASES=256 cargo test --test json_whitelist_proptest
+
+# Wide-N stress + fallback budget exhaustion verification.
+cargo test -- --ignored
 
 # Fuzz targets live in fuzz/fuzz_targets (cargo-fuzz workspace excluded
 # from the main workspace via Cargo.toml `exclude = ["fuzz"]`).
 cd fuzz && cargo +nightly fuzz run fuzz_parse_minimal
 cd fuzz && cargo +nightly fuzz run fuzz_rewrite_timestamps
 ```
+
+### `test-utils` feature
+
+Recommended for daily test iteration. Enables a small set of test-only
+injection points the test suite uses to skip multi-second production retry
+budgets when a test deliberately drives a non-recoverable failure (e.g.
+`spool_publish_failure_is_fatal_and_does_not_commit_manifest` blocks the
+publish destination with a directory, which under the production backoff
+budget waits ~21 s on `ERROR_ACCESS_DENIED` retries). Without the feature
+the same tests still run and pass; they just take ~35 % longer overall.
+
+The feature also gates `retl::set_available_memory_fraction_for_tests`
+(memory-pressure injection) and `retl::cap_backoff_budget_for_test` (retry
+budget cap). Both are `#[doc(hidden)]` and intended only for the test
+harness — production builds (`--no-default-features` or just no
+`--features test-utils`) compile them out entirely.
 
 ## Files worth knowing
 
