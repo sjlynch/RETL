@@ -71,23 +71,38 @@ mod tests {
             "unexpected error: {msg}"
         );
 
-        let status = for_each_line_cfg_status(&path, 16 * 1024, |_line| Ok(()))
-            .expect("status API should not bubble corrupt-frame decode errors");
+        let status = for_each_line_with_opts_status(
+            &path,
+            LineStreamOpts {
+                read_buf_bytes: Some(16 * 1024),
+                partial_read_policy: PartialReadPolicy::AllowPartial,
+                ..Default::default()
+            },
+            |_line| Ok(()),
+        )
+        .expect("status API should not bubble corrupt-frame decode errors");
         assert!(
             !status,
             "status API must report the corrupt file as incomplete"
         );
 
-        // The *_with_skip variant must also skip gracefully AND surface the
-        // skip event to the caller via `on_skip`. The path passed to the
-        // callback must match the file we tried to read, and the captured
-        // error must be non-empty.
+        // The allow-partial + on_skip path must also skip gracefully AND
+        // surface the skip event to the caller via `on_skip`. The path
+        // passed to the callback must match the file we tried to read, and
+        // the captured error must be non-empty.
         let mut skip_calls: Vec<(PathBuf, String)> = Vec::new();
         let mut lines_seen2 = 0usize;
-        let res = for_each_line_cfg_with_skip(
+        let mut on_skip = |p: &Path, e: &anyhow::Error| {
+            skip_calls.push((p.to_path_buf(), e.to_string()));
+        };
+        let res = for_each_line_with_opts(
             &path,
-            16 * 1024,
-            |p, e| skip_calls.push((p.to_path_buf(), e.to_string())),
+            LineStreamOpts {
+                read_buf_bytes: Some(16 * 1024),
+                on_skip: Some(&mut on_skip),
+                partial_read_policy: PartialReadPolicy::AllowPartial,
+                ..Default::default()
+            },
             |_line| {
                 lines_seen2 += 1;
                 Ok(())
@@ -95,7 +110,7 @@ mod tests {
         );
         assert!(
             res.is_ok(),
-            "for_each_line_cfg_with_skip should skip a corrupt file gracefully, got {:?}",
+            "allow-partial with on_skip should skip a corrupt file gracefully, got {:?}",
             res
         );
         assert_eq!(
@@ -131,10 +146,15 @@ mod tests {
 
         let mut skip_count = 0usize;
         let mut lines_seen = 0usize;
-        let res = for_each_line_cfg_with_skip(
+        let mut on_skip = |_: &Path, _: &anyhow::Error| skip_count += 1;
+        let res = for_each_line_with_opts(
             &path,
-            16 * 1024,
-            |_, _| skip_count += 1,
+            LineStreamOpts {
+                read_buf_bytes: Some(16 * 1024),
+                on_skip: Some(&mut on_skip),
+                partial_read_policy: PartialReadPolicy::AllowPartial,
+                ..Default::default()
+            },
             |_line| {
                 lines_seen += 1;
                 Ok(())
@@ -154,9 +174,18 @@ mod tests {
         let path = dir.path().join("missing.zst");
 
         let mut skip_count = 0usize;
-        let err =
-            for_each_line_cfg_with_skip(&path, 16 * 1024, |_, _| skip_count += 1, |_line| Ok(()))
-                .expect_err("missing input must be a fatal open error");
+        let mut on_skip = |_: &Path, _: &anyhow::Error| skip_count += 1;
+        let err = for_each_line_with_opts(
+            &path,
+            LineStreamOpts {
+                read_buf_bytes: Some(16 * 1024),
+                on_skip: Some(&mut on_skip),
+                partial_read_policy: PartialReadPolicy::AllowPartial,
+                ..Default::default()
+            },
+            |_line| Ok(()),
+        )
+        .expect_err("missing input must be a fatal open error");
 
         assert_eq!(skip_count, 0, "on_skip must not fire for open errors");
         let msg = err.to_string();
@@ -180,10 +209,15 @@ mod tests {
         );
 
         let mut skip_count = 0usize;
-        let err = for_each_line_cfg_with_skip(
+        let mut on_skip = |_: &Path, _: &anyhow::Error| skip_count += 1;
+        let err = for_each_line_with_opts(
             &path,
-            16 * 1024,
-            |_, _| skip_count += 1,
+            LineStreamOpts {
+                read_buf_bytes: Some(16 * 1024),
+                on_skip: Some(&mut on_skip),
+                partial_read_policy: PartialReadPolicy::AllowPartial,
+                ..Default::default()
+            },
             |_line| Err(anyhow::anyhow!("callback boom")),
         )
         .expect_err("callback errors must propagate from skip variants");
