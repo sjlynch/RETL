@@ -166,7 +166,6 @@ impl RedditETL {
         let parent_dir = output_parent(out);
         crate::util::create_dir_all_with_default_backoff(parent_dir)
             .with_context(|| format!("create direct parent output dir {}", parent_dir.display()))?;
-        let staging_dir = ensure_staging_dir(parent_dir)?;
         sweep_stale_inprogress(parent_dir, true)?;
 
         let legacy_payload = parents.payload_spec.is_legacy_default();
@@ -177,8 +176,7 @@ impl RedditETL {
         let mut s_payload_cache =
             WorkerShardCache::<ParentPayload>::new(SUBMISSION_SHARD_CACHE_CAP);
 
-        write_jsonl_atomic(
-            &staging_dir,
+        write_at_path_atomic(
             out,
             self.opts.write_buffer_bytes,
             |w| -> Result<ParentAttachStats> {
@@ -306,13 +304,15 @@ impl RedditETL {
                 None
             };
 
-            let parents_c_eager = &parents.comments;
-            let parents_s_eager = &parents.submissions;
             let empty_parent_payloads: HashMap<String, ParentPayload> = HashMap::new();
-            let legacy_payload = parents.payload_spec.is_legacy_default();
-
-            let comment_shards = parents.comment_shards.as_ref();
-            let submission_shards = parents.submission_shards.as_ref();
+            let file_ctx = AttachFileCtx {
+                legacy_payload: parents.payload_spec.is_legacy_default(),
+                parents_c_eager: &parents.comments,
+                parents_s_eager: &parents.submissions,
+                empty_parent_payloads: &empty_parent_payloads,
+                comment_shards: parents.comment_shards.as_ref(),
+                submission_shards: parents.submission_shards.as_ref(),
+            };
             let parent_cache_fingerprint = attach_parent_cache_fingerprint(parents);
             let resolution_range = attach_resolution_range(self.opts.start, self.opts.end);
 
@@ -362,222 +362,12 @@ impl RedditETL {
                         }
                     }
 
-                    // Per-worker FIFO caches of parsed shard JSON. See
-                    // `WorkerShardCache` for why eviction is plain FIFO with no
-                    // bump-on-hit.
-                    let mut c_cache = WorkerShardCache::<String>::new(COMMENT_SHARD_CACHE_CAP);
-                    let mut s_cache =
-                        WorkerShardCache::<(String, String)>::new(SUBMISSION_SHARD_CACHE_CAP);
-                    let mut c_payload_cache =
-                        WorkerShardCache::<ParentPayload>::new(COMMENT_SHARD_CACHE_CAP);
-                    let mut s_payload_cache =
-                        WorkerShardCache::<ParentPayload>::new(SUBMISSION_SHARD_CACHE_CAP);
-
                     let is_rc_spool_part = looks_like_rc_spool_path(in_path);
                     let (file_stats, diagnostics) = write_jsonl_atomic(
                         &staging_dir,
                         &out_path,
                         self.opts.write_buffer_bytes,
-                        |w| -> Result<(ParentAttachStats, ParentAttachDiagnostics)> {
-                            let mut file_stats = ParentAttachStats::default();
-                            let mut diagnostics = ParentAttachDiagnostics {
-                                files_scanned: 1,
-                                ..Default::default()
-                            };
-                            let f = crate::util::open_with_default_backoff(in_path)?;
-                            let mut r = BufReader::new(f);
-                            let mut line_buf = String::new();
-                            let mut line_no: u64 = 0;
-
-                            loop {
-                                let n = read_line_capped(
-                                    &mut r,
-                                    &mut line_buf,
-                                    DEFAULT_MAX_LINE_BYTES,
-                                    in_path,
-                                )
-                                .with_context(|| {
-                                    format!(
-                                        "read parent attach input {} at line {}",
-                                        in_path.display(),
-                                        line_no + 1
-                                    )
-                                })?;
-                                if n == 0 {
-                                    break;
-                                }
-                                line_no += 1;
-                                if line_buf.is_empty() {
-                                    continue;
-                                }
-                                let mut v: Value =
-                                    serde_json::from_str(&line_buf).with_context(|| {
-                                        format!(
-                                            "malformed JSON in parent attach input {} at line {}",
-                                            in_path.display(),
-                                            line_no
-                                        )
-                                    })?;
-
-                                let has_body = v.get("body").is_some();
-                                let has_parent_id = v.get("parent_id").is_some();
-                                let has_link_id = v.get("link_id").is_some();
-                                diagnostics.parsed_records += 1;
-                                if is_rc_spool_part {
-                                    diagnostics.rc_records += 1;
-                                }
-                                if has_body {
-                                    diagnostics.records_with_body += 1;
-                                }
-                                if has_parent_id {
-                                    diagnostics.records_with_parent_id += 1;
-                                }
-                                if has_link_id {
-                                    diagnostics.records_with_link_id += 1;
-                                }
-
-                                let is_comment = is_comment_record_for_parent_attach(&v);
-                                if is_comment {
-                                    diagnostics.comment_shaped_records += 1;
-                                    // Own-month is derived from the consuming record's
-                                    // created_utc; used to pick the most-likely parent
-                                    // shard before falling back to other months.
-                                    let own_ym = v
-                                        .get("created_utc")
-                                        .and_then(|x| x.as_i64())
-                                        .map(ym_from_epoch);
-
-                                    if let Some(parent_id) =
-                                        v.get("parent_id").and_then(|x| x.as_str())
-                                    {
-                                        let mut resolved_parent = false;
-
-                                        if legacy_payload {
-                                            let mut parent_obj = serde_json::Map::new();
-                                            let mut payload_fields = 0usize;
-
-                                            if let Some(rest) = parent_id.strip_prefix("t1_") {
-                                                if let Some(text) = load_shard_value(
-                                                    parents_c_eager,
-                                                    comment_shards,
-                                                    &mut c_cache,
-                                                    rest,
-                                                    own_ym,
-                                                )? {
-                                                    parent_obj.insert(
-                                                        "kind".into(),
-                                                        Value::String("comment".into()),
-                                                    );
-                                                    parent_obj.insert(
-                                                        "id".into(),
-                                                        Value::String(rest.to_string()),
-                                                    );
-                                                    parent_obj
-                                                        .insert("body".into(), Value::String(text));
-                                                    payload_fields += 1;
-                                                }
-                                            } else if let Some(rest) = parent_id.strip_prefix("t3_")
-                                            {
-                                                if let Some((title, selftext)) = load_shard_value(
-                                                    parents_s_eager,
-                                                    submission_shards,
-                                                    &mut s_cache,
-                                                    rest,
-                                                    own_ym,
-                                                )? {
-                                                    parent_obj.insert(
-                                                        "kind".into(),
-                                                        Value::String("submission".into()),
-                                                    );
-                                                    parent_obj.insert(
-                                                        "id".into(),
-                                                        Value::String(rest.to_string()),
-                                                    );
-                                                    parent_obj.insert(
-                                                        "title".into(),
-                                                        Value::String(title),
-                                                    );
-                                                    parent_obj.insert(
-                                                        "selftext".into(),
-                                                        Value::String(selftext),
-                                                    );
-                                                    payload_fields += 2;
-                                                }
-                                            }
-
-                                            if payload_fields > 0 {
-                                                if let Some(map) = v.as_object_mut() {
-                                                    map.insert(
-                                                        "parent".into(),
-                                                        Value::Object(parent_obj),
-                                                    );
-                                                }
-                                                resolved_parent = true;
-                                            }
-                                        } else if let Some(rest) = parent_id.strip_prefix("t1_") {
-                                            if let Some(mut payload) = load_shard_value(
-                                                &empty_parent_payloads,
-                                                comment_shards,
-                                                &mut c_payload_cache,
-                                                rest,
-                                                own_ym,
-                                            )? {
-                                                payload.insert(
-                                                    "kind".into(),
-                                                    Value::String("comment".into()),
-                                                );
-                                                payload.insert(
-                                                    "id".into(),
-                                                    Value::String(rest.to_string()),
-                                                );
-                                                if let Some(map) = v.as_object_mut() {
-                                                    map.insert(
-                                                        "parent".into(),
-                                                        Value::Object(payload),
-                                                    );
-                                                }
-                                                resolved_parent = true;
-                                            }
-                                        } else if let Some(rest) = parent_id.strip_prefix("t3_") {
-                                            if let Some(mut payload) = load_shard_value(
-                                                &empty_parent_payloads,
-                                                submission_shards,
-                                                &mut s_payload_cache,
-                                                rest,
-                                                own_ym,
-                                            )? {
-                                                payload.insert(
-                                                    "kind".into(),
-                                                    Value::String("submission".into()),
-                                                );
-                                                payload.insert(
-                                                    "id".into(),
-                                                    Value::String(rest.to_string()),
-                                                );
-                                                if let Some(map) = v.as_object_mut() {
-                                                    map.insert(
-                                                        "parent".into(),
-                                                        Value::Object(payload),
-                                                    );
-                                                }
-                                                resolved_parent = true;
-                                            }
-                                        }
-
-                                        if resolved_parent {
-                                            file_stats.resolved += 1;
-                                        } else {
-                                            file_stats.unresolved += 1;
-                                        }
-                                    }
-                                }
-
-                                serde_json::to_writer(&mut *w, &v)?;
-                                w.write_all(b"\n")?;
-                            }
-
-                            Ok((file_stats, diagnostics))
-                        },
+                        |w| attach_parents_for_one_file(in_path, w, &file_ctx, is_rc_spool_part),
                     )?;
 
                     write_attach_fingerprint_atomic(
@@ -616,36 +406,16 @@ impl RedditETL {
                 .collect();
             warn_if_no_comment_shaped_records(diagnostics);
 
-            let mut counts = BTreeMap::new();
-            counts.insert("input_files".to_string(), manifest_inputs.len() as u64);
-            counts.insert("attached_files".to_string(), out_paths.len() as u64);
-            counts.insert("parents_resolved".to_string(), stats.resolved);
-            counts.insert("parents_unresolved".to_string(), stats.unresolved);
-            counts.insert("records_scanned".to_string(), diagnostics.parsed_records);
-            let mut manifest = RunManifestInput::new("parents.attach_parents_jsonls_parallel");
-            manifest.start = manifest_start;
-            manifest.api_operation = Some("RedditETL::attach_parents_jsonls_parallel".to_string());
-            manifest.options = serde_json::json!({
-                "resume": resume,
-                "resolution_range": {
-                    "start": self.opts.start.map(|ym| ym.to_string()),
-                    "end": self.opts.end.map(|ym| ym.to_string()),
-                },
-                "parent_payload": {
-                    "full_record": parents.payload_spec.is_full_record(),
-                    "fields": parents.payload_spec.fields(),
-                },
-                "base_dir": path_to_stable_string(&self.opts.base_dir),
-                "comments_dir": path_to_stable_string(&self.opts.comments_dir),
-                "submissions_dir": path_to_stable_string(&self.opts.submissions_dir),
-                "parallelism": self.opts.parallelism,
-                "file_concurrency": self.opts.file_concurrency,
-                "emit_manifest": self.opts.emit_manifest,
-            });
-            manifest.inputs = file_identities(&manifest_inputs);
-            manifest.output_format = "jsonl-directory".to_string();
-            manifest.counts = counts;
-            manifest.upstream_manifests = discover_upstream_manifests_from_inputs(&manifest_inputs);
+            let manifest = build_attach_manifest(
+                &manifest_inputs,
+                &out_paths,
+                stats,
+                diagnostics,
+                manifest_start,
+                &self.opts,
+                &parents.payload_spec,
+                resume,
+            );
             maybe_write_run_manifest(
                 self.opts.emit_manifest,
                 manifest,

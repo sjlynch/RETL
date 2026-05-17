@@ -80,3 +80,40 @@ pub(crate) fn discover_spool_parts(dir: &Path) -> Result<(Vec<PathBuf>, YearMont
     let max_ym = parts.iter().map(|(ym, _)| *ym).max().unwrap();
     Ok((parts.into_iter().map(|(_, p)| p).collect(), min_ym, max_ym))
 }
+
+#[cfg(test)]
+mod tests_io {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn discover_spool_parts_orders_by_year_month_then_path() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            "part_RC_2006-02.jsonl",
+            "part_RS_2006-01.jsonl",
+            "part_RS_2006-02.jsonl",
+            "part_RC_2006-01.jsonl",
+        ] {
+            fs::write(dir.path().join(name), "{}\n").unwrap();
+        }
+
+        let (parts, min_ym, max_ym) = discover_spool_parts(dir.path()).unwrap();
+        let names: Vec<String> = parts
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(min_ym, YearMonth::new(2006, 1));
+        assert_eq!(max_ym, YearMonth::new(2006, 2));
+        assert_eq!(
+            names,
+            vec![
+                "part_RC_2006-01.jsonl",
+                "part_RS_2006-01.jsonl",
+                "part_RC_2006-02.jsonl",
+                "part_RS_2006-02.jsonl",
+            ]
+        );
+    }
+}

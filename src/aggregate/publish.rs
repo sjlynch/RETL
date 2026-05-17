@@ -35,8 +35,7 @@ impl RedditETL {
         // Atomically publish the final output through `<out-parent>/_staging`
         // so an interrupted run never leaves a half-written `final_out` in
         // place and concurrent runs never share a fixed temp path.
-        let staging_dir = ensure_staging_dir(output_parent(final_out))?;
-        write_jsonl_atomic(&staging_dir, final_out, AGGREGATE_WRITE_BUF_BYTES, |w| {
+        write_at_path_atomic(final_out, AGGREGATE_WRITE_BUF_BYTES, |w| {
             if pretty {
                 serde_json::to_writer_pretty(w, &total)?;
             } else {

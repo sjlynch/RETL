@@ -1,163 +1,12 @@
-use crate::config::clamp_parallelism_threads;
-use crate::ndjson::{read_line_capped, DEFAULT_MAX_LINE_BYTES};
-use crate::query::{normalize_str, QueryBuildError};
 use anyhow::{Context, Result};
-
-static INIT_ONCE: std::sync::Once = std::sync::Once::new();
-
-/// Initialize tracing for the binary. Call this once at program startup from
-/// `main`. Library code must NOT call this — the binary owns the tracing
-/// subscriber.
-pub fn init_tracing_for_binary() {
-    INIT_ONCE.call_once(|| {
-        let env_filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(env_filter)
-            .try_init();
-    });
-}
-
-// -------- NEW: default bot/service accounts + merging from env/file --------
-
-/// Returns a normalized (lowercase) default list of bot/service authors to exclude.
-/// This is a conservative set focused on high-volume/systemic accounts.
-/// Feel free to extend as needed; try_merge_extra_exclusions() will add env/file entries.
-pub fn default_bot_authors() -> Vec<String> {
-    // Hand-curated defaults (normalized to lowercase)
-    let defaults = [
-        "automoderator",
-        "imguralbumbot",
-        "autowikibot",
-        "remindmebot",
-        "totesmessenger",
-        "tweet_poster",
-        "video_link_bot",
-        "gifvbot",
-        "helper-bot",
-        "github-actions[bot]",
-        "slackbot",
-        "discordbot",
-    ];
-    let mut v: Vec<String> = defaults.iter().map(|s| normalize_str(s)).collect();
-    v.sort();
-    v.dedup();
-    v
-}
-
-/// Merge extra exclusions from env/file into the provided vector (in-place).
-/// - ETL_EXCLUDE_AUTHORS: comma/semicolon/space separated names
-/// - ETL_EXCLUDE_AUTHORS_FILE: path to newline-separated file of names
-///
-/// All entries are normalized (lowercase), then the list is sort+dedup. If
-/// `ETL_EXCLUDE_AUTHORS_FILE` is set to a non-blank path, failure to open or
-/// fully read it is fatal because the file is part of the query semantics.
-/// Per-line reads are bounded by [`DEFAULT_MAX_LINE_BYTES`] so an adversarial
-/// exclusions file cannot OOM the process.
-pub(crate) fn try_merge_extra_exclusions(
-    target: &mut Vec<String>,
-) -> std::result::Result<(), QueryBuildError> {
-    use std::io::BufReader;
-
-    let mut extras = Vec::new();
-
-    if let Ok(s) = std::env::var("ETL_EXCLUDE_AUTHORS") {
-        for raw in s.split(|c: char| c == ',' || c == ';' || c.is_whitespace()) {
-            let n = normalize_str(raw);
-            if !n.is_empty() {
-                extras.push(n);
-            }
-        }
-    }
-
-    if let Some(path_os) = std::env::var_os("ETL_EXCLUDE_AUTHORS_FILE") {
-        let path = std::path::PathBuf::from(path_os);
-        if !path.to_string_lossy().trim().is_empty() {
-            let f = open_with_default_backoff(&path).map_err(|e| {
-                QueryBuildError::new(format!(
-                    "ETL_EXCLUDE_AUTHORS_FILE {} cannot be opened: {e}",
-                    path.display()
-                ))
-            })?;
-            let mut r = BufReader::new(f);
-            let mut line = String::with_capacity(1024);
-            let mut line_no: usize = 0;
-            loop {
-                line_no += 1;
-                match read_line_capped(&mut r, &mut line, DEFAULT_MAX_LINE_BYTES, &path) {
-                    Ok(0) => break,
-                    Ok(_) => {
-                        let n = normalize_str(&line);
-                        if !n.is_empty() {
-                            extras.push(n);
-                        }
-                    }
-                    Err(e) => {
-                        return Err(QueryBuildError::new(format!(
-                            "ETL_EXCLUDE_AUTHORS_FILE {} could not be read at line {line_no}: {e}",
-                            path.display()
-                        )));
-                    }
-                }
-            }
-        }
-    }
-
-    target.extend(extras);
-
-    // normalize + sort + dedup
-    for s in target.iter_mut() {
-        *s = normalize_str(s);
-    }
-    target.sort();
-    target.dedup();
-    Ok(())
-}
-
-// -------- NEW: scoped Rayon thread pool helper --------
-
-/// Run `f` inside a scoped Rayon thread pool sized to `n` threads. If `n` is
-/// `None` (or `Some(0)`), run on the global default pool. Positive values are
-/// clamped through [`crate::config::max_parallelism_limit`]; if Rayon still
-/// rejects the pool, RETL logs a warning and safely falls back to the global
-/// pool instead of panicking.
-///
-/// Prefer this over `rayon::ThreadPoolBuilder::build_global()`, which mutates
-/// process-wide state, only succeeds for the first caller, and prevents
-/// different stages from picking different thread counts.
-pub fn with_thread_pool<R, F>(n: Option<usize>, f: F) -> R
-where
-    F: FnOnce() -> R + Send,
-    R: Send,
-{
-    match n {
-        Some(k) if k > 0 => {
-            let clamped = clamp_parallelism_threads(k, "with_thread_pool");
-            match rayon::ThreadPoolBuilder::new().num_threads(clamped).build() {
-                Ok(pool) => pool.install(f),
-                Err(e) => {
-                    tracing::warn!(
-                        requested = k,
-                        clamped,
-                        error = %e,
-                        "failed to build scoped Rayon thread pool; falling back to global pool"
-                    );
-                    f()
-                }
-            }
-        }
-        _ => f(),
-    }
-}
-
-// -------- NEW: robust open/create with backoff (Windows-friendly) --------
-
 use std::fs;
 use std::fs::File;
 use std::io;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::thread::sleep;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 /// Default retry count for Windows-friendly file operations.
 ///
@@ -173,48 +22,6 @@ pub const SHORT_BACKOFF_TRIES: usize = 8;
 /// Default linear backoff delay, in milliseconds, between retry attempts.
 pub const DEFAULT_BACKOFF_DELAY_MS: u64 = 50;
 
-const FNV1A_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
-const FNV1A_PRIME: u64 = 0x00000100000001B3;
-
-pub(crate) fn fnv1a_offset_basis() -> u64 {
-    FNV1A_OFFSET_BASIS
-}
-
-pub(crate) fn fnv1a_update(hash: &mut u64, bytes: &[u8]) {
-    for byte in bytes {
-        *hash ^= u64::from(*byte);
-        *hash = hash.wrapping_mul(FNV1A_PRIME);
-    }
-}
-
-pub(crate) fn stable_fnv1a_hex(bytes: &[u8]) -> String {
-    let mut hash = FNV1A_OFFSET_BASIS;
-    fnv1a_update(&mut hash, bytes);
-    format!("fnv1a64:{hash:016x}")
-}
-
-pub(crate) fn system_time_parts(t: SystemTime) -> (i64, u32) {
-    match t.duration_since(UNIX_EPOCH) {
-        Ok(d) => (
-            i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
-            d.subsec_nanos(),
-        ),
-        Err(e) => {
-            let d = e.duration();
-            (
-                -i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
-                d.subsec_nanos(),
-            )
-        }
-    }
-}
-
-pub fn output_parent(path: &Path) -> &Path {
-    path.parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."))
-}
-
 // Named Windows error codes commonly seen on filter-driver / sharing /
 // removable-volume hiccups. Used by `is_retriable_io_error` below; named so
 // the retry classification reads as documentation rather than a wall of magic
@@ -228,27 +35,6 @@ const WIN_ERR_NO_SUCH_DEVICE: i32 = 433; // ERROR_NO_SUCH_DEVICE
 const WIN_ERR_FILE_INVALID: i32 = 1006; // ERROR_FILE_INVALID — volume changed
 const WIN_ERR_IO_DEVICE: i32 = 1117; // ERROR_IO_DEVICE
 const WIN_ERR_USER_MAPPED_FILE: i32 = 1224; // ERROR_USER_MAPPED_FILE
-
-static SCRATCH_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// Return a process-unique scratch directory path under `work_dir`.
-///
-/// The directory name carries the logical `prefix`, scratch `kind`, PID,
-/// process-local counter, and current nanoseconds so separate `retl` processes
-/// sharing the same work dir do not reuse fixed shard roots.
-pub(crate) fn unique_scratch_dir(work_dir: &Path, prefix: &str, kind: &str) -> PathBuf {
-    let counter = SCRATCH_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    work_dir.join(format!(
-        "{prefix}_{kind}_{}_{}_{}",
-        std::process::id(),
-        counter,
-        nanos
-    ))
-}
 
 /// Return true for transient/retriable I/O errors often seen on Windows when
 /// filter drivers (AV/backup), USB/NAS volumes, or sharing violations occur.
@@ -558,22 +344,6 @@ fn copy_with_backoff(src: &Path, dest: &Path, tries: usize, delay_ms: u64) -> Re
     with_backoff(tries, delay_ms, || fs::copy(src, dest))
         .map(|_| ())
         .with_context(|| format!("copy {} -> {}", src.display(), dest.display()))
-}
-
-/// Smoothstep curve mapping a measured free-memory fraction onto `[0.0, 1.0]`,
-/// used by adaptive buffer sizing in dedupe and bucketing.
-///
-/// - At or below `soft_low`, returns `0.0` (favor smaller buffers).
-/// - At or above `high`, returns `1.0` (favor larger buffers).
-/// - Between the two, applies the cubic smoothstep `s*s*(3 - 2*s)` to soften
-///   the transition.
-///
-/// `(high - soft_low)` is floored at `0.05` to keep the divisor non-degenerate
-/// when callers are configured with overlapping thresholds.
-pub(crate) fn smoothstep_memory_fraction(free: f64, soft_low: f64, high: f64) -> f64 {
-    let span = (high - soft_low).max(0.05);
-    let scale = ((free - soft_low) / span).clamp(0.0, 1.0);
-    scale * scale * (3.0 - 2.0 * scale)
 }
 
 /// Atomically replace `dest` with `tmp` (Windows-friendly).

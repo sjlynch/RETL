@@ -13,7 +13,7 @@ pub(crate) fn run_scan(args: ScanArgs) -> Result<()> {
     match args.out {
         Some(path) => {
             let manifest_start = RunManifestStart::now();
-            let written = write_text_file_atomic(&path, |w| {
+            let written = write_text_atomic(&path, CLI_TEXT_WRITE_BUF_BYTES, |w| {
                 let mut written = 0_u64;
                 scan.try_for_each_username(|u| {
                     writeln!(w, "{u}")?;

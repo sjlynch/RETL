@@ -215,14 +215,7 @@ fn build_id_shard_index(
         // writers from colliding on a shared sibling temp and lets a
         // subsequent run's sweep recover crash leftovers — see
         // `sweep_stale_inprogress` in `resolve_parent_maps`.
-        let out_parent = out
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."));
-        let shard_staging = ensure_staging_dir(&out_parent)
-            .with_context(|| format!("ensure staging dir under {}", out_parent.display()))?;
-        write_jsonl_atomic(&shard_staging, &out, write_buf, |w| -> Result<()> {
+        write_at_path_atomic(&out, write_buf, |w| -> Result<()> {
             match (legacy_payload, job.kind) {
                 (true, FileKind::Comment) => serde_json::to_writer(w, &out_map_c)?,
                 (true, FileKind::Submission) => serde_json::to_writer(w, &out_map_s)?,

@@ -208,7 +208,7 @@ fn ensure_aggregate_inputs_succeeded(
 }
 
 fn write_rec_count_json(out: &Path, agg: &RecCount, pretty: bool) -> Result<()> {
-    write_text_file_atomic(out, |w| {
+    write_text_atomic(out, CLI_TEXT_WRITE_BUF_BYTES, |w| {
         if pretty {
             serde_json::to_writer_pretty(w, agg)?;
         } else {
@@ -220,7 +220,7 @@ fn write_rec_count_json(out: &Path, agg: &RecCount, pretty: bool) -> Result<()> 
 }
 
 fn write_grouped_tsv(out: &Path, rows: Vec<(String, String)>) -> Result<()> {
-    write_text_file_atomic(out, |w| {
+    write_text_atomic(out, CLI_TEXT_WRITE_BUF_BYTES, |w| {
         for (key, value) in rows {
             writeln!(w, "{key}\t{value}")?;
         }

@@ -1,6 +1,6 @@
 use crate::atomic_write::{
-    ensure_staging_dir, sweep_stale_inprogress, write_json_pretty_atomic, write_jsonl_atomic,
-    INPROGRESS_EXT,
+    ensure_staging_dir, sweep_stale_inprogress, write_at_path_atomic, write_json_pretty_atomic,
+    write_jsonl_atomic, INPROGRESS_EXT,
 };
 use crate::date::YearMonth;
 use crate::filters::ym_from_epoch;

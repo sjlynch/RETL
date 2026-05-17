@@ -1,4 +1,4 @@
-use crate::atomic_write::{ensure_staging_dir, write_jsonl_atomic};
+use crate::atomic_write::write_at_path_atomic;
 use crate::config::{ETLOptions, PartialReadReport, Sources};
 use crate::paths::{FileJob, FileKind};
 use crate::query::QuerySpec;

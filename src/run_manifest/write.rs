@@ -77,22 +77,11 @@ pub fn write_run_manifest(
         upstream_manifests: input.upstream_manifests,
     };
 
-    let parent = manifest_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let staging_dir = ensure_staging_dir(parent)
-        .with_context(|| format!("creating manifest staging dir under {}", parent.display()))?;
-    write_jsonl_atomic(
-        &staging_dir,
-        &manifest_path,
-        MANIFEST_WRITE_BUF_BYTES,
-        |w| {
-            serde_json::to_writer_pretty(&mut *w, &manifest)?;
-            w.write_all(b"\n")?;
-            Ok(())
-        },
-    )
+    write_at_path_atomic(&manifest_path, MANIFEST_WRITE_BUF_BYTES, |w| {
+        serde_json::to_writer_pretty(&mut *w, &manifest)?;
+        w.write_all(b"\n")?;
+        Ok(())
+    })
     .with_context(|| format!("writing run manifest {}", manifest_path.display()))?;
 
     Ok(manifest_path)

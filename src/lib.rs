@@ -227,6 +227,10 @@ pub use crate::zstd_jsonl::{quick_validate_zst, validate_zst_full};
 //export partition writers (lambda-capable)
 pub use crate::partition::{PartitionWriters, MAX_PARTITIONS};
 
+// Re-export atomic-write entry points used by binaries and downstream library
+// callers that don't already hold a staging-dir handle.
+pub use crate::atomic_write::{write_at_path_atomic, write_text_atomic};
+
 //export robust file ops from util so binaries can import from crate root.
 pub use crate::util::{
     create_dir_all_with_backoff, create_dir_all_with_default_backoff, create_new_with_backoff,

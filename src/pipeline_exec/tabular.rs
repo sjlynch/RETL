@@ -36,9 +36,7 @@ fn stitch_tabular_parts(
     write_buf: usize,
 ) -> Result<()> {
     let parts = tabular_part_paths(tmp_dir, format)?;
-    let parent = out_path.parent().unwrap_or_else(|| Path::new("."));
-    let staging_dir = ensure_staging_dir(parent)?;
-    write_jsonl_atomic(&staging_dir, out_path, write_buf, |out| {
+    write_at_path_atomic(out_path, write_buf, |out| {
         if opts.header {
             write_tabular_header(out, fields, format)?;
         }
@@ -402,9 +400,7 @@ where
     }
     let fields = normalize_tabular_fields(fields)?;
     let selectors = parse_tabular_field_selectors(&fields)?;
-    let parent = out_path.parent().unwrap_or_else(|| Path::new("."));
-    let staging_dir = ensure_staging_dir(parent)?;
-    write_jsonl_atomic(&staging_dir, out_path, 64 * 1024, |out| {
+    write_at_path_atomic(out_path, 64 * 1024, |out| {
         let mut written = 0_u64;
         if opts.header {
             write_tabular_header(out, &fields, format)?;

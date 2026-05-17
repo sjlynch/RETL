@@ -1,4 +1,4 @@
-use crate::atomic_write::{ensure_staging_dir, write_jsonl_atomic};
+use crate::atomic_write::{ensure_staging_dir, write_at_path_atomic, write_jsonl_atomic};
 use crate::ndjson::for_each_jsonl_line_cfg;
 use crate::pipeline::RedditETL;
 use crate::progress::make_count_progress;
@@ -6,7 +6,7 @@ use crate::run_manifest::{
     discover_upstream_manifests_from_inputs, file_identities, maybe_write_run_manifest,
     ManifestDestination, RunManifestInput, RunManifestStart,
 };
-use crate::util::{output_parent, with_thread_pool};
+use crate::util::with_thread_pool;
 use anyhow::{Context, Result};
 use indicatif::ProgressBar;
 use rayon::prelude::*;
