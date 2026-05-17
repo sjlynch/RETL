@@ -157,8 +157,12 @@ cd fuzz && cargo +nightly fuzz run fuzz_rewrite_timestamps
 - `src/key_extractor.rs` — `KeyExtractor::key_from_line`: `MinimalRecord` fast path for author/subreddit keys, `Value` slow path for pointer/custom keys.
 - `src/atomic_write.rs` — staging + atomic publish helpers.
 - `src/progress_manifest.rs` — resume sidecar.
-- `src/util.rs` — `*_with_backoff` I/O retries, `with_thread_pool`,
-  `init_tracing_for_binary`.
+- `src/util/` — split by concern (see `src/util/CLAUDE.md`):
+  `backoff.rs` for `*_with_backoff` I/O retries + `replace_file_atomic_backoff`,
+  `exclusions.rs` for `default_bot_authors` / `try_merge_extra_exclusions`,
+  `scratch.rs` for `unique_scratch_dir`, `thread_pool.rs` for `with_thread_pool`,
+  `tracing.rs` for `init_tracing_for_binary`. `mod.rs` re-exports everything so
+  `crate::util::*` import paths are unchanged.
 - `src/bin_args.rs` — clap `Cli`, `Command`, and `*Args` structs for the binary.
 - `src/bin_helpers.rs` — shared CLI helpers: `build_etl`, `ensure_dirs`, `plan!` macro, `discover_spool_parts`.
 - `src/bin_handlers.rs` — per-subcommand `run_*` handlers.

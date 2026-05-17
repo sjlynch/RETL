@@ -2,6 +2,7 @@
 //! corresponds 1:1 to a `Command` variant and is invoked from `main.rs`.
 
 include!("common.rs");
+include!("cli_manifest.rs");
 include!("corpus.rs");
 include!("describe.rs");
 include!("quickstart.rs");
