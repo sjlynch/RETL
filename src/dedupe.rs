@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
 
 const MAP_INITIAL_CAPACITY: usize = 64_000;
-const BYTES_PER_MB: usize = 1024 * 1024;
+pub(crate) const BYTES_PER_MB: usize = 1024 * 1024;
 
 type RunMap = ahash::AHashMap<String, Vec<String>>;
 
