@@ -62,6 +62,15 @@ fn with_backoff<T, F>(tries: usize, delay_ms: u64, mut f: F) -> io::Result<T>
 where
     F: FnMut() -> io::Result<T>,
 {
+    // When a test sets a budget cap via `cap_backoff_budget_for_test`, all
+    // `*_with_backoff` callers on that thread get clamped to the cap. This
+    // lets tests that deliberately trigger a non-recoverable failure (e.g.
+    // publishing onto a directory) skip the full multi-second retry budget
+    // while still exercising the production code path verbatim. Zero overhead
+    // in non-test builds.
+    #[cfg(test)]
+    let (tries, delay_ms) = test_backoff_override(tries, delay_ms);
+
     let tries = tries.max(1);
     let mut last_err: Option<io::Error> = None;
     for i in 0..tries {
@@ -79,6 +88,46 @@ where
     }
     Err(last_err
         .unwrap_or_else(|| io::Error::new(io::ErrorKind::Other, "with_backoff: retries exhausted")))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only per-thread cap on `(tries, delay_ms)` consulted by
+    /// `with_backoff`. `None` means "use the caller's budget unchanged."
+    static TEST_BACKOFF_BUDGET: std::cell::Cell<Option<(usize, u64)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn test_backoff_override(tries: usize, delay_ms: u64) -> (usize, u64) {
+    TEST_BACKOFF_BUDGET.with(|cell| {
+        cell.get()
+            .map(|(t, d)| (tries.min(t), delay_ms.min(d)))
+            .unwrap_or((tries, delay_ms))
+    })
+}
+
+/// RAII guard that caps the per-thread retry budget for `with_backoff` to
+/// `(max_tries, max_delay_ms)`. Used by tests that deliberately drive a
+/// non-recoverable failure and don't want to wait out the full ~10–20 s
+/// production retry budget. Resets on drop.
+#[cfg(test)]
+pub(crate) struct TestBackoffBudgetGuard;
+
+#[cfg(test)]
+impl Drop for TestBackoffBudgetGuard {
+    fn drop(&mut self) {
+        TEST_BACKOFF_BUDGET.with(|cell| cell.set(None));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn cap_backoff_budget_for_test(
+    max_tries: usize,
+    max_delay_ms: u64,
+) -> TestBackoffBudgetGuard {
+    TEST_BACKOFF_BUDGET.with(|cell| cell.set(Some((max_tries, max_delay_ms))));
+    TestBackoffBudgetGuard
 }
 
 #[cfg(test)]

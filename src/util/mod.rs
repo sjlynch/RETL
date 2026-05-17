@@ -40,7 +40,8 @@ pub(crate) use backoff::create_dir_with_default_backoff;
 pub(crate) use backoff::TestIoFailureGuard;
 #[cfg(test)]
 pub(crate) use backoff::{
-    inject_retriable_io_errors_for_file_name_tests, inject_retriable_io_errors_for_tests, TestIoOp,
+    cap_backoff_budget_for_test, inject_retriable_io_errors_for_file_name_tests,
+    inject_retriable_io_errors_for_tests, TestIoOp,
 };
 
 pub use exclusions::default_bot_authors;
