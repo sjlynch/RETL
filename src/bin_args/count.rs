@@ -9,7 +9,9 @@ pub(crate) struct CountArgs {
     pub(crate) common: CommonOpts,
     #[command(flatten)]
     pub(crate) query: QueryOpts,
-    /// Count mode: per month (`month`) or per author (`author`, writes TSV).
+    /// Count mode. Both write TSV (`<key><TAB><count>\n`, one row per key, sorted).
+    /// `month` keys are `YYYY-MM`; `author` keys are lowercased author names. There is
+    /// no JSON/CSV mode — pipe through `retl convert` or post-process if you need one.
     #[arg(long, value_enum, default_value_t = CountMode::Month)]
     pub(crate) mode: CountMode,
     /// Output file (default stdout for `month`, required for `author`).

@@ -20,9 +20,19 @@ use clap::Parser;
 use bin_args::{Cli, Command};
 
 fn main() -> Result<()> {
-    retl::init_tracing_for_binary();
     let cli = Cli::parse();
-    match cli.command {
+
+    // Install the monitor before dispatch so any tracing event the handler
+    // emits is captured by the EventLayer. Subcommands without CommonOpts
+    // get default monitoring (no events file, no caps) — they're typically
+    // short-running analytics/manifest commands.
+    let monitor_options = match cli.command.common_opts() {
+        Some(common) => bin_helpers::build_monitor_options(common),
+        None => retl::MonitorOptions::default(),
+    };
+    let mut monitor = retl::install_monitor(monitor_options)?;
+
+    let result = match cli.command {
         Command::Describe(a) => bin_handlers::run_describe(a),
         Command::Corpus(a) => bin_handlers::run_corpus(a),
         Command::Schema(a) => bin_handlers::run_schema(a),
@@ -37,5 +47,12 @@ fn main() -> Result<()> {
         Command::Aggregate(a) => bin_handlers::run_aggregate(a),
         Command::Parents(a) => bin_handlers::run_parents(a),
         Command::FirstSeen(a) => bin_handlers::run_first_seen(a),
-    }
+    };
+
+    let outcome = match &result {
+        Ok(()) => "completed",
+        Err(_) => "failed",
+    };
+    monitor.finalize(outcome);
+    result
 }

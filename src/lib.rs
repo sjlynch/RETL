@@ -163,6 +163,12 @@ mod json_utils;
 mod json_whitelist;
 mod key_extractor;
 mod ndjson;
+mod obs;
+
+pub use crate::obs::{
+    install_monitor, Event, EventKind, LifecycleEvent, LogFormat, MonitorHandle, MonitorOptions,
+    StatusSnapshot,
+};
 
 pub use crate::config::{
     max_parallelism_limit, ConfigBuildError, ETLOptions, PartialReadReport, PartialReadReporter,

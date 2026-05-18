@@ -25,7 +25,7 @@ serde_json = { version = "1", features = ["arbitrary_precision"] }
 sha2 = "0.10"
 time = { version = "0.3", features = ["parsing", "macros", "formatting"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "registry"] }
 walkdir = "2"
 zstd = "0.13"
 parking_lot = "0.12"

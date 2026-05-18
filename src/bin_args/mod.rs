@@ -55,6 +55,26 @@ pub(crate) struct Cli {
     pub(crate) command: Command,
 }
 
+impl Command {
+    /// Subcommands that flatten [`CommonOpts`] expose it here so the binary
+    /// can read observability flags once, up front, before dispatch.
+    /// Returns `None` for the analytics/manifest subcommands that have
+    /// their own argument shapes (`aggregate`, `corpus`, `describe`,
+    /// `parents`, `quickstart`, `convert`, `schema`).
+    pub(crate) fn common_opts(&self) -> Option<&CommonOpts> {
+        match self {
+            Command::Scan(a) => Some(&a.common),
+            Command::Export(a) => Some(&a.common),
+            Command::Dedupe(a) => Some(&a.common),
+            Command::Count(a) => Some(&a.common),
+            Command::Sample(a) => Some(&a.common),
+            Command::Integrity(a) => Some(&a.common),
+            Command::FirstSeen(a) => Some(&a.common),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Subcommand, Debug)]
 pub(crate) enum Command {
     /// Inspect discovered corpus months, file counts, and compressed bytes without decoding.

@@ -107,8 +107,58 @@ re-run that month. Format/version live in `src/progress_manifest.rs`.
 ## Tracing
 
 `init_tracing_for_binary` (in `util.rs`) is **binary-only**. The library
-must not initialize tracing — the binary owns the subscriber. `main.rs` and
-`examples/quickstart.rs` call it once at startup; nothing else should.
+must not initialize tracing — the binary owns the subscriber. The legacy
+helper is still exported, but `src/main.rs` now installs tracing through
+`retl::install_monitor` (see below) so the optional monitoring layer can
+attach. `examples/quickstart.rs` still calls `init_tracing_for_binary`
+directly for the no-monitoring case.
+
+## Query authoring (for humans and LLMs)
+
+The CLI's per-flag `--help` text covers individual filters, but composition
+patterns and the non-obvious semantic landmines (missing-field handling on
+`--json` predicates, URL-detection scope, subreddit normalization,
+case-insensitivity rules) live in `docs/query_cookbook.md`. Stack-3-filters
+worked examples cover the common shapes:
+
+- Multi-axis author+subreddit+date+score+URL filters.
+- AND/NOT keyword stacking with distinct-author dedupe.
+- JSON-pointer predicates with safe missing-field handling
+  (`exists:/path` before any other operator).
+- `--source rc` vs `rs` vs `both` performance/semantics trade-offs.
+
+`docs/default_bots.md` enumerates the curated bot list that
+`--exclude-common-bots` applies, plus `ETL_EXCLUDE_AUTHORS` /
+`ETL_EXCLUDE_AUTHORS_FILE` semantics (both additive; file errors fatal).
+
+When adding a new filter flag, update `docs/query_cookbook.md` with at
+least one worked example showing it composed with two other filters,
+not just in isolation.
+
+## Monitoring / observability
+
+`retl` ships an opt-in machine-readable monitoring surface for LLM-driven
+or scripted watchers. Tracing logs are still text on stdout by default —
+nothing changes for a normal run. Flags are wired into `CommonOpts`:
+
+- `--events <path>` — append-truncate NDJSON event stream
+  (`retl.v1` schema; one JSON object per line; lifecycle + tracing +
+  watchdog + status events).
+- `--status-file <path>` — atomically rewritten JSON snapshot
+  (`retl.status.v1`; current/peak RSS, throughput, throttle state,
+  watchdog config).
+- `--max-rss-mb` / `--max-runtime-sec` / `--stop-file` — watchdog kill
+  switches (hard exit; safe because the library's atomic-write contract
+  never leaves torn final outputs).
+- `--log-format text|json` — stderr fmt layer format (`RETL_LOG_FORMAT`
+  env wins).
+- `--heartbeat-sec N` — periodic `kind=status` mirror events.
+
+Implementation lives in `src/obs/` (see `src/obs/CLAUDE.md`). Schema
+reference + watcher quickstart: `docs/monitoring.md`. Adding new
+monitored facts: just emit `tracing::info!(field=value, ...)` — the
+`EventLayer` forwards it to the stream as `kind=tracing` with no other
+plumbing required.
 
 ## Build, test, bench, fuzz
 

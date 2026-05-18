@@ -32,3 +32,18 @@ pub(crate) fn emit_partial_read_report(reporter: &PartialReadReporter) -> Result
     eprintln!("{}", serde_json::to_string(&report)?);
     Ok(())
 }
+
+/// Translate the observability flags on `CommonOpts` into a
+/// [`retl::MonitorOptions`]. With nothing set the returned options are
+/// `Default::default()` (no events file, no status file, no watchdog).
+pub(crate) fn build_monitor_options(common: &CommonOpts) -> retl::MonitorOptions {
+    retl::MonitorOptions {
+        events_file: common.events.clone(),
+        status_file: common.status_file.clone(),
+        stop_file: common.stop_file.clone(),
+        max_rss_mb: common.max_rss_mb,
+        max_runtime_sec: common.max_runtime_sec,
+        log_format: retl::LogFormat::parse(&common.log_format).unwrap_or(retl::LogFormat::Text),
+        heartbeat_interval_sec: common.heartbeat_sec,
+    }
+}
