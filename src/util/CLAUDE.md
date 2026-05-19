@@ -3,11 +3,17 @@
 Crate-internal utility submodules. Submodules are private; `mod.rs` re-exports every
 public/`pub(crate)` item so existing callers keep importing from `crate::util::*`.
 
-- `backoff.rs` — Windows-friendly `*_with_backoff` / `*_with_default_backoff` /
-  `*_with_short_backoff` retry helpers, `replace_file_atomic_backoff`,
-  retriable-error classifier, `DEFAULT_BACKOFF_*` constants, plus the
-  `cfg(test)` failure-injection scaffolding (`TestIoOp`, `TestIoFailureGuard`,
-  `inject_retriable_io_errors_for_*`) used by tests in other modules.
+- `backoff/` — Windows-friendly backoff stack split by concern:
+  - `mod.rs` re-exports the stable `crate::util::*` surface.
+  - `retry.rs` owns retry budgets, Win32 error classification, `with_backoff`,
+    and the test-utils retry-budget cap.
+  - `fs_ops.rs` owns the `open_*`, `create_*`, `read_dir_*`, and `remove_*`
+    filesystem wrappers.
+  - `replace.rs` owns `rename_with_backoff`, `copy_with_backoff`, and
+    `replace_file_atomic_backoff`.
+  - `testing.rs` owns the `cfg(test)` retriable-I/O failure-injection
+    scaffolding (`TestIoOp`, `TestIoFailureGuard`,
+    `inject_retriable_io_errors_for_*`) used by tests in other modules.
 - `exclusions.rs` — `default_bot_authors` and `try_merge_extra_exclusions`
   (consumes `ETL_EXCLUDE_AUTHORS` / `ETL_EXCLUDE_AUTHORS_FILE`).
 - `scratch.rs` — `unique_scratch_dir` for per-PID scratch directory naming.

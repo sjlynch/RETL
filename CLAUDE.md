@@ -220,7 +220,8 @@ harness — production builds (`--no-default-features` or just no
 - `src/atomic_write.rs` — staging + atomic publish helpers.
 - `src/progress_manifest.rs` — resume sidecar.
 - `src/util/` — split by concern (see `src/util/CLAUDE.md`):
-  `backoff.rs` for `*_with_backoff` I/O retries + `replace_file_atomic_backoff`,
+  `backoff/` for retry policy, `*_with_backoff` I/O wrappers, and
+  `replace_file_atomic_backoff`,
   `exclusions.rs` for `default_bot_authors` / `try_merge_extra_exclusions`,
   `scratch.rs` for `unique_scratch_dir`, `thread_pool.rs` for `with_thread_pool`,
   `tracing.rs` for `init_tracing_for_binary`. `mod.rs` re-exports everything so
