@@ -4,6 +4,7 @@ include!("scan.rs");
 include!("fingerprint.rs");
 include!("checkpoint.rs");
 include!("scan_records.rs");
+include!("resume_run.rs");
 include!("extract_common.rs");
 include!("spool.rs");
 include!("partitioned.rs");

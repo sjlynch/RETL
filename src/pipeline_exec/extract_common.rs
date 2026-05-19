@@ -1,4 +1,22 @@
 
+/// Per-entry validator for the extract scratch dir: re-reads the cached part
+/// file and returns a freshly computed [`MonthEntry`] (size+line count). The
+/// returned entry replaces the manifest's recorded line count, matching the
+/// pre-refactor behavior of [`extract_to_jsonl`].
+fn validate_extract_entry(tmp_dir: &Path, key: &str, expected: MonthEntry) -> Result<MonthEntry> {
+    let part_path = export_part_path(tmp_dir, key);
+    let actual = validate_jsonl_part(&part_path)?;
+    if actual.size != expected.size {
+        anyhow::bail!(
+            "extract resume part size mismatch for {}: expected {}, got {}",
+            part_path.display(),
+            expected.size,
+            actual.size
+        );
+    }
+    Ok(actual)
+}
+
 /// Shared extraction logic used by:
 ///  - `ScanPlan::extract_to_jsonl`
 ///  - `ScanPlan::extract_to_json`
@@ -42,24 +60,36 @@ fn extract_common(
         let staging_dir = ensure_staging_dir(&tmp_dir)?;
         sweep_stale_inprogress(&tmp_dir, true)?;
 
-        let (initial_months, completed_keys) =
-            if let Some(fingerprint) = resume_fingerprint.as_deref() {
-                load_and_validate_export_manifest(&tmp_dir, fingerprint)?
-            } else {
-                (HashMap::new(), HashSet::new())
-            };
+        let ResumePrelude {
+            initial_months,
+            completed_keys,
+            accumulator,
+        } = if let Some(fingerprint) = resume_fingerprint.as_deref() {
+            prepare_resume_run(
+                &tmp_dir,
+                fingerprint,
+                None,
+                true,
+                true,
+                ResumeLogLabels {
+                    fingerprint_mismatch:
+                        "extract resume manifest fingerprint does not match current query/config; discarding cached parts",
+                    out_of_plan: "dropping extract progress entry outside current plan",
+                    stale_entry: "dropping stale extract progress entry; month will be re-run",
+                },
+                || clear_extract_resume_parts(&tmp_dir),
+                |_keep_keys| Ok(()),
+                |key, entry| validate_extract_entry(&tmp_dir, key, entry),
+            )?
+        } else {
+            ResumePrelude {
+                initial_months: HashMap::new(),
+                completed_keys: HashSet::new(),
+                accumulator: None,
+            }
+        };
         let resumed_lines = committed_line_count(&initial_months);
         let output_records = AtomicU64::new(resumed_lines);
-        let accumulator = if let Some(fingerprint) = resume_fingerprint.as_ref() {
-            crate::progress_manifest::save(&tmp_dir, &initial_months, Some(fingerprint))?;
-            Some(ManifestAccumulator::new(
-                &tmp_dir,
-                initial_months,
-                Some(fingerprint.clone()),
-            ))
-        } else {
-            None
-        };
 
         let whitelist = etl.opts.whitelist_fields.clone();
         let whitelist_tracker = whitelist.as_ref().map(|fields| {

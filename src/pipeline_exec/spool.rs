@@ -1,26 +1,4 @@
 
-fn remove_matching_files(dir: &Path, mut should_remove: impl FnMut(&str) -> bool) -> Result<()> {
-    if !dir.exists() {
-        return Ok(());
-    }
-    let entries = crate::util::read_dir_with_default_backoff(dir)
-        .with_context(|| format!("read_dir {}", dir.display()))?;
-    for entry in entries {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        if should_remove(name) {
-            crate::util::remove_with_short_backoff(&path)
-                .with_context(|| format!("remove stale RETL-owned output {}", path.display()))?;
-        }
-    }
-    Ok(())
-}
-
 fn planned_job_keys(files: &[FileJob]) -> HashSet<String> {
     files.iter().map(export_part_key).collect()
 }
@@ -72,46 +50,6 @@ struct MonthJobCtx<'a> {
     completed_keys: &'a HashSet<String>,
     allow_partial: bool,
     partial_reporter: Option<&'a crate::config::PartialReadReporter>,
-}
-
-/// Load `_progress.json`, validate it against the current fingerprint and each
-/// entry against the on-disk file size, drop mismatches with a warning, and
-/// return the surviving entries plus a snapshot of completed keys.
-fn load_and_validate_manifest(
-    out_dir: &Path,
-    fingerprint: &str,
-    planned_keys: &HashSet<String>,
-) -> Result<(HashMap<String, MonthEntry>, HashSet<String>)> {
-    let manifest = crate::progress_manifest::load(out_dir);
-    if manifest.fingerprint.as_deref() != Some(fingerprint) && !manifest.months.is_empty() {
-        tracing::warn!(
-            path=%crate::progress_manifest::manifest_path(out_dir).display(),
-            stored=?manifest.fingerprint,
-            current=%fingerprint,
-            "resume manifest fingerprint does not match current query/config; discarding spool parts"
-        );
-        clear_spool_resume_parts(out_dir)?;
-        return Ok((HashMap::new(), HashSet::new()));
-    }
-    let mut keep: HashMap<String, MonthEntry> = HashMap::new();
-    for (k, v) in manifest.months {
-        if !planned_keys.contains(&k) {
-            tracing::info!(key=%k, "dropping progress manifest entry outside current spool plan");
-            continue;
-        }
-        let final_name = format!("part_{}.jsonl", k);
-        let final_path = out_dir.join(&final_name);
-        match fs::metadata(&final_path) {
-            Ok(meta) if meta.len() == v.size => {
-                keep.insert(k, v);
-            }
-            _ => {
-                tracing::info!(key=%k, "dropping stale progress manifest entry; month will be re-run");
-            }
-        }
-    }
-    let completed_keys: HashSet<String> = keep.keys().cloned().collect();
-    Ok((keep, completed_keys))
 }
 
 /// Per-month closure body: skip if the month is already published (resume
@@ -194,16 +132,21 @@ fn commit_entry_to_manifest(acc: &ManifestAccumulator, result: MonthResult) -> R
     acc.commit(result.key, entry)
 }
 
-fn ensure_resume_manifest_durable(
-    accumulator: Option<&ManifestAccumulator>,
-    operation: &str,
-) -> Result<()> {
-    if let Some(error) = accumulator.and_then(ManifestAccumulator::last_save_error) {
+/// Spool-flavored per-entry validation: keep the recorded entry iff the final
+/// `part_<key>.jsonl` file is on disk and its size matches the manifest.
+fn validate_spool_entry(out_dir: &Path, key: &str, entry: MonthEntry) -> Result<MonthEntry> {
+    let final_path = out_dir.join(format!("part_{}.jsonl", key));
+    let meta = fs::metadata(&final_path)
+        .with_context(|| format!("stat spool output {}", final_path.display()))?;
+    if meta.len() != entry.size {
         anyhow::bail!(
-            "{operation} resume progress manifest is not durable; earlier save failed: {error}"
+            "spool output size mismatch for {}: expected {}, got {}",
+            final_path.display(),
+            entry.size,
+            meta.len()
         );
     }
-    Ok(())
+    Ok(entry)
 }
 
 impl ScanPlan {
@@ -240,18 +183,27 @@ impl ScanPlan {
             let resume = plan.etl.opts.resume;
             let resume_fingerprint =
                 build_resume_fingerprint(&plan.etl, &plan.query, "spool", plan.limit, &files)?;
-            // Resume manifest: load on entry, validate each entry against the
-            // current query/config fingerprint and the file actually on disk,
-            // then snapshot surviving keys before any worker mutates the accumulator.
-            let (initial_months, completed_keys) = if resume {
-                load_and_validate_manifest(out_dir, &resume_fingerprint, &planned_keys)?
-            } else {
-                clear_spool_resume_parts(out_dir)?;
-                (HashMap::new(), HashSet::new())
-            };
-            if resume {
-                prune_spool_outputs_except(out_dir, &completed_keys)?;
-            }
+
+            let ResumePrelude {
+                initial_months,
+                completed_keys,
+                accumulator,
+            } = prepare_resume_run(
+                out_dir,
+                &resume_fingerprint,
+                Some(&planned_keys),
+                resume,
+                false,
+                ResumeLogLabels {
+                    fingerprint_mismatch:
+                        "resume manifest fingerprint does not match current query/config; discarding spool parts",
+                    out_of_plan: "dropping progress manifest entry outside current spool plan",
+                    stale_entry: "dropping stale progress manifest entry; month will be re-run",
+                },
+                || clear_spool_resume_parts(out_dir),
+                |keep_keys| prune_spool_outputs_except(out_dir, keep_keys),
+                |key, entry| validate_spool_entry(out_dir, key, entry),
+            )?;
 
             let total_bytes = total_compressed_size(&files);
             let pb = if plan.etl.opts.progress {
@@ -277,23 +229,6 @@ impl ScanPlan {
 
             let resumed_lines = committed_line_count(&initial_months);
             let total_output_lines = AtomicU64::new(resumed_lines);
-
-            // Persist the (pruned) manifest before any work, so a crash mid-
-            // prune cannot resurrect entries we already know are stale.
-            let accumulator = if resume {
-                crate::progress_manifest::save(
-                    out_dir,
-                    &initial_months,
-                    Some(&resume_fingerprint),
-                )?;
-                Some(ManifestAccumulator::new(
-                    out_dir,
-                    initial_months,
-                    Some(resume_fingerprint.clone()),
-                ))
-            } else {
-                None
-            };
 
             let whitelist = plan.etl.opts.whitelist_fields.clone();
             let whitelist_tracker = whitelist.as_ref().map(|fields| {
