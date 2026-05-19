@@ -11,7 +11,12 @@ include!("extract.rs");
 include!("dedupe_keys.rs");
 include!("tabular_format/selector.rs");
 include!("tabular_format/writer.rs");
-include!("tabular.rs");
+include!("tabular/parts.rs");
+include!("tabular/stream.rs");
+include!("tabular/extract.rs");
+include!("tabular/convert.rs");
 include!("analytics.rs");
 include!("usernames.rs");
-include!("tests.rs");
+
+#[cfg(test)]
+mod tests;
