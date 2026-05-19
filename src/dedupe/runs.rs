@@ -1,4 +1,4 @@
-use super::cfg::{DedupeCfg, BYTES_PER_MB};
+use super::cfg::{DedupeCfg, BUILD_RUNS_CHANNEL_CAP, BYTES_PER_MB};
 use super::note_key_extraction_failed;
 use crate::key_extractor::KeyExtractor;
 use crate::mem::{available_memory_fraction, is_low_memory, AdaptiveMemCfg};
@@ -58,7 +58,7 @@ pub(crate) fn build_runs_sorted_with_key_stats(
         usize::MAX
     };
 
-    let (tx, rx) = crossbeam_channel::bounded::<(usize, RunMap)>(1);
+    let (tx, rx) = crossbeam_channel::bounded::<(usize, RunMap)>(BUILD_RUNS_CHANNEL_CAP);
 
     let runs_dir_buf = runs_dir.to_path_buf();
     let write_buf_bytes = cfg.write_buf_bytes;
