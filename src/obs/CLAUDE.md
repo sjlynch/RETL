@@ -10,6 +10,10 @@ schema reference.
 - `mod.rs` — re-exports the public surface (`MonitorHandle`,
   `MonitorOptions`, `Event`, `EventKind`, `LifecycleEvent`,
   `StatusSnapshot`, `LogFormat`, `install_monitor`).
+- `options.rs` — `LogFormat`, `MonitorOptions`, and `build_options_echo`.
+  The configuration surface for `install_monitor`; kept separate from
+  `handle.rs` so the runtime wiring and the option set can be read and
+  extended independently.
 - `events.rs` — `Event`, `EventKind`, `LifecycleEvent`, `now_rfc3339`,
   schema string constants. Schema is versioned (`retl.v1` / `retl.status.v1`).
 - `sink.rs` — `EventSink` trait, `JsonlSink` (file-backed, mutex-guarded,

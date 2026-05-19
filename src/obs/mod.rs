@@ -19,13 +19,15 @@
 
 mod events;
 mod handle;
+mod options;
 mod sink;
 mod status;
 mod tracing_layer;
 mod watchdog;
 
 pub use events::{Event, EventKind, LifecycleEvent};
-pub use handle::{install_monitor, LogFormat, MonitorHandle, MonitorOptions};
+pub use handle::{install_monitor, MonitorHandle};
+pub use options::{LogFormat, MonitorOptions};
 pub use status::StatusSnapshot;
 
 #[allow(unused_imports)]
