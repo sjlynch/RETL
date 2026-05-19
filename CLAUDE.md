@@ -214,7 +214,7 @@ harness — production builds (`--no-default-features` or just no
 - `src/streaming.rs` — `stream_job` (per-file scan/write hot loop).
 - `src/zstd_jsonl.rs` — `MinimalRecord`, `parse_minimal`,
   `for_each_line_cfg`, `window_log_max(31)`.
-- `src/filters.rs` — `matches_minimal` / `matches_full` / `within_bounds`.
+- `src/filters/` — split predicate helpers: minimal fast-path filters, full JSON-pointer predicates, text/URL matching, subreddit targets, and date bounds.
 - `src/dedupe.rs` — bounded-channel backpressure, sorted-run dedupe.
 - `src/key_extractor.rs` — `KeyExtractor::key_from_line`: `MinimalRecord` fast path for author/subreddit keys, `Value` slow path for pointer/custom keys.
 - `src/atomic_write.rs` — staging + atomic publish helpers.
