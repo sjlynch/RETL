@@ -73,7 +73,7 @@
 //!      used by stitch and dedupe.
 //!
 //! 5. **Reduce**
-//!    - `bucketize_shard` / [`process_bucket_streaming`] / [`partition_stage1`]
+//!    - [`bucketize_shards`] / [`process_bucket_streaming`] / [`partition_stage1`]
 //!      perform the bucketing stage that feeds dedupe.
 //!    - [`build_runs_sorted`] / [`merge_runs_sorted`] (driven by
 //!      [`DedupeCfg`] + [`KeyExtractor`]) produce sorted, de-duplicated runs.
