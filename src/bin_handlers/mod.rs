@@ -3,7 +3,9 @@
 
 include!("common.rs");
 include!("cli_manifest.rs");
-include!("corpus.rs");
+include!("corpus/mod.rs");
+include!("corpus/plan.rs");
+include!("corpus/manifest.rs");
 include!("describe.rs");
 include!("quickstart.rs");
 include!("schema.rs");
