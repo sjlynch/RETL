@@ -3,7 +3,9 @@
 
 include!("common.rs");
 include!("cli_manifest.rs");
-include!("corpus.rs");
+include!("corpus/mod.rs");
+include!("corpus/plan.rs");
+include!("corpus/manifest.rs");
 include!("describe.rs");
 include!("quickstart.rs");
 include!("schema.rs");
@@ -18,4 +20,6 @@ include!("aggregate.rs");
 include!("first_seen.rs");
 include!("parents_helpers.rs");
 include!("parents.rs");
-include!("tests.rs");
+
+#[cfg(test)]
+mod tests;

@@ -7,5 +7,7 @@ include!("resolver.rs");
 include!("attach.rs");
 include!("fingerprint/mod.rs");
 include!("resolver_tail.rs");
-include!("impls.rs");
+include!("resolve.rs");
+include!("direct.rs");
+include!("attach_pipeline.rs");
 include!("tests.rs");

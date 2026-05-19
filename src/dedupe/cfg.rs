@@ -3,6 +3,18 @@ use crate::mem::AdaptiveMemCfg;
 
 pub(crate) const BYTES_PER_MB: usize = 1024 * 1024;
 
+/// Capacity of the bounded crossbeam channel between the line-reader producer
+/// and the run-writer consumer in `runs::build_runs_sorted`.
+///
+/// **Do not change this without re-deriving the inflight-bytes budget.**
+/// The declared `inflight_bytes` contract assumes peak in-memory footprint of
+/// `(1 + BUILD_RUNS_CHANNEL_CAP) * per_flush_cap = 2 * per_flush_cap = inflight_bytes`
+/// (one map being filled by the producer + one map awaiting disk write in the
+/// channel). Raising this constant raises the peak proportionally and breaks
+/// the budget guarantee documented in the top-level CLAUDE.md backpressure
+/// section. It is **not** a tunable.
+pub(crate) const BUILD_RUNS_CHANNEL_CAP: usize = 1;
+
 /// Configuration for the generic dedupe engine.
 #[derive(Clone, Debug)]
 pub struct DedupeCfg {
