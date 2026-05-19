@@ -17,7 +17,7 @@ demonstrates the library API.
    `_progress.json`.
 3. **parents** — `ParentIds` collects referenced parent IDs, then
    `ParentMaps` resolves and stitches parent payloads back onto records.
-4. **aggregate** — `bucketize_shard` → `build_runs_sorted` →
+4. **aggregate** — `bucketize_shards` → `build_runs_sorted` →
    `merge_runs_sorted` → `Aggregator` produces sorted, de-duplicated rollups.
 
 `RedditETL` (in `src/pipeline.rs`) is the builder that configures everything;
@@ -78,7 +78,7 @@ channel between them. The channel capacity differs by stage:
 
 - **Dedupe** (`src/dedupe.rs::build_runs_sorted`): channel capacity is hard-
   coded to **1**. Worst-case peak ≈ `2 * per_flush_cap = inflight_bytes`.
-- **Bucketing** (`src/bucketing.rs::process_bucket_streaming`): channel
+- **Bucketing** (`src/bucketing/micro.rs::process_bucket_streaming`): channel
   capacity is `inflight_groups` (default 8). Worst-case peak ≈
   `(1 + inflight_groups) * (inflight_bytes / 2)`. With the defaults this is
   ≈ 1.125 GiB, **not** 256 MiB. The two knobs are **not** independent — use
@@ -214,13 +214,15 @@ harness — production builds (`--no-default-features` or just no
 - `src/streaming.rs` — `stream_job` (per-file scan/write hot loop).
 - `src/zstd_jsonl.rs` — `MinimalRecord`, `parse_minimal`,
   `for_each_line_cfg`, `window_log_max(31)`.
-- `src/filters.rs` — `matches_minimal` / `matches_full` / `within_bounds`.
-- `src/dedupe.rs` — bounded-channel backpressure, sorted-run dedupe.
+- `src/filters/` — split predicate helpers: minimal fast-path filters, full JSON-pointer predicates, text/URL matching, subreddit targets, and date bounds.
+- `src/dedupe/` — bounded-channel backpressure, sorted-run dedupe.
+- `src/bucketing/` — disk shard routing, seed policy, and adaptive micro-bucket backpressure.
 - `src/key_extractor.rs` — `KeyExtractor::key_from_line`: `MinimalRecord` fast path for author/subreddit keys, `Value` slow path for pointer/custom keys.
-- `src/atomic_write.rs` — staging + atomic publish helpers.
+- `src/atomic_write/` — staging-name contract, stale sweeps, and atomic publish helpers (see `src/atomic_write/CLAUDE.md`).
 - `src/progress_manifest.rs` — resume sidecar.
 - `src/util/` — split by concern (see `src/util/CLAUDE.md`):
-  `backoff.rs` for `*_with_backoff` I/O retries + `replace_file_atomic_backoff`,
+  `backoff/` for retry policy, `*_with_backoff` I/O wrappers, and
+  `replace_file_atomic_backoff`,
   `exclusions.rs` for `default_bot_authors` / `try_merge_extra_exclusions`,
   `scratch.rs` for `unique_scratch_dir`, `thread_pool.rs` for `with_thread_pool`,
   `tracing.rs` for `init_tracing_for_binary`. `mod.rs` re-exports everything so
