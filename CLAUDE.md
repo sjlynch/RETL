@@ -217,7 +217,7 @@ harness — production builds (`--no-default-features` or just no
 - `src/filters.rs` — `matches_minimal` / `matches_full` / `within_bounds`.
 - `src/dedupe.rs` — bounded-channel backpressure, sorted-run dedupe.
 - `src/key_extractor.rs` — `KeyExtractor::key_from_line`: `MinimalRecord` fast path for author/subreddit keys, `Value` slow path for pointer/custom keys.
-- `src/atomic_write.rs` — staging + atomic publish helpers.
+- `src/atomic_write/` — staging-name contract, stale sweeps, and atomic publish helpers (see `src/atomic_write/CLAUDE.md`).
 - `src/progress_manifest.rs` — resume sidecar.
 - `src/util/` — split by concern (see `src/util/CLAUDE.md`):
   `backoff.rs` for `*_with_backoff` I/O retries + `replace_file_atomic_backoff`,
