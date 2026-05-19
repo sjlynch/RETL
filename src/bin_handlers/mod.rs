@@ -20,4 +20,6 @@ include!("aggregate.rs");
 include!("first_seen.rs");
 include!("parents_helpers.rs");
 include!("parents.rs");
-include!("tests.rs");
+
+#[cfg(test)]
+mod tests;
