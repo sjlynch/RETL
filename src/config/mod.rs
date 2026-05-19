@@ -1,5 +1,9 @@
 include!("limits.rs");
 include!("sources.rs");
 include!("partial_read.rs");
-include!("options.rs");
+include!("options/types.rs");
+include!("options/defaults.rs");
+include!("options/builders_core.rs");
+include!("options/builders_output.rs");
+include!("options/inflight.rs");
 include!("tests.rs");

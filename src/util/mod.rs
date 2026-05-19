@@ -4,8 +4,8 @@
 //! stable across the split.
 //!
 //! Submodule map:
-//! - [`backoff`] — Windows-friendly `*_with_backoff` I/O retries and
-//!   `replace_file_atomic_backoff`.
+//! - [`backoff`] — Windows-friendly retry policy, `*_with_backoff` I/O
+//!   wrappers, and `replace_file_atomic_backoff`.
 //! - [`exclusions`] — default bot author list and env/file merging.
 //! - [`scratch`] — process-unique scratch directory naming.
 //! - [`thread_pool`] — `with_thread_pool` scoped Rayon helper.
@@ -38,13 +38,12 @@ pub(crate) use backoff::create_dir_with_default_backoff;
 #[cfg(test)]
 #[allow(unused_imports)]
 pub(crate) use backoff::TestIoFailureGuard;
-#[cfg(test)]
-pub(crate) use backoff::{
-    inject_retriable_io_errors_for_file_name_tests, inject_retriable_io_errors_for_tests,
-    TestIoOp,
-};
 #[cfg(any(test, feature = "test-utils"))]
 pub use backoff::{cap_backoff_budget_for_test, TestBackoffBudgetGuard};
+#[cfg(test)]
+pub(crate) use backoff::{
+    inject_retriable_io_errors_for_file_name_tests, inject_retriable_io_errors_for_tests, TestIoOp,
+};
 
 pub use exclusions::default_bot_authors;
 pub(crate) use exclusions::try_merge_extra_exclusions;
