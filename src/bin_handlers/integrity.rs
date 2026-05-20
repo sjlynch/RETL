@@ -33,7 +33,7 @@ pub(crate) fn run_integrity(args: IntegrityArgs) -> Result<()> {
             );
         }
     }
-    let bad = if args.collect {
+    let report = if args.collect {
         etl.check_corpus_integrity(mode)?
     } else {
         let print_lock = std::sync::Mutex::new(());
@@ -46,13 +46,25 @@ pub(crate) fn run_integrity(args: IntegrityArgs) -> Result<()> {
             Ok(())
         })?
     };
-    if bad.is_empty() {
+    if report.is_ok() {
         eprintln!("OK: no corruption detected.");
     } else {
-        eprintln!("FAILED: {} file(s) failed integrity check:", bad.len());
+        eprintln!(
+            "FAILED: {} file(s) failed integrity check:",
+            report.failure_count()
+        );
         if args.collect {
-            for (p, e) in &bad {
+            for (p, e) in &report.failures {
                 println!("{}\t{}", p.display(), e);
+            }
+            // The retained list is capped to bound memory on all-corrupt
+            // corpora; the streaming (non-collect) path already printed
+            // every failure as it happened, so this only applies here.
+            if report.dropped > 0 {
+                eprintln!(
+                    "... and {} more failure(s) not listed (retained list capped at {})",
+                    report.dropped, MAX_RETAINED_FAILURES
+                );
             }
         }
         std::process::exit(2);

@@ -9,6 +9,7 @@ use retl::{
     CorpusSnapshot, ExportFormat, FileIdentity, FileKind, IntegrityMode, KeyExtractor,
     ManifestDestination, ParentIds, ParentPayloadSpec, RedditETL, RunManifestInput,
     RunManifestStart, Sources, TabularExportOptions, YearMonth, DEFAULT_MAX_LINE_BYTES,
+    MAX_RETAINED_FAILURES,
 };
 use serde::Serialize;
 use serde_json::Value;

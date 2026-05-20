@@ -17,11 +17,36 @@ const ZSTD_WINDOW_LOG_MAX: u32 = 31;
 const ZERO_SAMPLE_BYTES_ERROR: &str =
     "--sample-bytes must be > 0; use --mode full for complete validation";
 
+/// Whether a [`quick_validate_zst`] sample covered the whole file or only a
+/// decompressed prefix.
+///
+/// Quick mode caps decode at `max_decompressed_bytes`. When a file's
+/// decompressed size is *smaller* than that budget the cap is never hit, the
+/// decode reaches EOF, and the trailing zstd checksum is verified — so quick
+/// mode on a small file is equivalent to a full check. `QuickOutcome` lets a
+/// caller tell that case apart from a genuine prefix-only sample.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuickOutcome {
+    /// The decompressed stream reached EOF before the sample budget was
+    /// exhausted. The entire frame — including its trailing checksum — was
+    /// decoded, so this is equivalent to a [`validate_zst_full`] check.
+    FullyDecoded,
+    /// The sample budget was exhausted before EOF; only a decompressed prefix
+    /// was validated. Corruption past the sampled prefix (including a bad
+    /// trailing checksum) is *not* detected — use [`validate_zst_full`] for
+    /// that.
+    PrefixOnly,
+}
+
 /// QUICK check: attempt to decode up to `max_decompressed_bytes` and stop.
 ///
-/// `max_decompressed_bytes` must be positive. Use [`validate_zst_full`] when
-/// you need to validate the complete frame payload and trailer/checksum.
-pub fn quick_validate_zst(path: &Path, max_decompressed_bytes: u64) -> Result<()> {
+/// `max_decompressed_bytes` must be positive. The returned [`QuickOutcome`]
+/// reports whether the sample covered the whole file ([`QuickOutcome::FullyDecoded`])
+/// or only a prefix ([`QuickOutcome::PrefixOnly`]): a file whose decompressed
+/// size is at or below `max_decompressed_bytes` is decoded to EOF and is
+/// therefore validated as thoroughly as [`validate_zst_full`] would. Use
+/// [`validate_zst_full`] directly when you need that guarantee unconditionally.
+pub fn quick_validate_zst(path: &Path, max_decompressed_bytes: u64) -> Result<QuickOutcome> {
     if max_decompressed_bytes == 0 {
         anyhow::bail!(ZERO_SAMPLE_BYTES_ERROR);
     }
@@ -30,8 +55,22 @@ pub fn quick_validate_zst(path: &Path, max_decompressed_bytes: u64) -> Result<()
     let mut decoder = Decoder::new(file)?;
     decoder.window_log_max(ZSTD_WINDOW_LOG_MAX)?;
     let mut limited = decoder.take(max_decompressed_bytes);
-    io::copy(&mut limited, &mut io::sink())?;
-    Ok(())
+    let decoded = io::copy(&mut limited, &mut io::sink())?;
+    if decoded < max_decompressed_bytes {
+        // The decompressed stream hit EOF before the sample budget — the
+        // whole frame (and its trailing checksum) was decoded and verified.
+        return Ok(QuickOutcome::FullyDecoded);
+    }
+    // The sample budget was exhausted. Probe one more byte to distinguish a
+    // file whose decompressed size is *exactly* the budget (fully decoded,
+    // checksum verified by the EOF read) from one that still has data — and
+    // therefore unverified trailing content — past the sampled prefix.
+    let mut decoder = limited.into_inner();
+    if decoder.read(&mut [0u8; 1])? == 0 {
+        Ok(QuickOutcome::FullyDecoded)
+    } else {
+        Ok(QuickOutcome::PrefixOnly)
+    }
 }
 
 /// FULL check: decode the entire stream to EOF.
@@ -73,8 +112,56 @@ fn validate_integrity_mode(mode: IntegrityMode) -> Result<()> {
 
 fn validate_integrity_job(job: &FileJob, mode: IntegrityMode) -> Result<()> {
     match mode {
-        IntegrityMode::Quick { sample_bytes } => quick_validate_zst(&job.path, sample_bytes),
+        // Quick mode's prefix-vs-full distinction is surfaced by
+        // [`quick_validate_zst`] for direct callers; the corpus runner only
+        // cares whether the file decoded without error.
+        IntegrityMode::Quick { sample_bytes } => {
+            quick_validate_zst(&job.path, sample_bytes).map(|_| ())
+        }
         IntegrityMode::Full => validate_zst_full(&job.path),
+    }
+}
+
+/// Upper bound on `(path, error)` pairs retained by a corpus integrity run.
+///
+/// On a corpus where many or all files are corrupt — a wrong volume, a
+/// wrong-format directory — retaining one error string per file (each
+/// carrying a long zstd/anyhow cause chain) would grow memory without bound.
+/// The runner therefore keeps at most this many failures in
+/// [`IntegrityReport::failures`]; failures beyond the cap are still delivered
+/// to the failure sink as they happen and counted in
+/// [`IntegrityReport::failure_count`], but are not held in memory.
+pub const MAX_RETAINED_FAILURES: usize = 1024;
+
+/// Outcome of a corpus integrity run.
+///
+/// `failures` is **capped** at [`MAX_RETAINED_FAILURES`] entries so a run over
+/// an all-corrupt corpus does not accumulate an unbounded list of error
+/// strings; `dropped` counts failures observed past that cap. Always use
+/// [`failure_count`](Self::failure_count) — not `failures.len()` — for the
+/// true number of bad files. When a streaming failure sink is supplied to
+/// [`RedditETL::check_corpus_integrity_with_failure_sink`], every failure
+/// (including dropped ones) is still reported through that sink as it occurs.
+#[derive(Debug, Default, Clone)]
+pub struct IntegrityReport {
+    /// `(path, error_message)` for failed files in completion order, capped at
+    /// [`MAX_RETAINED_FAILURES`] entries.
+    pub failures: Vec<(PathBuf, String)>,
+    /// Failures observed beyond [`MAX_RETAINED_FAILURES`] and dropped from
+    /// `failures` to keep memory bounded. `0` when nothing was dropped.
+    pub dropped: usize,
+}
+
+impl IntegrityReport {
+    /// Total number of files that failed the integrity check, including any
+    /// dropped from the retained `failures` list.
+    pub fn failure_count(&self) -> usize {
+        self.failures.len() + self.dropped
+    }
+
+    /// `true` when every checked file passed the integrity check.
+    pub fn is_ok(&self) -> bool {
+        self.failure_count() == 0
     }
 }
 
@@ -86,7 +173,7 @@ fn run_integrity_checks<F, V>(
     progress: bool,
     on_failure: &F,
     validate_job: &V,
-) -> Result<Vec<(PathBuf, String)>>
+) -> Result<IntegrityReport>
 where
     F: Fn(&Path, &str) -> Result<()> + Send + Sync,
     V: Fn(&FileJob, IntegrityMode) -> Result<()> + Send + Sync,
@@ -103,29 +190,36 @@ where
         None
     };
 
-    let errors = Mutex::new(Vec::<(PathBuf, String)>::new());
-    let failed_so_far = AtomicUsize::new(0);
+    // `failures` is capped at MAX_RETAINED_FAILURES to keep memory bounded on
+    // all-corrupt corpora; `total_failures` counts every failure regardless of
+    // the cap so the heartbeat and the returned `failure_count` stay accurate.
+    let failures = Mutex::new(Vec::<(PathBuf, String)>::new());
+    let total_failures = AtomicUsize::new(0);
     let heartbeat_reported = AtomicUsize::new(0);
 
     let fanout = with_thread_pool(parallelism, || {
         for_each_file_limited(files, file_concurrency, |job| -> Result<()> {
             let res = validate_job(job, mode);
             if let Err(e) = res {
-                let path = job.path.clone();
+                let path = &job.path;
                 let err = e.to_string();
+                total_failures.fetch_add(1, Ordering::Relaxed);
                 {
-                    let mut guard = errors.lock().unwrap();
-                    guard.push((path.clone(), err.clone()));
-                    failed_so_far.store(guard.len(), Ordering::Relaxed);
+                    let mut guard = failures.lock().unwrap();
+                    if guard.len() < MAX_RETAINED_FAILURES {
+                        guard.push((path.clone(), err.clone()));
+                    }
                 }
-                on_failure(&path, &err).with_context(|| {
+                // The sink observes *every* failure, even those past the
+                // retention cap, so a long all-corrupt run still streams.
+                on_failure(path, &err).with_context(|| {
                     format!("streaming integrity failure for {}", path.display())
                 })?;
             }
 
             if let Some(pb) = &pb {
                 pb.inc(1);
-                let n = failed_so_far.load(Ordering::Relaxed);
+                let n = total_failures.load(Ordering::Relaxed);
                 let mut last = heartbeat_reported.load(Ordering::Relaxed);
                 while n > last {
                     match heartbeat_reported.compare_exchange(
@@ -154,13 +248,17 @@ where
     }
     fanout?;
 
-    Ok(errors.into_inner().unwrap())
+    let failures = failures.into_inner().unwrap();
+    let dropped = total_failures
+        .load(Ordering::Relaxed)
+        .saturating_sub(failures.len());
+    Ok(IntegrityReport { failures, dropped })
 }
 
 impl RedditETL {
     /// Check all monthly `.zst` files (RC/RS depending on `sources`) within the date range
-    /// configured on this `RedditETL` instance. Returns a materialized list of
-    /// `(path, error_message)` for files that failed the selected integrity check.
+    /// configured on this `RedditETL` instance. Returns an [`IntegrityReport`]
+    /// describing the files that failed the selected integrity check.
     ///
     /// - Set `.sources()` (Comments / Submissions / Both) and `.date_range()` on the builder
     ///   before calling this.
@@ -171,10 +269,13 @@ impl RedditETL {
     /// - Parallelism is controlled by `.parallelism(n)`, while `.file_concurrency(n)`
     ///   bounds the number of zstd decoders in flight.
     ///
-    /// This convenience method only returns failures after the run completes. Use
+    /// The report's `failures` list is capped at [`MAX_RETAINED_FAILURES`] so an
+    /// all-corrupt corpus cannot grow memory without bound; consult
+    /// [`IntegrityReport::failure_count`] for the true total. This convenience
+    /// method only returns failures after the run completes — use
     /// [`RedditETL::check_corpus_integrity_with_failure_sink`] to observe failures
-    /// incrementally while still receiving the final collected list.
-    pub fn check_corpus_integrity(self, mode: IntegrityMode) -> Result<Vec<(PathBuf, String)>> {
+    /// incrementally.
+    pub fn check_corpus_integrity(self, mode: IntegrityMode) -> Result<IntegrityReport> {
         self.check_corpus_integrity_with_failure_sink(mode, |_path, _err| Ok(()))
     }
 
@@ -182,13 +283,20 @@ impl RedditETL {
     ///
     /// The callback may be invoked concurrently when `.file_concurrency(n) > 1`, so
     /// callers that write to stdout/stderr or an output file should synchronize and
-    /// flush inside the callback. The returned `Vec` still materializes the full
-    /// failure list for compatibility with existing library callers.
+    /// flush inside the callback.
+    ///
+    /// `on_failure` observes **every** failure as it happens — that is the point
+    /// of the streaming API. The returned [`IntegrityReport`], by contrast,
+    /// retains at most [`MAX_RETAINED_FAILURES`] `(path, error)` pairs and counts
+    /// the rest in [`IntegrityReport::dropped`]: on a corpus where every file is
+    /// corrupt this keeps the run's memory bounded instead of accumulating one
+    /// long zstd/anyhow error string per file. A caller that needs every failure
+    /// detail should record it from the sink rather than from the returned list.
     pub fn check_corpus_integrity_with_failure_sink<F>(
         self,
         mode: IntegrityMode,
         on_failure: F,
-    ) -> Result<Vec<(PathBuf, String)>>
+    ) -> Result<IntegrityReport>
     where
         F: Fn(&Path, &str) -> Result<()> + Send + Sync,
     {
@@ -328,7 +436,43 @@ mod tests {
         );
 
         release_slow_job.store(true, Ordering::Release);
-        let bad = handle.join().unwrap().unwrap();
-        assert_eq!(bad.len(), 1);
+        let report = handle.join().unwrap().unwrap();
+        assert_eq!(report.failure_count(), 1);
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.dropped, 0);
+    }
+
+    /// Streaming mode must not retain one error string per file on an
+    /// all-corrupt corpus: the retained list is capped at
+    /// `MAX_RETAINED_FAILURES` while the sink still observes every failure and
+    /// `failure_count()` still reports the true total. This is the memory
+    /// guard from the integrity capability-gap fix.
+    #[test]
+    fn streaming_failure_sink_caps_retained_list_on_all_corrupt_corpus() {
+        let file_count = MAX_RETAINED_FAILURES * 3;
+        let jobs = fake_jobs(file_count);
+        let streamed = AtomicUsize::new(0);
+
+        let report = run_integrity_checks(
+            &jobs,
+            IntegrityMode::Full,
+            4,
+            Some(4),
+            false,
+            &|_path, _err| {
+                streamed.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            },
+            &|_job, _mode| Err(anyhow!("every file is corrupt")),
+        )
+        .unwrap();
+
+        // The sink saw every failure...
+        assert_eq!(streamed.load(Ordering::Relaxed), file_count);
+        // ...and so does the reported total...
+        assert_eq!(report.failure_count(), file_count);
+        // ...but the retained list stays bounded regardless of file count.
+        assert_eq!(report.failures.len(), MAX_RETAINED_FAILURES);
+        assert_eq!(report.dropped, file_count - MAX_RETAINED_FAILURES);
     }
 }

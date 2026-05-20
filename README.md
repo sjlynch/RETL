@@ -572,11 +572,17 @@ provide SHA-256 values.
 Quick mode validates only the first `--sample-bytes` decompressed bytes of each
 file. `--sample-bytes` must be positive (default: 65536); very small samples
 (for example, below 4096 bytes) only cover a tiny prefix and emit a warning. Use
-`--mode full` for complete payload/trailer validation.
+`--mode full` for complete payload/trailer validation. A file whose
+*decompressed* size is at or below `--sample-bytes` is decoded all the way to
+EOF, so quick mode on such a small month is equivalent to a full check
+(trailing checksum included).
 
 Bad files print one `path<TAB>error` line per failure on stdout as soon as
 they are discovered, and the process exits with status `2`. Pass `--collect`
-to buffer the failure list and print it only after all files finish.
+to buffer the failure list and print it only after all files finish. The
+buffered list is capped (failures past the cap are still counted in the
+`FAILED: N file(s)` total and printed with a `... and N more` line); the
+streaming default already prints every failure as it happens.
 
 ### `aggregate` — fold JSONL inputs into JSON or TSV rollups
 
@@ -1029,9 +1035,12 @@ let bad_full = RedditETL::new()
     .progress(false)
     .check_corpus_integrity(IntegrityMode::Full)?;
 
-// The return value materializes the full failure list. For long runs, stream
-// failures incrementally while still receiving the final Vec:
-let bad_streamed = RedditETL::new()
+// Both calls return an `IntegrityReport`: `report.failure_count()` is the true
+// number of bad files, while `report.failures` is capped at
+// `retl::MAX_RETAINED_FAILURES` to keep memory bounded on all-corrupt corpora
+// (`report.dropped` counts the rest). For long runs, stream every failure
+// incrementally — the sink sees them all, even past the retention cap:
+let report = RedditETL::new()
     .base_dir("./data")
     .sources(Sources::Comments)
     .date_range(Some(YearMonth::new(2006, 2)), Some(YearMonth::new(2006, 2)))

@@ -63,11 +63,11 @@ fn real_corpus_quick_integrity_check_passes_for_one_month() {
         .expect("integrity check returned a hard error");
 
     assert!(
-        errors.is_empty(),
+        errors.is_ok(),
         "quick integrity check on real {} reported {} bad files; first: {:?}",
         ym,
-        errors.len(),
-        errors.first()
+        errors.failure_count(),
+        errors.failures.first()
     );
 }
 
