@@ -51,6 +51,19 @@ pub(crate) struct GroupMetricAgg {
     group_by: Option<GroupBySpec>,
     metric: MetricSpec,
     groups: BTreeMap<String, MetricState>,
+    /// Records passed to [`Aggregator::ingest`] with real `group_by`
+    /// metadata. The empty default identity state (its merge seed) is
+    /// never ingested into, so it never contributes here.
+    #[serde(default)]
+    records_ingested: u64,
+    /// Records dropped because the `--by` field was missing or null. A
+    /// non-zero count usually means a mistyped `--by` pointer/field.
+    #[serde(default)]
+    records_skipped_no_group_key: u64,
+    /// Records dropped because the `--metric` pointer was missing or its
+    /// value was not numeric. Always zero for the `count` metric.
+    #[serde(default)]
+    records_skipped_no_metric_value: u64,
 }
 
 impl GroupMetricAgg {
@@ -59,7 +72,25 @@ impl GroupMetricAgg {
             group_by: Some(group_by),
             metric,
             groups: BTreeMap::new(),
+            records_ingested: 0,
+            records_skipped_no_group_key: 0,
+            records_skipped_no_metric_value: 0,
         }
+    }
+
+    /// Records seen by [`Aggregator::ingest`] across every merged shard.
+    pub(crate) fn records_ingested(&self) -> u64 {
+        self.records_ingested
+    }
+
+    /// Records dropped for a missing/null `--by` group key.
+    pub(crate) fn records_skipped_no_group_key(&self) -> u64 {
+        self.records_skipped_no_group_key
+    }
+
+    /// Records dropped for a missing or non-numeric `--metric` value.
+    pub(crate) fn records_skipped_no_metric_value(&self) -> u64 {
+        self.records_skipped_no_metric_value
     }
 
     pub(crate) fn rows(&self, top: Option<usize>) -> Vec<(String, String)> {
@@ -120,7 +151,11 @@ impl Aggregator for GroupMetricAgg {
         let Some(group_by) = &self.group_by else {
             return;
         };
+        self.records_ingested += 1;
         let Some(key) = group_by.key_for(record) else {
+            // No `--by` value: count the drop so a mistyped field doesn't
+            // silently yield an all-zero rollup with no diagnostics.
+            self.records_skipped_no_group_key += 1;
             return;
         };
 
@@ -133,6 +168,9 @@ impl Aggregator for GroupMetricAgg {
             return;
         };
         let Some(n) = record.pointer(pointer).and_then(value_to_metric_number) else {
+            // The `--metric` pointer was missing or non-numeric for this
+            // record; count the drop rather than silently ignoring it.
+            self.records_skipped_no_metric_value += 1;
             return;
         };
         self.groups.entry(key).or_default().ingest_number(n);
@@ -155,6 +193,9 @@ impl Aggregator for GroupMetricAgg {
         for (key, state) in other.groups {
             self.groups.entry(key).or_default().merge(state);
         }
+        self.records_ingested += other.records_ingested;
+        self.records_skipped_no_group_key += other.records_skipped_no_group_key;
+        self.records_skipped_no_metric_value += other.records_skipped_no_metric_value;
     }
 }
 
@@ -235,5 +276,44 @@ mod tests_group {
 
     fn string_to_month(s: &str) -> Option<String> {
         value_to_month(&Value::String(s.to_string()))
+    }
+
+    #[test]
+    fn group_metric_counts_records_missing_group_key() {
+        let mut agg = GroupMetricAgg::new(
+            GroupBySpec::JsonPointer("/sub".to_string()),
+            MetricSpec::default(),
+        );
+        agg.ingest(&serde_json::json!({"sub": "rust"}));
+        agg.ingest(&serde_json::json!({"other": "x"}));
+        agg.ingest(&serde_json::json!({"sub": null}));
+        assert_eq!(agg.records_ingested(), 3);
+        assert_eq!(agg.records_skipped_no_group_key(), 2);
+        assert_eq!(agg.records_skipped_no_metric_value(), 0);
+    }
+
+    #[test]
+    fn group_metric_counts_records_missing_metric_value() {
+        let metric = MetricSpec::parse(Some("sum:/score")).unwrap();
+        let mut agg = GroupMetricAgg::new(GroupBySpec::Subreddit, metric);
+        agg.ingest(&serde_json::json!({"subreddit": "rust", "score": 5}));
+        agg.ingest(&serde_json::json!({"subreddit": "rust"}));
+        agg.ingest(&serde_json::json!({"subreddit": "rust", "score": "not-a-number"}));
+        assert_eq!(agg.records_ingested(), 3);
+        assert_eq!(agg.records_skipped_no_group_key(), 0);
+        assert_eq!(agg.records_skipped_no_metric_value(), 2);
+    }
+
+    #[test]
+    fn group_metric_merge_sums_skip_counters() {
+        let metric = MetricSpec::parse(Some("sum:/score")).unwrap();
+        let mut left = GroupMetricAgg::new(GroupBySpec::Subreddit, metric.clone());
+        left.ingest(&serde_json::json!({"other": "x"}));
+        let mut right = GroupMetricAgg::new(GroupBySpec::Subreddit, metric);
+        right.ingest(&serde_json::json!({"subreddit": "rust"}));
+        left.merge(right);
+        assert_eq!(left.records_ingested(), 2);
+        assert_eq!(left.records_skipped_no_group_key(), 1);
+        assert_eq!(left.records_skipped_no_metric_value(), 1);
     }
 }

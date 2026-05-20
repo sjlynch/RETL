@@ -13,6 +13,11 @@ pub fn process_file_for_usernames_with_skip(
     partial_reporter: Option<&crate::config::PartialReadReporter>,
     mut on_skip: impl FnMut(&std::path::Path, &anyhow::Error),
 ) -> Result<()> {
+    // Normalize the subreddit the same way the canonical `QuerySpec` path does
+    // (trim, lowercase, strip a leading `r/`). `matches_subreddit_basic`
+    // compares case-insensitively but does *not* strip `r/`, so without this
+    // an `r/foo` argument would silently match nothing.
+    let subreddit = crate::query::normalize_str(subreddit);
     let mut line_number: u64 = 0;
     let mut handle_line = |line: &str| -> Result<()> {
         line_number += 1;
@@ -23,12 +28,17 @@ pub fn process_file_for_usernames_with_skip(
                 Err(e) => return Err(malformed_json_error(&job.path, line_number, e)),
             },
         };
-        if !matches_subreddit_basic(&min, subreddit) {
+        if !matches_subreddit_basic(&min, &subreddit) {
             return Ok(());
         }
         if let Some(author) = min.author.as_deref() {
             let a = author.trim();
-            if a.is_empty() || a == "[deleted]" || a == "[removed]" {
+            // Match the canonical pseudo-user check (`matches_minimal`):
+            // `[deleted]`/`[removed]` are case-insensitive sentinels.
+            if a.is_empty()
+                || a.eq_ignore_ascii_case("[deleted]")
+                || a.eq_ignore_ascii_case("[removed]")
+            {
                 return Ok(());
             }
             shard_writer.write(a)?;

@@ -136,7 +136,7 @@ impl RedditETL {
         let staging_dir = ensure_staging_dir(&run_dir)?;
         let shard_paths = shard_names_for_inputs(&run_dir, &run_token, &inputs);
 
-        with_thread_pool(self.opts.parallelism, || {
+        let outcome = with_thread_pool(self.opts.parallelism, || {
             let BuildOutcome { shards, report } = build_aggregate_shards_with::<A, F>(
                 &inputs,
                 &shard_paths,
@@ -160,6 +160,24 @@ impl RedditETL {
             }
 
             Ok((total, report))
-        })
+        });
+
+        // The per-run shard directory is pure scratch: every shard has been
+        // folded into `total`. Aggregate historically never removed it, so
+        // each `retl aggregate` run permanently accreted a `run_*` directory
+        // of shard JSON under `shards_dir` (hundreds of MB over a 12-year
+        // spool). Remove it best-effort after a successful merge; a failed
+        // merge leaves it behind for post-mortem inspection.
+        if outcome.is_ok() {
+            if let Err(e) = crate::util::remove_dir_all_with_short_backoff(&run_dir) {
+                tracing::warn!(
+                    run_dir = %run_dir.display(),
+                    error = %e,
+                    "failed to remove aggregate per-run shard directory; scratch shards left behind"
+                );
+            }
+        }
+
+        outcome
     }
 }

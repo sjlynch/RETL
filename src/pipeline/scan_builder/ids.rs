@@ -42,6 +42,10 @@ impl ScanPlan {
     /// source constraint, so `t1_abc123` will not accidentally match a
     /// submission with the same bare ID. Duplicate or blank IDs are rejected by
     /// [`ScanPlan::build`].
+    ///
+    /// Repeated calls **accumulate** selectors (like the other list-builders,
+    /// e.g. [`json_predicate`](ScanPlan::json_predicate)); a second call does
+    /// not discard IDs supplied by an earlier one.
     pub fn ids<I, S>(self, iter: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -49,16 +53,18 @@ impl ScanPlan {
     {
         self.ids_in(iter)
     }
-    /// Alias for [`ScanPlan::ids`].
+    /// Alias for [`ScanPlan::ids`]; like `ids`, repeated calls accumulate.
     pub fn ids_in<I, S>(mut self, iter: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        let v: Vec<String> = iter.into_iter().map(|s| s.as_ref().to_string()).collect();
-        self.query.ids_in = Some(v);
-        self.query.comment_ids_in = None;
-        self.query.submission_ids_in = None;
+        // Append onto the unqualified bucket and re-normalize: `normalize`
+        // re-buckets every ID list, so previously supplied `t1_`/`t3_`
+        // selectors (already split into `comment_ids_in`/`submission_ids_in`)
+        // keep their source constraint instead of being wiped.
+        let new = iter.into_iter().map(|s| s.as_ref().to_string());
+        self.query.ids_in.get_or_insert_with(Vec::new).extend(new);
         self.query = self.query.normalize();
         self
     }

@@ -13,4 +13,7 @@ mod routing;
 
 pub use cfg::BucketingCfg;
 pub use micro::process_bucket_streaming;
-pub use routing::{bucketize_shards, partition_stage1};
+pub use routing::{
+    bucketize_shards, bucketize_shards_with_key_stats, partition_stage1,
+    partition_stage1_with_key_stats,
+};

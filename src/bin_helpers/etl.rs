@@ -43,7 +43,7 @@ pub(crate) fn build_monitor_options(monitor: &MonitorOpts) -> retl::MonitorOptio
         stop_file: monitor.stop_file.clone(),
         max_rss_mb: monitor.max_rss_mb,
         max_runtime_sec: monitor.max_runtime_sec,
-        log_format: retl::LogFormat::parse(&monitor.log_format).unwrap_or(retl::LogFormat::Text),
+        log_format: monitor.log_format.into(),
         heartbeat_interval_sec: monitor.heartbeat_sec,
     }
 }

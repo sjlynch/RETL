@@ -106,6 +106,10 @@ pub(crate) enum Command {
     /// Count records by month, or write per-author counts to TSV.
     Count(CountArgs),
     /// Validate `.zst` monthly files (quick sample or full decode).
+    ///
+    /// `integrity` only reads and checks corpus files; it emits no records and
+    /// writes no provenance manifest, so the shared `--no-manifest` flag has no
+    /// effect here and passing it logs a warning.
     Integrity(IntegrityArgs),
     /// Aggregate JSONL inputs into JSON record counts or built-in TSV rollups.
     Aggregate(AggregateArgs),
