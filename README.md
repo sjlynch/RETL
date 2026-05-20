@@ -1230,8 +1230,9 @@ cargo +nightly fuzz run fuzz_parse_minimal -- -max_total_time=300
 # Walks &str → rewrite_human_timestamps_bytes, then validates that
 # (a) the output is valid UTF-8 (enforced by the String type),
 # (b) the output round-trips through serde_json::from_str if the input did, and
-# (c) on shallow top-level objects, the byte path matches the slow path
-#     (apply_human_timestamps applied to the parsed Value).
+# (c) on any top-level JSON object, the byte path matches the slow path
+#     (apply_human_timestamps applied to the parsed Value) — both rewrite
+#     only the top-level object's timestamp keys, nested ones included.
 cargo +nightly fuzz run fuzz_rewrite_timestamps -- -max_total_time=300
 
 # Walks &str → WhitelistTokenizer::tokenize_into with a fixed Reddit-field

@@ -236,10 +236,14 @@ fn extract_common(
             manifest,
             ManifestDestination::File(out_path.to_path_buf()),
         )?;
-        if !resume {
-            if let Err(e) = crate::util::remove_dir_all_with_short_backoff(&tmp_dir) {
-                tracing::warn!(path=%tmp_dir.display(), error=%e, "failed to remove extract scratch dir");
-            }
+        // The scratch dir holds a complete per-month copy of the output (the
+        // `.part_*.jsonl` files just stitched into `out_path`). The final
+        // stitch succeeded above, so the checkpoint is no longer needed —
+        // remove it for resumed runs too, otherwise every successful resumed
+        // JSONL/JSON export silently leaves a full second copy of the output
+        // behind in `work_dir`.
+        if let Err(e) = crate::util::remove_dir_all_with_short_backoff(&tmp_dir) {
+            tracing::warn!(path=%tmp_dir.display(), error=%e, "failed to remove extract scratch dir");
         }
         Ok(())
     })
