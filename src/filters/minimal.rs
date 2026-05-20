@@ -84,7 +84,8 @@ pub fn matches_minimal(
     if q.timestamp_bounds.is_active() {
         match min.created_utc {
             Some(ts) if q.timestamp_bounds.contains(ts) => {}
-            // Exact timestamp filters reject missing/non-integer created_utc.
+            // Exact timestamp filters reject created_utc that is missing or
+            // not a number (string- and float-encoded numbers are coerced).
             _ => return false,
         }
     }

@@ -10,8 +10,9 @@ impl ScanPlan {
     /// Set an inclusive lower bound for the top-level `created_utc` Unix timestamp.
     ///
     /// This is evaluated on the MinimalRecord fast path and does not require a
-    /// full JSON parse. Records without an integer `created_utc` are rejected
-    /// when any timestamp bound is active.
+    /// full JSON parse. Records whose `created_utc` is missing or non-numeric
+    /// are rejected when any timestamp bound is active; string- and
+    /// float-encoded numbers (`"1700000000"`, `1.7e9`) are coerced.
     pub fn created_utc_gte(mut self, ts: i64) -> Self {
         self.query.timestamp_bounds.created_utc_gte = Some(ts);
         self
@@ -19,8 +20,9 @@ impl ScanPlan {
     /// Set an exclusive upper bound for the top-level `created_utc` Unix timestamp.
     ///
     /// This is evaluated on the MinimalRecord fast path and does not require a
-    /// full JSON parse. Records without an integer `created_utc` are rejected
-    /// when any timestamp bound is active.
+    /// full JSON parse. Records whose `created_utc` is missing or non-numeric
+    /// are rejected when any timestamp bound is active; string- and
+    /// float-encoded numbers (`"1700000000"`, `1.7e9`) are coerced.
     pub fn created_utc_lt(mut self, ts: i64) -> Self {
         self.query.timestamp_bounds.created_utc_lt = Some(ts);
         self

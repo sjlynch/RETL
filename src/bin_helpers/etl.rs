@@ -43,7 +43,7 @@ pub(crate) fn build_monitor_options(common: &CommonOpts) -> retl::MonitorOptions
         stop_file: common.stop_file.clone(),
         max_rss_mb: common.max_rss_mb,
         max_runtime_sec: common.max_runtime_sec,
-        log_format: retl::LogFormat::parse(&common.log_format).unwrap_or(retl::LogFormat::Text),
+        log_format: common.log_format.into(),
         heartbeat_interval_sec: common.heartbeat_sec,
     }
 }

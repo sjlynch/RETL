@@ -95,8 +95,8 @@ pub(crate) struct CommonOpts {
     /// Stderr log format. `RETL_LOG_FORMAT=json|text` env var overrides
     /// this flag. JSON output is one event per line, mirrors what
     /// `--events` writes to the file.
-    #[arg(long, value_name = "FMT", default_value = "text")]
-    pub(crate) log_format: String,
+    #[arg(long, value_name = "FMT", value_enum, default_value_t = LogFormatArg::Text)]
+    pub(crate) log_format: LogFormatArg,
 
     /// Periodic `kind=status` mirror events emitted on the event stream,
     /// in seconds. 0 disables. Default 5.
@@ -131,7 +131,8 @@ pub(crate) struct QueryOpts {
     pub(crate) exclude_common_bots: bool,
 
     /// Regex matched against author names (case-sensitive — anchor or use `(?i)` for
-    /// case-insensitive). Compiled before any data is read; invalid patterns are rejected.
+    /// case-insensitive). Compiled before any data is read; invalid or blank patterns
+    /// are rejected (an empty pattern would silently match every author).
     #[arg(long = "author-regex", value_name = "REGEX")]
     pub(crate) author_regex: Option<String>,
 
@@ -237,6 +238,28 @@ impl From<SourceArg> for Sources {
             SourceArg::Rc => Sources::Comments,
             SourceArg::Rs => Sources::Submissions,
             SourceArg::Both => Sources::Both,
+        }
+    }
+}
+
+/// CLI `--log-format` selector. Kept as a clap `ValueEnum` (like `--source`,
+/// `--format`, `--mode`) so a typo such as `--log-format jsonl` is rejected
+/// up front instead of being silently treated as `text`.
+#[derive(ValueEnum, Clone, Copy, Debug)]
+pub(crate) enum LogFormatArg {
+    /// Human-readable formatted log lines (the default).
+    #[value(alias = "pretty", alias = "fmt")]
+    Text,
+    /// One JSON object per log line.
+    #[value(alias = "ndjson")]
+    Json,
+}
+
+impl From<LogFormatArg> for retl::LogFormat {
+    fn from(f: LogFormatArg) -> Self {
+        match f {
+            LogFormatArg::Text => retl::LogFormat::Text,
+            LogFormatArg::Json => retl::LogFormat::Json,
         }
     }
 }

@@ -49,11 +49,21 @@ pub(crate) fn run_aggregate(args: AggregateArgs) -> Result<()> {
             ("fatal_inputs", report.fatal_count() as u64),
             ("merged_shards", report.merged_shards as u64),
             ("output_rows", agg.rows(None).len() as u64),
+            ("records_ingested", agg.records_ingested()),
+            (
+                "records_skipped_no_group_key",
+                agg.records_skipped_no_group_key(),
+            ),
+            (
+                "records_skipped_no_metric_value",
+                agg.records_skipped_no_metric_value(),
+            ),
         ]);
         if let Some(top) = args.top {
             counts.insert("top".to_string(), top as u64);
         }
-        let warnings = aggregate_manifest_warnings(&report);
+        let mut warnings = aggregate_manifest_warnings(&report);
+        warnings.extend(warn_aggregate_record_skips(&by, args.metric.as_deref(), &agg));
         write_cli_aggregate_manifest(
             manifest_start,
             &args,
@@ -69,6 +79,7 @@ pub(crate) fn run_aggregate(args: AggregateArgs) -> Result<()> {
             report.fatal_count(),
             report.partial_count()
         );
+        report_aggregate_record_skips(&agg);
     } else {
         if args.metric.is_some() {
             anyhow::bail!("--metric requires --by");
@@ -159,6 +170,85 @@ fn path_contains_glob_meta(path: &Path) -> bool {
         .to_string_lossy()
         .chars()
         .any(|c| matches!(c, '*' | '?' | '[' | ']'))
+}
+
+/// Warn (and record a manifest warning) once more than this fraction of
+/// ingested records is skipped for a missing group key or metric value.
+/// Mirrors `dedupe`'s `DEDUPE_KEY_DROP_WARN_RATE`.
+const AGGREGATE_RECORD_SKIP_WARN_RATE: f64 = 0.01;
+
+/// Emit a `tracing::warn!` for each record-skip class whose share of
+/// ingested records exceeds [`AGGREGATE_RECORD_SKIP_WARN_RATE`], and return
+/// the same set as manifest warning strings. A typo like
+/// `--metric sum:/scoer` otherwise produces an all-zero TSV with zero
+/// diagnostics.
+fn warn_aggregate_record_skips(
+    by: &str,
+    metric: Option<&str>,
+    agg: &GroupMetricAgg,
+) -> Vec<String> {
+    let ingested = agg.records_ingested();
+    let mut warnings = Vec::new();
+    if ingested == 0 {
+        return warnings;
+    }
+
+    let no_key = agg.records_skipped_no_group_key();
+    let no_key_rate = no_key as f64 / ingested as f64;
+    if no_key > 0 && no_key_rate > AGGREGATE_RECORD_SKIP_WARN_RATE {
+        tracing::warn!(
+            by = %by,
+            records_ingested = ingested,
+            records_skipped_no_group_key = no_key,
+            skip_rate = no_key_rate,
+            "aggregate skipped {} of {} record(s) with no --by '{}' value ({:.2}%); check the --by field name",
+            no_key,
+            ingested,
+            by,
+            no_key_rate * 100.0,
+        );
+        warnings.push(format!(
+            "{no_key} of {ingested} record(s) skipped: no --by '{by}' value"
+        ));
+    }
+
+    let no_metric = agg.records_skipped_no_metric_value();
+    let no_metric_rate = no_metric as f64 / ingested as f64;
+    if no_metric > 0 && no_metric_rate > AGGREGATE_RECORD_SKIP_WARN_RATE {
+        let metric_label = metric.unwrap_or("count");
+        tracing::warn!(
+            metric = %metric_label,
+            records_ingested = ingested,
+            records_skipped_no_metric_value = no_metric,
+            skip_rate = no_metric_rate,
+            "aggregate skipped {} of {} record(s) with a missing or non-numeric --metric value ({:.2}%); check the --metric pointer",
+            no_metric,
+            ingested,
+            no_metric_rate * 100.0,
+        );
+        warnings.push(format!(
+            "{no_metric} of {ingested} record(s) skipped: missing or non-numeric --metric '{metric_label}' value"
+        ));
+    }
+
+    warnings
+}
+
+/// Print the per-record skip counts to stderr whenever any record was
+/// dropped, so the CLI summary reflects record-level losses and not just
+/// input-file-level fail/partial counts.
+fn report_aggregate_record_skips(agg: &GroupMetricAgg) {
+    let no_key = agg.records_skipped_no_group_key();
+    let no_metric = agg.records_skipped_no_metric_value();
+    if no_key == 0 && no_metric == 0 {
+        return;
+    }
+    eprintln!(
+        "  {} record(s) skipped without a --by group key, {} record(s) skipped without a numeric --metric value (of {} ingested)",
+        no_key,
+        no_metric,
+        agg.records_ingested(),
+    );
 }
 
 fn aggregate_manifest_warnings(report: &AggregateBuildReport) -> Vec<String> {

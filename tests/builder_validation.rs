@@ -159,6 +159,18 @@ fn build_rejects_duplicate_record_ids_after_normalization() {
 }
 
 #[test]
+fn repeated_ids_calls_accumulate_rather_than_replace() {
+    // `ids` / `ids_in` append: a second call must not discard the first
+    // call's selectors. With the old replace-setter semantics the repeated
+    // ID below slipped through silently; accumulation now surfaces it as the
+    // same duplicate error a single `.ids(["abc", "abc"])` would.
+    expect_query_build_error(
+        RedditETL::new().scan().ids(["abc"]).ids(["abc"]),
+        &["ids_in", "duplicate ID", "abc"],
+    );
+}
+
+#[test]
 fn record_id_filters_do_not_require_full_parse() {
     let mut query = QuerySpec::default();
     query.ids_in = Some(vec!["t1_abc".to_string()]);
@@ -177,6 +189,21 @@ fn build_rejects_invalid_author_regex_pattern() {
         .expect("expected ScanPlan::build to fail");
     let msg = err_msg(err);
     assert!(msg.contains("author_regex"), "{msg}");
+}
+
+#[test]
+fn build_rejects_blank_author_regex_pattern() {
+    // `Regex::new("")` compiles and matches every author, so a blank
+    // `--author-regex ''` would silently widen the scan. Reject it the same
+    // way a blank `text_regex` is rejected.
+    expect_query_build_error(
+        RedditETL::new().scan().author_regex(""),
+        &["author_regex", "blank regex patterns are not allowed"],
+    );
+    expect_query_build_error(
+        RedditETL::new().scan().author_regex("   "),
+        &["author_regex", "blank regex patterns are not allowed"],
+    );
 }
 
 #[test]

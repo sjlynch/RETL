@@ -52,7 +52,7 @@ fn cli_timestamp_bounds_filter_exactly_and_derive_month_planning() {
             .to_string(),
             json!({
                 "id": "string_ts", "author": "alice", "subreddit": "programming",
-                "created_utc": lower.to_string(), "body": "not an integer timestamp"
+                "created_utc": lower.to_string(), "body": "string-encoded timestamp"
             })
             .to_string(),
         ],
@@ -107,5 +107,9 @@ fn cli_timestamp_bounds_filter_exactly_and_derive_month_planning() {
         .into_iter()
         .map(|value| value["id"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(ids, vec!["at_lower", "before_upper"]);
+    // `string_ts` carries a string-encoded `created_utc`; the fast path coerces
+    // it like a number, so it is kept (it sits exactly on the inclusive lower
+    // bound). `missing_ts` (no `created_utc`) and the out-of-window records
+    // stay dropped.
+    assert_eq!(ids, vec!["at_lower", "string_ts", "before_upper"]);
 }

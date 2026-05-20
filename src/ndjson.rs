@@ -77,8 +77,13 @@ pub fn read_line_capped<R: BufRead>(
     max_bytes: usize,
     path: &Path,
 ) -> io::Result<usize> {
-    buf.clear();
-    let mut bytes: Vec<u8> = Vec::new();
+    // Reuse the caller's `String` allocation as the byte accumulator instead
+    // of allocating a fresh `Vec` per line: take its backing buffer out, fill
+    // and validate it, then hand it straight back. `into_bytes` and
+    // `String::from_utf8` both move the allocation without copying, so a
+    // caller looping over a file pays no per-line allocation.
+    let mut bytes: Vec<u8> = std::mem::take(buf).into_bytes();
+    bytes.clear();
     loop {
         let available = match reader.fill_buf() {
             Ok(b) => b,
@@ -112,11 +117,11 @@ pub fn read_line_capped<R: BufRead>(
         }
     }
     if bytes.is_empty() {
+        // `buf` already holds the empty `String` left by `mem::take`.
         return Ok(0);
     }
     let raw_len = bytes.len();
-    let s = String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    buf.push_str(&s);
+    *buf = String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     if buf.ends_with('\n') {
         buf.pop();
         if buf.ends_with('\r') {

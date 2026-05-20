@@ -159,6 +159,27 @@ fn aggregate_shard_paths_recursive(dir: &Path) -> Vec<PathBuf> {
     shards
 }
 
+/// Per-run `run_*` shard directories directly under `shards_dir`. After a
+/// successful aggregate these are cleaned up; a non-empty result means a
+/// run leaked its scratch directory.
+fn shard_run_dirs(shards_dir: &Path) -> Vec<PathBuf> {
+    if !shards_dir.exists() {
+        return Vec::new();
+    }
+    fs::read_dir(shards_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.is_dir()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(|name| name.starts_with("run_"))
+                    .unwrap_or(false)
+        })
+        .collect()
+}
+
 fn wait_for_aggregate_shards(dir: &Path, timeout: Duration) -> Vec<PathBuf> {
     let start = Instant::now();
     loop {
@@ -233,18 +254,45 @@ fn aggregate_same_basename_inputs_get_distinct_shards() {
         .aggregate_jsonls_parallel_collect::<RecCount>(vec![a, b], &shards_dir)
         .unwrap();
 
+    // Two same-basename inputs from different directories must land on
+    // distinct shard paths. Had they collided, one shard would have
+    // overwritten the other and the merged count could not have reached 3.
     assert_eq!(agg.count, 3);
     assert_eq!(report.merged_shards, 2);
     assert_eq!(report.problem_count(), 0);
 
-    let mut shard_names: Vec<String> = aggregate_shard_paths_recursive(&shards_dir)
-        .into_iter()
-        .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
-        .collect();
-    shard_names.sort();
-    assert_eq!(shard_names.len(), 2);
-    assert_ne!(shard_names[0], shard_names[1]);
-    assert!(shard_names.iter().all(|name| name.contains("RC_2006-01")));
+    // The per-run shard directory is scratch and is removed after a
+    // successful merge — no `run_*` directory or shard file may survive.
+    assert!(
+        shard_run_dirs(&shards_dir).is_empty(),
+        "per-run shard directory leaked after a successful aggregate"
+    );
+    assert_eq!(aggregate_shard_paths_recursive(&shards_dir).len(), 0);
+}
+
+#[test]
+fn aggregate_removes_per_run_shard_dir_after_successful_merge() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input = tmp.path().join("input.jsonl");
+    fs::write(&input, "{\"id\":\"a\"}\n{\"id\":\"b\"}\n").unwrap();
+    let shards_dir = tmp.path().join("agg_shards");
+
+    // Repeated runs against a shared shards_dir must not accumulate
+    // `run_*` scratch directories of shard JSON.
+    for _ in 0..3 {
+        let (agg, report) = RedditETL::new()
+            .progress(false)
+            .aggregate_jsonls_parallel_collect::<RecCount>(vec![input.clone()], &shards_dir)
+            .unwrap();
+        assert_eq!(agg.count, 2);
+        assert_eq!(report.problem_count(), 0);
+    }
+
+    assert!(
+        shard_run_dirs(&shards_dir).is_empty(),
+        "aggregate leaked per-run shard directories across repeated runs"
+    );
+    assert_eq!(aggregate_shard_paths_recursive(&shards_dir).len(), 0);
 }
 
 #[test]
