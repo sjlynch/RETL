@@ -102,13 +102,22 @@ File name patterns are enforced at discovery time:
 
 ## Corpus acquisition workflow
 
-RETL now includes a manifest-backed acquisition planner so a fresh machine can
-start from an empty `./data` directory without hand-browsing Academic Torrents.
-The built-in manifest is versioned and knows the canonical `comments/RC_*.zst`
-/ `submissions/RS_*.zst` layout, public-corpus start months, known unavailable
-pre-corpus months, and Academic Torrents search URLs. It intentionally does not
-claim byte counts or checksums; pass `--manifest my_corpus_manifest.json` when
-your project maintains verified `compressed_bytes` or `sha256` values.
+RETL includes a manifest-backed acquisition **planner**. It plans the expected
+on-disk layout and validates files you place yourself — it does **not** locate
+or download the corpus for you. The built-in manifest is versioned and knows
+the canonical `comments/RC_*.zst` / `submissions/RS_*.zst` layout,
+public-corpus start months, and known unavailable pre-corpus months.
+
+The manifest's `url` / `torrent` columns are **best-effort Academic Torrents
+search links, not direct per-file download URLs**. The public Reddit monthly
+dumps are distributed as a few large bundled torrents — not as individually
+named `RC_YYYY-MM.zst` artifacts — so a search for `RC_2006-01.zst` will not
+resolve to a downloadable per-month file. You still have to fetch a bundle and
+map its contents onto the `comments/` / `submissions/` layout yourself; treat
+the search links as a starting point. The built-in manifest intentionally does
+not claim byte counts or checksums; pass `--manifest my_corpus_manifest.json`
+when your project maintains verified `compressed_bytes`, `sha256`, or direct
+download URLs.
 
 Plan the desired months and expected paths:
 
@@ -121,13 +130,23 @@ retl corpus plan \
   --out download_plan.json
 ~~~
 
-Each JSON item includes `source`, `month`, `availability`, `file_name`,
-`expected_path`, optional `compressed_bytes` / `sha256`, Academic Torrents
-search fields (`url` / `torrent`), and a `local.status` of `missing`,
-`present`, or `inaccessible`. Use the plan as a machine-readable checklist for
-your download tool, placing files exactly at `expected_path`. For a shell/CSV
-friendly checklist, use `--format tsv`; to emit only files still missing locally,
-add `--only-missing`.
+`--format json` emits a single `CorpusPlanDocument` **wrapper object**, not a
+bare array:
+
+~~~text
+{ manifest_version, manifest_name, source, start, end, dest, summary,
+  items, next_steps }
+~~~
+
+The per-file rows live under `.items` — a tool must iterate `plan.items`, not
+`JSON.parse(plan)` as an array. Each item includes `source`, `month`,
+`availability`, `file_name`, `expected_path`, optional `compressed_bytes` /
+`sha256`, the Academic Torrents search fields (`url` / `torrent`), and a
+`local.status` of `missing`, `present`, or `inaccessible`. `next_steps` is a
+human-readable list that states RETL does not perform direct downloads: you
+fetch each file yourself and place it exactly at `expected_path`. For a
+shell/CSV friendly checklist, use `--format tsv` (one row per file, no
+wrapper); to emit only files still missing locally, add `--only-missing`.
 
 After download, compare the requested manifest range against local files, then
 validate the zstd payloads:
@@ -255,15 +274,21 @@ and validation flags because it does not filter records by query:
 | `--data-dir <PATH>` | Corpus base dir (default `./data`). Must contain `comments/` and `submissions/`. |
 | `--work-dir <PATH>` | Scratch directory for sharded writers (default `./etl_work`). |
 | `--start <YYYY-MM>` / `--end <YYYY-MM>` | Inclusive month range. Omit either to leave that side unbounded; the present side is still enforced against each record's `created_utc`. |
+| `--after <TIME>` / `--before <TIME>` | Finer-grained `created_utc` bounds (epoch seconds, RFC3339, or `YYYY-MM-DD`). `--after` is inclusive, `--before` is exclusive. |
 | `--source rc\|rs\|both` | Comments only, submissions only, or both (default). |
 | `--subreddit <NAME>` (`-s`) | Subreddit selector. Repeatable; omit for "any subreddit". Blank values are rejected. |
+| `--id <ID>` / `--ids-file <PATH>` | Record-ID allow-list. `--id` is repeatable and accepts bare IDs or `t1_`/`t3_` fullnames; `--ids-file` reads one ID per non-empty line (`#` lines ignored). Both are OR-joined. |
 | `--author <NAME>` / `--author-in <NAME>` | Author allow-list selector. Repeatable. Blank values are rejected. |
 | `--exclude-author <NAME>` | Author deny-list selector. Repeatable. Blank values are rejected. |
 | `--exclude-common-bots` | Exclude RETL's built-in bot/service-account list plus `ETL_EXCLUDE_AUTHORS*` augments; composes with `--exclude-author`. |
 | `--author-regex <REGEX>` | Keep authors matching a regex. |
-| `--keyword <TEXT>` | Keep records containing a keyword in body/title/selftext. Repeatable; blank values are rejected. |
+| `--keyword <TEXT>` | Keep records containing a keyword in body/title/selftext. Repeatable, OR-joined; blank values are rejected. |
+| `--keyword-all <TEXT>` | Like `--keyword` but AND-joined: every repeated entry must appear in body/title/selftext. Blank values are rejected. |
+| `--exclude-keyword <TEXT>` | Drop records containing this substring in body/title/selftext. Repeatable; any single match drops the record. Blank values are rejected. |
+| `--text-regex <REGEX>` | Keep records whose body/selftext/title matches this regex. Invalid or blank patterns are rejected before scanning. |
 | `--min-score <N>` / `--max-score <N>` | Inclusive score thresholds. |
-| `--contains-url` | Keep records with an HTTP(S) URL in text or submission URL. This is a positive-only filter. |
+| `--contains-url` | Keep records with an HTTP(S) URL in text or submission URL. Mutually exclusive with `--no-url`. |
+| `--no-url` | Inverse of `--contains-url`: keep only records with no HTTP(S) URL in text or submission URL. Mutually exclusive with `--contains-url`. |
 | `--domain <DOMAIN>` | Submission-domain allow-list. Repeatable; comments are dropped when this filter is active. Blank values are rejected. |
 | `--json <PREDICATE>` | Full-record JSON Pointer predicate. Repeatable. Examples: `exists:/link_flair_text`, `/over_18=false`, `/is_self=true`, `/num_comments>=100`, `/link_flair_text~=^Question` (quote predicates containing `>` or `<` in shells). |
 | `--include-deleted` | Include pseudo-users (`[deleted]`, `[removed]`, and empty authors) that are filtered by default. |
@@ -747,8 +772,11 @@ All examples below operate on the same API you saw in the Quick Start.
 - `.contains_url(true)` keeps records with `http`/`https` in comment bodies,
   submission `selftext`/`title`, or a link-post submission whose top-level
   `url` starts with `http`/`https`. `.contains_url(false)` clears/disables
-  that positive filter and is equivalent to omitting it; RETL does not yet
-  provide a negative "without URL" filter.
+  that positive filter and is equivalent to omitting it. For the inverse,
+  `.no_url()` (alias `.without_url()`; CLI `--no-url`) keeps only records with
+  **no** such URL in text or submission `url`. `.no_url()` and
+  `.contains_url(true)` / `--contains-url` are mutually exclusive — setting
+  both is rejected before any corpus file is scanned.
 - `.domains_in([...])` matches the submission-only top-level `domain` field.
   Reddit comments do not have `domain`; when used with `Sources::Both` or
   `Sources::Comments`, comments are dropped and RETL emits a warning. Use
@@ -782,13 +810,13 @@ RedditETL::new()
     .sources(Sources::Both)
     .date_range(Some(YearMonth::new(2016, 1)), Some(YearMonth::new(2016, 3)))
     .progress(true)
+    .timestamps_human_readable(true) // builder knob — must precede .scan()
     .scan()
     .subreddit("askscience")
     .whitelist_fields([
         "author","body","created_utc","subreddit",
         "parent_id","link_id","id","score",
     ])
-    .timestamps_human_readable(true)
     .extract_to_jsonl(Path::new("askscience_comments_q1_2016_minimal.jsonl"))?;
 ~~~
 

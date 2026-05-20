@@ -96,6 +96,19 @@ Or use a domain allow-list, which implicitly excludes self-posts because
 retl export --source rs --domain youtube.com --domain youtu.be ...
 ```
 
+The inverse filter is `--no-url`: it keeps only records with **no** `http`
+substring in `body` / `selftext` / `title` and (for submissions) no `http`
+`url` field. `--no-url` and `--contains-url` are mutually exclusive — passing
+both is rejected before any file is scanned.
+
+```sh
+# Comments with no link of any kind (text-only discussion).
+retl export --source rc --no-url --out text_only_comments.jsonl
+
+# Self-posts only: a submission with no link and no URL in its text.
+retl export --source rs --no-url --out pure_self_posts.jsonl
+```
+
 ### 2c. `--domain` is submissions-only and matches exact equality
 
 With `--source both --domain example.com`, every *comment* is silently
