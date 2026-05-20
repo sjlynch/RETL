@@ -58,8 +58,18 @@ pub(crate) struct CommonOpts {
     #[arg(long)]
     pub(crate) allow_partial: bool,
 
-    // --- Observability / monitoring (opt-in, off by default) ---------------
+    /// Observability / monitoring flags (opt-in, off by default).
+    #[command(flatten)]
+    pub(crate) monitor: MonitorOpts,
+}
 
+/// Opt-in observability flags shared by every monitorable subcommand.
+///
+/// Kept separate from [`CommonOpts`] so commands with their own argument
+/// shape (`parents`, `aggregate`) can flatten the monitoring surface without
+/// also inheriting the corpus/query flags. See `docs/monitoring.md`.
+#[derive(Args, Debug, Clone)]
+pub(crate) struct MonitorOpts {
     /// Write a structured NDJSON event stream to this path (one JSON object
     /// per line). See docs/monitoring.md for the schema. Lets external
     /// watchers (LLM monitors, scripts) follow a long run without scraping

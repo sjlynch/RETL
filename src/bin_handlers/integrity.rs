@@ -1,5 +1,5 @@
 
-pub(crate) fn run_integrity(args: IntegrityArgs) -> Result<()> {
+pub(crate) fn run_integrity(args: IntegrityArgs) -> Result<HandlerOutcome> {
     if args.resume {
         anyhow::bail!(
             "retl integrity does not support --resume; it validates corpus files directly. Narrow long runs with --source/--start/--end or use resumable scan/export/count workflows for record processing."
@@ -48,6 +48,7 @@ pub(crate) fn run_integrity(args: IntegrityArgs) -> Result<()> {
     };
     if bad.is_empty() {
         eprintln!("OK: no corruption detected.");
+        Ok(HandlerOutcome::Done)
     } else {
         eprintln!("FAILED: {} file(s) failed integrity check:", bad.len());
         if args.collect {
@@ -55,7 +56,11 @@ pub(crate) fn run_integrity(args: IntegrityArgs) -> Result<()> {
                 println!("{}\t{}", p.display(), e);
             }
         }
-        std::process::exit(2);
+        // Signal exit code 2 to `main` via the return value rather than a
+        // bare `std::process::exit(2)`. That keeps the monitor's `finalize`
+        // in the loop: it emits the terminal `run.summary` (outcome
+        // `corrupt_files_found`) and marks the `--status-file` finished
+        // before the process exits 2. See [`HandlerOutcome`].
+        Ok(HandlerOutcome::CorruptFilesFound)
     }
-    Ok(())
 }

@@ -114,25 +114,52 @@ impl RedditETL {
                     v
                 };
 
-                for p in load(&comments_out) {
-                    let f = crate::util::open_with_default_backoff(&p)?;
+                // The eager load can `break` mid-way when memory runs low.
+                // Correctness is preserved — `load_shard_value` falls through
+                // to per-shard reads for whatever was skipped — but *which*
+                // months end up eager is then nondeterministic, so emit a
+                // warn naming shards loaded vs. skipped. Without it, a user
+                // debugging why attach is slow on one run and fast on the
+                // next gets no signal.
+                let comment_shard_paths = load(&comments_out);
+                let comment_shard_total = comment_shard_paths.len();
+                for (idx, p) in comment_shard_paths.iter().enumerate() {
+                    let f = crate::util::open_with_default_backoff(p)?;
                     let r = BufReader::new(f);
                     let m: HashMap<String, String> = serde_json::from_reader(r)?;
                     for (k, v) in m {
                         comments_map.insert(k, v);
                     }
                     if is_low_memory(0.10) {
+                        let loaded = idx + 1;
+                        tracing::warn!(
+                            cache = "comments",
+                            shards_loaded = loaded as u64,
+                            shards_skipped = (comment_shard_total - loaded) as u64,
+                            shards_total = comment_shard_total as u64,
+                            "parent resolver eager comment-map load truncated under memory pressure; skipped shards fall back to per-shard reads at attach time"
+                        );
                         break;
                     }
                 }
-                for p in load(&submissions_out) {
-                    let f = crate::util::open_with_default_backoff(&p)?;
+                let submission_shard_paths = load(&submissions_out);
+                let submission_shard_total = submission_shard_paths.len();
+                for (idx, p) in submission_shard_paths.iter().enumerate() {
+                    let f = crate::util::open_with_default_backoff(p)?;
                     let r = BufReader::new(f);
                     let m: HashMap<String, (String, String)> = serde_json::from_reader(r)?;
                     for (k, v) in m {
                         submissions_map.insert(k, v);
                     }
                     if is_low_memory(0.10) {
+                        let loaded = idx + 1;
+                        tracing::warn!(
+                            cache = "submissions",
+                            shards_loaded = loaded as u64,
+                            shards_skipped = (submission_shard_total - loaded) as u64,
+                            shards_total = submission_shard_total as u64,
+                            "parent resolver eager submission-map load truncated under memory pressure; skipped shards fall back to per-shard reads at attach time"
+                        );
                         break;
                     }
                 }

@@ -32,5 +32,22 @@ use crate::bin_helpers::{
 
 const CLI_TEXT_WRITE_BUF_BYTES: usize = 64 * 1024;
 const QUICK_SAMPLE_WARN_BELOW_BYTES: u64 = 4096;
+
+/// Outcome of a subcommand handler that influences the process exit code.
+///
+/// Most handlers just return `Result<()>` (mapped to exit 0 on `Ok`, 1 on
+/// `Err`). `integrity` returns [`HandlerOutcome::CorruptFilesFound`] for the
+/// 'corruption detected' result so `main` can exit 2 *after* the monitor
+/// finalizes. A bare `std::process::exit(2)` from the handler runs no
+/// destructors, so the `MonitorHandle` would never emit the terminal
+/// `run.summary` nor mark the `--status-file` finished — a watcher would
+/// then misread a normal 'corruption found' result as an abrupt hard-kill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HandlerOutcome {
+    /// Handler finished normally; `main` exits 0.
+    Done,
+    /// `integrity` found at least one corrupt corpus file; `main` exits 2.
+    CorruptFilesFound,
+}
 const QUICKSTART_SAMPLE_JSONL: &str = include_str!("../../benches/data/sample.jsonl");
 const QUICKSTART_ZST_LEVEL: i32 = 3;

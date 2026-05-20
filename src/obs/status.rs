@@ -7,7 +7,7 @@
 //! `last_event_*`. Writer thread serializes the snapshot and atomically
 //! replaces the on-disk file via the crate's standard staging-and-rename.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -18,8 +18,8 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 use sysinfo::{Pid, ProcessesToUpdate, System};
 
-use super::events::{now_rfc3339, STATUS_SCHEMA};
-use super::sink::SinkCounters;
+use super::events::{now_rfc3339, Event, LifecycleEvent, STATUS_SCHEMA};
+use super::sink::{SharedSink, SinkCounters};
 
 /// Single-file snapshot of the running scan. Layout is versioned via the
 /// `schema` field; field additions are backwards-compatible.
@@ -80,6 +80,11 @@ pub(crate) struct StatusShared {
     pub(crate) peak_rss_bytes: AtomicU64,
     pub(crate) sink_counters: Arc<SinkCounters>,
     pub(crate) shutdown: AtomicBool,
+    /// Check-and-set latch guarding the single `run.summary` event. Both
+    /// `MonitorHandle::finalize` and the watchdog's breach path can reach
+    /// end-of-run; whichever flips this from `false` first writes the
+    /// summary, the other is a no-op. See [`emit_run_summary_once`].
+    pub(crate) summary_emitted: AtomicBool,
 }
 
 impl StatusShared {
@@ -94,6 +99,7 @@ impl StatusShared {
             peak_rss_bytes: AtomicU64::new(0),
             sink_counters,
             shutdown: AtomicBool::new(false),
+            summary_emitted: AtomicBool::new(false),
         }
     }
 
@@ -277,4 +283,75 @@ pub(crate) fn final_summary_fields(
         serde_json::Value::from(snap.events_dropped),
     );
     out
+}
+
+/// Emit the single authoritative `run.summary` lifecycle event, guarded by
+/// the [`StatusShared::summary_emitted`] latch.
+///
+/// Both [`crate::obs::MonitorHandle::finalize`] and the watchdog's breach
+/// path can reach end-of-run. If a cap fires while `main` is concurrently
+/// inside `finalize`, both would otherwise write a `run.summary` — and
+/// `docs/monitoring.md` declares `run.summary` the *only* authoritative
+/// end-of-run marker. This check-and-set makes exactly one win: the caller
+/// that flips the latch from `false` writes the event and returns `true`;
+/// any later caller returns `false` and writes nothing.
+pub(crate) fn emit_run_summary_once(
+    shared: &Arc<StatusShared>,
+    sink: &SharedSink,
+    outcome: &str,
+) -> bool {
+    if shared.summary_emitted.swap(true, Ordering::SeqCst) {
+        return false;
+    }
+    let mut fields = BTreeMap::new();
+    for (k, v) in final_summary_fields(shared, outcome) {
+        fields.insert(k, v);
+    }
+    let msg = format!("run ended: outcome={outcome}");
+    // Mirror the marker into the status snapshot's `last_event_*` so a
+    // watcher polling only the status file still sees the end-of-run state.
+    shared.record_event("lifecycle", &msg);
+    let event = Event::lifecycle(LifecycleEvent::RunSummary, msg, fields);
+    sink.write(&event);
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::sink::JsonlSink;
+    use tempfile::TempDir;
+
+    #[test]
+    fn run_summary_is_emitted_at_most_once() {
+        // A normal `finalize` and a concurrent watchdog breach both route
+        // through `emit_run_summary_once`; the latch must let exactly one
+        // `run.summary` line reach the sink no matter the interleaving.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("events.ndjson");
+        let sink: SharedSink = Arc::new(JsonlSink::create(&path).unwrap());
+        let shared = Arc::new(StatusShared::new(
+            WatchdogConfig::default(),
+            sink.counters(),
+        ));
+
+        // First caller (e.g. main's finalize) wins the latch and writes it.
+        assert!(emit_run_summary_once(&shared, &sink, "completed"));
+        // Second caller (e.g. a watchdog breach racing finalize) is a no-op.
+        assert!(!emit_run_summary_once(&shared, &sink, "killed_rss"));
+        sink.flush();
+
+        let body = std::fs::read_to_string(&path).unwrap();
+        let summaries = body
+            .lines()
+            .filter(|l| l.contains("\"event\":\"run.summary\""))
+            .count();
+        assert_eq!(
+            summaries, 1,
+            "exactly one run.summary must ever be written; got:\n{body}"
+        );
+        // Only the winning caller's outcome is recorded.
+        assert!(body.contains("\"outcome\":\"completed\""));
+        assert!(!body.contains("\"outcome\":\"killed_rss\""));
+    }
 }

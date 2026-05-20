@@ -4,6 +4,9 @@
 //! `--stop-file` watchdog, plus drives the in-process unit tests via the
 //! public `retl::install_monitor` entry point.
 
+#[path = "common/mod.rs"]
+mod common;
+
 use std::fs;
 use std::path::Path;
 use std::time::Duration;
@@ -211,4 +214,69 @@ fn install_monitor_in_process_emits_run_start() {
     let last = lines.last().unwrap();
     assert_eq!(last["event"], "run.summary");
     assert_eq!(last["fields"]["outcome"], "test_done");
+}
+
+#[test]
+fn integrity_corruption_finalizes_monitor_before_exit_2() {
+    // Regression: `retl integrity` exit-2 on a 'corruption found' result
+    // used to `std::process::exit(2)` directly from the handler, skipping
+    // the monitor's finalize — no terminal `run.summary`, status file never
+    // marked finished. A watcher then misreads a normal corruption result
+    // as an abrupt hard-kill. The handler now returns a typed outcome and
+    // `main` finalizes the monitor *before* exiting 2.
+    let base = common::make_corpus_basic();
+    common::add_corrupt_month(&base);
+
+    let dir = tempfile::tempdir().unwrap();
+    let events = dir.path().join("events.ndjson");
+    let status = dir.path().join("status.json");
+
+    retl()
+        .arg("integrity")
+        .arg("--data-dir")
+        .arg(&base)
+        .arg("--source")
+        .arg("rc")
+        .arg("--start")
+        .arg("2006-02")
+        .arg("--end")
+        .arg("2006-02")
+        .arg("--events")
+        .arg(&events)
+        .arg("--status-file")
+        .arg(&status)
+        .arg("--heartbeat-sec")
+        .arg("0")
+        .assert()
+        .code(2);
+
+    // Exactly one terminal `run.summary`, and it is the last line.
+    let lines = read_lines(&events);
+    let summaries: Vec<&Value> = lines
+        .iter()
+        .filter(|l| l["event"] == "run.summary")
+        .collect();
+    assert_eq!(
+        summaries.len(),
+        1,
+        "expected exactly one run.summary; got events:\n{lines:?}"
+    );
+    assert_eq!(summaries[0]["fields"]["outcome"], "corrupt_files_found");
+    assert_eq!(
+        lines.last().unwrap()["event"],
+        "run.summary",
+        "run.summary must be the final line on the stream"
+    );
+
+    // The status file was finalized before the exit-2: its last event
+    // mirrors the lifecycle `run.summary`, not the last tracing line.
+    let status_json: Value =
+        serde_json::from_str(&fs::read_to_string(&status).expect("status file written"))
+            .expect("status parses");
+    assert_eq!(status_json["last_event_kind"], "lifecycle");
+    let last_msg = status_json["last_event_msg"].as_str().unwrap_or("");
+    assert!(
+        last_msg.contains("run ended"),
+        "status file should reflect the run.summary marker; got {status_json}"
+    );
 }

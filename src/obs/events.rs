@@ -78,7 +78,8 @@ impl LifecycleEvent {
 /// versioning contract stays under our control.
 #[derive(Debug, Clone, Serialize)]
 pub struct Event {
-    /// ISO-8601 / RFC3339 timestamp with millisecond precision, UTC.
+    /// RFC3339 timestamp in UTC, truncated to millisecond precision
+    /// (e.g. `2026-05-17T19:08:33.195Z`). See [`now_rfc3339`].
     pub ts: String,
     /// Versioned schema identifier (`retl.v1`).
     pub schema: &'static str,
@@ -107,8 +108,15 @@ pub struct Event {
 }
 
 pub(crate) fn now_rfc3339() -> String {
-    OffsetDateTime::now_utc()
-        .format(&Rfc3339)
+    let now = OffsetDateTime::now_utc();
+    // Truncate sub-second precision to whole milliseconds before formatting.
+    // `Rfc3339` otherwise emits the platform's full precision (nanoseconds
+    // on modern systems), which breaks watchers that parse `ts` as a strict
+    // millisecond-resolution timestamp — the documented contract.
+    let now = now
+        .replace_nanosecond(now.millisecond() as u32 * 1_000_000)
+        .unwrap_or(now);
+    now.format(&Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
 }
 
@@ -217,5 +225,19 @@ mod tests {
         let ts = now_rfc3339();
         // Smoke test: parseable.
         let _ = OffsetDateTime::parse(&ts, &Rfc3339).expect("rfc3339 should round-trip");
+    }
+
+    #[test]
+    fn rfc3339_now_truncates_to_millisecond_precision() {
+        // The documented contract is millisecond-precision `ts`; `Rfc3339`
+        // would otherwise emit a nanosecond tail on modern platforms.
+        let ts = now_rfc3339();
+        if let Some(dot) = ts.find('.') {
+            let frac = &ts[dot + 1..ts.len() - 1]; // between '.' and trailing 'Z'
+            assert!(
+                frac.len() <= 3 && frac.chars().all(|c| c.is_ascii_digit()),
+                "ts {ts} must carry at most millisecond precision"
+            );
+        }
     }
 }

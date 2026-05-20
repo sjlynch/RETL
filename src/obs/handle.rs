@@ -70,22 +70,17 @@ impl MonitorHandle {
         let pid = sysinfo::Pid::from_u32(std::process::id());
         let _ = super::status::refresh_snapshot(&self.status, &mut sys, pid);
 
-        let mut fields = BTreeMap::new();
-        for (k, v) in super::status::final_summary_fields(&self.status, outcome) {
-            fields.insert(k, v);
-        }
-        let msg = format!("run ended: outcome={outcome}");
-        // Go through `record_event` so the writer thread's final snapshot
-        // pickup of `last_event_*` reflects the summary rather than the
-        // last tracing line. Watchers polling the status file expect to
-        // see the end-of-run marker there as well as on the event stream.
-        self.status.record_event("lifecycle", &msg);
-        let event = Event::lifecycle(LifecycleEvent::RunSummary, msg, fields);
-        self.sink.write(&event);
+        // Emit the terminal `run.summary` — but only if the watchdog thread
+        // hasn't already done so on a concurrent cap breach. The shared
+        // `summary_emitted` latch guarantees exactly one `run.summary` per
+        // run. `emit_run_summary_once` also `record_event`s the marker so
+        // the writer thread's final snapshot pickup of `last_event_*`
+        // reflects the summary rather than the last tracing line.
+        super::status::emit_run_summary_once(&self.status, &self.sink, outcome);
 
         // Stop background threads. Joining the writer thread guarantees
         // its final atomic write reflects the lifecycle.RunSummary
-        // record_event call above.
+        // record_event above.
         self.status.shutdown.store(true, Ordering::Relaxed);
         for handle in self.threads.drain(..) {
             let _ = handle.join();
