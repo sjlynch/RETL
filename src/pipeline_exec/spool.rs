@@ -48,6 +48,7 @@ struct MonthJobCtx<'a> {
     record_limit: Option<&'a RecordLimit>,
     resume: bool,
     completed_keys: &'a HashSet<String>,
+    accumulator: Option<&'a ManifestAccumulator>,
     allow_partial: bool,
     partial_reporter: Option<&'a crate::config::PartialReadReporter>,
 }
@@ -69,6 +70,14 @@ fn process_month(job: &FileJob, ctx: &MonthJobCtx<'_>) -> Result<Option<MonthRes
     let key = crate::progress_manifest::month_key(key_prefix, job.ym);
 
     if ctx.record_limit.is_some_and(|limit| limit.is_exhausted()) {
+        return Ok(None);
+    }
+
+    // Abort fast-path: once any worker's manifest commit has failed, this run
+    // is doomed (`ensure_resume_manifest_durable` will fail it). Stop
+    // publishing further months so the on-disk spool set cannot outrun what
+    // `_progress.json` durably records.
+    if ctx.accumulator.is_some_and(ManifestAccumulator::is_poisoned) {
         return Ok(None);
     }
 
@@ -263,6 +272,7 @@ impl ScanPlan {
                         record_limit: record_limit.as_deref(),
                         resume,
                         completed_keys: &completed_keys,
+                        accumulator: accumulator.as_ref(),
                         allow_partial: plan.etl.opts.allow_partial,
                         partial_reporter: Some(&plan.etl.opts.partial_read_reporter),
                     };

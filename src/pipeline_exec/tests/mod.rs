@@ -10,3 +10,4 @@ mod checkpoint_reuse;
 mod fingerprint;
 mod fixtures;
 mod manifest_commit;
+mod partitioned_zero_record;

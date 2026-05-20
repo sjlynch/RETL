@@ -20,21 +20,30 @@ pub fn ensure_staging_dir(out_root: &Path) -> Result<PathBuf> {
 }
 
 /// Stage a write under a unique `<staging_dir>/<dest_filename>.*.inprogress`,
-/// run `body` against a buffered writer, then atomically promote the staged
-/// file onto `final_dest`. Caller is responsible for any encoder finalization
-/// (e.g. closing a zstd frame) before returning from `body`; this helper only
-/// flushes the underlying buffer.
+/// run `body` against a buffered writer, then — when `should_publish` accepts
+/// the body's result — atomically promote the staged file onto `final_dest`.
+/// Caller is responsible for any encoder finalization (e.g. closing a zstd
+/// frame) before returning from `body`; this helper only flushes the
+/// underlying buffer.
+///
+/// When `should_publish` returns `false` the staged file is discarded and the
+/// atomic rename is skipped, so the suppressed output is never momentarily
+/// visible at the published path. A failed discard only strands a PID-owned
+/// `.inprogress` file in the staging dir (reclaimed by the stale sweep) —
+/// never a stray file at `final_dest`.
 ///
 /// On a `body` or flush/publish error the staged file is removed so we never
 /// leave a partial `<dest>.*.inprogress` behind a successful return path.
-fn stage_and_execute<T, F>(
+fn stage_and_execute<T, F, P>(
     staging_dir: &Path,
     final_dest: &Path,
     write_buf_bytes: usize,
+    should_publish: P,
     body: F,
 ) -> Result<T>
 where
     F: FnOnce(&mut BufWriter<File>) -> Result<T>,
+    P: FnOnce(&T) -> bool,
 {
     crate::util::create_dir_all_with_default_backoff(staging_dir)
         .with_context(|| format!("create staging dir {}", staging_dir.display()))?;
@@ -61,6 +70,14 @@ where
         return Err(e).with_context(|| format!("flush staged {}", staged.display()));
     }
     drop(writer); // release file handle before atomic rename (Windows)
+
+    // Inspect the body's result before the atomic rename. A caller can decline
+    // to publish (e.g. a zero-record partition); the staged file is discarded
+    // in the staging dir and never reaches the published path.
+    if !should_publish(&result) {
+        let _ = crate::util::remove_with_short_backoff(&staged);
+        return Ok(result);
+    }
 
     if let Some(parent) = final_dest.parent() {
         if let Err(e) = crate::util::create_dir_all_with_default_backoff(parent) {
@@ -95,9 +112,33 @@ pub fn write_jsonl_atomic<T, F>(
 where
     F: FnOnce(&mut dyn Write) -> Result<T>,
 {
-    stage_and_execute(staging_dir, final_dest, write_buf_bytes, |writer| {
-        body(writer)
-    })
+    write_jsonl_atomic_if(staging_dir, final_dest, write_buf_bytes, |_| true, body)
+}
+
+/// Like [`write_jsonl_atomic`], but publish the staged file onto `final_dest`
+/// only when `should_publish` returns `true` for the body's result. When it
+/// returns `false` the staged `*.inprogress` file is discarded and the atomic
+/// rename is skipped, so an output the caller wants to suppress (e.g. a
+/// zero-record partition) is never momentarily visible at the published path.
+/// Returns the body's result either way.
+pub fn write_jsonl_atomic_if<T, F, P>(
+    staging_dir: &Path,
+    final_dest: &Path,
+    write_buf_bytes: usize,
+    should_publish: P,
+    body: F,
+) -> Result<T>
+where
+    F: FnOnce(&mut dyn Write) -> Result<T>,
+    P: FnOnce(&T) -> bool,
+{
+    stage_and_execute(
+        staging_dir,
+        final_dest,
+        write_buf_bytes,
+        should_publish,
+        |writer| body(writer),
+    )
 }
 
 /// Derive the staging directory from `final_dest.parent()` and atomically
@@ -147,7 +188,9 @@ where
     })
 }
 
-/// Atomically write a `.zst` file with a checksum-protected zstd frame.
+/// Atomically write a `.zst` file with a checksum-protected zstd frame,
+/// publishing the staged file onto `final_dest` only when `should_publish`
+/// returns `true` for the body's result.
 ///
 /// Stages to a unique `<staging_dir>/<filename>.*.inprogress`, runs `body`
 /// against a `ZstdEncoder` configured with `include_checksum(true)` so
@@ -155,26 +198,115 @@ where
 /// finished before the atomic rename — this is the fix for unreadable `.zst`
 /// outputs where the frame was never closed. On `body` error the encoder is
 /// dropped without finishing and the staged file is cleaned up.
-pub fn write_zst_atomic<T, F>(
+///
+/// When `should_publish` returns `false` the staged `*.inprogress` file (a
+/// closed, checksummed — but empty-payload — zstd frame) is discarded and the
+/// atomic rename is skipped, so a zero-record partition never appears at the
+/// published path. Pass `|_| true` to always publish. Returns the body's
+/// result either way.
+pub fn write_zst_atomic_if<T, F, P>(
     staging_dir: &Path,
     final_dest: &Path,
     level: i32,
     write_buf_bytes: usize,
+    should_publish: P,
     body: F,
 ) -> Result<T>
 where
     F: FnOnce(&mut dyn Write) -> Result<T>,
+    P: FnOnce(&T) -> bool,
 {
-    stage_and_execute(staging_dir, final_dest, write_buf_bytes, |writer| {
-        // Build the encoder over a mutable reference to the staged BufWriter so
-        // we can finish() it before stage_and_execute flushes/renames.
-        let mut enc = ZstdEncoder::new(writer.by_ref(), level).context("zstd encoder init")?;
-        enc.include_checksum(true)
-            .context("enable zstd content checksum")?;
+    stage_and_execute(
+        staging_dir,
+        final_dest,
+        write_buf_bytes,
+        should_publish,
+        |writer| {
+            // Build the encoder over a mutable reference to the staged
+            // BufWriter so we can finish() it before stage_and_execute
+            // flushes/renames.
+            let mut enc =
+                ZstdEncoder::new(writer.by_ref(), level).context("zstd encoder init")?;
+            enc.include_checksum(true)
+                .context("enable zstd content checksum")?;
 
-        let result = body(&mut enc)?;
+            let result = body(&mut enc)?;
 
-        enc.finish().context("finish zstd frame")?;
-        Ok(result)
-    })
+            enc.finish().context("finish zstd frame")?;
+            Ok(result)
+        },
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn staged_file_count(staging: &Path) -> usize {
+        fs::read_dir(staging)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_file())
+            .count()
+    }
+
+    #[test]
+    fn write_jsonl_atomic_if_discards_staged_file_when_not_published() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = ensure_staging_dir(tmp.path()).unwrap();
+        let dest = tmp.path().join("out.jsonl");
+
+        let written =
+            write_jsonl_atomic_if(&staging, &dest, 64 * 1024, |&n: &u64| n > 0, |_w| Ok(0u64))
+                .unwrap();
+
+        assert_eq!(written, 0);
+        assert!(
+            !dest.exists(),
+            "a declined write must never reach the published path",
+        );
+        assert_eq!(
+            staged_file_count(&staging),
+            0,
+            "the discarded staged file must be cleaned out of the staging dir",
+        );
+    }
+
+    #[test]
+    fn write_jsonl_atomic_if_publishes_when_predicate_accepts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = ensure_staging_dir(tmp.path()).unwrap();
+        let dest = tmp.path().join("out.jsonl");
+
+        let written = write_jsonl_atomic_if(&staging, &dest, 64 * 1024, |&n: &u64| n > 0, |w| {
+            w.write_all(b"one\n")?;
+            Ok(1u64)
+        })
+        .unwrap();
+
+        assert_eq!(written, 1);
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "one\n");
+        assert_eq!(staged_file_count(&staging), 0);
+    }
+
+    #[test]
+    fn write_zst_atomic_if_discards_staged_file_when_not_published() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = ensure_staging_dir(tmp.path()).unwrap();
+        let dest = tmp.path().join("out.zst");
+
+        // The encoder still closes a real (empty-payload) frame on the staged
+        // file; declining to publish must discard it rather than rename it on.
+        let written =
+            write_zst_atomic_if(&staging, &dest, 3, 64 * 1024, |&n: &u64| n > 0, |_w| Ok(0u64))
+                .unwrap();
+
+        assert_eq!(written, 0);
+        assert!(
+            !dest.exists(),
+            "a declined zst write must never reach the published path",
+        );
+        assert_eq!(staged_file_count(&staging), 0);
+    }
 }

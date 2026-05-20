@@ -29,6 +29,6 @@ pub use sweep::sweep_stale_inprogress;
 pub(crate) use testing::{set_stage_path_observer_for_tests, StagePathObserverGuard};
 pub(crate) use writer::write_json_pretty_atomic;
 pub use writer::{
-    ensure_staging_dir, write_at_path_atomic, write_jsonl_atomic, write_text_atomic,
-    write_zst_atomic,
+    ensure_staging_dir, write_at_path_atomic, write_jsonl_atomic, write_jsonl_atomic_if,
+    write_text_atomic, write_zst_atomic_if,
 };

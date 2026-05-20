@@ -182,15 +182,24 @@ struct PartitionedJobCtx<'a> {
 }
 
 /// Per-file body for partitioned exports. Returns `Ok(())` on resume-skip,
-/// successful publish (including the zero-records-discard case), or a tolerated
-/// zstd partial-scan skip (already logged). Single `stream_job_with_partial_policy`
-/// call site dispatched by `format` — the writer wrapper (`write_jsonl_atomic`
-/// vs `write_zst_atomic`) is the only thing that differs between branches.
+/// abort-flag skip, a successful publish, a zero-record month (staged then
+/// discarded, never published), or a tolerated zstd partial-scan skip (already
+/// logged). Single `stream_job_with_partial_policy` call site dispatched by
+/// `format` — the writer wrapper (`write_jsonl_atomic_if` vs
+/// `write_zst_atomic_if`) is the only thing that differs between branches.
 fn process_partitioned_job(job: &FileJob, ctx: &PartitionedJobCtx<'_>) -> Result<()> {
     let key = export_part_key(job);
     let out_path = partitioned_output_path(ctx.out_base_dir, job, ctx.format);
 
     if ctx.record_limit.is_some_and(|limit| limit.is_exhausted()) {
+        return Ok(());
+    }
+
+    // Abort fast-path: once any worker's manifest commit has failed, this run
+    // is doomed (`ensure_resume_manifest_durable` will fail it). Stop
+    // publishing further partitions so the on-disk output set cannot outrun
+    // what `_progress.json` durably records.
+    if ctx.accumulator.is_some_and(ManifestAccumulator::is_poisoned) {
         return Ok(());
     }
 
@@ -221,15 +230,28 @@ fn process_partitioned_job(job: &FileJob, ctx: &PartitionedJobCtx<'_>) -> Result
         complete_stream_job(job, result)
     };
 
+    // Publish only when the month yielded at least one record. A zero-record
+    // month stages its (near-empty) output, the count is inspected before the
+    // atomic rename, and the staged file is discarded in the staging dir —
+    // never renamed onto the published path. This avoids the publish-then-
+    // delete race where a best-effort `remove` failing after the rename would
+    // strand a non-empty zero-record file at the published path while the
+    // manifest records `size: 0`.
+    let should_publish = |&n: &u64| n > 0;
     let written_result = match ctx.format {
-        ExportFormat::Jsonl => {
-            write_jsonl_atomic(ctx.staging_dir, &out_path, ctx.write_buf, stream)
-        }
-        ExportFormat::Zst => write_zst_atomic(
+        ExportFormat::Jsonl => write_jsonl_atomic_if(
+            ctx.staging_dir,
+            &out_path,
+            ctx.write_buf,
+            should_publish,
+            stream,
+        ),
+        ExportFormat::Zst => write_zst_atomic_if(
             ctx.staging_dir,
             &out_path,
             ctx.zst_level,
             ctx.write_buf,
+            should_publish,
             stream,
         ),
     };
@@ -244,9 +266,7 @@ fn process_partitioned_job(job: &FileJob, ctx: &PartitionedJobCtx<'_>) -> Result
     };
 
     ctx.output_records.fetch_add(written, Ordering::Relaxed);
-    if written == 0 {
-        let _ = crate::util::remove_with_short_backoff(&out_path);
-    } else {
+    if written > 0 {
         ctx.output_files.fetch_add(1, Ordering::Relaxed);
     }
     if let Some(acc) = ctx.accumulator {
@@ -389,7 +409,15 @@ impl ScanPlan {
 
             let resumed_lines = committed_line_count(&initial_months);
             let output_records = AtomicU64::new(resumed_lines);
-            let output_files = AtomicU64::new(completed_keys.len() as u64);
+            // Seed only with months that actually published a partition file.
+            // `completed_keys` also counts zero-record months (kept by
+            // `validate_partitioned_resume_output` when `lines == 0 &&
+            // !path.exists()`), which never incremented `output_files` on the
+            // fresh run — counting them here would make a resumed run's
+            // `partition_files` total over-count versus a fresh run.
+            let resumed_output_files =
+                initial_months.values().filter(|e| e.lines > 0).count() as u64;
+            let output_files = AtomicU64::new(resumed_output_files);
 
             let whitelist = prepared.etl.opts.whitelist_fields.clone();
             let whitelist_tracker = whitelist.as_ref().map(|fields| {
