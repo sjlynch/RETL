@@ -1178,7 +1178,10 @@ The three benchmark groups:
 
 ## Environment variables
 
-- `RUST_LOG` — standard `tracing` filter (e.g. `RUST_LOG=info`).
+- `RETL_LOG` — RETL's `tracing` filter (e.g. `RETL_LOG=debug`). Takes
+  precedence over `RUST_LOG` when both are set.
+- `RUST_LOG` — standard `tracing` filter (e.g. `RUST_LOG=info`); used when
+  `RETL_LOG` is unset.
 - `ETL_EXCLUDE_AUTHORS` — comma/semicolon/whitespace-separated authors to add
   to the default bot/service exclusion list.
 - `ETL_EXCLUDE_AUTHORS_FILE` — path to a newline-separated file of additional

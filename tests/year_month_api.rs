@@ -141,3 +141,19 @@ fn new_panics_on_zero_month() {
 fn new_panics_on_thirteen_month() {
     let _ = YearMonth::new(2020, 13);
 }
+
+#[test]
+fn try_new_accepts_valid_months_and_matches_new() {
+    for month in 1u8..=12 {
+        assert_eq!(YearMonth::try_new(2020, month), Some(YearMonth::new(2020, month)));
+    }
+}
+
+#[test]
+fn try_new_returns_none_for_out_of_range_month() {
+    // The non-panicking counterpart to `new`: a library caller computing a
+    // month from arithmetic gets `None` instead of a process panic.
+    assert_eq!(YearMonth::try_new(2020, 0), None);
+    assert_eq!(YearMonth::try_new(2020, 13), None);
+    assert_eq!(YearMonth::try_new(2020, u8::MAX), None);
+}

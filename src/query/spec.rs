@@ -187,9 +187,7 @@ impl QuerySpec {
         }
 
         if let Some(pattern) = &self.author_regex_pattern {
-            Regex::new(pattern).map_err(|e| {
-                QueryBuildError::new(format!("author_regex is invalid: {e}; pattern={pattern:?}"))
-            })?;
+            validate_author_regex_pattern(pattern)?;
         }
 
         for predicate in &self.json_predicates {
@@ -201,6 +199,7 @@ impl QuerySpec {
 
     pub(crate) fn compile_author_regex(mut self) -> Result<Self, QueryBuildError> {
         if let Some(pattern) = &self.author_regex_pattern {
+            validate_author_regex_pattern(pattern)?;
             let re = Regex::new(pattern).map_err(|e| {
                 QueryBuildError::new(format!("author_regex is invalid: {e}; pattern={pattern:?}"))
             })?;

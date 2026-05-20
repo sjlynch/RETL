@@ -187,6 +187,22 @@ pub fn install_monitor(options: MonitorOptions) -> Result<MonitorHandle> {
 
 static TRACING_INIT: OnceLock<()> = OnceLock::new();
 
+/// Resolve the tracing level filter from the environment.
+///
+/// `RETL_LOG` is RETL's own filter variable and wins over the generic
+/// `RUST_LOG`; when neither is set (or set to an unparseable value) the
+/// filter defaults to `info`.
+fn resolve_env_filter() -> EnvFilter {
+    for var in ["RETL_LOG", "RUST_LOG"] {
+        if let Ok(value) = std::env::var(var) {
+            if let Ok(filter) = EnvFilter::try_new(&value) {
+                return filter;
+            }
+        }
+    }
+    EnvFilter::new("info")
+}
+
 fn init_tracing(
     format: LogFormat,
     sink: SharedSink,
@@ -198,8 +214,7 @@ fn init_tracing(
         return Ok(());
     }
 
-    let env_layer = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let env_layer = resolve_env_filter();
 
     let event_layer = EventLayer::new(sink, status);
 
