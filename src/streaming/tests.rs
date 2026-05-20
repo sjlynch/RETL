@@ -253,4 +253,136 @@ mod tests {
             .finalize()
             .expect("healthy fast-path emissions must not trigger strict_whitelist");
     }
+
+    #[test]
+    fn legacy_usernames_normalizes_subreddit_and_pseudo_users() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("RC_2020-01.zst");
+        // The subreddit is recorded as mixed-case "Programming"; one record's
+        // author is a mixed-case `[Deleted]` pseudo-user; one record is in a
+        // different subreddit.
+        write_zst(
+            &path,
+            concat!(
+                r#"{"id":"c1","author":"Alice","subreddit":"Programming","created_utc":1}"#,
+                "\n",
+                r#"{"id":"c2","author":"[Deleted]","subreddit":"Programming","created_utc":2}"#,
+                "\n",
+                r#"{"id":"c3","author":"bob","subreddit":"other","created_utc":3}"#,
+                "\n",
+            )
+            .as_bytes(),
+        );
+
+        let job = FileJob {
+            kind: FileKind::Comment,
+            ym: YearMonth::new(2020, 1),
+            path,
+        };
+
+        let shard_writer = ShardedWriter::create(dir.path(), "legacy_un", 4).unwrap();
+        // The caller passes the subreddit *with* an `r/` prefix and odd casing:
+        // the legacy path must normalize it the same way the canonical query
+        // path does, otherwise it silently matches nothing.
+        process_file_for_usernames_with_skip(
+            &job,
+            16 * 1024,
+            "r/Programming",
+            &shard_writer,
+            None,
+            false,
+            None,
+            |_p, _e| {},
+        )
+        .unwrap();
+
+        let outs = shard_writer.dedup("legacy_un").unwrap();
+        let mut names = std::collections::BTreeSet::new();
+        for p in outs {
+            let f = std::fs::File::open(&p).unwrap();
+            for line in std::io::BufRead::lines(std::io::BufReader::new(f)) {
+                let line = line.unwrap();
+                if !line.is_empty() {
+                    names.insert(line);
+                }
+            }
+        }
+        // `Alice` is kept (subreddit matched after `r/` strip + case-fold);
+        // mixed-case `[Deleted]` is excluded (case-insensitive pseudo-user);
+        // `bob` is excluded (different subreddit).
+        assert_eq!(
+            names,
+            std::iter::once("Alice".to_string()).collect::<std::collections::BTreeSet<_>>()
+        );
+    }
+
+    #[test]
+    fn nested_created_utc_left_untouched_by_all_three_human_timestamp_paths() {
+        // Regression: an RS record nests full submission objects with their
+        // own `created_utc` (here inside `crosspost_parent_list`). All three
+        // human-timestamp rewriters — the byte path, the whitelist tokenizer,
+        // and the slow `serde_json::Value` path — must rewrite only the
+        // top-level timestamps and leave the nested ones as integers. The
+        // byte path previously rewrote nested matches, diverging from the
+        // other two whenever a whitelist or the tokenizer fallback was used.
+        let raw = concat!(
+            r#"{"id":"abc123","subreddit":"rust","created_utc":1136074600,"#,
+            r#""edited":1136074800,"crosspost_parent_list":[{"id":"xpost1","#,
+            r#""created_utc":1100000000,"edited":false}],"title":"hi"}"#,
+        );
+        // Round-trip through serde_json so `line` is already in the canonical
+        // compact form the slow path re-emits — that makes a byte-identical
+        // three-way comparison meaningful.
+        let canonical: Value = serde_json::from_str(raw).unwrap();
+        let line = serde_json::to_string(&canonical).unwrap();
+
+        // Path 1: byte-level rewriter.
+        let mut byte_out = String::new();
+        rewrite_human_timestamps_bytes(&line, &mut byte_out);
+
+        // Path 2: whitelist tokenizer with the fused timestamp rewrite. Every
+        // top-level key is whitelisted, so the projection is the identity.
+        let fields: Vec<String> = canonical
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        let tokenizer = WhitelistTokenizer::new(fields.iter().map(|s| s.as_str()));
+        let mut tok_out = String::new();
+        tokenizer
+            .tokenize_and_rewrite_timestamps_into(&line, &mut tok_out)
+            .expect("flat top-level object must tokenize");
+
+        // Path 3: slow `serde_json::Value` path.
+        let mut slow_val: Value = serde_json::from_str(&line).unwrap();
+        apply_human_timestamps(&mut slow_val);
+        let slow_out = serde_json::to_string(&slow_val).unwrap();
+
+        assert_eq!(
+            byte_out, tok_out,
+            "byte path and whitelist tokenizer must agree byte-for-byte"
+        );
+        assert_eq!(
+            byte_out, slow_out,
+            "byte path and slow Value path must agree byte-for-byte"
+        );
+
+        // And explicitly: top-level timestamps became RFC3339 strings while
+        // the nested ones inside `crosspost_parent_list` stayed integers.
+        let got: Value = serde_json::from_str(&byte_out).unwrap();
+        assert!(got["created_utc"].is_string(), "top-level created_utc");
+        assert!(got["edited"].is_string(), "top-level edited");
+        let nested = &got["crosspost_parent_list"][0];
+        assert_eq!(
+            nested["created_utc"].as_i64(),
+            Some(1_100_000_000),
+            "nested created_utc must stay an integer"
+        );
+        assert_eq!(
+            nested["edited"].as_bool(),
+            Some(false),
+            "nested edited must stay a bool"
+        );
+    }
 }

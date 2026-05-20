@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use sysinfo::{Pid, ProcessesToUpdate, System};
 
-use super::events::{Event, LifecycleEvent};
+use super::events::Event;
 use super::sink::SharedSink;
 use super::status::StatusShared;
 
@@ -154,17 +154,12 @@ fn emit_breach(sink: &SharedSink, breach: &Breach) {
 }
 
 fn emit_final_summary(sink: &SharedSink, shared: &Arc<StatusShared>, outcome: &str) {
-    let mut fields = BTreeMap::new();
-    for (k, v) in super::status::final_summary_fields(shared, outcome) {
-        fields.insert(k, v);
-    }
-    let msg = format!("run ended: outcome={outcome}");
-    // Mirror the lifecycle event into the status's `last_event_*` so an
-    // operator polling the status snapshot post-mortem can identify the
-    // outcome without also reading the event stream.
-    shared.record_event("lifecycle", &msg);
-    let event = Event::lifecycle(LifecycleEvent::RunSummary, msg, fields);
-    sink.write(&event);
+    // Route through the shared `summary_emitted` latch: if a cap fires while
+    // `MonitorHandle::finalize` is concurrently running, exactly one of the
+    // two paths writes `run.summary`. `emit_run_summary_once` also mirrors
+    // the marker into the status snapshot's `last_event_*` so an operator
+    // polling the status file post-mortem can still identify the outcome.
+    super::status::emit_run_summary_once(shared, sink, outcome);
 }
 
 #[cfg(test)]

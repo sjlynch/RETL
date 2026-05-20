@@ -1,5 +1,6 @@
-//! Event sinks. `JsonlSink` writes one JSON object per line, line-buffered,
-//! mutex-guarded so an `on_event` from any thread produces a complete line.
+//! Event sinks. `JsonlSink` writes one JSON object per line and flushes
+//! after every event line, mutex-guarded so an `on_event` from any thread
+//! produces a complete line.
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -11,8 +12,15 @@ use anyhow::{Context, Result};
 
 use super::events::Event;
 
-/// Counter shared with the status snapshot writer so a watcher can detect
-/// drops vs. silent stalls.
+/// Counters shared with the status snapshot writer. `emitted` counts
+/// successfully written event lines; `dropped` counts events lost to a
+/// serialization or write error.
+///
+/// NOTE: `dropped` does **not** count backpressure. The sink writes
+/// synchronously on the tracing call site — there is no bounded channel —
+/// so a slow `--events` disk throttles the whole run instead of dropping
+/// events. `dropped > 0` therefore means a hard write/serialize failure
+/// (disk full, I/O error), not a watcher that fell behind.
 #[derive(Debug, Default)]
 pub(crate) struct SinkCounters {
     pub(crate) emitted: AtomicU64,
@@ -114,8 +122,12 @@ impl EventSink for JsonlSink {
             self.counters.dropped.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        // Line-flush so watchers see events promptly. BufWriter still
-        // amortizes small writes per syscall when bursts arrive.
+        // Flush after every event line so watchers tailing the file see
+        // events promptly. This is a synchronous write+flush on the tracing
+        // call site — there is no background writer thread, so a slow
+        // `--events` disk throttles the run rather than dropping events.
+        // The 64 KiB `BufWriter` only amortizes the two `write_all`s within
+        // a single event into one syscall.
         let _ = guard.flush();
         self.counters.emitted.fetch_add(1, Ordering::Relaxed);
     }

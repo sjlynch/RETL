@@ -5,7 +5,7 @@ use assert_cmd::Command;
 use common::*;
 use predicates::prelude::*;
 use predicates::str::contains;
-use retl::{quick_validate_zst, IntegrityMode, RedditETL, Sources, YearMonth};
+use retl::{quick_validate_zst, IntegrityMode, QuickOutcome, RedditETL, Sources, YearMonth};
 
 fn retl_cmd() -> Command {
     Command::cargo_bin("retl").expect("retl binary should be built")
@@ -32,7 +32,7 @@ fn integrity_check_detects_corrupt_month() {
         .unwrap();
 
     assert_eq!(
-        bad_quick.len(),
+        bad_quick.failure_count(),
         1,
         "quick integrity should flag the corrupt file"
     );
@@ -46,9 +46,47 @@ fn integrity_check_detects_corrupt_month() {
         .unwrap();
 
     assert_eq!(
-        bad_full.len(),
+        bad_full.failure_count(),
         1,
         "full integrity should also flag the corrupt file"
+    );
+}
+
+/// A file whose *decompressed* size is smaller than the quick-mode sample
+/// budget is decoded all the way to EOF — including its trailing checksum —
+/// so quick mode on it is equivalent to a full check. `quick_validate_zst`
+/// must report that distinctly as `FullyDecoded`, not as a prefix sample.
+#[test]
+fn quick_validate_reports_fully_decoded_for_sub_sample_size_file() {
+    let base = make_corpus_basic();
+    // The basic corpus file holds three tiny comment records — well under a
+    // mebibyte of decompressed JSON.
+    let path = base.join("comments").join("RC_2006-01.zst");
+
+    let outcome = quick_validate_zst(&path, 1024 * 1024).unwrap();
+
+    assert_eq!(
+        outcome,
+        QuickOutcome::FullyDecoded,
+        "a file smaller than the sample budget must be reported as fully decoded"
+    );
+}
+
+/// The converse: when the sample budget is exhausted before EOF, the same
+/// file is reported as `PrefixOnly` so a caller knows trailing corruption
+/// past the sampled prefix was not checked.
+#[test]
+fn quick_validate_reports_prefix_only_when_budget_exhausted() {
+    let base = make_corpus_basic();
+    let path = base.join("comments").join("RC_2006-01.zst");
+
+    // 8 decompressed bytes is far less than the file's JSON payload.
+    let outcome = quick_validate_zst(&path, 8).unwrap();
+
+    assert_eq!(
+        outcome,
+        QuickOutcome::PrefixOnly,
+        "a tiny sample budget must be reported as a prefix-only check"
     );
 }
 

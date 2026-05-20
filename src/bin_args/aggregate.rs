@@ -1,6 +1,8 @@
 use clap::Args;
 use std::path::PathBuf;
 
+use super::MonitorOpts;
+
 #[derive(Args, Debug, Clone)]
 pub(crate) struct AggregateRuntimeOpts {
     /// Number of Rayon worker threads (defaults to the global pool; clamped to RETL's safe cap).
@@ -20,6 +22,12 @@ pub(crate) struct AggregateRuntimeOpts {
 pub(crate) struct AggregateArgs {
     #[command(flatten)]
     pub(crate) runtime: AggregateRuntimeOpts,
+    /// Observability / monitoring flags (opt-in, off by default).
+    /// `aggregate` reduces materialized JSONL inputs and is one of the
+    /// most memory-hungry stages, so `--max-rss-mb`/`--status-file` and
+    /// the rest of the watchdog surface apply here.
+    #[command(flatten)]
+    pub(crate) monitor: MonitorOpts,
     /// Spool directory containing `part_RC_YYYY-MM.jsonl` /
     /// `part_RS_YYYY-MM.jsonl` files to aggregate.
     #[arg(long)]

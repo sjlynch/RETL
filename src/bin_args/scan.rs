@@ -9,7 +9,7 @@ pub(crate) struct ScanArgs {
     pub(crate) common: CommonOpts,
     #[command(flatten)]
     pub(crate) query: QueryOpts,
-    /// Output file for usernames (default: stdout).
+    /// Output file for usernames (default: stdout; `-` also means stdout).
     #[arg(long, short)]
     pub(crate) out: Option<PathBuf>,
     /// Stop after approximately N matching records have been scanned/emitted.

@@ -21,7 +21,9 @@ pub(crate) fn run_scan_to(args: ScanArgs, w: &mut dyn Write) -> Result<()> {
         scan = scan.limit(limit);
     }
 
-    match args.out {
+    // `--out -` is an explicit request for stdout, matching every sibling
+    // subcommand (`dedupe`, `count`, `export`, `convert`, `sample`).
+    match args.out.filter(|p| p.as_path() != Path::new("-")) {
         Some(path) => {
             let manifest_start = RunManifestStart::now();
             let written = write_text_atomic(&path, CLI_TEXT_WRITE_BUF_BYTES, |w| {

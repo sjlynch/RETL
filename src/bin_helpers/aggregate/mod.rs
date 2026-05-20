@@ -28,7 +28,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
 
-use crate::bin_args::CommonOpts;
+use crate::bin_args::{CommonOpts, MonitorOpts};
 
 include!("spec.rs");
 include!("numeric.rs");

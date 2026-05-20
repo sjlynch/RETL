@@ -10,9 +10,28 @@ pub struct YearMonth {
 }
 
 impl YearMonth {
+    /// Construct a `YearMonth` from a year and a `1..=12` month.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `month` is not in `1..=12`. Use [`YearMonth::try_new`] for a
+    /// non-panicking constructor when `month` is computed at runtime (e.g.
+    /// from arithmetic) and may fall outside the valid range.
     pub fn new(year: u16, month: u8) -> Self {
-        assert!((1..=12).contains(&month), "Month must be 1..=12");
-        Self { year, month }
+        Self::try_new(year, month).expect("Month must be 1..=12")
+    }
+    /// Construct a `YearMonth`, returning `None` when `month` is outside
+    /// `1..=12`.
+    ///
+    /// Prefer this over [`YearMonth::new`] for runtime-computed months — `new`
+    /// panics on an out-of-range month, which a library caller deriving a
+    /// month from arithmetic generally does not want.
+    pub fn try_new(year: u16, month: u8) -> Option<Self> {
+        if (1..=12).contains(&month) {
+            Some(Self { year, month })
+        } else {
+            None
+        }
     }
     pub fn next(self) -> Option<Self> {
         if self.month < 12 {

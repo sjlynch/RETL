@@ -2,6 +2,8 @@ use clap::{Args, ValueEnum};
 use retl::YearMonth;
 use std::path::PathBuf;
 
+use super::MonitorOpts;
+
 #[derive(ValueEnum, Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ParentIdKindArg {
     /// Bare IDs are comment IDs (`t1_...`).
@@ -99,4 +101,10 @@ pub(crate) struct ParentsArgs {
     /// Set to 1 to match the declared `inflight_bytes` budget exactly.
     #[arg(long)]
     pub(crate) inflight_groups: Option<usize>,
+    /// Observability / monitoring flags (opt-in, off by default). `parents`
+    /// resolves parent payloads over a multi-month corpus window and can
+    /// balloon the parent cache to several times the compressed input size,
+    /// so `--events`/`--status-file`/`--max-rss-mb` are worth wiring up.
+    #[command(flatten)]
+    pub(crate) monitor: MonitorOpts,
 }

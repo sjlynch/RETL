@@ -26,7 +26,7 @@ mod schema;
 pub(crate) use aggregate::AggregateArgs;
 #[allow(unused_imports)]
 pub(crate) use aggregate::AggregateRuntimeOpts;
-pub(crate) use common::{CommonOpts, QueryOpts, SourceArg};
+pub(crate) use common::{CommonOpts, MonitorOpts, QueryOpts, SourceArg};
 pub(crate) use convert::{ConvertArgs, ConvertFmt};
 pub(crate) use corpus::{
     CorpusArgs, CorpusCommand, CorpusManifestArgs, CorpusPlanArgs, CorpusPlanFmt,
@@ -56,20 +56,24 @@ pub(crate) struct Cli {
 }
 
 impl Command {
-    /// Subcommands that flatten [`CommonOpts`] expose it here so the binary
-    /// can read observability flags once, up front, before dispatch.
-    /// Returns `None` for the analytics/manifest subcommands that have
-    /// their own argument shapes (`aggregate`, `corpus`, `describe`,
-    /// `parents`, `quickstart`, `convert`, `schema`).
-    pub(crate) fn common_opts(&self) -> Option<&CommonOpts> {
+    /// Expose each subcommand's [`MonitorOpts`] so the binary can install
+    /// the monitor once, up front, before dispatch. Most commands carry it
+    /// inside their flattened [`CommonOpts`]; `parents` and `aggregate`
+    /// flatten [`MonitorOpts`] directly because they have their own
+    /// argument shape. Returns `None` only for the short-running
+    /// analytics/manifest subcommands (`corpus`, `describe`, `quickstart`,
+    /// `convert`, `schema`), which get default (no-op) monitoring.
+    pub(crate) fn monitor_opts(&self) -> Option<&MonitorOpts> {
         match self {
-            Command::Scan(a) => Some(&a.common),
-            Command::Export(a) => Some(&a.common),
-            Command::Dedupe(a) => Some(&a.common),
-            Command::Count(a) => Some(&a.common),
-            Command::Sample(a) => Some(&a.common),
-            Command::Integrity(a) => Some(&a.common),
-            Command::FirstSeen(a) => Some(&a.common),
+            Command::Scan(a) => Some(&a.common.monitor),
+            Command::Export(a) => Some(&a.common.monitor),
+            Command::Dedupe(a) => Some(&a.common.monitor),
+            Command::Count(a) => Some(&a.common.monitor),
+            Command::Sample(a) => Some(&a.common.monitor),
+            Command::Integrity(a) => Some(&a.common.monitor),
+            Command::FirstSeen(a) => Some(&a.common.monitor),
+            Command::Parents(a) => Some(&a.monitor),
+            Command::Aggregate(a) => Some(&a.monitor),
             _ => None,
         }
     }
@@ -102,6 +106,10 @@ pub(crate) enum Command {
     /// Count records by month, or write per-author counts to TSV.
     Count(CountArgs),
     /// Validate `.zst` monthly files (quick sample or full decode).
+    ///
+    /// `integrity` only reads and checks corpus files; it emits no records and
+    /// writes no provenance manifest, so the shared `--no-manifest` flag has no
+    /// effect here and passing it logs a warning.
     Integrity(IntegrityArgs),
     /// Aggregate JSONL inputs into JSON record counts or built-in TSV rollups.
     Aggregate(AggregateArgs),
