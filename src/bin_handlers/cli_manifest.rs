@@ -86,15 +86,27 @@ fn cli_corpus_snapshot(common: &CommonOpts) -> Result<CorpusSnapshot> {
 fn cli_query_value(common: &CommonOpts, query: &QueryOpts) -> Value {
     serde_json::json!({
         "subreddits": normalize_cli_values(&common.subreddits, true),
+        "ids": &query.ids,
+        "ids_files": query
+            .ids_files
+            .iter()
+            .map(|path| path_to_stable_string(path))
+            .collect::<Vec<_>>(),
         "authors_in": normalize_cli_values(&query.authors, false),
         "authors_out": normalize_cli_values(&query.exclude_authors, false),
         "exclude_common_bots": query.exclude_common_bots,
         "author_regex": query.author_regex.as_deref(),
         "min_score": query.min_score,
         "max_score": query.max_score,
+        "after": query.after,
+        "before": query.before,
         "keywords_any": normalize_cli_values(&query.keywords, false),
+        "keywords_all": normalize_cli_values(&query.keywords_all, false),
+        "keywords_exclude": normalize_cli_values(&query.exclude_keywords, false),
+        "text_regex": query.text_regex.as_deref(),
         "domains_in": normalize_cli_values(&query.domains, false),
         "contains_url": query.contains_url.then_some(true),
+        "no_url": query.no_url.then_some(true),
         "json_predicates": &query.json_predicates,
         "filter_pseudo_users": !common.include_deleted,
     })

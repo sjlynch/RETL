@@ -1,12 +1,30 @@
 
 pub(crate) fn run_first_seen(args: FirstSeenArgs) -> Result<()> {
+    let to_stdout = args.out == Path::new("-");
     let mut etl = build_etl(&args.common)?;
+    if to_stdout {
+        // The TSV is written to a scratch tempfile, so a run manifest beside
+        // it would be orphaned in `work_dir/lib_tmp`. Suppress it, matching
+        // `count --mode author --out -` and `dedupe --out -`.
+        etl = etl.run_manifest(false);
+    }
     if args.resume {
         etl = etl.resume(true);
     }
     let partial_reporter = etl.partial_read_reporter();
-    let scan = plan!(etl, args.common, args.query);
-    scan.build_first_seen_index_to_tsv(&args.out)?;
+    let mut scan = plan!(etl, args.common, args.query);
+    if let Some(limit) = args.limit {
+        scan = scan.limit(limit);
+    }
+    // `--out -` streams the TSV to stdout, matching `count --mode author`.
+    if to_stdout {
+        let work_dir = args.common.work_dir.clone();
+        stream_path_output_to_stdout(&work_dir, "first_seen", "first_seen.tsv", |p| {
+            scan.build_first_seen_index_to_tsv(p)
+        })?;
+    } else {
+        scan.build_first_seen_index_to_tsv(&args.out)?;
+    }
     emit_partial_read_report(&partial_reporter)?;
     Ok(())
 }

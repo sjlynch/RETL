@@ -280,4 +280,43 @@ mod tests {
             "allow_partial skip should advance progress exactly to metadata length"
         );
     }
+
+    /// Reddit dumps occasionally store `score` / `created_utc` as JSON strings
+    /// or floats. `parse_minimal` must coerce those encodings to `i64` so the
+    /// fast-path filters (`matches_minimal`, `within_bounds`) see the same
+    /// value regardless of how the number was written; a bare `as_i64()` would
+    /// yield `None` and silently drop the record.
+    #[test]
+    fn parse_minimal_coerces_string_and_float_numeric_fields() {
+        // Integer-typed: the baseline encoding.
+        let int_rec = parse_minimal(r#"{"score":100,"created_utc":1136074600}"#).unwrap();
+        assert_eq!(int_rec.score, Some(100));
+        assert_eq!(int_rec.created_utc, Some(1136074600));
+
+        // String-typed numbers coerce identically.
+        let str_rec = parse_minimal(r#"{"score":"100","created_utc":"1136074600"}"#).unwrap();
+        assert_eq!(str_rec.score, Some(100));
+        assert_eq!(str_rec.created_utc, Some(1136074600));
+
+        // Whole-number floats coerce too (`as_i64()` rejects these).
+        let flt_rec = parse_minimal(r#"{"score":100.0,"created_utc":1136074600.0}"#).unwrap();
+        assert_eq!(flt_rec.score, Some(100));
+        assert_eq!(flt_rec.created_utc, Some(1136074600));
+
+        // Negative values survive in every encoding.
+        let neg = parse_minimal(r#"{"score":-5,"created_utc":"-5"}"#).unwrap();
+        assert_eq!(neg.score, Some(-5));
+        assert_eq!(neg.created_utc, Some(-5));
+
+        // Fractional floats and non-numeric strings stay `None` rather than
+        // being rounded or guessed — coercion only accepts integral values.
+        let bad = parse_minimal(r#"{"score":100.5,"created_utc":"not-a-number"}"#).unwrap();
+        assert_eq!(bad.score, None);
+        assert_eq!(bad.created_utc, None);
+
+        // Genuinely missing fields remain `None`.
+        let missing = parse_minimal(r#"{"id":"c1"}"#).unwrap();
+        assert_eq!(missing.score, None);
+        assert_eq!(missing.created_utc, None);
+    }
 }

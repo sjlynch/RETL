@@ -21,7 +21,10 @@ pub(crate) fn run_count_to(args: CountArgs, w: &mut dyn Write) -> Result<()> {
         etl = etl.resume(true);
     }
     let partial_reporter = etl.partial_read_reporter();
-    let scan = plan!(etl, args.common, args.query);
+    let mut scan = plan!(etl, args.common, args.query);
+    if let Some(limit) = args.limit {
+        scan = scan.limit(limit);
+    }
 
     match args.mode {
         CountMode::Month => {
@@ -54,7 +57,7 @@ pub(crate) fn run_count_to(args: CountArgs, w: &mut dyn Write) -> Result<()> {
                         ("records_counted", total_records),
                     ]),
                     &partial_reporter,
-                    serde_json::json!({ "mode": "month" }),
+                    serde_json::json!({ "mode": "month", "limit": args.limit }),
                 )?;
             }
         }

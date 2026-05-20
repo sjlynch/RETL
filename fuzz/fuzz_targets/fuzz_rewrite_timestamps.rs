@@ -14,32 +14,21 @@
 //! 2. The output is valid UTF-8 (enforced by the `String` return type) AND,
 //!    if the input was valid JSON, the output is also valid JSON. A regression
 //!    that emits truncated/garbled JSON for a parsable input is a finding.
-//! 3. For inputs that parse as a "shallow" top-level JSON object (no nested
-//!    objects/arrays in the values), the byte-rewrite output must equal the
-//!    slow path — `apply_human_timestamps` applied to the parsed Value. The
-//!    two paths are run side-by-side in production; semantic divergence on
-//!    that shape is a regression to file separately.
+//! 3. For inputs that parse as a top-level JSON object, the byte-rewrite
+//!    output must equal the slow path — `apply_human_timestamps` applied to
+//!    the parsed Value. The two paths are run side-by-side in production;
+//!    semantic divergence on that shape is a regression to file separately.
 //!
-//! The shallow-object guard is deliberate: `apply_human_timestamps` only
-//! touches the top-level object, while the byte rewriter walks every byte
-//! and would (correctly, per its docs) rewrite nested-object timestamp keys
-//! too. We do not assert equivalence on shapes where the two paths are
-//! known to diverge by design — only on the flat Reddit-line shape that
-//! matches the production payload.
+//! The object guard restricts the side-by-side check to the production
+//! payload shape — a top-level JSON object. Both the byte rewriter and
+//! `apply_human_timestamps` rewrite only the *top-level* object's timestamp
+//! keys, leaving nested ones (e.g. inside `crosspost_parent_list`) untouched,
+//! so the two paths must agree on every JSON object, shallow or deeply
+//! nested. Non-object top-level values (a bare array or scalar) are never fed
+//! through this rewriter in production, so they are not asserted.
 
 use libfuzzer_sys::fuzz_target;
 use serde_json::Value;
-
-/// True when `v` is a JSON object whose direct children are all scalars
-/// (no nested objects or arrays). Mirrors the production Reddit-line shape.
-fn is_shallow_object(v: &Value) -> bool {
-    match v {
-        Value::Object(map) => map
-            .values()
-            .all(|x| !matches!(x, Value::Object(_) | Value::Array(_))),
-        _ => false,
-    }
-}
 
 fuzz_target!(|data: &[u8]| {
     // Production calls the rewriter on a `&str` (a decoded JSONL line), so
@@ -58,14 +47,14 @@ fuzz_target!(|data: &[u8]| {
     let rewritten_val: Value = serde_json::from_str(&buf)
         .expect("byte-rewrite of a valid-JSON line must itself be valid JSON");
 
-    // Contract 3: on the shallow-object shape used in production, the byte
-    // path must match the slow path exactly.
-    if is_shallow_object(&input_val) {
+    // Contract 3: on any top-level JSON object — nested values included —
+    // the byte path must match the slow path exactly.
+    if input_val.is_object() {
         let mut slow = input_val;
         retl::apply_human_timestamps(&mut slow);
         assert_eq!(
             rewritten_val, slow,
-            "byte-rewrite diverges from apply_human_timestamps on shallow object\n\
+            "byte-rewrite diverges from apply_human_timestamps on object\n\
              input:     {line}\n\
              rewritten: {buf}"
         );
