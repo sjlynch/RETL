@@ -1,6 +1,6 @@
 use crate::atomic_write::{
     ensure_staging_dir, sweep_stale_inprogress, write_at_path_atomic, write_jsonl_atomic,
-    write_zst_atomic,
+    write_jsonl_atomic_if, write_zst_atomic_if,
 };
 use crate::config::ETLOptions;
 use crate::date::YearMonth;

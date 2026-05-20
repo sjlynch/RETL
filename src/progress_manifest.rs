@@ -200,6 +200,19 @@ impl ManifestAccumulator {
     pub fn last_save_error(&self) -> Option<String> {
         self.save_error.lock().clone()
     }
+
+    /// Run-level abort flag: `true` once any commit in this run has failed to
+    /// durably save (the same condition [`Self::last_save_error`] latches).
+    ///
+    /// The per-file workers fan out concurrently, so when one worker's commit
+    /// fails the others are still mid-flight. They check this at entry and
+    /// skip staging any further output: a run already doomed by a
+    /// non-durable checkpoint must not keep publishing final files the failed
+    /// manifest can never record, which would let the on-disk output set
+    /// outrun what `_progress.json` durably lists.
+    pub fn is_poisoned(&self) -> bool {
+        self.save_error.lock().is_some()
+    }
 }
 
 #[cfg(test)]

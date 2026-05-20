@@ -69,6 +69,26 @@ pub(super) fn make_two_month_comment_corpus() -> PathBuf {
     base
 }
 
+/// Build a corpus of `months` consecutive monthly comment files starting at
+/// `RC_2006-01.zst`, one `programming` record each. Used by the manifest-
+/// commit abort tests, which need many months so a save failure injected
+/// early can be shown to *stop* further publishing rather than letting every
+/// remaining month land.
+pub(super) fn make_n_month_comment_corpus(months: u8) -> PathBuf {
+    assert!((1..=12).contains(&months), "helper covers a single 2006 year");
+    let base = tempfile::tempdir().unwrap().keep();
+    for i in 0..months {
+        let ym = YearMonth::new(2006, i + 1);
+        let created = 1_136_073_600 + i64::from(i) * 2_419_200;
+        write_zst_lines(
+            &base.join("comments").join(format!("RC_{ym}.zst")),
+            &[comment_line(&format!("c{i}"), "alice", created)],
+        );
+    }
+    fs::create_dir_all(base.join("submissions")).unwrap();
+    base
+}
+
 pub(super) fn two_month_scan(base: &Path, work_dir: &Path) -> ScanPlan {
     RedditETL::new()
         .base_dir(base)

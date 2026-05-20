@@ -16,6 +16,10 @@ pub(crate) struct DedupeArgs {
     /// Output text file, one unique key per line. Use `-` for stdout.
     #[arg(long, short)]
     pub(crate) out: PathBuf,
+    /// Stop after approximately N matching records have been scanned.
+    /// With file_concurrency >1, already-running workers may emit a bounded over-shoot.
+    #[arg(long, visible_alias = "head")]
+    pub(crate) limit: Option<u64>,
     /// Per-flush byte budget for bucketing/dedupe (`per_flush_cap = N / 2`).
     /// 0 disables the explicit cap and falls back to memory-fraction sampling.
     /// NOTE: this is NOT the worst-case peak — see `--inflight-groups`.

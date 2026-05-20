@@ -44,12 +44,15 @@ contract guarantees no corrupt outputs even on abrupt termination.
 
 ## Flags
 
-All flags below are part of the shared `CommonOpts`. Subcommands that
-flatten `CommonOpts` (`scan`, `dedupe`, `export`, `count`, `integrity`,
-`sample`, `first-seen`) accept them. Subcommands without `CommonOpts`
-(`aggregate`, `corpus`, `describe`, `parents`, `quickstart`, `convert`,
-`schema`) get default monitoring (no event file, no caps) — those commands
-are typically short-running.
+The monitoring flags below are accepted by every long-running subcommand.
+`scan`, `dedupe`, `export`, `count`, `integrity`, `sample`, and `first-seen`
+carry them inside the shared `CommonOpts`. `parents` and `aggregate` — among
+the longest-running, most memory-hungry operations in the toolkit — flatten
+the same flags directly (a `parents` run can balloon the parent cache to
+several times the compressed input size, so it especially benefits from an
+RSS cap). The remaining short-running analytics/manifest subcommands
+(`corpus`, `describe`, `quickstart`, `convert`, `schema`) get default
+monitoring (no event file, no caps).
 
 | Flag | Purpose |
 |---|---|
@@ -68,6 +71,12 @@ are typically short-running.
 One JSON object per line, NDJSON. The file is opened with `File::create` so
 each run starts fresh. Watchers should tail with `Get-Content -Wait -Tail 0`
 (PowerShell) or `tail -f` (bash) and parse line-by-line.
+
+Each event is serialized and flushed synchronously on the `tracing` call
+site — there is no background writer thread and no bounded channel between
+the producer and the file. A slow `--events` disk therefore *throttles the
+run* rather than dropping events; point `--events` at fast local storage
+for long scans. (See "Liveness" and the `events_dropped` notes below.)
 
 ### Envelope
 
@@ -107,13 +116,18 @@ Optional fields (omitted when empty):
 
 ### Stable `outcome` values on `run.summary`
 
-| `outcome`        | Exit code | Meaning |
-|------------------|----------:|---------|
-| `completed`      | 0         | Subcommand returned `Ok`. |
-| `failed`         | 1         | Subcommand returned `Err`. |
-| `killed_rss`     | 2         | Watchdog RSS cap fired. |
-| `killed_runtime` | 2         | Watchdog runtime cap fired. |
-| `stop_file`      | 0         | Operator-requested graceful stop. |
+| `outcome`             | Exit code | Meaning |
+|-----------------------|----------:|---------|
+| `completed`           | 0         | Subcommand returned `Ok`. |
+| `failed`              | 1         | Subcommand returned `Err`. |
+| `corrupt_files_found` | 2         | `retl integrity` ran cleanly but detected at least one corrupt corpus file. This is a normal result, **not** a crash — the monitor finalizes (terminal `run.summary`, status file marked finished) *before* the process exits 2. |
+| `killed_rss`          | 2         | Watchdog RSS cap fired. |
+| `killed_runtime`      | 2         | Watchdog runtime cap fired. |
+| `stop_file`           | 0         | Operator-requested graceful stop. |
+
+Note that exit code 2 is shared by `corrupt_files_found`, `killed_rss`, and
+`killed_runtime` — a watcher must read `fields.outcome` on `run.summary` (not
+the exit code alone) to tell a corruption result from a watchdog kill.
 
 ### Tracing events (`kind=tracing`)
 
@@ -182,8 +196,12 @@ Field guide for watchers:
 - `throttle_active` — when true, the library is intentionally slowing
   bucketing/dedupe producers. A watcher seeing this set for extended
   periods may want to lower `--inflight-bytes`.
-- `events_dropped` — should always be 0. Non-zero means the watcher's
-  sink stalled (disk full, lock contention). Treat as a serious signal.
+- `events_dropped` — counts events lost to a **serialization or write
+  error** (disk full, I/O failure), not to backpressure. The events file
+  is written synchronously with no bounded channel, so a slow sink
+  throttles the run instead of dropping events — `events_dropped` cannot
+  rise from a watcher falling behind. Should normally be 0; a non-zero
+  value means a hard write/serialize failure on the `--events` path.
 - `last_event_kind` + `last_event_msg` — what's happening right now.
 
 ---
@@ -195,7 +213,8 @@ Field guide for watchers:
 | `current_rss_mb` climbing past `--inflight-bytes` × 4 | Pathological `inflight_groups` × `inflight_bytes` pair | Lower `--inflight-groups`, or use `RedditETL::inflight_budget()` to set both together |
 | `throttle_active=true` for > 60 s | System under memory pressure | Reduce `--inflight-bytes` or close other apps |
 | `last_event_ts` unchanging for > 30 s, `cpu_percent` near 0 | Wedged in zstd decode or stuck on a slow I/O path | Inspect the process; consider hard-kill + resume |
-| `events_dropped > 0` | Watcher sink failing to keep up | Check disk space, lock contention on the events file |
+| `events_dropped > 0` | Serialization or write error on the events file (disk full, I/O failure) — *not* a slow watcher | Check disk space and permissions on the `--events` path |
+| `throttle_active=false` but the run is slow and `--events` is on a slow disk | Synchronous event writes throttling the run | Move `--events` to fast local storage, or lower `--heartbeat-sec` |
 | `outcome: killed_rss` in `run.summary` | RSS cap fired | Re-run with a higher cap or smaller `--inflight-bytes` |
 | Stream stops mid-run with no `run.summary` | Hard kill (SIGKILL / Stop-Process / OOM-killer) | See "Detecting hard kill" below; re-run with `--resume` if applicable |
 
@@ -223,7 +242,10 @@ every other event (`SharedSink` write), so its absence is informative.
 - **Graceful exit (handler returned, `MonitorHandle::finalize` ran):**
   the status file is rewritten one final time so its `last_event_kind`
   is `"lifecycle"` and `last_event_msg` is `"run ended: outcome=…"`.
-  This is a reliable secondary signal.
+  This is a reliable secondary signal. This includes `retl integrity`
+  exiting 2 on a 'corruption found' result (outcome `corrupt_files_found`):
+  the monitor finalizes normally before the exit, so a watcher sees a
+  proper `run.summary` and must not mistake it for a hard kill.
 - **Watchdog hard-exit (cap fired):** `run.summary` *is* emitted on the
   event stream before `process::exit`, but the status writer thread may
   not get a final tick before termination — so the on-disk status file

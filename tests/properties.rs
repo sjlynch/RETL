@@ -192,7 +192,7 @@ fn project(v: &Value, wl: &Option<Vec<String>>) -> Value {
 }
 
 /// Write `records` as a single one-month `.zst` (RC_2006-01.zst) using the
-/// same encoder shape as `atomic_write::write_zst_atomic` (level 3 +
+/// same encoder shape as `atomic_write::write_zst_atomic_if` (level 3 +
 /// `include_checksum(true)`).
 fn write_input_zst(path: &Path, records: &[TestRecord]) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();

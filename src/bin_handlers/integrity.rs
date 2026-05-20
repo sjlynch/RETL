@@ -1,8 +1,16 @@
 
-pub(crate) fn run_integrity(args: IntegrityArgs) -> Result<()> {
+pub(crate) fn run_integrity(args: IntegrityArgs) -> Result<HandlerOutcome> {
     if args.resume {
         anyhow::bail!(
             "retl integrity does not support --resume; it validates corpus files directly. Narrow long runs with --source/--start/--end or use resumable scan/export/count workflows for record processing."
+        );
+    }
+    // `integrity` validates corpus files in place and never writes a
+    // provenance manifest, so `--no-manifest` (shared via `CommonOpts`) is
+    // inert here. Surface it instead of silently accepting it.
+    if args.common.no_manifest {
+        tracing::warn!(
+            "--no-manifest has no effect on `retl integrity`: it validates corpus files in place and writes no manifest"
         );
     }
     if args.expected || args.manifest.is_some() {
@@ -33,7 +41,7 @@ pub(crate) fn run_integrity(args: IntegrityArgs) -> Result<()> {
             );
         }
     }
-    let bad = if args.collect {
+    let report = if args.collect {
         etl.check_corpus_integrity(mode)?
     } else {
         let print_lock = std::sync::Mutex::new(());
@@ -46,16 +54,33 @@ pub(crate) fn run_integrity(args: IntegrityArgs) -> Result<()> {
             Ok(())
         })?
     };
-    if bad.is_empty() {
+    if report.is_ok() {
         eprintln!("OK: no corruption detected.");
+        Ok(HandlerOutcome::Done)
     } else {
-        eprintln!("FAILED: {} file(s) failed integrity check:", bad.len());
+        eprintln!(
+            "FAILED: {} file(s) failed integrity check:",
+            report.failure_count()
+        );
         if args.collect {
-            for (p, e) in &bad {
+            for (p, e) in &report.failures {
                 println!("{}\t{}", p.display(), e);
             }
+            // The retained list is capped to bound memory on all-corrupt
+            // corpora; the streaming (non-collect) path already printed
+            // every failure as it happened, so this only applies here.
+            if report.dropped > 0 {
+                eprintln!(
+                    "... and {} more failure(s) not listed (retained list capped at {})",
+                    report.dropped, MAX_RETAINED_FAILURES
+                );
+            }
         }
-        std::process::exit(2);
+        // Signal exit code 2 to `main` via the return value rather than a
+        // bare `std::process::exit(2)`. That keeps the monitor's `finalize`
+        // in the loop: it emits the terminal `run.summary` (outcome
+        // `corrupt_files_found`) and marks the `--status-file` finished
+        // before the process exits 2. See [`HandlerOutcome`].
+        Ok(HandlerOutcome::CorruptFilesFound)
     }
-    Ok(())
 }

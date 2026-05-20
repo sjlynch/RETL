@@ -130,6 +130,7 @@ fn materialize_scan_checkpoint(
                 record_limit: record_limit.as_deref(),
                 resume: true,
                 completed_keys: &completed_keys,
+                accumulator: Some(&accumulator),
                 allow_partial: etl.opts.allow_partial,
                 partial_reporter: Some(&etl.opts.partial_read_reporter),
             };

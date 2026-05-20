@@ -45,15 +45,15 @@ fn full_integrity_detects_tail_truncation() {
         .unwrap();
 
     assert_eq!(
-        bad.len(),
+        bad.failure_count(),
         1,
         "Full integrity must report the truncated month: {:?}",
         bad
     );
     assert!(
-        bad[0].0.ends_with("RC_2006-03.zst"),
+        bad.failures[0].0.ends_with("RC_2006-03.zst"),
         "reported path should be the truncated file, got {:?}",
-        bad[0].0
+        bad.failures[0].0
     );
 }
 
@@ -74,7 +74,7 @@ fn quick_integrity_misses_tail_truncation() {
     // This locks in the *documented limitation*: Quick samples a prefix and
     // therefore cannot detect trailing corruption.
     assert!(
-        bad.is_empty(),
+        bad.is_ok(),
         "Quick integrity is documented to miss trailing corruption when the \
          decompressed prefix is healthy; got reports: {:?}",
         bad

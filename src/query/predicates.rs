@@ -225,8 +225,16 @@ fn value_to_f64(value: &Value) -> Option<f64> {
 
 fn scalar_values_equal(left: &Value, right: &Value) -> bool {
     match (left, right) {
-        (Value::Number(a), Value::Number(b)) => match (a.as_f64(), b.as_f64()) {
-            (Some(a), Some(b)) if a.is_finite() && b.is_finite() => a == b,
+        // Two numbers, or a number paired with a string, compare numerically
+        // via `value_to_f64` so `--json '/score=100'` agrees with
+        // `--json '/score>=100'` (which already coerces) and with the
+        // `--min-score` fast path on string-/float-typed `score`. A non-numeric
+        // string falls back to structural inequality. String-vs-string stays an
+        // exact match — coercing it would silently change unrelated `=` checks.
+        (Value::Number(_), Value::Number(_))
+        | (Value::Number(_), Value::String(_))
+        | (Value::String(_), Value::Number(_)) => match (value_to_f64(left), value_to_f64(right)) {
+            (Some(a), Some(b)) => a == b,
             _ => left == right,
         },
         _ => left == right,

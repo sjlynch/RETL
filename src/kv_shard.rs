@@ -10,6 +10,20 @@ use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 /// Sharded key->i64 writer for large-scale reductions (sum/min, etc.).
+///
+/// # Key constraints
+///
+/// Each `(key, value)` pair is persisted as a single TAB-delimited,
+/// newline-terminated line (`<key>\t<value>\n`) and parsed back with
+/// `split_once('\t')`. Keys must therefore be free of the bytes that delimit
+/// that format: a key containing a tab would be truncated at the first tab
+/// (the remainder mis-parsed as the value), and a key containing a newline /
+/// carriage-return would split into two corrupt lines. [`write_kv`] rejects
+/// such keys with an error instead of silently corrupting the shard; callers
+/// keying by arbitrary text (JSON-pointer string values, flair, titles)
+/// should escape or hash those keys before writing.
+///
+/// [`write_kv`]: Self::write_kv
 pub struct ShardedKVWriter {
     run_root: PathBuf,
     base_dir: PathBuf,
@@ -50,7 +64,24 @@ impl ShardedKVWriter {
         shard_common::shard_index(&self.state, k, self.count)
     }
 
+    /// Append a `(key, value)` pair to the shard the key hashes to.
+    ///
+    /// Returns an error (without writing anything) when `key` contains a tab,
+    /// newline, or carriage-return — those bytes delimit the on-disk
+    /// TAB-delimited line format, so writing them would silently corrupt the
+    /// shard on read-back. See the [type-level docs](Self) for the rationale.
     pub fn write_kv(&self, key: &str, val: i64) -> Result<()> {
+        if let Some(pos) = key
+            .bytes()
+            .position(|b| b == b'\t' || b == b'\n' || b == b'\r')
+        {
+            let bad = key.as_bytes()[pos];
+            anyhow::bail!(
+                "ShardedKVWriter::write_kv: key contains a disallowed delimiter byte \
+                 {bad:#04x} at offset {pos}; keys are stored in a TAB-delimited line \
+                 format and must not contain tab, newline, or carriage-return"
+            );
+        }
         let idx = self.shard_index(key);
         let mut w = self.shards[idx].lock();
         w.write_all(key.as_bytes())?;
@@ -261,6 +292,36 @@ mod tests {
             .expect("huge shard count should be clamped before allocation");
         assert_eq!(writer.count, crate::config::MAX_SHARDS);
         assert_eq!(writer.shards.len(), crate::config::MAX_SHARDS);
+    }
+
+    #[test]
+    fn write_kv_rejects_keys_with_delimiter_bytes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let writer = ShardedKVWriter::create(tmp.path(), "delim", 4).expect("create");
+
+        for bad in ["ta\tb", "new\nline", "carriage\rreturn"] {
+            let err = writer
+                .write_kv(bad, 1)
+                .expect_err("delimiter byte in key must be rejected");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("disallowed delimiter byte"),
+                "unexpected error for key {bad:?}: {msg}"
+            );
+        }
+
+        // A clean key still writes fine and round-trips through reduce.
+        writer.write_kv("clean_key", 7).expect("clean key writes");
+        let outs = writer.reduce_sum("delim").expect("reduce");
+        let mut total = HashMap::new();
+        for out in &outs {
+            for (k, v) in read_kv_tsv(out) {
+                total.insert(k, v);
+            }
+        }
+        assert_eq!(total.get("clean_key").copied(), Some(7));
+        // The rejected keys never made it into any shard.
+        assert_eq!(total.len(), 1);
     }
 
     #[test]

@@ -31,8 +31,15 @@ struct ResumeLogLabels {
 ///    - Otherwise iterates the recorded entries: drops any whose key is not
 ///      in `planned_keys` (when `Some`), then runs `validate_entry`; on `Err`
 ///      drops the entry with an info log.
-/// 3. Calls `prune_outputs_except(&completed_keys)` to remove unowned files.
-/// 4. Pre-saves the pruned manifest and constructs a `ManifestAccumulator`.
+/// 3. Pre-saves the pruned manifest.
+/// 4. Calls `prune_outputs_except(&completed_keys)` to remove unowned files,
+///    then constructs a `ManifestAccumulator`.
+///
+/// Step 3 deliberately precedes step 4: rewriting `_progress.json` to the
+/// surviving key set *before* deleting any output keeps the manifest no more
+/// optimistic than the filesystem if the save fails — a manifest listing
+/// fewer months than exist on disk is harmless, but one listing months whose
+/// files were already pruned is the desync inter-run tooling trips on.
 ///
 /// `validate_entry` returns the canonical `MonthEntry` to keep on success;
 /// callers that recompute line counts (e.g. `extract_common`) can return a
@@ -99,8 +106,14 @@ where
     };
 
     let completed_keys: HashSet<String> = keep.keys().cloned().collect();
-    prune_outputs_except(&completed_keys)?;
+    // Persist the pruned manifest BEFORE deleting any output file. If this
+    // save fails the run aborts with `_progress.json` still describing the
+    // larger, fully-intact output set — conservative, and harmless. Pruning
+    // first would risk aborting with files already deleted but the manifest
+    // still listing them, leaving inter-run tooling reading a manifest of
+    // months whose outputs no longer exist.
     crate::progress_manifest::save(manifest_dir, &keep, Some(fingerprint))?;
+    prune_outputs_except(&completed_keys)?;
     let accumulator =
         ManifestAccumulator::new(manifest_dir, keep.clone(), Some(fingerprint.to_string()));
 

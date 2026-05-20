@@ -31,10 +31,10 @@ foundation everything else will plug into.
 
 ### Feature 1 — Structured NDJSON event stream (`--events <path>`)
 
-A line-buffered NDJSON file an external watcher can `tail -f`. Each line is
-one JSON object with a stable schema. Source is a `tracing_subscriber::Layer`
-installed alongside the existing fmt layer, so anything the library logs
-through `tracing` flows out for free.
+An NDJSON file, flushed after every event line, that an external watcher
+can `tail -f`. Each line is one JSON object with a stable schema. Source is
+a `tracing_subscriber::Layer` installed alongside the existing fmt layer, so
+anything the library logs through `tracing` flows out for free.
 
 **Event envelope** (every line):
 
@@ -64,10 +64,14 @@ Lifecycle events have a stable `event:` field (`run.start`, `run.knobs`,
 `run.summary`). Tracing-forwarded events do not — they carry whatever the
 library emits and an LLM is expected to read `target` + `msg`.
 
-The file is opened with append + line buffering; writes go through a
-`Mutex<File>`. Atomic-write contract: the path itself is a final path, but
-each line is a complete JSON object — partial lines never appear because the
-writer holds the lock around `write_all(line) + write_all(b"\n")`.
+The file is opened with `File::create` (truncated fresh per run); each
+event is serialized, written, and flushed synchronously on the `tracing`
+call site under a `Mutex<BufWriter<File>>`. There is no background writer
+thread and no channel — the `BufWriter` only coalesces the two `write_all`s
+within one event. Each line is a complete JSON object: partial lines never
+appear because the writer holds the lock around
+`write_all(line) + write_all(b"\n")` and then flushes. A slow events disk
+throttles the run rather than dropping events.
 
 ### Feature 2 — Live status snapshot (`--status-file <path>`)
 
@@ -248,7 +252,7 @@ prompted against `retl.v1` should always be able to read at least
 
 ## Risks / open questions
 
-- **Tracing layer overhead** — `Layer::on_event` runs in hot paths. Mitigation: the layer's only work is push-onto-bounded-channel-or-drop. The actual file I/O happens on the writer thread. If the channel is full, drop the event and count drops in the status snapshot (`events_dropped`). An LLM watcher seeing `events_dropped > 0` knows the scan out-paced the watcher channel.
+- **Tracing layer overhead** — `Layer::on_event` runs in hot paths. As shipped, the layer serializes the event and writes+flushes it synchronously under a `Mutex<BufWriter<File>>` (see Feature 1) — there is no bounded channel and no writer thread. The cost is one small `write`+`flush` syscall per event on the emitting thread; a slow events disk throttles the run rather than dropping events. `events_dropped` counts only hard serialization/write failures (disk full, I/O error), never backpressure. (The original design considered a bounded-channel-or-drop layer with a background writer thread; it was not implemented — the synchronous path is simpler and, given how sparse tracing events are on the hot path, fast enough.)
 - **Sysinfo on Windows process RSS** — `sysinfo::Process::memory()` returns RSS in bytes on Windows. Confirmed working in this codebase (`src/mem.rs` already uses sysinfo for system memory). For process-specific RSS, sample the current PID's `Process` view.
 - **Status file atomic rewrite cost** — once per second, ~1 KB write + rename. Negligible.
 - **`tracing-subscriber/json` adds dependencies** — already pulled in transitively by env-filter; small marginal cost.

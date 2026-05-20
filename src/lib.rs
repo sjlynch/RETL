@@ -100,11 +100,14 @@
 //! 7. **Verify**
 //!    - [`IntegrityMode::Quick`] (positive prefix sample) /
 //!      [`IntegrityMode::Full`] + `RedditETL::check_corpus_integrity` validate
-//!      `.zst` files and return a materialized failure list.
+//!      `.zst` files and return an [`IntegrityReport`] whose retained failure
+//!      list is capped at [`MAX_RETAINED_FAILURES`] to bound memory.
 //!    - [`RedditETL::check_corpus_integrity_with_failure_sink`] streams each
 //!      failure to a caller-provided callback during long runs.
 //!    - [`quick_validate_zst`] / [`validate_zst_full`] are the underlying
-//!      decoders, also re-exported for direct use.
+//!      decoders, also re-exported for direct use; `quick_validate_zst`
+//!      returns a [`QuickOutcome`] flagging whether a small file was decoded
+//!      in full.
 //!
 //! ## Cross-cutting helpers
 //!
@@ -234,9 +237,9 @@ pub use crate::mem::set_available_memory_fraction_for_tests;
 #[doc(hidden)]
 pub use crate::util::{cap_backoff_budget_for_test, TestBackoffBudgetGuard};
 
-// Expose integrity checker mode, and (optionally) direct zstd validators.
-pub use crate::integrity::IntegrityMode;
-pub use crate::zstd_jsonl::{quick_validate_zst, validate_zst_full};
+// Expose integrity checker mode + report, and (optionally) direct zstd validators.
+pub use crate::integrity::{IntegrityMode, IntegrityReport, MAX_RETAINED_FAILURES};
+pub use crate::zstd_jsonl::{quick_validate_zst, validate_zst_full, QuickOutcome};
 
 //export partition writers (lambda-capable)
 pub use crate::partition::{PartitionWriters, MAX_PARTITIONS};
@@ -261,7 +264,8 @@ pub use crate::util::{init_tracing_for_binary, with_thread_pool};
 
 //export bucketing & json utils to application code
 pub use crate::bucketing::{
-    bucketize_shards, partition_stage1, process_bucket_streaming, BucketingCfg,
+    bucketize_shards, bucketize_shards_with_key_stats, partition_stage1,
+    partition_stage1_with_key_stats, process_bucket_streaming, BucketingCfg,
 };
 pub use crate::json_utils::{author_lower, is_comment_record, subreddit_lower};
 

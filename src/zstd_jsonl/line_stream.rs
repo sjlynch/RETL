@@ -296,4 +296,4 @@ fn for_each_line_attempt<'borrow, 'cb: 'borrow>(
     Ok(())
 }
 
-pub use crate::integrity::{quick_validate_zst, validate_zst_full};
+pub use crate::integrity::{quick_validate_zst, validate_zst_full, QuickOutcome};

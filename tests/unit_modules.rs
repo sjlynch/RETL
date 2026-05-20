@@ -11,8 +11,8 @@ mod common;
 
 use retl::{
     build_runs_sorted, bucketize_shards, merge_runs_sorted, partition_stage1,
-    process_bucket_streaming, BucketingCfg, DedupeCfg, KeyExtractor, NdjsonReader,
-    NdjsonWriter, ShardedKVWriter,
+    partition_stage1_with_key_stats, process_bucket_streaming, BucketingCfg, DedupeCfg,
+    KeyExtractor, NdjsonReader, NdjsonWriter, ShardedKVWriter,
 };
 
 use serde_json::Value;
@@ -321,6 +321,54 @@ fn assert_bucketize_shard_splits(n_records: usize, n_buckets: usize) {
 #[test]
 fn bucketing_bucketize_shard_splits_into_n_buckets() {
     assert_bucketize_shard_splits(200, 4);
+}
+
+#[test]
+fn bucketing_partition_stage1_with_key_stats_counts_unkeyable_lines() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let dir = tempfile::tempdir().unwrap();
+    // 3 keyable records (have `author`) + 2 records the author key extractor
+    // cannot key (no `author` field) — the latter must be dropped *and counted*.
+    let lines = vec![
+        serde_json::json!({"author": "alice", "id": "a1"}).to_string(),
+        serde_json::json!({"author": "bob", "id": "b1"}).to_string(),
+        serde_json::json!({"id": "noauthor1"}).to_string(),
+        serde_json::json!({"author": "carol", "id": "c1"}).to_string(),
+        serde_json::json!({"id": "noauthor2"}).to_string(),
+    ];
+    let in_path = dir.path().join("in.ndjson");
+    write_ndjson(&in_path, &lines);
+
+    let key = KeyExtractor::author_lowercase_fast();
+    let failed = AtomicU64::new(0);
+    let shards = partition_stage1_with_key_stats(
+        std::slice::from_ref(&in_path.to_path_buf()),
+        &dir.path().join("out"),
+        4,
+        &key,
+        Some(&failed),
+    )
+    .unwrap();
+
+    let total: usize = shards.iter().map(|p| count_lines(p)).sum();
+    assert_eq!(total, 3, "only keyable lines are routed to shards");
+    assert_eq!(
+        failed.load(Ordering::Relaxed),
+        2,
+        "both unkeyable lines must be counted as key-extraction failures"
+    );
+
+    // The no-counter entry point still drops the same lines, just silently.
+    let shards = partition_stage1(
+        std::slice::from_ref(&in_path.to_path_buf()),
+        &dir.path().join("out2"),
+        4,
+        &key,
+    )
+    .unwrap();
+    let total: usize = shards.iter().map(|p| count_lines(p)).sum();
+    assert_eq!(total, 3);
 }
 
 // ---------- dedupe ----------

@@ -597,11 +597,17 @@ provide SHA-256 values.
 Quick mode validates only the first `--sample-bytes` decompressed bytes of each
 file. `--sample-bytes` must be positive (default: 65536); very small samples
 (for example, below 4096 bytes) only cover a tiny prefix and emit a warning. Use
-`--mode full` for complete payload/trailer validation.
+`--mode full` for complete payload/trailer validation. A file whose
+*decompressed* size is at or below `--sample-bytes` is decoded all the way to
+EOF, so quick mode on such a small month is equivalent to a full check
+(trailing checksum included).
 
 Bad files print one `path<TAB>error` line per failure on stdout as soon as
 they are discovered, and the process exits with status `2`. Pass `--collect`
-to buffer the failure list and print it only after all files finish.
+to buffer the failure list and print it only after all files finish. The
+buffered list is capped (failures past the cap are still counted in the
+`FAILED: N file(s)` total and printed with a `... and N more` line); the
+streaming default already prints every failure as it happens.
 
 ### `aggregate` — fold JSONL inputs into JSON or TSV rollups
 
@@ -1057,9 +1063,12 @@ let bad_full = RedditETL::new()
     .progress(false)
     .check_corpus_integrity(IntegrityMode::Full)?;
 
-// The return value materializes the full failure list. For long runs, stream
-// failures incrementally while still receiving the final Vec:
-let bad_streamed = RedditETL::new()
+// Both calls return an `IntegrityReport`: `report.failure_count()` is the true
+// number of bad files, while `report.failures` is capped at
+// `retl::MAX_RETAINED_FAILURES` to keep memory bounded on all-corrupt corpora
+// (`report.dropped` counts the rest). For long runs, stream every failure
+// incrementally — the sink sees them all, even past the retention cap:
+let report = RedditETL::new()
     .base_dir("./data")
     .sources(Sources::Comments)
     .date_range(Some(YearMonth::new(2006, 2)), Some(YearMonth::new(2006, 2)))
@@ -1206,7 +1215,10 @@ The three benchmark groups:
 
 ## Environment variables
 
-- `RUST_LOG` — standard `tracing` filter (e.g. `RUST_LOG=info`).
+- `RETL_LOG` — RETL's `tracing` filter (e.g. `RETL_LOG=debug`). Takes
+  precedence over `RUST_LOG` when both are set.
+- `RUST_LOG` — standard `tracing` filter (e.g. `RUST_LOG=info`); used when
+  `RETL_LOG` is unset.
 - `ETL_EXCLUDE_AUTHORS` — comma/semicolon/whitespace-separated authors to add
   to the default bot/service exclusion list.
 - `ETL_EXCLUDE_AUTHORS_FILE` — path to a newline-separated file of additional
@@ -1255,8 +1267,9 @@ cargo +nightly fuzz run fuzz_parse_minimal -- -max_total_time=300
 # Walks &str → rewrite_human_timestamps_bytes, then validates that
 # (a) the output is valid UTF-8 (enforced by the String type),
 # (b) the output round-trips through serde_json::from_str if the input did, and
-# (c) on shallow top-level objects, the byte path matches the slow path
-#     (apply_human_timestamps applied to the parsed Value).
+# (c) on any top-level JSON object, the byte path matches the slow path
+#     (apply_human_timestamps applied to the parsed Value) — both rewrite
+#     only the top-level object's timestamp keys, nested ones included.
 cargo +nightly fuzz run fuzz_rewrite_timestamps -- -max_total_time=300
 
 # Walks &str → WhitelistTokenizer::tokenize_into with a fixed Reddit-field
