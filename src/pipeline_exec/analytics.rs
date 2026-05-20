@@ -14,7 +14,7 @@ impl ScanPlan {
                 let checkpoint = materialize_scan_checkpoint(
                     &plan.etl,
                     &plan.query,
-                    /*show_progress=*/ false,
+                    /*show_progress=*/ true,
                     plan.limit,
                 )?;
                 for_each_checkpoint_record(
@@ -32,7 +32,7 @@ impl ScanPlan {
                 scan_records(
                     &plan.etl,
                     &plan.query,
-                    /*show_progress=*/ false,
+                    /*show_progress=*/ true,
                     plan.limit,
                     |min, _kind, _line| {
                         if let Some(ts) = min.created_utc {
@@ -65,7 +65,7 @@ impl ScanPlan {
                     let checkpoint = materialize_scan_checkpoint(
                         &plan.etl,
                         &plan.query,
-                        /*show_progress=*/ false,
+                        /*show_progress=*/ true,
                         plan.limit,
                     )?;
                     for_each_checkpoint_record(
@@ -87,7 +87,7 @@ impl ScanPlan {
                     scan_records(
                         &plan.etl,
                         &plan.query,
-                        /*show_progress=*/ false,
+                        /*show_progress=*/ true,
                         plan.limit,
                         |min, _kind, _line| {
                             if let Some(a) = min.author.as_deref() {
@@ -151,7 +151,7 @@ impl ScanPlan {
                     let checkpoint = materialize_scan_checkpoint(
                         &plan.etl,
                         &plan.query,
-                        /*show_progress=*/ false,
+                        /*show_progress=*/ true,
                         plan.limit,
                     )?;
                     for_each_checkpoint_record(
@@ -173,7 +173,7 @@ impl ScanPlan {
                     scan_records(
                         &plan.etl,
                         &plan.query,
-                        /*show_progress=*/ false,
+                        /*show_progress=*/ true,
                         plan.limit,
                         |min, _kind, _line| {
                             if let (Some(a), Some(ts)) = (min.author.as_deref(), min.created_utc) {

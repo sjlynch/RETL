@@ -264,7 +264,8 @@ pub use crate::util::{init_tracing_for_binary, with_thread_pool};
 
 //export bucketing & json utils to application code
 pub use crate::bucketing::{
-    bucketize_shards, partition_stage1, process_bucket_streaming, BucketingCfg,
+    bucketize_shards, bucketize_shards_with_key_stats, partition_stage1,
+    partition_stage1_with_key_stats, process_bucket_streaming, BucketingCfg,
 };
 pub use crate::json_utils::{author_lower, is_comment_record, subreddit_lower};
 

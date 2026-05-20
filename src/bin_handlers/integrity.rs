@@ -5,6 +5,14 @@ pub(crate) fn run_integrity(args: IntegrityArgs) -> Result<()> {
             "retl integrity does not support --resume; it validates corpus files directly. Narrow long runs with --source/--start/--end or use resumable scan/export/count workflows for record processing."
         );
     }
+    // `integrity` validates corpus files in place and never writes a
+    // provenance manifest, so `--no-manifest` (shared via `CommonOpts`) is
+    // inert here. Surface it instead of silently accepting it.
+    if args.common.no_manifest {
+        tracing::warn!(
+            "--no-manifest has no effect on `retl integrity`: it validates corpus files in place and writes no manifest"
+        );
+    }
     if args.expected || args.manifest.is_some() {
         preflight_expected_corpus(
             &args.common.data_dir,

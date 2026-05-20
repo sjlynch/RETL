@@ -11,6 +11,21 @@ fn validate_text_regex_pattern(pattern: &str) -> Result<(), QueryBuildError> {
     Ok(())
 }
 
+fn validate_author_regex_pattern(pattern: &str) -> Result<(), QueryBuildError> {
+    // `Regex::new("")` succeeds and matches every author — a silent match-all.
+    // Reject blank patterns the same way `text_regex` does so an empty
+    // `--author-regex ''` fails loudly instead of widening the scan.
+    if pattern.trim().is_empty() {
+        return Err(QueryBuildError::new(
+            "author_regex contains a blank pattern; blank regex patterns are not allowed",
+        ));
+    }
+    Regex::new(pattern).map_err(|e| {
+        QueryBuildError::new(format!("author_regex is invalid: {e}; pattern={pattern:?}"))
+    })?;
+    Ok(())
+}
+
 fn validate_text_regex_filter(
     pattern: &Option<String>,
     compiled: &Option<Regex>,
