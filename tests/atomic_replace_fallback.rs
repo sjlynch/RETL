@@ -1,16 +1,17 @@
-//! Exercises the copy+remove fallback inside `replace_file_atomic_backoff`.
+//! Exercises the copy+rename fallback inside `replace_file_atomic_backoff`.
 //!
 //! `replace_file_atomic_backoff` retries `MoveFileExW(REPLACE_EXISTING)` for
-//! ~10s before falling back to `fs::copy` + `fs::remove`. That fallback is the
-//! one place where the function's "atomic" contract is hardest to honor and
-//! the only path on Windows that runs when a sharing violation on `dest`
-//! refuses to clear within the retry budget.
+//! ~10s before falling back to: copy `tmp` into a private sibling temp, then
+//! `rename` that sibling over `dest`. That fallback runs on Windows when a
+//! sharing violation on `dest` refuses to clear within the retry budget — and
+//! the sibling rename keeps the swap atomic instead of truncating `dest`.
 //!
 //! Reproducing this path deterministically requires holding an open `File`
-//! handle on `dest` with a restrictive share mode that blocks DELETE access
-//! (which `MoveFileExW(REPLACE_EXISTING)` and `CopyFileExW(CREATE_ALWAYS)`
-//! both need to overwrite). The handle is released after the rename retry
-//! budget elapses so the copy fallback can succeed.
+//! handle on `dest` with a restrictive share mode that blocks write/delete
+//! access. That blocks both `MoveFileExW(REPLACE_EXISTING)` swaps (the primary
+//! rename and the sibling rename); the copy itself targets an unblocked
+//! sibling path. The handle is released after the primary rename retry budget
+//! elapses so the sibling rename can succeed.
 //!
 //! Linux's `rename(2)` doesn't have this sharing-violation behavior, so this
 //! test is `#[cfg(windows)]`-only.
@@ -63,9 +64,10 @@ fn copy_fallback_runs_when_rename_retries_exhaust_then_dest_unlocks() {
     let blocker_ready_for_thread = Arc::clone(&blocker_ready);
 
     // Acquire a restrictive handle on `dest` and hold it just past the rename
-    // retry budget. While held, neither MoveFileExW(REPLACE_EXISTING) nor
-    // CopyFileExW(CREATE_ALWAYS) can open `dest` for write/delete, so both
-    // get sharing violations and the function's retry loops engage.
+    // retry budget. While held, no MoveFileExW(REPLACE_EXISTING) can swap
+    // `dest` — both the primary rename and the sibling rename get sharing
+    // violations and the function's retry loops engage. The fallback copy
+    // targets an unblocked sibling temp path, so it still succeeds.
     let blocker = thread::spawn(move || {
         let handle = OpenOptions::new()
             .read(true)
@@ -112,9 +114,10 @@ fn copy_fallback_runs_when_rename_retries_exhaust_then_dest_unlocks() {
         "dest must hold the tmp file's contents after copy fallback"
     );
 
-    // ...and the staged tmp file is gone (copy fallback removes it).
+    // ...and the staged tmp file is gone (the fallback removes it after the
+    // sibling rename publishes its copy).
     assert!(
         !tmp.exists(),
-        "tmp file must be cleaned up by the copy+remove fallback path"
+        "tmp file must be cleaned up by the copy+rename fallback path"
     );
 }
