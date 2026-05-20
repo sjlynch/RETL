@@ -28,7 +28,10 @@ pub(crate) fn run_dedupe_to(args: DedupeArgs, w: &mut dyn Write) -> Result<()> {
     }
     let partial_reporter = etl.partial_read_reporter();
     let work_dir = args.common.work_dir.clone();
-    let scan = plan!(etl, args.common, args.query);
+    let mut scan = plan!(etl, args.common, args.query);
+    if let Some(limit) = args.limit {
+        scan = scan.limit(limit);
+    }
 
     if args.out == Path::new("-") {
         let tmp_path = stdout_dedupe_path(&work_dir);

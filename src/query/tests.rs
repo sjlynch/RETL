@@ -27,6 +27,35 @@ mod tests {
     }
 
     #[test]
+    fn scalar_values_equal_coerces_numeric_strings_against_numbers() {
+        use serde_json::json;
+
+        // A number and a numeric string (in either order) compare numerically,
+        // so `--json '/score=100'` agrees with `--json '/score>=100'` and with
+        // the `--min-score` fast path on string-typed `score`.
+        assert!(scalar_values_equal(&json!(100), &json!("100")));
+        assert!(scalar_values_equal(&json!("100"), &json!(100)));
+        assert!(scalar_values_equal(&json!(100.0), &json!("100")));
+        assert!(scalar_values_equal(&json!("100.0"), &json!(100)));
+
+        // Different numeric values still differ across encodings.
+        assert!(!scalar_values_equal(&json!(100), &json!("101")));
+
+        // A number vs a non-numeric string is unequal, not a panic.
+        assert!(!scalar_values_equal(&json!(100), &json!("abc")));
+
+        // String-vs-string stays an exact match — `"100"` is not `"100.0"`.
+        assert!(!scalar_values_equal(&json!("100"), &json!("100.0")));
+        assert!(scalar_values_equal(&json!("100"), &json!("100")));
+
+        // Plain number/number and other scalar equality is unaffected.
+        assert!(scalar_values_equal(&json!(100), &json!(100)));
+        assert!(!scalar_values_equal(&json!(100), &json!(101)));
+        assert!(scalar_values_equal(&json!(true), &json!(true)));
+        assert!(!scalar_values_equal(&json!(true), &json!("true")));
+    }
+
+    #[test]
     fn timestamp_bounds_derive_months_from_inclusive_exclusive_edges() {
         // 2020-11-30T12:00:00Z .. 2020-12-01T00:00:00Z should plan Nov only;
         // the exclusive upper endpoint is exactly at the start of December.
