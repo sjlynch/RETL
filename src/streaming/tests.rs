@@ -253,4 +253,66 @@ mod tests {
             .finalize()
             .expect("healthy fast-path emissions must not trigger strict_whitelist");
     }
+
+    #[test]
+    fn legacy_usernames_normalizes_subreddit_and_pseudo_users() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("RC_2020-01.zst");
+        // The subreddit is recorded as mixed-case "Programming"; one record's
+        // author is a mixed-case `[Deleted]` pseudo-user; one record is in a
+        // different subreddit.
+        write_zst(
+            &path,
+            concat!(
+                r#"{"id":"c1","author":"Alice","subreddit":"Programming","created_utc":1}"#,
+                "\n",
+                r#"{"id":"c2","author":"[Deleted]","subreddit":"Programming","created_utc":2}"#,
+                "\n",
+                r#"{"id":"c3","author":"bob","subreddit":"other","created_utc":3}"#,
+                "\n",
+            )
+            .as_bytes(),
+        );
+
+        let job = FileJob {
+            kind: FileKind::Comment,
+            ym: YearMonth::new(2020, 1),
+            path,
+        };
+
+        let shard_writer = ShardedWriter::create(dir.path(), "legacy_un", 4).unwrap();
+        // The caller passes the subreddit *with* an `r/` prefix and odd casing:
+        // the legacy path must normalize it the same way the canonical query
+        // path does, otherwise it silently matches nothing.
+        process_file_for_usernames_with_skip(
+            &job,
+            16 * 1024,
+            "r/Programming",
+            &shard_writer,
+            None,
+            false,
+            None,
+            |_p, _e| {},
+        )
+        .unwrap();
+
+        let outs = shard_writer.dedup("legacy_un").unwrap();
+        let mut names = std::collections::BTreeSet::new();
+        for p in outs {
+            let f = std::fs::File::open(&p).unwrap();
+            for line in std::io::BufRead::lines(std::io::BufReader::new(f)) {
+                let line = line.unwrap();
+                if !line.is_empty() {
+                    names.insert(line);
+                }
+            }
+        }
+        // `Alice` is kept (subreddit matched after `r/` strip + case-fold);
+        // mixed-case `[Deleted]` is excluded (case-insensitive pseudo-user);
+        // `bob` is excluded (different subreddit).
+        assert_eq!(
+            names,
+            std::iter::once("Alice".to_string()).collect::<std::collections::BTreeSet<_>>()
+        );
+    }
 }
