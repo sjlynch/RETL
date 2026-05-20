@@ -204,18 +204,55 @@ fn cmp_i128_ratios(a_num: i128, a_den: u64, b_num: i128, b_den: u64) -> Ordering
     }
 }
 
+/// Exact ordering of an `i128` against an `f64`.
+///
+/// `i as f64` rounds for `|i| > 2^53`, so the old `(i as f64).total_cmp(&f)`
+/// could report `Equal` for an integer that is strictly different from `f`
+/// — and `MetricState::ingest_number` would then keep the wrong group
+/// min/max. This compares exactly by bracketing `f` with `floor(f)`.
+///
+/// NaN is ordered deterministically rather than returned as `Equal`:
+/// matching `f64::total_cmp`, a positive-signed NaN sorts above every
+/// integer and a negative-signed NaN below every integer.
 fn cmp_i128_f64(i: i128, f: f64) -> Ordering {
     if f.is_nan() {
-        return Ordering::Equal;
-    }
-    if f.is_infinite() {
-        return if f.is_sign_positive() {
-            Ordering::Less
-        } else {
+        return if f.is_sign_negative() {
+            // -NaN is the minimum: every integer is greater.
             Ordering::Greater
+        } else {
+            // +NaN is the maximum: every integer is less.
+            Ordering::Less
         };
     }
-    (i as f64).total_cmp(&f)
+
+    // 2^127 is exactly representable in f64. `i128::MAX < 2^127` and
+    // `i128::MIN == -2^127`, so any `f` outside `[-2^127, 2^127)` (including
+    // the infinities) is strictly beyond the integer's possible range.
+    const TWO_POW_127: f64 = 170_141_183_460_469_231_731_687_303_715_884_105_728.0;
+    if f >= TWO_POW_127 {
+        return Ordering::Less; // i <= i128::MAX < 2^127 <= f
+    }
+    if f < -TWO_POW_127 {
+        return Ordering::Greater; // i >= i128::MIN = -2^127 > f
+    }
+
+    // `f` is finite and within `[-2^127, 2^127)`, so `floor(f)` is an
+    // integer-valued f64 that converts to `i128` losslessly.
+    let floor = f.floor();
+    match i.cmp(&(floor as i128)) {
+        // i <= floor(f) - 1 < floor(f) <= f
+        Ordering::Less => Ordering::Less,
+        // i >= floor(f) + 1 > f
+        Ordering::Greater => Ordering::Greater,
+        // i == floor(f): equal only when f has no fractional part.
+        Ordering::Equal => {
+            if f == floor {
+                Ordering::Equal
+            } else {
+                Ordering::Less
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -237,5 +274,53 @@ mod tests_numeric {
             value_to_metric_number(&value),
             Some(MetricNumber::Int(90_071_992_547_409_931_234_i128))
         );
+    }
+
+    #[test]
+    fn cmp_i128_f64_is_exact_past_f64_mantissa() {
+        // 2^53 + 1 has no f64 representation; the old `i as f64` cast
+        // rounded it to 2^53 and reported Equal against the float 2^53.
+        let pow53 = 1_i128 << 53;
+        let float_pow53 = (1_u64 << 53) as f64;
+        assert_eq!(cmp_i128_f64(pow53 + 1, float_pow53), Ordering::Greater);
+        assert_eq!(cmp_i128_f64(pow53, float_pow53), Ordering::Equal);
+        assert_eq!(cmp_i128_f64(pow53 - 1, float_pow53), Ordering::Less);
+    }
+
+    #[test]
+    fn cmp_i128_f64_brackets_fractional_floats() {
+        assert_eq!(cmp_i128_f64(2, 2.5), Ordering::Less);
+        assert_eq!(cmp_i128_f64(3, 2.5), Ordering::Greater);
+        assert_eq!(cmp_i128_f64(-3, -2.5), Ordering::Less);
+        assert_eq!(cmp_i128_f64(-2, -2.5), Ordering::Greater);
+        assert_eq!(cmp_i128_f64(0, 0.0), Ordering::Equal);
+    }
+
+    #[test]
+    fn cmp_i128_f64_orders_nan_and_infinities_deterministically() {
+        assert_eq!(cmp_i128_f64(0, f64::INFINITY), Ordering::Less);
+        assert_eq!(cmp_i128_f64(0, f64::NEG_INFINITY), Ordering::Greater);
+        // +NaN sorts above every integer, -NaN below — never Equal.
+        assert_eq!(cmp_i128_f64(i128::MAX, f64::NAN), Ordering::Less);
+        assert_eq!(cmp_i128_f64(i128::MIN, -f64::NAN), Ordering::Greater);
+    }
+
+    #[test]
+    fn cmp_i128_f64_handles_floats_beyond_i128_range() {
+        assert_eq!(cmp_i128_f64(i128::MAX, 1e300), Ordering::Less);
+        assert_eq!(cmp_i128_f64(i128::MIN, -1e300), Ordering::Greater);
+    }
+
+    #[test]
+    fn metric_min_max_keeps_exact_value_past_f64_precision() {
+        // The integer is strictly larger than the float, but both round to
+        // the same f64. Min/max must keep the exact values regardless.
+        let big_int = MetricNumber::Int((1_i128 << 53) + 1);
+        let float_at_pow53 = MetricNumber::Float((1_u64 << 53) as f64);
+        let mut state = MetricState::default();
+        state.ingest_number(big_int);
+        state.ingest_number(float_at_pow53);
+        assert_eq!(state.max, Some(big_int));
+        assert_eq!(state.min, Some(float_at_pow53));
     }
 }
