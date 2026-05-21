@@ -197,7 +197,7 @@ injection points the test suite uses to skip multi-second production retry
 budgets when a test deliberately drives a non-recoverable failure (e.g.
 `spool_publish_failure_is_fatal_and_does_not_commit_manifest` blocks the
 publish destination with a directory, which under the production backoff
-budget waits ~21 s on `ERROR_ACCESS_DENIED` retries). Without the feature
+budget waits ~14 s on `ERROR_ACCESS_DENIED` retries). Without the feature
 the same tests still run and pass; they just take ~35 % longer overall.
 
 The feature also gates `retl::set_available_memory_fraction_for_tests`
