@@ -28,8 +28,10 @@ pub use tokenizer::WhitelistTokenizer;
 #[derive(Debug)]
 pub enum TokenizerError {
     /// The input is not a syntactically well-formed flat top-level object that
-    /// the tokenizer knows how to walk. The caller should fall back to the
-    /// `serde_json::Value` slow path.
+    /// the tokenizer knows how to walk, or it repeats a whitelisted top-level
+    /// key (which `serde_json::Map` would collapse last-wins — emitting both
+    /// verbatim would diverge from the slow path). The caller should fall back
+    /// to the `serde_json::Value` slow path.
     Malformed,
 }
 
