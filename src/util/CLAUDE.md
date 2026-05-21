@@ -16,7 +16,10 @@ public/`pub(crate)` item so existing callers keep importing from `crate::util::*
     `inject_retriable_io_errors_for_*`) used by tests in other modules.
 - `exclusions.rs` — `default_bot_authors` and `try_merge_extra_exclusions`
   (consumes `ETL_EXCLUDE_AUTHORS` / `ETL_EXCLUDE_AUTHORS_FILE`).
-- `scratch.rs` — `unique_scratch_dir` for per-PID scratch directory naming.
+- `scratch.rs` — `unique_scratch_dir` for per-PID scratch directory naming,
+  and `ScratchGuard`: an RAII guard that removes scratch paths on drop
+  (covering success, `Err`, and panic-unwind) unless `disarm()`ed for a
+  deliberate post-mortem.
 - `thread_pool.rs` — `with_thread_pool` scoped Rayon helper.
 - `tracing.rs` — `init_tracing_for_binary` (binary-only).
 - `mod.rs` — grab-bag bits with no clearer home (`output_parent`,
