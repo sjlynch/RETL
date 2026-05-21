@@ -82,9 +82,12 @@ channel between them. The channel capacity differs by stage:
   capacity is `inflight_groups` (default 8). Worst-case peak ≈
   `(1 + inflight_groups) * (inflight_bytes / 2)`. With the defaults this is
   ≈ 1.125 GiB, **not** 256 MiB. The two knobs are **not** independent — use
-  `RedditETL::inflight_budget(bytes)` to set both together so the declared
+  `ETLOptions::with_inflight_budget(bytes)` (or the `RedditETL` builder's
+  `.inflight_budget(bytes)` forwarder) to set both together so the declared
   budget matches the actual peak. `BucketingCfg::from(&ETLOptions)` emits a
-  one-shot `tracing::warn!` when a pair exceeds roughly 2× `inflight_bytes`.
+  one-shot `tracing::warn!` when a pair exceeds roughly 2× `inflight_bytes`;
+  the dedupe stage does **not** emit this warning (its peak is always
+  `inflight_bytes`, independent of `inflight_groups`).
 - `per_flush_cap = inflight_bytes / 2` — the producer flushes a map once
   it reaches that byte budget.
 - `inflight_bytes` defaults to **256 MiB** and is the per-flush byte lever.
