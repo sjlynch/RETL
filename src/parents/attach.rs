@@ -244,7 +244,14 @@ fn attach_parents_for_one_file<W: std::io::Write + ?Sized>(
         })?;
 
         let has_body = v.get("body").is_some();
-        let has_parent_id = v.get("parent_id").is_some();
+        let parent_id_value = v.get("parent_id");
+        let has_parent_id = parent_id_value.is_some();
+        // A `parent_id` is usable only if it is a string prefixed `t1_`/`t3_`;
+        // anything else (unprefixed, numeric, null) is skipped by
+        // `is_comment_record_for_parent_attach` without being tallied.
+        let has_prefixed_parent_id = parent_id_value
+            .and_then(|x| x.as_str())
+            .is_some_and(|s| s.starts_with("t1_") || s.starts_with("t3_"));
         let has_link_id = v.get("link_id").is_some();
         diagnostics.parsed_records += 1;
         if is_rc_spool_part {
@@ -255,6 +262,9 @@ fn attach_parents_for_one_file<W: std::io::Write + ?Sized>(
         }
         if has_parent_id {
             diagnostics.records_with_parent_id += 1;
+        }
+        if has_parent_id && !has_prefixed_parent_id {
+            diagnostics.records_with_unprefixed_parent_id += 1;
         }
         if has_link_id {
             diagnostics.records_with_link_id += 1;
@@ -313,6 +323,10 @@ fn build_attach_manifest(
     counts.insert("parents_resolved".to_string(), stats.resolved);
     counts.insert("parents_unresolved".to_string(), stats.unresolved);
     counts.insert("records_scanned".to_string(), diagnostics.parsed_records);
+    counts.insert(
+        "records_with_unprefixed_parent_id".to_string(),
+        diagnostics.records_with_unprefixed_parent_id,
+    );
 
     let mut manifest = RunManifestInput::new("parents.attach_parents_jsonls_parallel");
     manifest.start = manifest_start;

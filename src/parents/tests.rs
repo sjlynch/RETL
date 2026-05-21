@@ -84,14 +84,6 @@ mod tests {
                     shards: 0,
                     digest: format!("submissions-{tag}"),
                 },
-                eager_comments: AttachMapDigest {
-                    entries: 0,
-                    digest: format!("comments-map-{tag}"),
-                },
-                eager_submissions: AttachMapDigest {
-                    entries: 0,
-                    digest: format!("submissions-map-{tag}"),
-                },
             },
         }
     }
@@ -286,6 +278,46 @@ mod tests {
         assert!(
             inprogress_entries(&staging).is_empty(),
             "successful sidecar writes clean up staged files"
+        );
+    }
+
+    #[test]
+    fn attach_parent_cache_fingerprint_ignores_memory_dependent_eager_maps() {
+        // The eager `comments`/`submissions` maps are a memory-pressure-
+        // dependent performance cache (populated only when RAM is plentiful,
+        // truncated mid-load when it is not). The attach fingerprint must
+        // depend only on the shard set so two resolves of identical parent
+        // data produce identical fingerprints regardless of memory pressure.
+        let shards: HashMap<YearMonth, PathBuf> = HashMap::new();
+
+        let mut full_comments = HashMap::new();
+        full_comments.insert("p1".to_string(), "body one".to_string());
+        full_comments.insert("p2".to_string(), "body two".to_string());
+        let mut full_submissions = HashMap::new();
+        full_submissions.insert(
+            "s1".to_string(),
+            ("a title".to_string(), "some selftext".to_string()),
+        );
+
+        let empty_eager = ParentMaps {
+            comments: HashMap::new(),
+            submissions: HashMap::new(),
+            comment_shards: Some(shards.clone()),
+            submission_shards: Some(shards.clone()),
+            payload_spec: Default::default(),
+        };
+        let full_eager = ParentMaps {
+            comments: full_comments,
+            submissions: full_submissions,
+            comment_shards: Some(shards.clone()),
+            submission_shards: Some(shards),
+            payload_spec: Default::default(),
+        };
+
+        assert_eq!(
+            attach_parent_cache_fingerprint(&empty_eager),
+            attach_parent_cache_fingerprint(&full_eager),
+            "attach fingerprint must not depend on eager-map contents"
         );
     }
 

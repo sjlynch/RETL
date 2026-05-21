@@ -1,5 +1,6 @@
 use crate::common::parents::*;
 use retl::{RedditETL, YearMonth};
+use std::fs;
 
 #[test]
 fn resolve_resume_rebuilds_when_parent_ids_change() {
@@ -40,6 +41,68 @@ fn resolve_resume_rebuilds_when_parent_ids_change() {
     assert!(
         !second.contains_key("p1"),
         "resume reused a parent-cache shard from the prior ParentIds"
+    );
+}
+
+#[test]
+fn resolve_resume_prunes_shards_outside_a_narrowed_window() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("corpus");
+    let work_dir = tmp.path().join("work");
+    let cache_dir = tmp.path().join("parents_cache");
+    let jan = YearMonth::new(2006, 1);
+    let feb = YearMonth::new(2006, 2);
+
+    write_comment_parent_corpus(&base, jan, &[("p1", "january parent")]);
+    write_comment_parent_corpus(&base, feb, &[("p2", "february parent")]);
+
+    let spool = tmp.path().join("spool.jsonl");
+    fs::write(
+        &spool,
+        "{\"id\":\"c1\",\"body\":\"child\",\"parent_id\":\"t1_p1\",\"created_utc\":1136073600}\n\
+         {\"id\":\"c2\",\"body\":\"child\",\"parent_id\":\"t1_p2\",\"created_utc\":1138752000}\n",
+    )
+    .unwrap();
+    let ids = collect_parent_ids_for_test(&base, &work_dir, &spool);
+
+    // Wide window resolves both months into the cache.
+    RedditETL::new()
+        .base_dir(&base)
+        .work_dir(&work_dir)
+        .date_range(Some(jan), Some(feb))
+        .progress(false)
+        .resolve_parent_maps(&ids, &cache_dir, true)
+        .unwrap();
+    let jan_shard = cache_dir.join("comments").join("RC_2006-01.json");
+    let feb_shard = cache_dir.join("comments").join("RC_2006-02.json");
+    let feb_sidecar = cache_dir
+        .join("comments")
+        .join("RC_2006-02.json.parents-resolve.json");
+    assert!(jan_shard.exists());
+    assert!(feb_shard.exists());
+    assert!(feb_sidecar.exists());
+
+    // Re-running with a narrowed window must prune the now-out-of-window
+    // February shard (and its resolver sidecar) instead of leaving it on
+    // disk where it could leak into resolution.
+    RedditETL::new()
+        .base_dir(&base)
+        .work_dir(&work_dir)
+        .date_range(Some(jan), Some(jan))
+        .progress(false)
+        .resolve_parent_maps(&ids, &cache_dir, true)
+        .unwrap();
+    assert!(
+        jan_shard.exists(),
+        "in-window shard must survive a narrowed re-run"
+    );
+    assert!(
+        !feb_shard.exists(),
+        "out-of-window shard must be pruned on a narrowed re-run"
+    );
+    assert!(
+        !feb_sidecar.exists(),
+        "out-of-window resolver sidecar must be pruned alongside its shard"
     );
 }
 

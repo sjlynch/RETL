@@ -45,6 +45,13 @@ impl RedditETL {
                     self.opts.start, self.opts.end
                 )
             })?;
+            // Report corpus holes inside the resolution window. A child whose
+            // `parent_id` lives in a missing month resolves as `unresolved`;
+            // without this the only signal is the generic unresolved-rate
+            // warning, whose "use a larger --window-months" remedy is
+            // misleading when the real cause is a gap inside the window.
+            warn_resolver_window_gaps(&discovered, self.opts.start, self.opts.end);
+
             let parent_ids_fp = parent_ids_fingerprint(ids)?;
             let resolution_range = attach_resolution_range(self.opts.start, self.opts.end);
             let payload_spec = self.opts.parent_payload_spec.clone();
@@ -83,6 +90,13 @@ impl RedditETL {
                 pb.finish_with_message(final_msg);
             }
 
+            // `build_id_shard_index` only ever adds shards. Prune any cache
+            // JSON for a month outside the current `files` set so a narrowed
+            // re-run against an existing `--cache` does not leave (or resolve
+            // against) shards the user dropped from the window.
+            prune_stale_resolver_shards(&comments_out, "RC", &comment_shards)?;
+            prune_stale_resolver_shards(&submissions_out, "RS", &submission_shards)?;
+
             // Much stricter: only eager-load when plenty of RAM is free.
             let eager_ok = available_memory_fraction() > 0.50;
 
@@ -90,26 +104,13 @@ impl RedditETL {
             let mut submissions_map: HashMap<String, (String, String)> = HashMap::new();
 
             if eager_ok && payload_spec.is_legacy_default() {
-                let load = |dir: &Path| -> Vec<PathBuf> {
-                    let mut v: Vec<PathBuf> = crate::util::read_dir_with_default_backoff(dir)
-                        .map_err(|e| {
-                            tracing::warn!(dir=%dir.display(), error=%e, "failed to eager-list parent cache shards");
-                            e
-                        })
-                        .ok()
-                        .into_iter()
-                        .flat_map(|entries| entries.into_iter().map(|e| e.path()))
-                        .filter(|p| {
-                            p.file_name()
-                                .and_then(|name| name.to_str())
-                                .map(|name| {
-                                    name.ends_with(".json")
-                                        && !name.ends_with(RESOLVER_SIDECAR_SUFFIX)
-                                        && !name.ends_with(INPROGRESS_EXT)
-                                })
-                                .unwrap_or(false)
-                        })
-                        .collect();
+                // Gate the eager load to exactly the shards recorded in the
+                // shard index — the in-window months only. Globbing the cache
+                // dir instead would merge stale out-of-window `.json` files
+                // left by a prior wider run into the eager map, silently
+                // resolving against months the user excluded.
+                let sorted_shard_paths = |shards: &HashMap<YearMonth, PathBuf>| -> Vec<PathBuf> {
+                    let mut v: Vec<PathBuf> = shards.values().cloned().collect();
                     v.sort();
                     v
                 };
@@ -121,7 +122,7 @@ impl RedditETL {
                 // warn naming shards loaded vs. skipped. Without it, a user
                 // debugging why attach is slow on one run and fast on the
                 // next gets no signal.
-                let comment_shard_paths = load(&comments_out);
+                let comment_shard_paths = sorted_shard_paths(&comment_shards);
                 let comment_shard_total = comment_shard_paths.len();
                 for (idx, p) in comment_shard_paths.iter().enumerate() {
                     let f = crate::util::open_with_default_backoff(p)?;
@@ -142,7 +143,7 @@ impl RedditETL {
                         break;
                     }
                 }
-                let submission_shard_paths = load(&submissions_out);
+                let submission_shard_paths = sorted_shard_paths(&submission_shards);
                 let submission_shard_total = submission_shard_paths.len();
                 for (idx, p) in submission_shard_paths.iter().enumerate() {
                     let f = crate::util::open_with_default_backoff(p)?;

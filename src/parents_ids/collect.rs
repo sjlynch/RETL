@@ -33,7 +33,11 @@ impl RedditETL {
 
             let read_buf = self.opts.read_buffer_bytes;
 
-            let parent_ref_count = AtomicUsize::new(0);
+            // Counts *records* that carry at least one parent reference, not
+            // raw field occurrences: a comment almost always has both
+            // `parent_id` and `link_id`, so the old per-field tally was
+            // ~2×records and meaningless to report.
+            let records_with_ref = AtomicUsize::new(0);
 
             paths.par_iter().try_for_each(|p| -> Result<()> {
                 let f = crate::util::open_with_default_backoff(p)
@@ -63,8 +67,9 @@ impl RedditETL {
 
                     let v: Value = serde_json::from_str(&buf)
                         .map_err(|e| malformed_json_error(p, line_number, e))?;
+                    let mut record_has_ref = false;
                     if let Some(parent_id) = v.get("parent_id").and_then(|x| x.as_str()) {
-                        parent_ref_count.fetch_add(1, Ordering::Relaxed);
+                        record_has_ref = true;
                         if let Some(rest) = parent_id.strip_prefix("t1_") {
                             t1_writer.write(rest)?;
                         } else if let Some(rest) = parent_id.strip_prefix("t3_") {
@@ -72,10 +77,13 @@ impl RedditETL {
                         }
                     }
                     if let Some(link_id) = v.get("link_id").and_then(|x| x.as_str()) {
-                        parent_ref_count.fetch_add(1, Ordering::Relaxed);
+                        record_has_ref = true;
                         if let Some(rest) = link_id.strip_prefix("t3_") {
                             t3_writer.write(rest)?;
                         }
+                    }
+                    if record_has_ref {
+                        records_with_ref.fetch_add(1, Ordering::Relaxed);
                     }
 
                     if let Some(pb) = &pb {
@@ -97,11 +105,17 @@ impl RedditETL {
                 pb.finish_with_message(final_msg);
             }
 
-            let parent_refs = parent_ref_count.load(Ordering::Relaxed);
-            if parent_refs == 0 {
+            let records_with_ref = records_with_ref.load(Ordering::Relaxed);
+            if records_with_ref == 0 {
                 tracing::warn!(
                     input_files = paths.len(),
                     "collect_parent_ids_from_jsonls found zero parent_id/link_id fields across the spool; parents pipeline requires parent_id and link_id to survive any --whitelist/.whitelist_fields"
+                );
+            } else {
+                tracing::info!(
+                    input_files = paths.len(),
+                    records_with_parent_ref = records_with_ref,
+                    "collect_parent_ids_from_jsonls: records carrying a parent_id/link_id reference"
                 );
             }
 

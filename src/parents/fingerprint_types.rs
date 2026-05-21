@@ -17,22 +17,20 @@ struct AttachResolutionRange {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct AttachParentCacheFingerprint {
     payload: ParentPayloadFingerprint,
+    // The resolved parent corpus is uniquely identified by these shard-set
+    // digests. The eager `comments`/`submissions` maps were intentionally NOT
+    // fingerprinted: they are a memory-pressure-dependent performance cache
+    // (populated only when RAM is plentiful, and truncated mid-load when it
+    // is not), so digesting them made two byte-identical resolves produce
+    // different fingerprints and forced spurious full attach rebuilds.
     comment_shards: AttachShardSetFingerprint,
     submission_shards: AttachShardSetFingerprint,
-    eager_comments: AttachMapDigest,
-    eager_submissions: AttachMapDigest,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct AttachShardSetFingerprint {
     index_present: bool,
     shards: u64,
-    digest: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-struct AttachMapDigest {
-    entries: u64,
     digest: String,
 }
 

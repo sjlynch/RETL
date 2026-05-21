@@ -61,13 +61,6 @@ fn finish_unordered_digest_string(entries: u64, sum: u64, xor: u64) -> String {
     format!("{hash:016x}")
 }
 
-fn finish_unordered_digest(entries: usize, sum: u64, xor: u64) -> AttachMapDigest {
-    AttachMapDigest {
-        entries: entries as u64,
-        digest: finish_unordered_digest_string(entries as u64, sum, xor),
-    }
-}
-
 fn update_unordered_id_digest(count: &mut u64, sum: &mut u64, xor: &mut u64, id: &str) {
     let mut entry_hash = fnv1a_offset_basis();
     update_digest_str(&mut entry_hash, id);
