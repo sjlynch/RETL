@@ -204,9 +204,16 @@ fn extract_common(
             },
         )?;
 
-        if let Some(tracker) = &whitelist_tracker {
-            tracker.finalize()?;
-        }
+        // The strict whitelist verdict is post-hoc — by here every month's
+        // `.part_*.jsonl` is staged in `tmp_dir` and (when resuming) recorded
+        // in `_progress.json`. `out_path` is only stitched below, so a strict
+        // failure never publishes the final file; but the cached parts and
+        // manifest would let a resumed run skip every month and re-stitch the
+        // bad output. Discard the whole scratch dir on a strict failure so a
+        // resumed run re-streams and re-evaluates the whitelist.
+        finalize_whitelist_strict(whitelist_tracker.as_deref(), &tmp_dir, || {
+            crate::util::remove_dir_all_with_short_backoff(&tmp_dir)
+        })?;
         if let Some(pb) = pb {
             pb.finish_with_message("done");
         }
