@@ -138,7 +138,7 @@ not just in isolation.
 ## Monitoring / observability
 
 `retl` ships an opt-in machine-readable monitoring surface for LLM-driven
-or scripted watchers. Tracing logs are still text on stdout by default —
+or scripted watchers. Tracing logs are still text on stderr by default —
 nothing changes for a normal run. Flags are wired into `CommonOpts`:
 
 - `--events <path>` — append-truncate NDJSON event stream
