@@ -10,7 +10,7 @@ This guide is the cold-read reference for any human or LLM watching a running
 5. How to extend monitoring from library callers.
 
 The default behavior of `retl` is unchanged from prior releases: tracing
-logs go to stdout (text), no extra files are written, no caps fire. All
+logs go to stderr (text), no extra files are written, no caps fire. All
 monitoring features below are opt-in.
 
 ---

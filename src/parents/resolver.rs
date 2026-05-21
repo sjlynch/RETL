@@ -234,3 +234,56 @@ fn build_id_shard_index(
 
     Ok((comment_shards.into_inner(), submission_shards.into_inner()))
 }
+
+/// Remove resolver-cache shard JSONs (and their `.parents-resolve.json`
+/// sidecars) whose month is not in `shards` — i.e. not in the currently
+/// planned `files` set.
+///
+/// Mirrors `prune_stale_attach_outputs`. `build_id_shard_index` only ever
+/// *adds* `<RC|RS>_<ym>.json` shards, so re-running `parents` with a narrowed
+/// `--window-months` (or `--start`/`--end`) against the same `--cache` would
+/// otherwise leave out-of-window shard files on disk. Combined with the
+/// gating of the eager `load()` in `resolve_parent_maps`, this guarantees a
+/// narrowed re-run resolves only against months inside the new window.
+fn prune_stale_resolver_shards(
+    dir: &Path,
+    prefix: &str,
+    shards: &HashMap<YearMonth, PathBuf>,
+) -> Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    // Keep set: the basename of every in-window shard JSON.
+    let keep: BTreeSet<String> = shards
+        .keys()
+        .map(|ym| format!("{prefix}_{ym}.json"))
+        .collect();
+    for entry in crate::util::read_dir_with_default_backoff(dir)
+        .with_context(|| format!("read_dir {}", dir.display()))?
+    {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        // A cache entry is either the shard JSON itself or its resolver
+        // fingerprint sidecar; reduce both to the shard basename.
+        let base = name.strip_suffix(RESOLVER_SIDECAR_SUFFIX).unwrap_or(name);
+        // Only touch files we own: `<prefix>_<YYYY-MM>.json`. This skips
+        // `_staging/`, `.inprogress` leftovers, and anything unrelated.
+        let is_owned_shard = base
+            .strip_prefix(prefix)
+            .and_then(|r| r.strip_prefix('_'))
+            .and_then(|r| r.strip_suffix(".json"))
+            .is_some_and(|ym| ym.parse::<YearMonth>().is_ok());
+        if !is_owned_shard || keep.contains(base) {
+            continue;
+        }
+        crate::util::remove_with_short_backoff(&path).with_context(|| {
+            format!("remove stale parent resolver shard {}", path.display())
+        })?;
+    }
+    Ok(())
+}

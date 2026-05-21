@@ -24,7 +24,10 @@
 mod common;
 
 use common::{decompress_zst_lines, read_jsonl_values, write_zst_lines};
-use retl::{ExportFormat, RedditETL, Sources, WhitelistTokenizer, YearMonth};
+use retl::{
+    project_whitelist_line_for_tests, ExportFormat, RedditETL, Sources, WhitelistTokenizer,
+    YearMonth,
+};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -143,6 +146,31 @@ fn tokenizer_rejects_missing_value() {
     let line = r#"{"a":1,"b":}"#;
     assert_tokenizer_rejects(line);
     assert!(serde_json::from_str::<Value>(line).is_err());
+}
+
+/// Duplicate *whitelisted* top-level key. serde_json accepts the line (its
+/// `Map` collapses duplicates last-wins), so the byte-copying fast path —
+/// which would emit `{"id":"a","id":"b"}` verbatim — must reject it and defer
+/// to the slow path, which is the single source of truth for last-wins
+/// semantics. This is the divergence the tokenizer fuzz target guards against.
+#[test]
+fn tokenizer_rejects_duplicate_whitelisted_key() {
+    let line = r#"{"id":"a","id":"b"}"#;
+    assert_tokenizer_rejects(line);
+    assert_serde_json_accepts(line);
+}
+
+/// Duplicate *non*-whitelisted key. Both paths skip the key regardless of how
+/// often it appears, so there is nothing to diverge — the fast path must NOT
+/// fall back here (an unnecessary fallback would be a perf regression).
+#[test]
+fn tokenizer_accepts_duplicate_non_whitelisted_key() {
+    let line = r#"{"junk":"a","junk":"b","id":"keep"}"#;
+    let tok = WhitelistTokenizer::new(WHITELIST.iter().copied());
+    let mut out = String::new();
+    tok.tokenize_into(line, &mut out)
+        .expect("a duplicate non-whitelisted key must not trigger a fallback");
+    assert_eq!(out, r#"{"id":"keep"}"#);
 }
 
 // ---------------------------------------------------------------------------
@@ -413,5 +441,82 @@ fn stream_job_handles_escaped_keys_via_canonical_decode() {
     // `Value` equality compares object contents (key set + values), so it
     // doesn't matter whether the export carried the escaped or decoded form
     // of the `author` key — both decode to the same JSON document.
+    assert_eq!(values[0], expected);
+}
+
+// ---------------------------------------------------------------------------
+// Section 3: duplicate-key fast/slow-path parity
+//
+// `project_whitelist_line_for_tests` runs the production `write_with_whitelist`
+// helper — tokenizer fast path, with the `serde_json::Value` slow path as the
+// documented fallback. For a line with a duplicate whitelisted key the
+// tokenizer rejects, so the helper falls back; the bytes it returns must be
+// *identical* to the slow-path projection, which is the acceptance criterion
+// for the divergence this test file's tokenizer guards against.
+// ---------------------------------------------------------------------------
+
+/// A duplicate whitelisted top-level key produces the exact same export bytes
+/// through `write_with_whitelist` as the standalone slow-path projection — the
+/// fast path no longer emits a duplicate-keyed object.
+#[test]
+fn duplicate_whitelisted_key_export_matches_slow_path_byte_for_byte() {
+    let path = PathBuf::from("RC_dup-key.zst");
+    let fields = vec!["id".to_string(), "author".to_string()];
+
+    for line in [
+        r#"{"id":"a","id":"b"}"#,
+        r#"{"id":"a","author":"alice","id":"b"}"#,
+        r#"{"author":"x","id":"a","author":"y","id":"b"}"#,
+    ] {
+        let via_pipeline = project_whitelist_line_for_tests(line, &fields, &path, 1)
+            .expect("duplicate-key line is valid JSON, so the slow-path fallback serves it");
+        let via_slow_path = slow_path_projection(line, &["id", "author"]);
+        assert_eq!(
+            via_pipeline, via_slow_path,
+            "fast-path-with-fallback output must equal the slow-path projection for: {line}"
+        );
+    }
+}
+
+/// End-to-end through a real `export_partitioned` run. The whitelisted
+/// duplicate is `permalink`, deliberately *not* a `MinimalRecord` field:
+/// `parse_minimal` rejects a line that duplicates one of its own fields (serde
+/// errors on duplicate struct fields) and that line is then skipped before the
+/// whitelist branch ever sees it — so a duplicate of `id`/`author`/etc. cannot
+/// reach the tokenizer through the pipeline at all. A duplicate of an
+/// ignored-by-`MinimalRecord` field like `permalink` does reach it, and the
+/// exported bytes must still match the slow-path projection.
+#[test]
+fn stream_job_export_collapses_duplicate_whitelisted_key_like_slow_path() {
+    let whitelist = ["id", "permalink"];
+    let record = r#"{"id":"d1","author":"alice","subreddit":"programming","score":1,"created_utc":1136073700,"body":"hi","permalink":"/r/first","permalink":"/r/second"}"#;
+    assert_serde_json_accepts(record);
+
+    let lines = vec![record.to_string()];
+    let base = make_corpus_from_lines(&lines);
+    let out_dir = base.join("out_dup_key");
+
+    RedditETL::new()
+        .base_dir(&base)
+        .sources(Sources::Comments)
+        .date_range(Some(YearMonth::new(2006, 1)), Some(YearMonth::new(2006, 1)))
+        .progress(false)
+        .scan()
+        .subreddit("programming")
+        .whitelist_fields(whitelist.iter().copied())
+        .export_partitioned(&out_dir, ExportFormat::Jsonl)
+        .expect("export must complete for a record with a duplicate whitelisted key");
+
+    let exported = out_dir.join("comments").join("RC_2006-01.jsonl");
+    let values = read_jsonl_values(&exported);
+    assert_eq!(values.len(), 1, "the single record must export exactly once");
+
+    let expected: Value =
+        serde_json::from_str(&slow_path_projection(record, &whitelist)).unwrap();
+    // serde_json's Map keeps the last value for a duplicate key.
+    assert_eq!(
+        expected,
+        serde_json::json!({"id": "d1", "permalink": "/r/second"})
+    );
     assert_eq!(values[0], expected);
 }

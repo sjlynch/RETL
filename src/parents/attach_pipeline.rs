@@ -144,6 +144,7 @@ impl RedditETL {
                 })
                 .collect();
             warn_if_no_comment_shaped_records(diagnostics);
+            warn_if_malformed_parent_ids(diagnostics);
 
             let manifest = build_attach_manifest(
                 &manifest_inputs,

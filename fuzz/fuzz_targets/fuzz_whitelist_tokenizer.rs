@@ -16,6 +16,12 @@
 //! 3. For valid top-level JSON objects, successful tokenizer output matches the
 //!    slow `serde_json::Value` projection for a fixed set of common Reddit
 //!    fields.
+//!
+//! The one valid object shape the tokenizer is *expected* to reject is a line
+//! that repeats a whitelisted top-level key: `serde_json::Value` collapses
+//! duplicate keys last-wins, so the byte-copying fast path must defer to the
+//! slow path rather than emit a duplicate-keyed object. `has_duplicate_-
+//! whitelisted_key` lets contract 3's regression check exempt that case.
 
 use libfuzzer_sys::fuzz_target;
 use serde_json::Value;
@@ -53,6 +59,47 @@ fn projected_value(input: &serde_json::Map<String, Value>) -> Value {
         }
     }
     Value::Object(out)
+}
+
+/// Reports whether `line`'s top-level JSON object repeats any whitelisted key.
+///
+/// `serde_json::Value` silently collapses duplicate object keys (last value
+/// wins), so the byte-copying tokenizer is *expected* to reject such a line
+/// and defer to the slow path — otherwise the two paths would emit different
+/// bytes for the same input. This lets contract 3's regression check tell a
+/// sanctioned duplicate-key rejection apart from a genuine fast-path
+/// regression. Only meaningful for inputs that are themselves JSON objects;
+/// any parse hiccup conservatively reports `false`.
+fn has_duplicate_whitelisted_key(line: &str) -> bool {
+    use serde::de::{Deserializer, IgnoredAny, MapAccess, Visitor};
+    use std::collections::HashSet;
+    use std::fmt;
+
+    struct DupVisitor;
+
+    impl<'de> Visitor<'de> for DupVisitor {
+        type Value = bool;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a JSON object")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<bool, A::Error> {
+            let mut seen: HashSet<String> = HashSet::new();
+            let mut duplicate = false;
+            while let Some(key) = map.next_key::<String>()? {
+                map.next_value::<IgnoredAny>()?;
+                let whitelisted = WHITELIST.contains(&key.as_str());
+                if whitelisted && !seen.insert(key) {
+                    duplicate = true;
+                }
+            }
+            Ok(duplicate)
+        }
+    }
+
+    let mut de = serde_json::Deserializer::from_str(line);
+    de.deserialize_map(DupVisitor).unwrap_or(false)
 }
 
 fuzz_target!(|data: &[u8]| {
@@ -97,8 +144,11 @@ fuzz_target!(|data: &[u8]| {
 
             // A valid top-level object is the production happy path; if that
             // shape is rejected, fallback preserves correctness but the fast
-            // path has regressed.
-            if matches!(input, Some(Value::Object(_))) {
+            // path has regressed. The one sanctioned exception is a line that
+            // repeats a whitelisted top-level key: the tokenizer deliberately
+            // rejects it so the slow path — the single source of truth for
+            // duplicate-key last-wins semantics — produces the output.
+            if matches!(input, Some(Value::Object(_))) && !has_duplicate_whitelisted_key(line) {
                 panic!("tokenizer rejected a valid top-level JSON object: {line}");
             }
         }

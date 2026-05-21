@@ -13,7 +13,12 @@ parents/aggregate stages of the canonical pipeline.
 - `merge.rs` — phase 2: `merge_runs_sorted` k-way merges the run files
   through a `BinaryHeap`, applies the reducer per key, and publishes the
   final output atomically. Variant `_with_key_stats` exposes a key-
-  extraction-failure counter for the parents pipeline.
+  extraction-failure counter for the parents pipeline. The input `run_*`
+  files are scratch: a `crate::util::ScratchGuard` removes them on **every**
+  exit path — success, a propagated merge error, and a panic out of the
+  caller's `merge_same_key` — so a re-run with a reused `runs_dir` cannot
+  pick up stale runs. There is no post-mortem case here; the guard is never
+  disarmed. (Contrast `aggregate`, which keeps its shard scratch on `Err`.)
 - `mod.rs` — module wiring + `note_key_extraction_failed` shared helper.
 
 ## Backpressure contract

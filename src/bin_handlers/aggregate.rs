@@ -87,6 +87,9 @@ pub(crate) fn run_aggregate(args: AggregateArgs) -> Result<()> {
         if args.top.is_some() {
             anyhow::bail!("--top requires --by");
         }
+        if args.scientific {
+            anyhow::bail!("--scientific requires --by");
+        }
         let (agg, report) =
             etl.aggregate_jsonls_parallel_collect::<RecCount>(inputs, &shards_dir)?;
         report_aggregate_input_issues(&report);

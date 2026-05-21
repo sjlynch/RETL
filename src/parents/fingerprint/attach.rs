@@ -51,33 +51,6 @@ fn attach_shard_set_fingerprint(
     }
 }
 
-fn attach_comment_map_digest(map: &HashMap<String, String>) -> AttachMapDigest {
-    let mut sum = 0u64;
-    let mut xor = 0u64;
-    for (id, body) in map {
-        let mut entry_hash = fnv1a_offset_basis();
-        update_digest_str(&mut entry_hash, id);
-        update_digest_str(&mut entry_hash, body);
-        sum = sum.wrapping_add(entry_hash);
-        xor ^= entry_hash.rotate_left((entry_hash & 63) as u32);
-    }
-    finish_unordered_digest(map.len(), sum, xor)
-}
-
-fn attach_submission_map_digest(map: &HashMap<String, (String, String)>) -> AttachMapDigest {
-    let mut sum = 0u64;
-    let mut xor = 0u64;
-    for (id, (title, selftext)) in map {
-        let mut entry_hash = fnv1a_offset_basis();
-        update_digest_str(&mut entry_hash, id);
-        update_digest_str(&mut entry_hash, title);
-        update_digest_str(&mut entry_hash, selftext);
-        sum = sum.wrapping_add(entry_hash);
-        xor ^= entry_hash.rotate_left((entry_hash & 63) as u32);
-    }
-    finish_unordered_digest(map.len(), sum, xor)
-}
-
 fn parent_payload_fingerprint(spec: &ParentPayloadSpec) -> ParentPayloadFingerprint {
     ParentPayloadFingerprint {
         payload_format_version: spec.payload_format_version(),
@@ -91,8 +64,6 @@ fn attach_parent_cache_fingerprint(parents: &ParentMaps) -> AttachParentCacheFin
         payload: parent_payload_fingerprint(&parents.payload_spec),
         comment_shards: attach_shard_set_fingerprint(parents.comment_shards.as_ref()),
         submission_shards: attach_shard_set_fingerprint(parents.submission_shards.as_ref()),
-        eager_comments: attach_comment_map_digest(&parents.comments),
-        eager_submissions: attach_submission_map_digest(&parents.submissions),
     }
 }
 

@@ -1,4 +1,4 @@
-use ahash::{AHashMap, AHashSet};
+use ahash::AHashMap;
 
 use super::skip::{scan_string_body, skip_value, skip_ws};
 use super::timestamps::emit_timestamp_rewritten_value;
@@ -10,7 +10,11 @@ use super::TokenizerError;
 /// Construct once per pipeline (the field set is hashed up front) and reuse the
 /// same instance — and the same output `String` buffer — across every line.
 pub struct WhitelistTokenizer {
-    keys: AHashSet<Vec<u8>>,
+    /// Canonical (escape-decoded) whitelisted key bytes → the positions in the
+    /// caller's field list that requested that key. Doubles as the membership
+    /// set: a top-level key is whitelisted iff it has an entry here. Every
+    /// entry holds at least one index (`new` always pushes), and the first
+    /// index serves as a stable per-key slot for duplicate-key detection.
     key_indices: AHashMap<Vec<u8>, Vec<usize>>,
 }
 
@@ -20,14 +24,12 @@ impl WhitelistTokenizer {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        let mut keys = AHashSet::new();
         let mut key_indices: AHashMap<Vec<u8>, Vec<usize>> = AHashMap::new();
         for (idx, field) in fields.into_iter().enumerate() {
             let key = field.as_ref().as_bytes().to_vec();
-            keys.insert(key.clone());
             key_indices.entry(key).or_default().push(idx);
         }
-        Self { keys, key_indices }
+        Self { key_indices }
     }
 
     /// Walk `line` and append a compact JSON object containing the whitelisted
@@ -103,6 +105,15 @@ impl WhitelistTokenizer {
     /// and `:` are written, then `emit_value` is invoked with the canonical
     /// (escape-decoded) key bytes and the raw value bytes, and decides what
     /// to write for the value.
+    ///
+    /// A line that repeats a whitelisted top-level key is rejected with
+    /// [`TokenizerError::Malformed`]. The slow `serde_json::Value` fallback
+    /// parses into a `serde_json::Map`, which collapses duplicate keys
+    /// last-wins (`{"id":"a","id":"b"}` → `{"id":"b"}`); copying both pairs
+    /// verbatim here would emit a duplicate-keyed object and diverge from the
+    /// slow path for the same input. Deferring to the fallback keeps the two
+    /// paths byte-identical. Duplicate *non*-whitelisted keys are harmless —
+    /// they are skipped on both paths — so they do not trigger a fallback.
     #[inline]
     fn tokenize_with<F>(
         &self,
@@ -143,6 +154,12 @@ impl WhitelistTokenizer {
         // skipped because its key isn't in the whitelist.
         let mut first_pair = true;
         let mut emitted_any = false;
+        // Bitmask of whitelisted keys already emitted on this line, indexed by
+        // each key's stable slot (see the duplicate-key handling below). Used
+        // to reject lines with a repeated whitelisted top-level key so they
+        // fall back to the slow path instead of emitting a duplicate-keyed
+        // object the slow path would never produce.
+        let mut seen_keys: u128 = 0;
         loop {
             i = skip_ws(bytes, i);
             if i >= bytes.len() {
@@ -200,14 +217,16 @@ impl WhitelistTokenizer {
             // for the canonical decoding before checking the whitelist. The
             // decoded bytes are retained so `emit_value` can also see the
             // canonical key (needed for the timestamp-rewrite special case).
+            // The lookup returns the requested-field indices directly, so it
+            // serves as both the membership test and the matched-index source.
             let decoded_key: Option<Vec<u8>>;
-            let matched = if key_has_escape {
+            let field_indices: Option<&Vec<usize>> = if key_has_escape {
                 let raw = &bytes[key_quoted_start..key_quoted_end];
                 match serde_json::from_slice::<String>(raw) {
                     Ok(decoded) => {
-                        let m = self.keys.contains(decoded.as_bytes());
+                        let found = self.key_indices.get(decoded.as_bytes());
                         decoded_key = Some(decoded.into_bytes());
-                        m
+                        found
                     }
                     Err(_) => {
                         malformed!();
@@ -215,11 +234,27 @@ impl WhitelistTokenizer {
                 }
             } else {
                 decoded_key = None;
-                self.keys
-                    .contains(&bytes[key_content_start..key_content_end])
+                self.key_indices
+                    .get(&bytes[key_content_start..key_content_end])
             };
 
-            if matched {
+            if let Some(field_indices) = field_indices {
+                // Reject a repeated whitelisted top-level key: the slow path
+                // would collapse it last-wins, so emitting both occurrences
+                // here would diverge (see `tokenize_with`'s doc comment).
+                // `field_indices` is non-empty by construction, and its first
+                // entry is a stable per-key slot — each field-list position
+                // belongs to exactly one key, so distinct keys get distinct
+                // slots. Slots past bit 127 (only reachable with an
+                // implausibly large whitelist) are clamped onto the top bit,
+                // which can only ever cause an extra, still-correct slow-path
+                // fallback — never a silent divergence.
+                let bit = 1u128 << field_indices[0].min(127);
+                if seen_keys & bit != 0 {
+                    malformed!();
+                }
+                seen_keys |= bit;
+
                 if emitted_any {
                     out.push(',');
                 }
@@ -237,9 +272,7 @@ impl WhitelistTokenizer {
                 };
 
                 if let Some(indices_out) = matched_indices.as_mut() {
-                    if let Some(indices) = self.key_indices.get(canonical_key) {
-                        indices_out.extend(indices.iter().copied());
-                    }
+                    indices_out.extend(field_indices.iter().copied());
                 }
 
                 emit_value(canonical_key, &bytes[value_start..value_end], out);

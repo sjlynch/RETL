@@ -9,6 +9,11 @@ struct ParentAttachDiagnostics {
     records_with_parent_id: u64,
     records_with_link_id: u64,
     comment_shaped_records: u64,
+    /// Records that carry a `parent_id` field whose value is not a string
+    /// prefixed with `t1_`/`t3_` (unprefixed, numeric, or null). These fail
+    /// `is_comment_record_for_parent_attach` and are silently skipped — see
+    /// `warn_if_malformed_parent_ids`.
+    records_with_unprefixed_parent_id: u64,
 }
 
 impl ParentAttachDiagnostics {
@@ -21,6 +26,7 @@ impl ParentAttachDiagnostics {
         self.records_with_parent_id += other.records_with_parent_id;
         self.records_with_link_id += other.records_with_link_id;
         self.comment_shaped_records += other.comment_shaped_records;
+        self.records_with_unprefixed_parent_id += other.records_with_unprefixed_parent_id;
     }
 }
 

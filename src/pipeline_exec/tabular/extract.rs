@@ -132,9 +132,39 @@ fn extract_tabular_common(
     })
 }
 
+/// Warn when an extract's `fields` argument overrides a previously configured
+/// field whitelist.
+///
+/// `extract_to_csv`/`extract_to_tsv` install `fields` as the whitelist
+/// unconditionally. If the caller already set one via
+/// `RedditETL::whitelist_fields` / `ScanPlan::whitelist_fields`, that earlier
+/// choice is silently dropped — two ways to say "which fields" with no signal
+/// which won. Surface the override so it is not a silent footgun.
+fn warn_tabular_whitelist_override(
+    preset: &[String],
+    authoritative: &[String],
+    format: TabularFormat,
+) {
+    if preset != authoritative {
+        tracing::warn!(
+            preset = ?preset,
+            authoritative = ?authoritative,
+            "extract_to_{} ignores the field whitelist set via \
+             RedditETL/ScanPlan::whitelist_fields; the `fields` argument is \
+             authoritative and overrides it",
+            format.label(),
+        );
+    }
+}
+
 impl ScanPlan {
     /// Export matching records as CSV. `fields` is the fixed top-level schema;
     /// missing fields render as empty cells.
+    ///
+    /// `fields` is authoritative: it always becomes the projection/whitelist
+    /// for this export. Any whitelist previously configured via
+    /// [`RedditETL::whitelist_fields`] / [`ScanPlan::whitelist_fields`] is
+    /// overridden (a `tracing::warn!` is emitted if the two differ).
     pub fn extract_to_csv<I, S>(
         self,
         out_path: &Path,
@@ -151,6 +181,11 @@ impl ScanPlan {
     /// Export matching records as TSV. `fields` is the fixed top-level schema;
     /// missing fields render as empty cells. Values containing a literal tab
     /// are rejected because TSV has no standard escaping convention.
+    ///
+    /// `fields` is authoritative: it always becomes the projection/whitelist
+    /// for this export. Any whitelist previously configured via
+    /// [`RedditETL::whitelist_fields`] / [`ScanPlan::whitelist_fields`] is
+    /// overridden (a `tracing::warn!` is emitted if the two differ).
     pub fn extract_to_tsv<I, S>(
         self,
         out_path: &Path,
@@ -187,6 +222,9 @@ impl ScanPlan {
         }
         let fields = normalize_tabular_fields(fields)?;
         let mut scan = self;
+        if let Some(preset) = &scan.etl.opts.whitelist_fields {
+            warn_tabular_whitelist_override(preset, &fields, format);
+        }
         scan.etl.opts.whitelist_fields = Some(fields.clone());
         let plan = scan.build()?;
         log_pseudo_user_filter(&plan.query);

@@ -37,13 +37,41 @@ pub(crate) fn unique_inprogress_path(staging_dir: &Path, final_dest: &Path) -> R
     Ok(staging_dir.join(staged_name))
 }
 
-pub(super) fn owner_pid_from_inprogress(path: &Path) -> Option<u32> {
+/// RETL-owned suffix fields parsed out of a staged `.inprogress` filename.
+///
+/// `unique_inprogress_path` always emits `<pid>-<nonce>-<nanos>`, but a sweep
+/// may also encounter `.inprogress` files left by an older RETL build whose
+/// suffix carried no trailing timestamp; `created_nanos` is `None` for those.
+pub(super) struct StagedSuffix {
+    /// PID of the process that staged the file.
+    pub pid: u32,
+    /// Wall-clock nanoseconds since the Unix epoch captured when the staged
+    /// file was created. `None` for legacy two-field suffixes.
+    pub created_nanos: Option<u128>,
+}
+
+/// Parse the RETL-owned suffix of a staged `.inprogress` path.
+///
+/// Returns `None` for legacy fixed-name `.inprogress` files and any path that
+/// does not carry the `STAGE_MARKER` suffix — those cannot be safely
+/// attributed to a RETL process, so the sweep leaves them in place.
+pub(super) fn parse_inprogress_suffix(path: &Path) -> Option<StagedSuffix> {
     let name = path.file_name()?.to_str()?;
     if !name.ends_with(INPROGRESS_EXT) {
         return None;
     }
     let start = name.rfind(STAGE_MARKER)? + STAGE_MARKER.len();
     let rest = &name[start..name.len() - INPROGRESS_EXT.len()];
-    let pid = rest.split('-').next()?;
-    pid.parse().ok()
+    let parts: Vec<&str> = rest.split('-').collect();
+    let pid: u32 = parts.first()?.parse().ok()?;
+    // `unique_inprogress_path` emits `<pid>-<nonce>-<nanos>`; the trailing
+    // field is the creation timestamp. A legacy `<pid>-<nonce>` suffix has no
+    // third field, so `created_nanos` stays `None` and the sweep falls back to
+    // the file's mtime to estimate its age.
+    let created_nanos = if parts.len() >= 3 {
+        parts.last().and_then(|field| field.parse().ok())
+    } else {
+        None
+    };
+    Some(StagedSuffix { pid, created_nanos })
 }
