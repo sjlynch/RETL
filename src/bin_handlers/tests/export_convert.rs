@@ -55,6 +55,49 @@ fn export_tsv_rejects_resume() {
 }
 
 #[test]
+fn export_csv_rejects_resume() {
+    let cwd = tempfile::tempdir().unwrap();
+    let args = export_args(&[
+        "--data-dir",
+        cwd.path().join("missing_data").to_str().unwrap(),
+        "--format",
+        "csv",
+        "--whitelist",
+        "id",
+        "--resume",
+        "--no-progress",
+        "--out",
+        cwd.path().join("out.csv").to_str().unwrap(),
+    ]);
+    let err = run_export(args).expect_err("--resume must be rejected for csv");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("--resume is not supported"), "got: {msg}");
+}
+
+#[test]
+fn export_tsv_rejects_human_timestamps() {
+    let cwd = tempfile::tempdir().unwrap();
+    let args = export_args(&[
+        "--data-dir",
+        cwd.path().join("missing_data").to_str().unwrap(),
+        "--format",
+        "tsv",
+        "--whitelist",
+        "id",
+        "--human-timestamps",
+        "--no-progress",
+        "--out",
+        cwd.path().join("out.tsv").to_str().unwrap(),
+    ]);
+    let err = run_export(args).expect_err("--human-timestamps must be rejected for tsv");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("--human-timestamps is not supported"),
+        "got: {msg}"
+    );
+}
+
+#[test]
 fn sample_csv_rejects_human_timestamps() {
     let cwd = tempfile::tempdir().unwrap();
     let args = sample_args(&[
