@@ -24,6 +24,35 @@ fn aggregate_resume_surfaces_supported_workflow_hint() {
     );
 }
 
+/// `aggregate --scientific` is a grouped-metric display toggle and has no
+/// effect on the rec-count JSON output produced without `--by`. Like the
+/// sibling `--metric` / `--top` flags, passing it without `--by` should fail
+/// loudly instead of being silently ignored.
+#[test]
+fn aggregate_scientific_without_by_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let cli = Cli::try_parse_from([
+        "retl",
+        "aggregate",
+        "--out",
+        dir.path().join("out.json").to_str().unwrap(),
+        "--shards-dir",
+        dir.path().join("shards").to_str().unwrap(),
+        "--scientific",
+        dir.path().join("missing.jsonl").to_str().unwrap(),
+    ])
+    .unwrap();
+    let args = match cli.command {
+        Command::Aggregate(a) => a,
+        other => panic!("expected aggregate command, got {other:?}"),
+    };
+    let err = run_aggregate(args).expect_err("--scientific without --by must error");
+    assert!(
+        format!("{err}").contains("--scientific requires --by"),
+        "unexpected error: {err}"
+    );
+}
+
 /// `integrity --resume` is also intentionally not supported; the handler
 /// should bail with a pointer to scoping flags / resumable workflows.
 /// Migrated from tests/cli_help.rs::integrity_resume_flag_fails_with_supported_workflow_hint.
