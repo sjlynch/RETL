@@ -131,21 +131,249 @@ impl PartitionWriters {
         Ok(())
     }
 
-    /// Flush, close, and promote all `.inprogress` files to final `.ndjson` files atomically.
-    /// Returns the list of final file paths in stable order.
+    /// Flush, close, and promote all `.inprogress` files to final `.ndjson`
+    /// files. Returns the list of final file paths in stable partition order.
+    ///
+    /// ## Atomicity scope — read before relying on the return value
+    ///
+    /// Each partition is promoted with its own atomic
+    /// [`replace_file_atomic_backoff`](crate::util::replace_file_atomic_backoff)
+    /// rename, but `finalize` is **not** a transaction across the partition
+    /// set: no filesystem primitive renames N files as one unit. Partitions
+    /// are promoted in index order.
+    ///
+    /// If a mid-loop rename fails (a transient error outlives the backoff
+    /// budget, or a destination is locked), `finalize` does **not** silently
+    /// leave a partial `*_part_*.ndjson` set on disk:
+    ///
+    /// 1. It rolls every already-promoted partition back into staging with a
+    ///    best-effort reverse rename, so the common outcome of a failure is
+    ///    still "all partitions published" or "none published".
+    /// 2. It returns `Err` wrapping a [`PartitionFinalizeError`] that names
+    ///    exactly which partitions are published vs. still staged, and whether
+    ///    the rollback fully succeeded.
+    ///
+    /// A caller that gets an `Err` can therefore tell a cleanly rolled-back
+    /// run (retryable, nothing on disk) apart from a genuinely partial export,
+    /// instead of enumerating `*_part_*.ndjson` and mistaking a partial set
+    /// for a complete one. On `Ok`, every partition is published and the
+    /// returned paths are safe to enumerate as a complete export.
     pub fn finalize(mut self) -> Result<Vec<PathBuf>> {
         self.flush_all()?;
         // Ensure files are closed before rename/copy
         let writers = std::mem::take(&mut self.writers);
         drop(writers);
 
-        let tmp_paths = self.tmp_paths;
-        let final_paths = self.final_paths;
+        let tmp_paths = std::mem::take(&mut self.tmp_paths);
+        let final_paths = std::mem::take(&mut self.final_paths);
 
+        // Promote each partition in index order, tracking how many reached
+        // their final path so a mid-loop failure can be reported — and rolled
+        // back — precisely.
+        let mut promoted = 0usize;
+        let mut promote_err: Option<anyhow::Error> = None;
         for (tmp, final_p) in tmp_paths.iter().zip(final_paths.iter()) {
-            replace_file_atomic_backoff(tmp, final_p)?;
+            match replace_file_atomic_backoff(tmp, final_p) {
+                Ok(()) => promoted += 1,
+                Err(e) => {
+                    promote_err = Some(e);
+                    break;
+                }
+            }
         }
 
-        Ok(final_paths)
+        let Some(source) = promote_err else {
+            return Ok(final_paths);
+        };
+        // `promoted` is now the index of the partition that could not be
+        // promoted: partitions [0, promoted) are published, the rest staged.
+        let failed_index = promoted;
+
+        // `at_final[i]` tracks whether partition `i`'s data currently sits at
+        // its final path. Roll the already-published partitions back into
+        // staging so the output directory does not present a partial
+        // `*_part_*.ndjson` set that a reader could mistake for a complete
+        // export. Each reverse rename is itself atomic; a partition whose
+        // rollback fails simply stays published (recorded as a partial state).
+        let parts = final_paths.len();
+        let mut at_final = vec![false; parts];
+        for slot in at_final.iter_mut().take(promoted) {
+            *slot = true;
+        }
+        for i in 0..promoted {
+            match replace_file_atomic_backoff(&final_paths[i], &tmp_paths[i]) {
+                Ok(()) => at_final[i] = false,
+                Err(rollback_err) => {
+                    tracing::warn!(
+                        partition = i,
+                        final_path = %final_paths[i].display(),
+                        error = %rollback_err,
+                        "PartitionWriters::finalize: could not roll a published \
+                         partition back to staging after a mid-loop promote failure; \
+                         output directory holds a partial export"
+                    );
+                }
+            }
+        }
+
+        let published: Vec<PathBuf> = (0..parts)
+            .filter(|&i| at_final[i])
+            .map(|i| final_paths[i].clone())
+            .collect();
+        let pending: Vec<PathBuf> = (0..parts)
+            .filter(|&i| !at_final[i])
+            .map(|i| tmp_paths[i].clone())
+            .collect();
+        let rolled_back = published.is_empty();
+
+        Err(anyhow::Error::new(PartitionFinalizeError {
+            published,
+            pending,
+            failed_index,
+            rolled_back,
+            source,
+        }))
+    }
+}
+
+/// Error returned by [`PartitionWriters::finalize`] when the staged partition
+/// files could not all be promoted to their final paths.
+///
+/// `finalize` promotes partitions one at a time — it is *not* atomic across
+/// the partition set (see [`PartitionWriters::finalize`]). When a promote
+/// fails partway through, `finalize` rolls the already-promoted partitions
+/// back into staging and returns this error so the caller can tell a cleanly
+/// rolled-back run apart from a genuinely partial export, instead of mistaking
+/// a partial `*_part_*.ndjson` set for a complete one.
+#[derive(Debug)]
+pub struct PartitionFinalizeError {
+    /// Final paths of partitions still published at their final location.
+    /// Empty when the rollback fully succeeded ([`Self::rolled_back`] is
+    /// `true`); non-empty only when rolling one or more partitions back
+    /// failed, in which case the output directory holds a *partial* export
+    /// and these are the files a reader must not treat as complete.
+    pub published: Vec<PathBuf>,
+    /// Staging (`.inprogress`) paths of partitions not currently published —
+    /// the partitions never promoted plus any that were rolled back into
+    /// staging.
+    pub pending: Vec<PathBuf>,
+    /// Index of the partition whose promotion first failed.
+    pub failed_index: usize,
+    /// `true` when every previously promoted partition was rolled back into
+    /// staging, so the output directory holds *none* of this export's final
+    /// files — a clean, retryable "nothing published" state. `false` means at
+    /// least one partition could not be rolled back and a partial export
+    /// remains on disk (see [`Self::published`]).
+    pub rolled_back: bool,
+    /// The underlying rename failure that aborted promotion.
+    source: anyhow::Error,
+}
+
+impl PartitionFinalizeError {
+    /// Total number of partitions the writer was finalizing.
+    pub fn total_partitions(&self) -> usize {
+        self.published.len() + self.pending.len()
+    }
+
+    /// Whether a partial export remains on disk — some partitions published
+    /// while others are not. Always `false` after a fully successful
+    /// rollback; equivalent to `!self.rolled_back`.
+    pub fn is_partial_export(&self) -> bool {
+        !self.published.is_empty()
+    }
+}
+
+impl std::fmt::Display for PartitionFinalizeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "PartitionWriters::finalize: promoting partition {} of {} failed; \
+             {} partition(s) published, {} staged in _staging/. {}",
+            self.failed_index,
+            self.total_partitions(),
+            self.published.len(),
+            self.pending.len(),
+            if self.rolled_back {
+                "All promoted partitions were rolled back to staging — no partial \
+                 export remains on disk and finalize can be safely retried."
+            } else {
+                "Rolling promoted partitions back to staging did not fully succeed — \
+                 a partial export remains on disk; see `published` for the partition \
+                 files a reader must not treat as a complete export."
+            },
+        )
+    }
+}
+
+impl std::error::Error for PartitionFinalizeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A mid-loop rename failure must not silently leave a partial
+    /// `*_part_*.ndjson` set. With a blocked destination, `finalize` rolls the
+    /// already-promoted partitions back into staging and returns a
+    /// `PartitionFinalizeError` naming the published/pending split.
+    #[test]
+    fn finalize_mid_loop_failure_rolls_back_and_reports_partition_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let pw = PartitionWriters::new(dir.path(), "blocked", 3, 64 * 1024).unwrap();
+        for user in ["alice", "bob", "carol", "dave", "erin", "frank"] {
+            pw.write_with(user, |w| {
+                w.write_all(format!("{{\"u\":\"{user}\"}}\n").as_bytes())?;
+                Ok(())
+            })
+            .unwrap();
+        }
+
+        // Block partition 1's final path with a directory so its promote
+        // rename fails after partition 0 has already been published.
+        let blocker = dir.path().join("blocked_part_000001.ndjson");
+        std::fs::create_dir(&blocker).unwrap();
+
+        // Cap the retry budget so the blocked rename surfaces immediately
+        // instead of burning the full production ~10–20 s backoff.
+        let _cap = crate::util::cap_backoff_budget_for_test(1, 0);
+
+        let err = pw
+            .finalize()
+            .expect_err("finalize must fail when a partition cannot be promoted");
+        let fe = err
+            .downcast_ref::<PartitionFinalizeError>()
+            .expect("error must carry a PartitionFinalizeError");
+
+        assert_eq!(fe.failed_index, 1, "partition 1 is the blocked one");
+        assert_eq!(fe.total_partitions(), 3);
+        assert!(
+            fe.rolled_back,
+            "partition 0 should roll back cleanly into staging"
+        );
+        assert!(!fe.is_partial_export());
+        assert!(
+            fe.published.is_empty(),
+            "rollback should leave nothing published, got {:?}",
+            fe.published
+        );
+        assert_eq!(
+            fe.pending.len(),
+            3,
+            "every partition should be reported as staged after rollback"
+        );
+
+        // No final `*_part_*.ndjson` file may remain — the blocker directory
+        // is the only `blocked_part_*` entry, and partition 0 was rolled back.
+        assert!(
+            !dir.path().join("blocked_part_000000.ndjson").exists(),
+            "partition 0 must not stay published after rollback"
+        );
+        // Every reported pending file is a real staged file ready for retry.
+        for staged in &fe.pending {
+            assert!(staged.exists(), "staged file should exist: {staged:?}");
+        }
     }
 }

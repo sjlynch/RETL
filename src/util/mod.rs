@@ -7,7 +7,8 @@
 //! - [`backoff`] — Windows-friendly retry policy, `*_with_backoff` I/O
 //!   wrappers, and `replace_file_atomic_backoff`.
 //! - [`exclusions`] — default bot author list and env/file merging.
-//! - [`scratch`] — process-unique scratch directory naming.
+//! - [`scratch`] — process-unique scratch directory naming and the
+//!   `ScratchGuard` RAII cleanup guard.
 //! - [`thread_pool`] — `with_thread_pool` scoped Rayon helper.
 //! - [`tracing`] — binary-only tracing subscriber init.
 
@@ -48,7 +49,7 @@ pub(crate) use backoff::{
 pub use exclusions::default_bot_authors;
 pub(crate) use exclusions::try_merge_extra_exclusions;
 
-pub(crate) use scratch::unique_scratch_dir;
+pub(crate) use scratch::{unique_scratch_dir, ScratchGuard};
 
 pub use thread_pool::with_thread_pool;
 

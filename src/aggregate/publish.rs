@@ -136,6 +136,25 @@ impl RedditETL {
         let staging_dir = ensure_staging_dir(&run_dir)?;
         let shard_paths = shard_names_for_inputs(&run_dir, &run_token, &inputs);
 
+        // The per-run shard directory is pure scratch: every shard is folded
+        // into `total`, after which it serves no purpose. Aggregate
+        // historically accreted one `run_*` directory of shard JSON per
+        // `retl aggregate` run (hundreds of MB over a 12-year spool).
+        //
+        // A `ScratchGuard` reclaims it on *every* exit path from the block
+        // below — a normal return, a `?`-propagated error inside
+        // `with_thread_pool`, and (critically) a panic unwinding out of
+        // `merge_aggregator_shards_parallel`, `load_shard`, or a non-
+        // associative user `Aggregator::merge` impl. The old
+        // `if outcome.is_ok()` check missed the panic case: the panic unwound
+        // straight past it and `run_*` scratch silently accreted.
+        //
+        // Only an explicit `Err` outcome disarms the guard, preserving the
+        // documented post-mortem policy — a failed merge leaves its shards
+        // behind for inspection. A panic is a different failure class and is
+        // *always* cleaned up.
+        let mut run_scratch = crate::util::ScratchGuard::new(run_dir);
+
         let outcome = with_thread_pool(self.opts.parallelism, || {
             let BuildOutcome { shards, report } = build_aggregate_shards_with::<A, F>(
                 &inputs,
@@ -162,20 +181,10 @@ impl RedditETL {
             Ok((total, report))
         });
 
-        // The per-run shard directory is pure scratch: every shard has been
-        // folded into `total`. Aggregate historically never removed it, so
-        // each `retl aggregate` run permanently accreted a `run_*` directory
-        // of shard JSON under `shards_dir` (hundreds of MB over a 12-year
-        // spool). Remove it best-effort after a successful merge; a failed
-        // merge leaves it behind for post-mortem inspection.
-        if outcome.is_ok() {
-            if let Err(e) = crate::util::remove_dir_all_with_short_backoff(&run_dir) {
-                tracing::warn!(
-                    run_dir = %run_dir.display(),
-                    error = %e,
-                    "failed to remove aggregate per-run shard directory; scratch shards left behind"
-                );
-            }
+        // Success and panic both let `run_scratch` clean up on drop. Only a
+        // returned `Err` is left for post-mortem inspection.
+        if outcome.is_err() {
+            run_scratch.disarm();
         }
 
         outcome

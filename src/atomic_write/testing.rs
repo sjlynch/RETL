@@ -46,8 +46,60 @@ mod tests {
     };
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::process::{Child, Command, Stdio};
     use std::sync::{Arc, Barrier};
     use std::thread;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    /// Kills the spawned helper process when the test ends, pass or fail.
+    struct ChildGuard(Child);
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// Spawn a real, long-lived process so the sweep sees a genuine live PID.
+    /// Used to model a PID that the OS recycled onto an unrelated process
+    /// after the original RETL writer crashed.
+    fn spawn_live_process() -> ChildGuard {
+        let mut cmd = if cfg!(windows) {
+            let mut c = Command::new("cmd");
+            c.args(["/c", "ping", "-n", "60", "127.0.0.1"]);
+            c
+        } else {
+            let mut c = Command::new("sleep");
+            c.arg("60");
+            c
+        };
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let child = cmd.spawn().expect("spawn live helper process");
+        // Give the OS a beat to register the process so the sweep's `sysinfo`
+        // refresh reliably reports it as live.
+        thread::sleep(Duration::from_millis(300));
+        ChildGuard(child)
+    }
+
+    fn now_nanos() -> u128 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    }
+
+    /// Write a staged `.inprogress` file with the RETL-owned suffix
+    /// `<dest>.retl-<pid>-<nonce>-<nanos>.inprogress`.
+    fn write_staged(staging: &Path, dest: &str, pid: u32, nonce: u64, nanos: u128) -> PathBuf {
+        let path = staging.join(format!(
+            "{dest}.retl-{pid}-{nonce}-{nanos}{INPROGRESS_EXT}"
+        ));
+        fs::write(&path, b"partial output").unwrap();
+        path
+    }
 
     fn inprogress_entries(staging: &Path) -> Vec<PathBuf> {
         let mut paths: Vec<PathBuf> = fs::read_dir(staging)
@@ -117,5 +169,81 @@ mod tests {
             inprogress_entries(&staging).is_empty(),
             "successful writes clean up staged files"
         );
+    }
+
+    /// Acceptance: a stale `.inprogress` older than the age threshold is swept
+    /// even when its embedded PID currently belongs to an unrelated live
+    /// process (a recycled PID). A recent leftover owned by that same live PID
+    /// is still left in place — it may be an active writer.
+    #[test]
+    fn stale_inprogress_with_recycled_pid_is_swept() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let staging = ensure_staging_dir(root).unwrap();
+
+        // A genuinely live process. Its PID stands in for a recycled PID: the
+        // original RETL writer crashed long ago and this unrelated process now
+        // happens to hold the same number.
+        let child = spawn_live_process();
+        let recycled_pid = child.0.id();
+        assert_ne!(
+            recycled_pid,
+            std::process::id(),
+            "helper PID must differ from the test process"
+        );
+
+        // Stale leftover: embedded timestamp at the Unix epoch — decades old,
+        // far beyond the recycle grace window.
+        let stale = write_staged(&staging, "stale.jsonl", recycled_pid, 0, 0);
+        // Fresh leftover owned by the same live PID — plausibly an active
+        // writer, so it must survive the sweep.
+        let fresh = write_staged(&staging, "fresh.jsonl", recycled_pid, 1, now_nanos());
+
+        let swept = sweep_stale_inprogress(root, true).unwrap();
+        assert_eq!(swept, 1, "only the stale recycled-PID file is swept");
+        assert!(
+            !stale.exists(),
+            "stale .inprogress with a recycled PID was reclaimed"
+        );
+        assert!(
+            fresh.exists(),
+            "recent .inprogress owned by a live PID left in place"
+        );
+    }
+
+    /// An old staged file owned by *this* still-running process must never be
+    /// swept: a long-running RETL run legitimately holds an old live staged
+    /// file, and sweeping it would delete its own active output.
+    #[test]
+    fn old_inprogress_owned_by_self_is_never_swept() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let staging = ensure_staging_dir(root).unwrap();
+
+        let own = write_staged(&staging, "own.jsonl", std::process::id(), 0, 0);
+
+        let swept = sweep_stale_inprogress(root, true).unwrap();
+        assert_eq!(
+            swept, 0,
+            "the sweep never reclaims a staged file owned by the live self PID"
+        );
+        assert!(own.exists(), "self-owned .inprogress survived the sweep");
+    }
+
+    /// The age gate only ever *keeps* files; it never blocks the sweep of a
+    /// leftover whose PID is no longer live, even one with a recent timestamp.
+    #[test]
+    fn recent_inprogress_owned_by_dead_pid_is_swept() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let staging = ensure_staging_dir(root).unwrap();
+
+        // A PID that is not live: huge, and not a multiple-of-4 Windows PID.
+        let dead_pid = u32::MAX - 1;
+        let leftover = write_staged(&staging, "dead.jsonl", dead_pid, 0, now_nanos());
+
+        let swept = sweep_stale_inprogress(root, true).unwrap();
+        assert_eq!(swept, 1, "a dead-PID leftover is swept regardless of age");
+        assert!(!leftover.exists(), "dead-PID .inprogress was reclaimed");
     }
 }

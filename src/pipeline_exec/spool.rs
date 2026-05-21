@@ -292,9 +292,9 @@ impl ScanPlan {
                 },
             )?;
 
-            if let Some(tracker) = &whitelist_tracker {
-                tracker.finalize()?;
-            }
+            finalize_whitelist_strict(whitelist_tracker.as_deref(), out_dir, || {
+                clear_spool_resume_parts(out_dir)
+            })?;
             if let Some(pb) = pb {
                 pb.finish_with_message("done");
             }
