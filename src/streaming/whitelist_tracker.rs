@@ -63,6 +63,16 @@ impl WhitelistMatchTracker {
         Ok(())
     }
 
+    /// Decide the per-field verdict for the whole job. In non-strict mode a
+    /// missing field only logs a `warn!`; in strict mode it returns `Err`.
+    ///
+    /// This is necessarily **post-hoc** — it can only run once every record has
+    /// been observed, which by then means each month's output is already
+    /// published and (when resuming) its `_progress.json` entry committed. A
+    /// caller that publishes per-month outputs must therefore undo those side
+    /// effects on a strict `Err` (see
+    /// `pipeline_exec::finalize_whitelist_strict`); otherwise a resumed run
+    /// would skip the months and never re-trigger this check.
     pub(crate) fn finalize(&self) -> Result<()> {
         let mut state = self
             .state

@@ -33,6 +33,13 @@ impl ETLOptions {
     /// [`ETLOptions::inflight_bytes`]). Use this when you want the value you
     /// pass to be the actual RAM ceiling; use the individual setters when you
     /// need throughput tuning (a deeper channel) and have measured headroom.
+    ///
+    /// **`bytes == 0` does not set a zero-byte ceiling.** `0` is the sentinel
+    /// that *disables* the explicit `inflight_bytes` cap (see
+    /// [`Self::with_inflight_bytes`]), falling back to memory-fraction
+    /// sampling — the opposite of a hard ceiling. If you derive the budget
+    /// from a computation that can yield `0`, guard against it before calling
+    /// this so an empty input does not silently unbound the run.
     pub fn with_inflight_budget(mut self, bytes: usize) -> Self {
         self.inflight_bytes = bytes;
         self.inflight_groups = 1;
@@ -75,11 +82,15 @@ pub(crate) fn inflight_worst_case_peak_bytes(
 /// inflight_groups)` pair would produce a worst-case bucketing peak above
 /// roughly 2× the declared `inflight_bytes`.
 ///
-/// Fires from `BucketingCfg::from(&ETLOptions)` and the dedupe-config builder
-/// in `pipeline_exec`; gated by a process-wide [`Once`] so the warning is
-/// emitted at most once per process. Tests that don't initialize tracing
-/// won't see it; binaries that call [`crate::util::init_tracing_for_binary`]
-/// will.
+/// Fires **only** from `BucketingCfg::from(&ETLOptions)` — the peak it
+/// describes is bucketing-specific. The dedupe pipeline pins its channel
+/// capacity to 1 and never reads `inflight_groups`, so this warning must not
+/// be raised from the dedupe-config builder (its peak is always bounded by
+/// `inflight_bytes`, and the `Once` gate below would otherwise let a dedupe
+/// run silence the bucketing path). Gated by a process-wide [`Once`] so the
+/// warning is emitted at most once per process. Tests that don't initialize
+/// tracing won't see it; binaries that call
+/// [`crate::util::init_tracing_for_binary`] will.
 pub(crate) fn warn_if_inflight_pair_pathological(inflight_bytes: usize, inflight_groups: usize) {
     use std::sync::Once;
     static WARNED: Once = Once::new();
@@ -102,7 +113,7 @@ pub(crate) fn warn_if_inflight_pair_pathological(inflight_bytes: usize, inflight
             worst_case_peak_bytes = peak,
             ratio,
             "bucketing memory peak ≈ {peak_mib} MiB ({ratio:.1}× declared inflight_bytes={declared_mib} MiB) — worst-case = (1 + inflight_groups) * inflight_bytes/2. \
-             Lower --inflight-groups (or call RedditETL::inflight_budget(bytes) to set both together) to bring the peak back under the declared budget.",
+             Lower --inflight-groups (or call ETLOptions::with_inflight_budget(bytes) to set both together) to bring the peak back under the declared budget.",
         );
     });
 }

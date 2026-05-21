@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::fs_ops::remove_with_backoff;
-use super::retry::with_backoff;
+use super::retry::{with_backoff, DEFAULT_BACKOFF_DELAY_MS, DEFAULT_BACKOFF_TRIES};
 
 /// Per-process nonce so two concurrent fallbacks never collide on a temp name.
 static FALLBACK_NONCE: AtomicU64 = AtomicU64::new(0);
@@ -80,8 +80,12 @@ fn unique_sibling_tmp(dest: &Path) -> Result<PathBuf> {
 /// last-resort path is therefore **not** atomic, and emits a `tracing::warn!`
 /// recording that atomicity was lost.
 pub fn replace_file_atomic_backoff(tmp: &Path, dest: &Path) -> Result<()> {
-    let tries = 20usize;
-    let delay_ms = 50u64;
+    // The atomic publish step is the most critical I/O path in the toolkit;
+    // it shares the crate-wide backoff budget so it can never silently
+    // diverge from the other `*_with_backoff` call sites, and a future tune
+    // of `DEFAULT_BACKOFF_TRIES` reaches it for free.
+    let tries = DEFAULT_BACKOFF_TRIES;
+    let delay_ms = DEFAULT_BACKOFF_DELAY_MS;
 
     // Primary path: a single atomic MoveFileExW(REPLACE_EXISTING).
     if rename_with_backoff(tmp, dest, tries, delay_ms).is_ok() {
