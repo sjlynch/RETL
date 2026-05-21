@@ -48,7 +48,7 @@ When you add a new filter or key extractor, prefer extending `MinimalRecord`
   its final path with `util::replace_file_atomic_backoff(tmp, dest)`.
 - Library code **never** writes to a final path directly. If you add a new
   output, route through `atomic_write::write_jsonl_atomic` /
-  `write_zst_atomic` (or replicate their unique staging+rename dance) so a
+  `write_zst_atomic_if` (or replicate their unique staging+rename dance) so a
   crashed run never leaves a partial file readers can mistake for complete
   output. Staging sweeps must not delete live files from another PID.
 - `replace_file_atomic_backoff` relies on Windows
@@ -82,9 +82,12 @@ channel between them. The channel capacity differs by stage:
   capacity is `inflight_groups` (default 8). Worst-case peak ≈
   `(1 + inflight_groups) * (inflight_bytes / 2)`. With the defaults this is
   ≈ 1.125 GiB, **not** 256 MiB. The two knobs are **not** independent — use
-  `RedditETL::inflight_budget(bytes)` to set both together so the declared
+  `ETLOptions::with_inflight_budget(bytes)` (or the `RedditETL` builder's
+  `.inflight_budget(bytes)` forwarder) to set both together so the declared
   budget matches the actual peak. `BucketingCfg::from(&ETLOptions)` emits a
-  one-shot `tracing::warn!` when a pair exceeds roughly 2× `inflight_bytes`.
+  one-shot `tracing::warn!` when a pair exceeds roughly 2× `inflight_bytes`;
+  the dedupe stage does **not** emit this warning (its peak is always
+  `inflight_bytes`, independent of `inflight_groups`).
 - `per_flush_cap = inflight_bytes / 2` — the producer flushes a map once
   it reaches that byte budget.
 - `inflight_bytes` defaults to **256 MiB** and is the per-flush byte lever.
@@ -138,7 +141,7 @@ not just in isolation.
 ## Monitoring / observability
 
 `retl` ships an opt-in machine-readable monitoring surface for LLM-driven
-or scripted watchers. Tracing logs are still text on stdout by default —
+or scripted watchers. Tracing logs are still text on stderr by default —
 nothing changes for a normal run. Flags are wired into `CommonOpts`:
 
 - `--events <path>` — append-truncate NDJSON event stream
@@ -197,7 +200,7 @@ injection points the test suite uses to skip multi-second production retry
 budgets when a test deliberately drives a non-recoverable failure (e.g.
 `spool_publish_failure_is_fatal_and_does_not_commit_manifest` blocks the
 publish destination with a directory, which under the production backoff
-budget waits ~21 s on `ERROR_ACCESS_DENIED` retries). Without the feature
+budget waits ~14 s on `ERROR_ACCESS_DENIED` retries). Without the feature
 the same tests still run and pass; they just take ~35 % longer overall.
 
 The feature also gates `retl::set_available_memory_fraction_for_tests`
@@ -227,9 +230,12 @@ harness — production builds (`--no-default-features` or just no
   `scratch.rs` for `unique_scratch_dir`, `thread_pool.rs` for `with_thread_pool`,
   `tracing.rs` for `init_tracing_for_binary`. `mod.rs` re-exports everything so
   `crate::util::*` import paths are unchanged.
-- `src/bin_args.rs` — clap `Cli`, `Command`, and `*Args` structs for the binary.
-- `src/bin_helpers.rs` — shared CLI helpers: `build_etl`, `ensure_dirs`, `plan!` macro, `discover_spool_parts`.
-- `src/bin_handlers.rs` — per-subcommand `run_*` handlers.
+- `src/bin_args/` — clap `Cli`, `Command`, and the per-subcommand `*Args`
+  structs for the binary (one file per subcommand; see `src/bin_args/CLAUDE.md`).
+- `src/bin_helpers/` — shared CLI helpers: `build_etl`, `ensure_dirs`, `plan!`
+  macro, `discover_spool_parts` (see `src/bin_helpers/CLAUDE.md`).
+- `src/bin_handlers/` — per-subcommand `run_*` handlers, one file per
+  subcommand (see `src/bin_handlers/CLAUDE.md`).
 - `src/paths.rs` — `discover_all`, `plan_files`, `FileKind`, `FileJob`.
 - `src/date.rs` — `YearMonth` type and year-month string parsing.
 - `src/mem.rs` — `available_memory_fraction`, `is_low_memory`, `smoothstep_memory_fraction`, `maybe_throttle_low_memory`.

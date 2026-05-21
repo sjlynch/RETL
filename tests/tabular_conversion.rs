@@ -152,6 +152,54 @@ fn convert_parent_enriched_jsonl_to_csv_and_tsv_with_nested_fields() {
 }
 
 #[test]
+fn convert_rejects_zst_input_with_clear_capability_message() {
+    // RETL's own corpus and partitioned-zst exports are .zst; pointing
+    // `convert` at one used to surface a baffling "malformed JSON ... line 1"
+    // from serde_json choking on raw compressed bytes.
+    let base = make_multiline_comment_corpus();
+    let zst_input = base.join("comments").join("RC_2006-01.zst");
+    let err = convert_jsonl_to_csv(
+        [&zst_input],
+        &base.join("from_zst.csv"),
+        ["id"],
+        TabularExportOptions::default(),
+    )
+    .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("zstd-compressed")
+            && msg.contains("plain JSONL")
+            && msg.contains("RC_2006-01.zst"),
+        "expected a clear zstd capability message, got: {msg}"
+    );
+    assert!(
+        !msg.contains("malformed JSON"),
+        "should not surface a JSON parse error: {msg}"
+    );
+}
+
+#[test]
+fn convert_rejects_zstd_magic_input_even_without_zst_extension() {
+    // A zstd file mislabelled with a .jsonl extension is still caught via the
+    // frame magic bytes, so the user never reaches the serde_json trap.
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("mislabelled.jsonl");
+    write_zst_lines(&input, &[json!({ "id": "c1" }).to_string()]);
+    let err = convert_jsonl_to_tsv(
+        [&input],
+        &dir.path().join("out.tsv"),
+        ["id"],
+        TabularExportOptions::default(),
+    )
+    .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("zstd-compressed") && msg.contains("plain JSONL"),
+        "expected zstd magic-byte detection, got: {msg}"
+    );
+}
+
+#[test]
 fn convert_malformed_json_reports_path_and_line() {
     let dir = tempfile::tempdir().unwrap();
     let input = dir.path().join("bad.jsonl");

@@ -4,7 +4,6 @@ use crate::atomic_write::write_at_path_atomic;
 use crate::key_extractor::KeyExtractor;
 use crate::ndjson::{read_line_capped, DEFAULT_MAX_LINE_BYTES};
 use crate::progress::ProgressScope;
-use crate::util::remove_with_backoff;
 use crate::zstd_jsonl::malformed_json_error;
 use anyhow::{Context, Result};
 use std::cmp::Ordering;
@@ -91,6 +90,11 @@ fn advance_reader(
 /// Phase 2: K-way merge of sorted runs. For each key, gather all consecutive lines
 /// from all runs and call the user-provided `merge_same_key` callback to write **one**
 /// output NDJSON line for that key.
+///
+/// The input `run_*` files are scratch and are **always** removed before this
+/// function returns — on success, on a propagated merge error, and on a panic
+/// — so a later dedupe re-run cannot pick up stale runs. The caller still owns
+/// (and removes) the enclosing runs directory.
 pub fn merge_runs_sorted(
     runs: &[PathBuf],
     output: &Path,
@@ -119,6 +123,16 @@ pub(crate) fn merge_runs_sorted_with_key_stats(
         write_at_path_atomic(output, cfg.write_buf_bytes, |_w| Ok(()))?;
         return Ok(());
     }
+
+    // The `run_*.ndjson` files are scratch: phase 1 (`build_runs_sorted`)
+    // produced them and phase 2 consumes them here. Guard them so they are
+    // reclaimed on *every* exit path — a successful publish, a `?`-propagated
+    // merge error, and a panic out of the caller-supplied `merge_same_key`.
+    // The old code deleted them only *after* `write_at_path_atomic(...)?`
+    // succeeded, so a failed merge left `run_*` files behind; a later dedupe
+    // re-run with a reused `runs_dir` could then pick up stale runs. There is
+    // no post-mortem case for run files, so the guard is never disarmed.
+    let _run_scratch = crate::util::ScratchGuard::for_paths(runs.to_vec());
 
     let total_merge_bytes: u64 = runs
         .iter()
@@ -210,11 +224,8 @@ pub(crate) fn merge_runs_sorted_with_key_stats(
         },
     )?;
 
-    // Cleanup run files (caller removes the runs directory)
-    for p in runs {
-        let _ = remove_with_backoff(p, 10, 25);
-    }
-
+    // Run files are removed by `_run_scratch` on drop (caller removes the
+    // runs directory itself).
     pb.finish("merge done");
     Ok(())
 }

@@ -132,8 +132,8 @@ mod tests {
         // Renaming onto an existing directory returns ERROR_ACCESS_DENIED (5)
         // on Windows, which is in the retry list (covers AV / sharing-violation
         // hiccups in production). Without a cap, this test waits out the full
-        // 20-try * 50 ms linear backoff TWICE (rename, then copy fallback) —
-        // ~21 s. Cap to 1 try / 0 ms delay so the failure surfaces in
+        // 16-try * 50 ms linear backoff TWICE (rename, then copy fallback) —
+        // ~14 s. Cap to 1 try / 0 ms delay so the failure surfaces in
         // microseconds; the invariant ("publish failure cleans only this
         // run's staged file") is independent of how long the failure took.
         let _backoff_cap = crate::util::cap_backoff_budget_for_test(1, 0);

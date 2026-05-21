@@ -21,6 +21,13 @@ pub fn process_file_for_usernames_with_skip(
     let mut line_number: u64 = 0;
     let mut handle_line = |line: &str| -> Result<()> {
         line_number += 1;
+        // An interior blank/whitespace-only line (from manual concatenation or
+        // re-compression of monthly dumps) is not malformed JSON. `read_line_capped`
+        // yields `Ok(0)` only at true EOF, so blank lines reach us as an empty
+        // `&str`; skip them rather than aborting the whole month.
+        if line.trim().is_empty() {
+            return Ok(());
+        }
         let min = match parse_minimal(line) {
             Ok(min) => min,
             Err(_) => match serde_json::from_str::<Value>(line) {

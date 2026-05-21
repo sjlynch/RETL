@@ -16,6 +16,12 @@ fn bail_empty_parent_ids(spool_parts: &[PathBuf]) -> Result<()> {
 
 fn parent_payload_spec_from_args(args: &ParentsArgs) -> ParentPayloadSpec {
     if args.parent_full {
+        if !args.parent_fields.is_empty() {
+            tracing::warn!(
+                parent_fields = ?args.parent_fields,
+                "--parent-full overrides --parent-fields; the supplied --parent-fields list is ignored and the full parent record is attached"
+            );
+        }
         ParentPayloadSpec::full_record()
     } else if args.parent_fields.is_empty() {
         ParentPayloadSpec::default()

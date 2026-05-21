@@ -60,6 +60,23 @@ impl Aggregator for BlockingRecCount {
     }
 }
 
+/// An aggregator whose `merge` always panics. Models a non-associative or
+/// otherwise buggy user `Aggregator` whose merge unwinds rather than returning
+/// `Err`. `ingest` is well-behaved so per-input shards still build and the
+/// panic only fires during the merge phase.
+#[derive(Default, Serialize, Deserialize)]
+struct PanicOnMergeAgg {
+    count: u64,
+}
+impl Aggregator for PanicOnMergeAgg {
+    fn ingest(&mut self, _record: &Value) {
+        self.count += 1;
+    }
+    fn merge(&mut self, _other: Self) {
+        panic!("PanicOnMergeAgg::merge intentionally panics");
+    }
+}
+
 struct AggregatePause {
     entered: Mutex<bool>,
     entered_cv: Condvar,
@@ -293,6 +310,44 @@ fn aggregate_removes_per_run_shard_dir_after_successful_merge() {
         "aggregate leaked per-run shard directories across repeated runs"
     );
     assert_eq!(aggregate_shard_paths_recursive(&shards_dir).len(), 0);
+}
+
+#[test]
+fn aggregate_panicking_merge_does_not_leak_run_scratch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.jsonl");
+    let b = tmp.path().join("b.jsonl");
+    fs::write(&a, "{\"id\":\"a\"}\n").unwrap();
+    fs::write(&b, "{\"id\":\"b\"}\n").unwrap();
+    let shards_dir = tmp.path().join("agg_shards");
+
+    // A panicking `Aggregator::merge` unwinds past the success-only cleanup
+    // check. The per-run `run_*` scratch directory must still be reclaimed by
+    // the `ScratchGuard` drop during unwind — otherwise every panicking run
+    // silently accretes shard JSON under `shards_dir`.
+    let shards_for_run = shards_dir.clone();
+    let inputs = vec![a.clone(), b.clone()];
+    let result = std::panic::catch_unwind(move || {
+        RedditETL::new()
+            .progress(false)
+            .parallelism(2)
+            .aggregate_jsonls_parallel_collect::<PanicOnMergeAgg>(inputs, &shards_for_run)
+    });
+    assert!(
+        result.is_err(),
+        "a panicking Aggregator::merge should unwind, not return"
+    );
+
+    assert!(
+        shard_run_dirs(&shards_dir).is_empty(),
+        "panicking merge leaked per-run scratch: {:?}",
+        shard_run_dirs(&shards_dir)
+    );
+    assert_eq!(
+        aggregate_shard_paths_recursive(&shards_dir).len(),
+        0,
+        "panicking merge leaked shard JSON"
+    );
 }
 
 #[test]

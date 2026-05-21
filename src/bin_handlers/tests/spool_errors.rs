@@ -14,7 +14,7 @@ use super::*;
 /// feature the library-level
 /// `spool_publish_failure_is_fatal_and_does_not_commit_manifest`
 /// in `tests/streaming_error_hardening.rs` provides equivalent coverage
-/// (just slower, ~21 s of retry-budget exhaustion).
+/// (just slower, ~14 s of retry-budget exhaustion).
 #[cfg(feature = "test-utils")]
 #[test]
 fn export_spool_publish_failure_surfaces_helpful_error() {
