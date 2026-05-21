@@ -11,9 +11,11 @@ pub(crate) enum ConvertFmt {
 
 #[derive(Args, Debug)]
 pub(crate) struct ConvertArgs {
-    /// Scratch directory used when streaming converted output to stdout.
-    #[arg(long, default_value = "./etl_work")]
-    pub(crate) work_dir: PathBuf,
+    /// Scratch directory used only when streaming converted output to stdout
+    /// (`--out -`); defaults to `./etl_work`. Has no effect with a file `--out`
+    /// (a warning is emitted if passed in that case).
+    #[arg(long)]
+    pub(crate) work_dir: Option<PathBuf>,
     /// RETL spool/parent-enriched directory containing part_RC_*.jsonl / part_RS_*.jsonl files.
     #[arg(long)]
     pub(crate) spool: Option<PathBuf>,
@@ -35,7 +37,9 @@ pub(crate) struct ConvertArgs {
     /// Omit the header row.
     #[arg(long)]
     pub(crate) no_header: bool,
-    /// JSONL input files. Omit when using --spool, or combine with --spool to append extra files.
+    /// Plain (uncompressed) JSONL input files. `.zst` inputs are not accepted —
+    /// decompress first or use `retl export --format csv/tsv`. Omit when using
+    /// --spool, or combine with --spool to append extra files.
     #[arg(num_args = 0.., value_name = "INPUTS")]
     pub(crate) inputs: Vec<PathBuf>,
 }

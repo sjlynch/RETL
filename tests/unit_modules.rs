@@ -628,6 +628,53 @@ fn merge_runs_sorted_concurrent_writes_share_dir_with_distinct_stems() {
     }
 }
 
+/// A failed `merge_runs_sorted` must still reclaim its `run_*` scratch files.
+/// The old code deleted them only after the atomic publish succeeded, so a
+/// merge error (here: a callback that bails) left `run_*` files behind — and a
+/// dedupe re-run with a reused `runs_dir` could pick up stale runs.
+#[test]
+fn merge_runs_sorted_failure_removes_run_scratch() {
+    let dir = tempfile::tempdir().unwrap();
+    let in_path = dir.path().join("dedupe_in.ndjson");
+    let mut lines = Vec::with_capacity(60);
+    for i in 0..60 {
+        let author = format!("user_{:04}", i % 20);
+        lines.push(serde_json::json!({"author": author, "id": format!("c{}", i)}).to_string());
+    }
+    write_ndjson(&in_path, &lines);
+
+    // buf_mb = 0 forces multiple runs so there is real merge scratch to clean.
+    let cfg = DedupeCfg {
+        mem: retl::AdaptiveMemCfg { soft_low_frac: 0.999, high_frac: 1.0, adapt_cooldown_ms: 1 },
+        min_buf_mb: 0,
+        max_buf_mb: 0,
+        read_buf_bytes: 8 * 1024,
+        write_buf_bytes: 8 * 1024,
+        inflight_bytes: 0,
+    };
+    let runs_dir = dir.path().join("runs");
+    let key = KeyExtractor::author_lowercase_fast();
+    let runs = build_runs_sorted(&in_path, &runs_dir, &key, &cfg).unwrap();
+    assert!(!runs.is_empty(), "expected at least one run file");
+    for r in &runs {
+        assert!(r.is_file(), "run file missing before merge: {}", r.display());
+    }
+
+    let out = dir.path().join("merged.ndjson");
+    let result = merge_runs_sorted(&runs, &out, &key, &cfg, |_k, _group, _w| {
+        Err(anyhow::anyhow!("merge callback deliberately fails"))
+    });
+    assert!(result.is_err(), "merge should fail when the callback errors");
+
+    for r in &runs {
+        assert!(
+            !r.exists(),
+            "failed merge leaked run scratch file: {}",
+            r.display()
+        );
+    }
+}
+
 // ---------- kv_shard ----------
 
 /// Drive ShardedKVWriter.reduce_sum with `n_keys` distinct keys, each written

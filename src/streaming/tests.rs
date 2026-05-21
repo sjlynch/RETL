@@ -73,6 +73,56 @@ mod tests {
     }
 
     #[test]
+    fn stream_job_skips_interior_blank_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("RC_2020-01.zst");
+        // Two valid records with a stray interior blank line between them
+        // (and a whitespace-only line), as produced by manual concatenation
+        // or re-compression of monthly dumps. The blank lines must be skipped,
+        // not abort the whole month with a misleading "malformed JSON" error.
+        write_zst(
+            &path,
+            concat!(
+                r#"{"id":"c1","author":"alice","subreddit":"rust","created_utc":1577836800}"#,
+                "\n",
+                "\n",
+                "   \n",
+                r#"{"id":"c2","author":"bob","subreddit":"rust","created_utc":1577836801}"#,
+                "\n",
+            )
+            .as_bytes(),
+        );
+
+        let job = FileJob {
+            kind: FileKind::Comment,
+            ym: YearMonth::new(2020, 1),
+            path,
+        };
+        let query = QuerySpec::default();
+        let whitelist: Option<Vec<String>> = None;
+        let mut out: Vec<u8> = Vec::new();
+
+        let res = stream_job(
+            &job,
+            &mut out,
+            None,
+            &query,
+            &whitelist,
+            None,
+            None,
+            16 * 1024,
+            false,
+            None,
+        )
+        .expect("an interior blank line must not abort the month");
+
+        assert_eq!(res.written, 2, "both valid records must be written");
+        assert!(res.complete);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("\"c1\"") && text.contains("\"c2\""));
+    }
+
+    #[test]
     fn whitelist_slow_path_reports_field_presence_independent_of_tokenizer_buffer() {
         let fields = vec!["id".to_string()];
         let tokenizer = WhitelistTokenizer::new(fields.iter().map(|s| s.as_str()));
@@ -313,6 +363,62 @@ mod tests {
         assert_eq!(
             names,
             std::iter::once("Alice".to_string()).collect::<std::collections::BTreeSet<_>>()
+        );
+    }
+
+    #[test]
+    fn legacy_usernames_skips_interior_blank_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("RC_2020-01.zst");
+        // A stray interior blank line between two valid records must be
+        // skipped rather than aborting the whole month as malformed JSON.
+        write_zst(
+            &path,
+            concat!(
+                r#"{"id":"c1","author":"alice","subreddit":"rust","created_utc":1}"#,
+                "\n",
+                "\n",
+                r#"{"id":"c2","author":"bob","subreddit":"rust","created_utc":2}"#,
+                "\n",
+            )
+            .as_bytes(),
+        );
+
+        let job = FileJob {
+            kind: FileKind::Comment,
+            ym: YearMonth::new(2020, 1),
+            path,
+        };
+
+        let shard_writer = ShardedWriter::create(dir.path(), "blank_un", 4).unwrap();
+        process_file_for_usernames_with_skip(
+            &job,
+            16 * 1024,
+            "rust",
+            &shard_writer,
+            None,
+            false,
+            None,
+            |_p, _e| {},
+        )
+        .expect("an interior blank line must not abort the month");
+
+        let outs = shard_writer.dedup("blank_un").unwrap();
+        let mut names = std::collections::BTreeSet::new();
+        for p in outs {
+            let f = std::fs::File::open(&p).unwrap();
+            for line in std::io::BufRead::lines(std::io::BufReader::new(f)) {
+                let line = line.unwrap();
+                if !line.is_empty() {
+                    names.insert(line);
+                }
+            }
+        }
+        assert_eq!(
+            names,
+            ["alice".to_string(), "bob".to_string()]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
         );
     }
 

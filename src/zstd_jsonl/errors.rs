@@ -46,11 +46,12 @@ pub fn malformed_json_error(
 }
 
 pub fn zstd_decode_error(path: &Path, source: anyhow::Error) -> anyhow::Error {
-    let source_msg = source.to_string();
+    // Do not interpolate the source message into the context: `source` stays
+    // in the error chain, so `{:#}` rendering already appends it once. Adding
+    // it here would render the underlying zstd message twice.
     source.context(format!(
-        "zstd decode error while streaming {}: {}",
-        path.display(),
-        source_msg
+        "zstd decode error while streaming {}",
+        path.display()
     ))
 }
 

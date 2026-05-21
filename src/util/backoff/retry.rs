@@ -123,7 +123,7 @@ impl Drop for TestBackoffBudgetGuard {
 /// Cap the per-thread `with_backoff` budget for the lifetime of the returned
 /// guard. Used by tests that drive a deliberately non-recoverable failure
 /// (e.g. publishing onto a directory) — without the cap, the production
-/// 20-try × 50 ms linear backoff burns ~10–20 s before the failure surfaces.
+/// 16-try × 50 ms linear backoff burns ~10–20 s before the failure surfaces.
 ///
 /// The cap is *clamped*, not replaced: callers using a smaller production
 /// budget keep theirs. Available under `cfg(test)` (lib unit tests) or

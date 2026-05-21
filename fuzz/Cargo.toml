@@ -13,6 +13,9 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+# `fuzz_whitelist_tokenizer` uses a `serde::de::Visitor` to count duplicate
+# top-level keys (which `serde_json::Value` would otherwise collapse).
+serde = "1"
 serde_json = "1"
 
 [dependencies.retl]

@@ -144,8 +144,8 @@ where
 /// Derive the staging directory from `final_dest.parent()` and atomically
 /// publish `body`'s output at `final_dest`. Convenience wrapper around
 /// `write_jsonl_atomic` for call sites that don't already carry a staging-dir
-/// handle (use `write_jsonl_atomic` / `write_zst_atomic` directly when you do,
-/// e.g. inside a per-shard loop that pre-derives one staging dir).
+/// handle (use `write_jsonl_atomic` / `write_zst_atomic_if` directly when you
+/// do, e.g. inside a per-shard loop that pre-derives one staging dir).
 pub fn write_at_path_atomic<T, F>(final_dest: &Path, write_buf_bytes: usize, body: F) -> Result<T>
 where
     F: FnOnce(&mut dyn Write) -> Result<T>,
