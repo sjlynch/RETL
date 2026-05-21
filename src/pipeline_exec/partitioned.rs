@@ -467,9 +467,9 @@ impl ScanPlan {
                 |job| process_partitioned_job(job, &ctx),
             )?;
 
-            if let Some(tracker) = &whitelist_tracker {
-                tracker.finalize()?;
-            }
+            finalize_whitelist_strict(whitelist_tracker.as_deref(), out_base_dir, || {
+                clear_partitioned_resume_outputs(out_base_dir, format)
+            })?;
             if let Some(pb) = pb {
                 pb.finish_with_message("done");
             }

@@ -27,7 +27,10 @@ pub(crate) struct ExportArgs {
     /// Comments use `body`/`parent_id`/`link_id`; submissions use `title`/`selftext`/`domain`.
     #[arg(long, value_delimiter = ',')]
     pub(crate) whitelist: Vec<String>,
-    /// Error if `--whitelist` matches zero fields in the first sampled records.
+    /// Error if a `--whitelist` field never matches. The verdict is post-hoc
+    /// (decided after streaming); on failure the run's output files and any
+    /// `_progress.json` are discarded so a resumed run re-streams every month
+    /// instead of skipping them.
     #[arg(long)]
     pub(crate) strict_whitelist: bool,
     /// Convert `created_utc` to RFC3339 strings on JSON-family exports (not csv/tsv).

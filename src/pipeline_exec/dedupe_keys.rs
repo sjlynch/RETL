@@ -28,7 +28,14 @@ fn warn_dedupe_key_drops(key: &KeyExtractor, summary: &DedupeKeySummary) {
 }
 
 fn dedupe_cfg_from_options(opts: &ETLOptions) -> DedupeCfg {
-    crate::config::warn_if_inflight_pair_pathological(opts.inflight_bytes, opts.inflight_groups);
+    // NB: do *not* call `warn_if_inflight_pair_pathological` here. That helper
+    // computes the *bucketing* worst-case peak `(1 + inflight_groups) *
+    // inflight_bytes/2` and tells the user to lower `--inflight-groups`. The
+    // dedupe pipeline (`build_runs_sorted`) pins its crossbeam channel to
+    // `BUILD_RUNS_CHANNEL_CAP = 1` and never reads `inflight_groups`, so its
+    // peak is always bounded by `inflight_bytes` — there is no pathological
+    // pair to warn about, and firing the (process-wide `Once`-gated) warning
+    // here would also silence it on the bucketing path where it *is* accurate.
     let mut cfg = DedupeCfg::from(opts);
     if cfg.inflight_bytes > 0 {
         let per_flush_mb = (cfg.inflight_bytes / 2 / (1024 * 1024)).max(1);
