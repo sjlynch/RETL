@@ -55,6 +55,11 @@ impl ETLOptions {
     /// files instead of failing the operation. Skipped paths are collected in
     /// [`PartialReadReporter`] and incomplete months are not committed to
     /// resume manifests.
+    ///
+    /// The reporter is reset at the start of each consuming operation, so a
+    /// [`PartialReadReporter::snapshot`] taken after a run reflects only that
+    /// run's skipped files even when the same builder drives several
+    /// operations.
     pub fn with_allow_partial(mut self, yes: bool) -> Self {
         self.allow_partial = yes;
         self

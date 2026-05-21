@@ -5,7 +5,7 @@ impl ScanPlan {
             .opts
             .subreddit
             .as_deref()
-            .is_some_and(str::is_empty)
+            .is_some_and(|s| s.trim().is_empty())
         {
             return Err(QueryBuildError::new(
                 "subreddits contains a blank entry after normalization; blank entries are not allowed",

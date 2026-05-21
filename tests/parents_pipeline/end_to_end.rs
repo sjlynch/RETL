@@ -199,3 +199,36 @@ fn parent_id_collections_sharing_work_dir_keep_held_ids_alive() {
     assert_eq!(second.get("p2").map(String::as_str), Some("second parent"));
     assert!(!second.contains_key("p1"));
 }
+
+/// A backwards date range from `with_date_range` is stored as a deferred
+/// `ConfigBuildError`. The parents resolver must surface it before planning so
+/// the user gets the "invalid date range" message rather than the resolver's
+/// "planned zero corpus files" context.
+#[test]
+fn resolve_parent_maps_rejects_backwards_date_range() {
+    let base = make_corpus_basic();
+    let tmp = tempfile::tempdir().unwrap();
+    let ids = ParentIds::default();
+
+    // `ParentMaps` is not `Debug`, so match instead of `unwrap_err()`.
+    let err = match RedditETL::new()
+        .base_dir(&base)
+        .progress(false)
+        .date_range(Some(YearMonth::new(2006, 3)), Some(YearMonth::new(2006, 1)))
+        .resolve_parent_maps(&ids, &tmp.path().join("cache"), false)
+    {
+        Ok(_) => panic!("backwards date range should fail before resolving parents"),
+        Err(e) => e,
+    };
+
+    let build = err
+        .downcast_ref::<retl::ConfigBuildError>()
+        .expect("backwards date range should surface a ConfigBuildError");
+    assert_eq!(
+        build,
+        &retl::ConfigBuildError::InvalidDateRange {
+            start: YearMonth::new(2006, 3),
+            end: YearMonth::new(2006, 1),
+        }
+    );
+}

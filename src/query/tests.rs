@@ -70,4 +70,18 @@ mod tests {
         );
         assert_eq!(spanning.derived_end_month(), Some(YearMonth::new(2020, 12)));
     }
+
+    #[test]
+    fn normalize_str_re_trims_after_stripping_r_prefix() {
+        // Without the post-strip re-trim, "r/  foo" yields a leading-space
+        // subreddit that passes `is_empty()` validation and then silently
+        // matches zero records.
+        assert_eq!(normalize_str("r/  foo"), "foo");
+        assert_eq!(normalize_str("  R/ Foo  "), "foo");
+        assert_eq!(normalize_str("r/foo"), "foo");
+        assert_eq!(normalize_str("  foo  "), "foo");
+        // Whitespace-only after the prefix collapses to "" so validation can
+        // reject it as a blank entry rather than letting it through.
+        assert_eq!(normalize_str("r/   "), "");
+    }
 }

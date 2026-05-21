@@ -147,6 +147,36 @@ fn build_rejects_blank_normalized_filter_values() {
 }
 
 #[test]
+fn space_padded_r_prefixed_subreddit_normalizes_and_matches_records() {
+    let base = common::make_corpus_basic();
+
+    let run = |sub: &str| -> u64 {
+        RedditETL::new()
+            .base_dir(&base)
+            .sources(Sources::Both)
+            .date_range(Some(YearMonth::new(2006, 1)), Some(YearMonth::new(2006, 1)))
+            .progress(false)
+            .scan()
+            .subreddits([sub])
+            .count_by_month()
+            .unwrap()
+            .get(&YearMonth::new(2006, 1))
+            .copied()
+            .unwrap_or(0)
+    };
+
+    let plain = run("programming");
+    assert!(plain > 0, "sanity: a plain subreddit name must match records");
+    // "r/  programming" must normalize to "programming"; the leading space
+    // left after the stripped prefix would otherwise silently match nothing.
+    assert_eq!(
+        run("r/  programming"),
+        plain,
+        "a space-padded 'r/'-prefixed subreddit must match the same records as the plain name"
+    );
+}
+
+#[test]
 fn build_rejects_duplicate_record_ids_after_normalization() {
     expect_query_build_error(
         RedditETL::new().scan().ids(["t1_abc", "T1_ABC"]),

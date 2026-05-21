@@ -5,7 +5,10 @@ use assert_cmd::Command;
 use common::*;
 use predicates::prelude::*;
 use predicates::str::contains;
-use retl::{quick_validate_zst, IntegrityMode, QuickOutcome, RedditETL, Sources, YearMonth};
+use retl::{
+    quick_validate_zst, ConfigBuildError, IntegrityMode, QuickOutcome, RedditETL, Sources,
+    YearMonth,
+};
 
 fn retl_cmd() -> Command {
     Command::cargo_bin("retl").expect("retl binary should be built")
@@ -49,6 +52,34 @@ fn integrity_check_detects_corrupt_month() {
         bad_full.failure_count(),
         1,
         "full integrity should also flag the corrupt file"
+    );
+}
+
+/// A backwards date range from `with_date_range` is stored as a deferred
+/// `ConfigBuildError`. The integrity runner must surface it before planning so
+/// the user gets the purpose-built "invalid date range" message instead of a
+/// confusing "planned zero files" / `DateRangeNoFiles` error.
+#[test]
+fn integrity_rejects_backwards_date_range_with_invalid_date_range_error() {
+    let base = make_corpus_basic();
+
+    let err = RedditETL::new()
+        .base_dir(&base)
+        .sources(Sources::Comments)
+        .date_range(Some(YearMonth::new(2006, 3)), Some(YearMonth::new(2006, 1)))
+        .progress(false)
+        .check_corpus_integrity(IntegrityMode::Full)
+        .unwrap_err();
+
+    let build = err
+        .downcast_ref::<ConfigBuildError>()
+        .expect("backwards date range should surface a ConfigBuildError");
+    assert_eq!(
+        build,
+        &ConfigBuildError::InvalidDateRange {
+            start: YearMonth::new(2006, 3),
+            end: YearMonth::new(2006, 1),
+        }
     );
 }
 

@@ -29,11 +29,35 @@ fn effective_plan_range(
     let mut end = etl.opts.end;
 
     if let Some(bounds) = query.map(|q| q.timestamp_bounds) {
-        if start.is_none() {
-            start = bounds.derived_start_month();
+        // The explicit date range wins for file planning on any side it
+        // covers; a `created_utc` timestamp bound only fills in a `None`
+        // side. When both are present the explicit range silently governs
+        // which months are read — narrower timestamp bounds don't shrink the
+        // scan and wider ones don't widen it (the bound is still applied as a
+        // record-level filter, so results stay correct either way). Log it so
+        // a user wondering why an `--after` scan reads more or fewer months
+        // than expected can see what drove file selection.
+        match (start, bounds.derived_start_month()) {
+            (None, derived) => start = derived,
+            (Some(explicit), Some(derived)) => {
+                tracing::info!(
+                    explicit_start = %explicit,
+                    timestamp_start = %derived,
+                    "file planning start month governed by the explicit date range ({explicit}); the created_utc timestamp bound (>= {derived}) is applied only as a record-level filter"
+                );
+            }
+            (Some(_), None) => {}
         }
-        if end.is_none() {
-            end = bounds.derived_end_month();
+        match (end, bounds.derived_end_month()) {
+            (None, derived) => end = derived,
+            (Some(explicit), Some(derived)) => {
+                tracing::info!(
+                    explicit_end = %explicit,
+                    timestamp_end = %derived,
+                    "file planning end month governed by the explicit date range ({explicit}); the created_utc timestamp bound (<= {derived}) is applied only as a record-level filter"
+                );
+            }
+            (Some(_), None) => {}
         }
     }
 
@@ -41,9 +65,13 @@ fn effective_plan_range(
 }
 
 fn plan_pipeline_files(etl: &RedditETL, query: Option<&QuerySpec>) -> Result<Vec<FileJob>> {
-    if let Some(err) = etl.opts.build_error.clone() {
-        return Err(err.into());
-    }
+    etl.opts.check_config()?;
+    // Reset the partial-read reporter at the start of every consuming
+    // operation, before any month is processed. The reporter's `Arc` is
+    // shared across `ETLOptions::clone()`, so without this a second
+    // operation on a reused builder would report the first run's skipped
+    // files too and inflate `skipped_file_count` in its run manifest.
+    etl.opts.partial_read_reporter.clear();
     let discovered = discover_sources_checked(
         &etl.opts.comments_dir,
         &etl.opts.submissions_dir,

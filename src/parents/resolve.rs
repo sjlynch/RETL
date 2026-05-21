@@ -6,6 +6,11 @@ impl RedditETL {
         cache_dir: &Path,
         resume: bool,
     ) -> Result<ParentMaps> {
+        // Surface a deferred ConfigBuildError (e.g. a backwards date range from
+        // `with_date_range`) before planning, so the parents resolver fails
+        // fast with the "invalid date range" message instead of the confusing
+        // "planned zero corpus files" context below.
+        self.opts.check_config()?;
         with_thread_pool(self.opts.parallelism, || {
             let comments_out = cache_dir.join("comments");
             let submissions_out = cache_dir.join("submissions");

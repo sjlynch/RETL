@@ -207,6 +207,11 @@ impl RedditETL {
 
     /// Return a handle that snapshots tolerated partial zstd reads recorded by
     /// this builder. Clone it before starting a consuming operation.
+    ///
+    /// Each consuming operation clears the reporter before processing any
+    /// month, so a snapshot taken after a run reflects only that run's
+    /// skipped files — running two operations on one builder does not make
+    /// the second snapshot include the first run's skips.
     pub fn partial_read_reporter(&self) -> crate::config::PartialReadReporter {
         self.opts.partial_read_reporter.clone()
     }

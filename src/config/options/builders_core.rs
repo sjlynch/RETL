@@ -11,7 +11,10 @@ impl ETLOptions {
     pub fn with_subreddit(mut self, sub: impl AsRef<str>) -> Self {
         let mut s = sub.as_ref().trim().to_lowercase();
         if let Some(rest) = s.strip_prefix("r/") {
-            s = rest.to_string();
+            // Re-trim after stripping the prefix: "r/  foo" otherwise yields
+            // a leading-space subreddit that passes validation and then
+            // silently matches zero records.
+            s = rest.trim().to_string();
         }
         self.subreddit = Some(s);
         self
@@ -32,6 +35,22 @@ impl ETLOptions {
             _ => None,
         };
         self
+    }
+
+    /// Surface any deferred [`ConfigBuildError`] recorded by a builder setter.
+    ///
+    /// `with_date_range` stores an invalid (`start > end`) range as a deferred
+    /// `build_error` instead of failing at the call site. Every public
+    /// operation entry point that consumes these options — `extract`/`spool`
+    /// (via file planning), `integrity`, and the parents resolver — calls this
+    /// first so a backwards date range fails fast with the purpose-built
+    /// "invalid date range" message rather than a confusing downstream
+    /// "planned zero corpus files" / `DateRangeNoFiles` error.
+    pub fn check_config(&self) -> anyhow::Result<()> {
+        if let Some(err) = self.build_error.clone() {
+            return Err(err.into());
+        }
+        Ok(())
     }
 
     pub fn with_shard_count(mut self, shards: usize) -> Self {

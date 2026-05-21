@@ -95,4 +95,48 @@ mod tests {
         assert_eq!(opts.parallelism, Some(1));
         assert_eq!(opts.file_concurrency, 1);
     }
+
+    #[test]
+    fn with_subreddit_re_trims_after_stripping_r_prefix() {
+        // "r/  foo" must not leave leading spaces — a space-padded subreddit
+        // passes `is_empty()` validation and then silently matches nothing.
+        #[allow(deprecated)]
+        let opts = ETLOptions::default().with_subreddit("r/  foo");
+        assert_eq!(opts.subreddit.as_deref(), Some("foo"));
+
+        #[allow(deprecated)]
+        let padded = ETLOptions::default().with_subreddit("  R/ Foo  ");
+        assert_eq!(padded.subreddit.as_deref(), Some("foo"));
+
+        #[allow(deprecated)]
+        let blank = ETLOptions::default().with_subreddit("r/   ");
+        assert_eq!(blank.subreddit.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn check_config_surfaces_deferred_invalid_date_range() {
+        let ok = ETLOptions::default().with_date_range(
+            Some(YearMonth::new(2006, 1)),
+            Some(YearMonth::new(2006, 3)),
+        );
+        assert!(ok.check_config().is_ok());
+
+        let backwards = ETLOptions::default().with_date_range(
+            Some(YearMonth::new(2006, 3)),
+            Some(YearMonth::new(2006, 1)),
+        );
+        let err = backwards
+            .check_config()
+            .expect_err("backwards date range should surface a ConfigBuildError");
+        let cfg = err
+            .downcast_ref::<ConfigBuildError>()
+            .expect("error should be a ConfigBuildError");
+        assert_eq!(
+            cfg,
+            &ConfigBuildError::InvalidDateRange {
+                start: YearMonth::new(2006, 3),
+                end: YearMonth::new(2006, 1),
+            }
+        );
+    }
 }

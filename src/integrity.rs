@@ -301,6 +301,10 @@ impl RedditETL {
         F: Fn(&Path, &str) -> Result<()> + Send + Sync,
     {
         validate_integrity_mode(mode)?;
+        // Surface a deferred ConfigBuildError (e.g. a backwards date range from
+        // `with_date_range`) before planning, so `integrity` fails fast with
+        // the "invalid date range" message instead of "planned zero files".
+        self.opts.check_config()?;
 
         let discovered = discover_sources_checked(
             &self.opts.comments_dir,

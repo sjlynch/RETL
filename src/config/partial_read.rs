@@ -18,6 +18,11 @@ pub struct PartialReadReport {
 ///
 /// Clone the handle before starting a consuming operation, then call
 /// [`PartialReadReporter::snapshot`] afterwards to inspect the skipped paths.
+///
+/// The handle is cloned by `Arc`, so the same collector is shared across
+/// `ETLOptions::clone()`. Each consuming operation calls [`Self::clear`]
+/// before processing any month, so a snapshot reflects only the most recent
+/// operation rather than accumulating skips across every run on a builder.
 #[derive(Clone, Debug, Default)]
 pub struct PartialReadReporter {
     inner: Arc<Mutex<Vec<SkippedFile>>>,
@@ -39,6 +44,9 @@ impl PartialReadReporter {
         }
     }
 
+    /// Drop all recorded skips. Called at the start of each consuming
+    /// operation so a reused builder's reporter does not accumulate skips
+    /// across runs.
     pub fn clear(&self) {
         self.inner.lock().clear();
     }

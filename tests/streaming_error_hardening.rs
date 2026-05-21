@@ -266,3 +266,51 @@ fn spool_publish_failure_is_fatal_and_does_not_commit_manifest() {
 // have been written to stderr and surfaced as a non-zero exit. The
 // in-process version uses `cap_backoff_budget_for_test` so the failure
 // surfaces in microseconds instead of ~21 s of retry-budget exhaustion.
+
+/// PART 1: `PartialReadReporter` holds an `Arc<Mutex<Vec<_>>>` that is shared
+/// across `ETLOptions::clone()`. Each consuming operation must reset it before
+/// processing any month, so a second run on a reused builder reports only its
+/// own skipped files — not the first run's carried over too.
+#[test]
+fn consecutive_allow_partial_runs_report_only_their_own_skipped_files() {
+    let base = tempfile::tempdir().unwrap().keep();
+    let rc = base.join("comments").join("RC_2006-03.zst");
+    make_truncated_zst(&rc, 500, 256);
+    fs::create_dir_all(base.join("submissions")).unwrap();
+
+    let etl = RedditETL::new()
+        .base_dir(&base)
+        .work_dir(base.join("work"))
+        .sources(Sources::Comments)
+        .date_range(Some(YearMonth::new(2006, 3)), Some(YearMonth::new(2006, 3)))
+        .allow_partial(true)
+        .progress(false);
+    let reporter = etl.partial_read_reporter();
+
+    let _first = etl
+        .clone()
+        .scan()
+        .include_pseudo_users()
+        .count_by_month()
+        .unwrap();
+    assert_eq!(
+        reporter.snapshot().skipped_file_count,
+        1,
+        "first allow_partial run should record the one truncated file as skipped"
+    );
+
+    // The reporter's Arc is still shared with this second run's cloned opts.
+    let _second = etl
+        .clone()
+        .scan()
+        .include_pseudo_users()
+        .count_by_month()
+        .unwrap();
+    let second = reporter.snapshot();
+    assert_eq!(
+        second.skipped_file_count, 1,
+        "second run on the reused builder must report only its own skip, not \
+         accumulate the first run's; got {:?}",
+        second.skipped_files
+    );
+}

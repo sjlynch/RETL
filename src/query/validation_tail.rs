@@ -161,7 +161,7 @@ fn validate_string_list_filter(
             "{field} cannot be an empty list; omit {field} to match all"
         )));
     }
-    if list.iter().any(|s| s.is_empty()) {
+    if list.iter().any(|s| s.trim().is_empty()) {
         return Err(QueryBuildError::new(format!(
             "{field} contains a blank entry after normalization; blank entries are not allowed"
         )));
@@ -172,7 +172,10 @@ fn validate_string_list_filter(
 pub fn normalize_str(s: &str) -> String {
     let s = s.trim().to_lowercase();
     if let Some(rest) = s.strip_prefix("r/") {
-        rest.to_string()
+        // Re-trim: an input like "r/  foo" leaves leading spaces after the
+        // prefix is stripped. Without this, a space-padded subreddit passes
+        // `is_empty()` validation and then silently matches zero records.
+        rest.trim().to_string()
     } else {
         s
     }
