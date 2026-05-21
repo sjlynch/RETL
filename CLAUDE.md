@@ -48,7 +48,7 @@ When you add a new filter or key extractor, prefer extending `MinimalRecord`
   its final path with `util::replace_file_atomic_backoff(tmp, dest)`.
 - Library code **never** writes to a final path directly. If you add a new
   output, route through `atomic_write::write_jsonl_atomic` /
-  `write_zst_atomic` (or replicate their unique staging+rename dance) so a
+  `write_zst_atomic_if` (or replicate their unique staging+rename dance) so a
   crashed run never leaves a partial file readers can mistake for complete
   output. Staging sweeps must not delete live files from another PID.
 - `replace_file_atomic_backoff` relies on Windows
@@ -227,9 +227,12 @@ harness — production builds (`--no-default-features` or just no
   `scratch.rs` for `unique_scratch_dir`, `thread_pool.rs` for `with_thread_pool`,
   `tracing.rs` for `init_tracing_for_binary`. `mod.rs` re-exports everything so
   `crate::util::*` import paths are unchanged.
-- `src/bin_args.rs` — clap `Cli`, `Command`, and `*Args` structs for the binary.
-- `src/bin_helpers.rs` — shared CLI helpers: `build_etl`, `ensure_dirs`, `plan!` macro, `discover_spool_parts`.
-- `src/bin_handlers.rs` — per-subcommand `run_*` handlers.
+- `src/bin_args/` — clap `Cli`, `Command`, and the per-subcommand `*Args`
+  structs for the binary (one file per subcommand; see `src/bin_args/CLAUDE.md`).
+- `src/bin_helpers/` — shared CLI helpers: `build_etl`, `ensure_dirs`, `plan!`
+  macro, `discover_spool_parts` (see `src/bin_helpers/CLAUDE.md`).
+- `src/bin_handlers/` — per-subcommand `run_*` handlers, one file per
+  subcommand (see `src/bin_handlers/CLAUDE.md`).
 - `src/paths.rs` — `discover_all`, `plan_files`, `FileKind`, `FileJob`.
 - `src/date.rs` — `YearMonth` type and year-month string parsing.
 - `src/mem.rs` — `available_memory_fraction`, `is_low_memory`, `smoothstep_memory_fraction`, `maybe_throttle_low_memory`.

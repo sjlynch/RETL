@@ -27,7 +27,8 @@ pub(crate) struct SampleArgs {
     /// Error if `--whitelist` matches zero fields in sampled records.
     #[arg(long)]
     pub(crate) strict_whitelist: bool,
-    /// Convert `created_utc` to RFC3339 strings on JSON-family exports (not csv/tsv).
+    /// Convert `created_utc`, `retrieved_on`, and `edited` to RFC3339 strings
+    /// on JSON-family exports (not csv/tsv).
     #[arg(long)]
     pub(crate) human_timestamps: bool,
 }

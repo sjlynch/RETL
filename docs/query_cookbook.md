@@ -245,7 +245,7 @@ Walk-through:
 
 - `--format csv` and `--format tsv` **require** `--whitelist` because the schema must be fixed before any record is read.
 - `--whitelist` is repeatable; field order in the output matches the order of the flags.
-- `--human-timestamps` rewrites Unix epochs in `created_utc` / `retrieved_on` to RFC3339.
+- `--human-timestamps` rewrites Unix epochs in `created_utc` / `retrieved_on` / `edited` to RFC3339.
 
 ### 3f. Per-author counts with a clever pre-filter (analytics)
 

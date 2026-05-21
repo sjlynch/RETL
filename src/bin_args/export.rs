@@ -30,7 +30,8 @@ pub(crate) struct ExportArgs {
     /// Error if `--whitelist` matches zero fields in the first sampled records.
     #[arg(long)]
     pub(crate) strict_whitelist: bool,
-    /// Convert `created_utc` to RFC3339 strings on JSON-family exports (not csv/tsv).
+    /// Convert `created_utc`, `retrieved_on`, and `edited` to RFC3339 strings
+    /// on JSON-family exports (not csv/tsv).
     #[arg(long)]
     pub(crate) human_timestamps: bool,
     /// Stop after approximately N records have been emitted.
@@ -51,8 +52,9 @@ pub(crate) struct ExportArgs {
     /// `jsonl`/`json` reuse per-month `.part_*.jsonl` files and `_progress.json`
     /// in a namespaced scratch dir under `--work-dir`; `spool`, `zst`, and
     /// `partitioned-jsonl` use `_progress.json` under `--out`. Changing filters,
-    /// corpus paths, sources, date range, whitelist, timestamp formatting, or
-    /// (for ZST) zst level invalidates the checkpoint and rebuilds the parts.
+    /// corpus paths, sources, date range, whitelist, `--limit`, timestamp
+    /// formatting, or (for ZST) zst level invalidates the checkpoint and
+    /// rebuilds the parts.
     #[arg(long)]
     pub(crate) resume: bool,
 }
