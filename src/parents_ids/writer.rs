@@ -49,6 +49,16 @@ impl IdShardWriter {
         shard_common::flush_line_shard_writers(&self.writers)
     }
     pub(crate) fn dedup(self) -> Result<IdShards> {
+        // `base_dir` (raw `<kind>_ids_shards/` scratch) and, once it exists,
+        // `out_dir` (the partially-populated `<kind>_ids_dedup/` directory)
+        // are scratch until this method returns `Ok`. Guard them so a
+        // `dedup_one` failure — or a panic on a rayon worker — reclaims both
+        // instead of leaving them solely to the `IdScratchRoot::drop`
+        // fallback, which only runs once the last `Arc` clone is dropped. On
+        // success the guard is disarmed: `out_dir` becomes the live dedup
+        // output and only `base_dir` is disposable.
+        let mut scratch = crate::util::ScratchGuard::new(self.base_dir.clone());
+
         self.flush()?;
         let IdShardWriter {
             scratch_root,
@@ -69,6 +79,7 @@ impl IdShardWriter {
                 )
             })?
             .join(format!("{kind}_ids_dedup"));
+        scratch.guard_also(out_dir.clone());
         crate::util::create_dir_all_with_default_backoff(&out_dir)
             .with_context(|| format!("create parent-id dedup dir {}", out_dir.display()))?;
 
@@ -90,6 +101,11 @@ impl IdShardWriter {
             .collect::<Result<Vec<_>>>()?;
         let total_ids = shard_counts.into_iter().sum();
 
+        // Success: `out_dir` is now the live dedup output and must survive;
+        // only the raw shard scratch (`base_dir`) is disposable. Disarm the
+        // guard so it leaves `out_dir` alone, then remove `base_dir`
+        // explicitly (logging, not failing, on a cleanup hiccup).
+        scratch.disarm();
         if let Err(e) = crate::util::remove_dir_all_with_short_backoff(&base_dir) {
             tracing::debug!(
                 path = %base_dir.display(),

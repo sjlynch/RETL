@@ -27,14 +27,23 @@ pub(crate) fn run_convert(args: ConvertArgs) -> Result<()> {
     };
 
     if to_stdout {
+        let work_dir = args
+            .work_dir
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("./etl_work"));
         let stem = match args.format {
             ConvertFmt::Csv => "convert.csv",
             ConvertFmt::Tsv => "convert.tsv",
         };
-        stream_path_output_to_stdout(&args.work_dir, "convert", stem, |path| {
+        stream_path_output_to_stdout(&work_dir, "convert", stem, |path| {
             write(path).map(|_| ())
         })?;
     } else {
+        if args.work_dir.is_some() {
+            tracing::warn!(
+                "--work-dir is only used when streaming converted output to stdout (--out -); it has no effect with a file --out and is ignored"
+            );
+        }
         write(&args.out)?;
     }
     Ok(())

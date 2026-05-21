@@ -122,6 +122,86 @@ fn non_object_top_level_errors() {
 }
 
 // ---------------------------------------------------------------------
+// Duplicate-key handling. A repeated *whitelisted* top-level key would let
+// the byte-copying fast path emit a duplicate-keyed object, while the slow
+// `serde_json::Value` path collapses duplicates last-wins. The tokenizer
+// rejects such lines so the caller falls back and both paths agree.
+// ---------------------------------------------------------------------
+
+#[test]
+fn duplicate_whitelisted_key_is_rejected_for_slow_path_parity() {
+    let line = r#"{"id":"a","id":"b"}"#;
+    let tok = WhitelistTokenizer::new(["id"]);
+    let mut out = String::from("leftover");
+    let res = tok.tokenize_into(line, &mut out);
+    assert!(res.is_err(), "duplicate whitelisted key must be rejected");
+    assert!(out.is_empty(), "rejection must clear the output buffer");
+    // The slow path the caller falls back to keeps the last value, so the
+    // export bytes are well-defined and duplicate-free.
+    assert_eq!(slow_path(line, &["id"]), r#"{"id":"b"}"#);
+}
+
+#[test]
+fn duplicate_whitelisted_key_separated_by_other_keys_is_rejected() {
+    // The two `id` occurrences straddle a non-whitelisted key and a second
+    // whitelisted key — the duplicate must still be caught.
+    let line = r#"{"id":"a","x":1,"author":"alice","id":"b"}"#;
+    let tok = WhitelistTokenizer::new(["id", "author"]);
+    let mut out = String::new();
+    assert!(tok.tokenize_into(line, &mut out).is_err());
+    assert!(out.is_empty());
+}
+
+#[test]
+fn duplicate_non_whitelisted_key_is_accepted() {
+    // Only whitelisted-key duplicates can diverge — a non-whitelisted key is
+    // skipped on both paths however many times it appears, so the fast path
+    // must NOT fall back here.
+    let line = r#"{"x":"a","x":"b","id":"c"}"#;
+    let tok = WhitelistTokenizer::new(["id"]);
+    let mut out = String::new();
+    tok.tokenize_into(line, &mut out).unwrap();
+    assert!(equal_as_json(&out, &slow_path(line, &["id"])));
+    assert_eq!(out, r#"{"id":"c"}"#);
+}
+
+#[test]
+fn duplicate_whitelisted_key_via_unicode_escape_is_rejected() {
+    // One occurrence is written with a `\u` escape that decodes to `id`. The
+    // tokenizer decodes the key before the whitelist check, so the duplicate
+    // is detected against the canonical form.
+    let line = "{\"\\u0069d\":\"a\",\"id\":\"b\"}";
+    let tok = WhitelistTokenizer::new(["id"]);
+    let mut out = String::new();
+    assert!(tok.tokenize_into(line, &mut out).is_err());
+    assert!(out.is_empty());
+}
+
+#[test]
+fn duplicate_key_rejection_clears_matched_indices() {
+    let line = r#"{"id":"a","id":"b"}"#;
+    let tok = WhitelistTokenizer::new(["id", "author"]);
+    let mut out = String::new();
+    let mut matched = vec![7, 9];
+    assert!(tok
+        .tokenize_into_with_matches(line, &mut out, &mut matched)
+        .is_err());
+    assert!(out.is_empty());
+    assert!(matched.is_empty(), "rejection must clear matched_indices");
+}
+
+#[test]
+fn fused_duplicate_timestamp_key_is_rejected() {
+    let line = r#"{"created_utc":1136074600,"created_utc":1136074800}"#;
+    let tok = WhitelistTokenizer::new(["created_utc"]);
+    let mut out = String::new();
+    assert!(tok
+        .tokenize_and_rewrite_timestamps_into(line, &mut out)
+        .is_err());
+    assert!(out.is_empty());
+}
+
+// ---------------------------------------------------------------------
 // Fused tokenize + rewrite-timestamps tests. The fused path must agree
 // with the two-pass composition (tokenize_into → rewrite_human_timestamps_bytes)
 // at the JSON-value level on every input the streaming pipeline could see.

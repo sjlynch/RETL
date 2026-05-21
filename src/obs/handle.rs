@@ -219,18 +219,23 @@ fn init_tracing(
         .and_then(|v| LogFormat::parse(&v))
         .unwrap_or(format);
 
-    // Preserve the historical default of writing fmt output to stdout so
-    // existing CLI tests (and operators piping stdout) continue to see
-    // tracing lines where they always did. The new `--events` NDJSON file
-    // is the structured destination; the stderr stream is unchanged.
+    // Route the fmt layer to stderr so tracing lines stay out of record
+    // output: `retl scan`/`export` with `--out -` write records to stdout,
+    // and mixing logs into that stream corrupts it. stderr keeps the two
+    // separable (`retl export --out - --log-format json 2>logs.json`). The
+    // `--events` NDJSON file remains the structured destination.
     let registry = tracing_subscriber::registry().with(env_layer);
     let result = match effective_format {
         LogFormat::Json => registry
-            .with(tracing_subscriber::fmt::layer().json())
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .json()
+                    .with_writer(std::io::stderr),
+            )
             .with(event_layer)
             .try_init(),
         LogFormat::Text => registry
-            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
             .with(event_layer)
             .try_init(),
     };
