@@ -346,3 +346,65 @@ fn empty_whitelist_after_normalization_is_rejected() {
         "unexpected error: {msg}"
     );
 }
+
+#[test]
+fn extract_to_csv_warns_when_fields_override_a_preset_whitelist() {
+    // `fields` always becomes the projection whitelist for a tabular export.
+    // A whitelist set earlier via RedditETL/ScanPlan::whitelist_fields used to
+    // be dropped silently — two ways to say "which fields" with no signal.
+    let base = make_corpus_n_records(1);
+    let out = base.join("override.csv");
+    let logs = CaptureLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .with_writer(logs.clone())
+        .finish();
+
+    tracing::subscriber::with_default(subscriber, || {
+        RedditETL::new()
+            .base_dir(&base)
+            .sources(Sources::Comments)
+            .progress(false)
+            .whitelist_fields(["author", "subreddit"])
+            .scan()
+            .extract_to_csv(&out, ["id", "body"], Default::default())
+            .unwrap();
+    });
+
+    let logs = logs.contents();
+    assert!(
+        logs.contains("extract_to_csv ignores the field whitelist")
+            && logs.contains("authoritative"),
+        "expected whitelist-override warning, got logs: {logs:?}"
+    );
+}
+
+#[test]
+fn extract_to_csv_does_not_warn_when_preset_whitelist_matches_fields() {
+    let base = make_corpus_n_records(1);
+    let out = base.join("no_override.csv");
+    let logs = CaptureLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .with_writer(logs.clone())
+        .finish();
+
+    tracing::subscriber::with_default(subscriber, || {
+        RedditETL::new()
+            .base_dir(&base)
+            .sources(Sources::Comments)
+            .progress(false)
+            .whitelist_fields(["id", "body"])
+            .scan()
+            .extract_to_csv(&out, ["id", "body"], Default::default())
+            .unwrap();
+    });
+
+    let logs = logs.contents();
+    assert!(
+        !logs.contains("ignores the field whitelist"),
+        "a matching preset whitelist should not warn, got logs: {logs:?}"
+    );
+}

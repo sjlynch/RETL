@@ -35,7 +35,9 @@ pub(crate) struct ConvertArgs {
     /// Omit the header row.
     #[arg(long)]
     pub(crate) no_header: bool,
-    /// JSONL input files. Omit when using --spool, or combine with --spool to append extra files.
+    /// Plain (uncompressed) JSONL input files. `.zst` inputs are not accepted —
+    /// decompress first or use `retl export --format csv/tsv`. Omit when using
+    /// --spool, or combine with --spool to append extra files.
     #[arg(num_args = 0.., value_name = "INPUTS")]
     pub(crate) inputs: Vec<PathBuf>,
 }
