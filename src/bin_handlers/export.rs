@@ -1,4 +1,26 @@
 
+/// CSV/TSV exports ignore the timestamp/resume knobs entirely (`extract_to_csv`
+/// / `extract_to_tsv` never read them), so accepting these flags would silently
+/// no-op them and leave the user believing a CSV/TSV run was resumable. Reject
+/// them at the CLI layer rather than silently ignoring them — the library's
+/// `extract_to_tabular` enforces the same contract, but failing here keeps the
+/// error close to the flag and avoids constructing the scan plan first.
+fn reject_unsupported_tabular_flags(args: &ExportArgs) -> Result<()> {
+    if args.human_timestamps {
+        anyhow::bail!(
+            "--human-timestamps is not supported for CSV/TSV export; \
+             use --format jsonl/json/spool/zst/partitioned-jsonl or omit the flag"
+        );
+    }
+    if args.resume {
+        anyhow::bail!(
+            "--resume is not supported for CSV/TSV export; \
+             use --format jsonl/json/spool/zst/partitioned-jsonl or omit the flag"
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn run_export(args: ExportArgs) -> Result<()> {
     let mut etl = build_etl(&args.common)?;
     if !args.whitelist.is_empty() {
@@ -55,6 +77,7 @@ pub(crate) fn run_export(args: ExportArgs) -> Result<()> {
             }
         }
         ExportFmt::Csv => {
+            reject_unsupported_tabular_flags(&args)?;
             if args.whitelist.is_empty() {
                 anyhow::bail!("--format csv requires --whitelist so the CSV schema is fixed");
             }
@@ -68,6 +91,7 @@ pub(crate) fn run_export(args: ExportArgs) -> Result<()> {
             }
         }
         ExportFmt::Tsv => {
+            reject_unsupported_tabular_flags(&args)?;
             if args.whitelist.is_empty() {
                 anyhow::bail!("--format tsv requires --whitelist so the TSV schema is fixed");
             }

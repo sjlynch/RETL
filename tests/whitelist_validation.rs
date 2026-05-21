@@ -326,6 +326,118 @@ fn strict_whitelist_verdict_follows_fast_path_for_escaped_unicode_key() {
     );
 }
 
+/// Names of published per-month spool parts (`part_RC_*.jsonl` /
+/// `part_RS_*.jsonl`) currently in `out_dir`.
+fn published_spool_parts(out_dir: &std::path::Path) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(out_dir) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| {
+            (name.starts_with("part_RC_") || name.starts_with("part_RS_"))
+                && name.ends_with(".jsonl")
+        })
+        .collect()
+}
+
+/// Regression: a strict `--whitelist` failure on a *resumable* spool run must
+/// not leave committed state (`_progress.json` + published parts) that a
+/// resumed run would skip. The strict verdict is post-hoc — by the time the
+/// tracker knows a field never matched, every month is already published and
+/// recorded. Before the fix, a resumed run loaded `_progress.json`, skipped
+/// every month, observed zero fresh records, and silently "succeeded" with
+/// empty-projection output.
+#[test]
+fn strict_whitelist_spool_failure_leaves_no_resume_skippable_state() {
+    let base = make_corpus_n_records(100);
+    let out_dir = base.join("strict_spool_out");
+
+    let run = || {
+        RedditETL::new()
+            .base_dir(&base)
+            .sources(Sources::Comments)
+            .progress(false)
+            .resume(true)
+            .whitelist_fields(["not_a_real_field"])
+            .strict_whitelist(true)
+            .scan()
+            .extract_spool_monthly(&out_dir)
+    };
+
+    // First strict run: the whitelisted field never matches, so it fails.
+    let err = run().unwrap_err();
+    assert!(
+        format!("{err:#}").contains("--whitelist matched zero fields"),
+        "unexpected error: {err:#}"
+    );
+
+    // The failed strict run must leave nothing a resumed run would honor.
+    assert!(
+        !out_dir.join("_progress.json").exists(),
+        "strict-whitelist failure left a resume manifest a resumed run would skip months from"
+    );
+    let parts = published_spool_parts(&out_dir);
+    assert!(
+        parts.is_empty(),
+        "strict-whitelist failure left published spool parts behind: {parts:?}"
+    );
+
+    // The resumed run must re-stream every month and re-trigger the strict
+    // check — not silently succeed by skipping months marked complete.
+    let resumed_err = run().unwrap_err();
+    assert!(
+        format!("{resumed_err:#}").contains("--whitelist matched zero fields"),
+        "resumed strict run skipped the affected months instead of re-failing: {resumed_err:#}"
+    );
+}
+
+/// Regression: same guarantee for a resumable JSONL `extract`. `out_path` is
+/// only stitched after the strict check, so a strict failure never publishes
+/// it directly — but the cached `.part_*.jsonl` files and `_progress.json` in
+/// the work dir would let a resumed run skip every month and stitch the bad
+/// (empty-projection) output. The resumed run must re-fail instead.
+#[test]
+fn strict_whitelist_extract_failure_does_not_let_resume_stitch_bad_output() {
+    let base = make_corpus_n_records(100);
+    let out = base.join("strict_extract_out.jsonl");
+
+    let run = || {
+        RedditETL::new()
+            .base_dir(&base)
+            .sources(Sources::Comments)
+            .progress(false)
+            .resume(true)
+            .whitelist_fields(["not_a_real_field"])
+            .strict_whitelist(true)
+            .scan()
+            .extract_to_jsonl(&out)
+    };
+
+    let err = run().unwrap_err();
+    assert!(
+        format!("{err:#}").contains("--whitelist matched zero fields"),
+        "unexpected error: {err:#}"
+    );
+    assert!(
+        !out.exists(),
+        "strict-whitelist failure published the final extract output"
+    );
+
+    // Resumed run must re-stream and re-fail, not skip cached months and
+    // stitch the bad output into `out`.
+    let resumed_err = run().unwrap_err();
+    assert!(
+        format!("{resumed_err:#}").contains("--whitelist matched zero fields"),
+        "resumed strict extract skipped cached months instead of re-failing: {resumed_err:#}"
+    );
+    assert!(
+        !out.exists(),
+        "resumed strict-whitelist extract stitched bad output instead of re-failing"
+    );
+}
+
 #[test]
 fn empty_whitelist_after_normalization_is_rejected() {
     let base = make_corpus_n_records(1);
