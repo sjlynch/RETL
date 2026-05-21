@@ -242,7 +242,7 @@ pub use crate::integrity::{IntegrityMode, IntegrityReport, MAX_RETAINED_FAILURES
 pub use crate::zstd_jsonl::{quick_validate_zst, validate_zst_full, QuickOutcome};
 
 //export partition writers (lambda-capable)
-pub use crate::partition::{PartitionWriters, MAX_PARTITIONS};
+pub use crate::partition::{PartitionFinalizeError, PartitionWriters, MAX_PARTITIONS};
 
 // Re-export atomic-write entry points used by binaries and downstream library
 // callers that don't already hold a staging-dir handle.

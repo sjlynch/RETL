@@ -24,7 +24,8 @@ pub(crate) struct SampleArgs {
     /// Whitelist of top-level fields to keep. Required for csv/tsv.
     #[arg(long, value_delimiter = ',')]
     pub(crate) whitelist: Vec<String>,
-    /// Error if `--whitelist` matches zero fields in sampled records.
+    /// Error if a `--whitelist` field never matches. The verdict is post-hoc
+    /// (decided after streaming); a strict failure publishes no output file.
     #[arg(long)]
     pub(crate) strict_whitelist: bool,
     /// Convert `created_utc`, `retrieved_on`, and `edited` to RFC3339 strings

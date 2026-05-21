@@ -139,6 +139,60 @@ fn ensure_resume_manifest_durable(
     Ok(())
 }
 
+/// Run the strict `--whitelist` finalization, discarding this run's published
+/// outputs and resume manifest if it fails.
+///
+/// [`WhitelistMatchTracker::finalize`] is unavoidably post-hoc: it can only
+/// decide that a requested `--whitelist` field never matched any record after
+/// the per-file loop has already atomically published each processed month's
+/// output *and* durably committed its `_progress.json` entry. A bare
+/// `finalize()?` would therefore abort the run while leaving those bad (empty /
+/// wrong-projection) outputs on disk — and with `resume = true` a re-run would
+/// load `_progress.json`, skip every month, observe zero fresh records, and
+/// never re-trigger the strict check, silently "succeeding" with bad output.
+///
+/// To keep `--strict-whitelist`'s "fail before producing bad output" guarantee
+/// meaningful, a strict failure here discards the whole output set (via
+/// `discard_all_outputs` — the same cleanup used on a resume-fingerprint
+/// mismatch) and removes the resume manifest, so a resumed run starts fresh,
+/// re-streams every month, and re-evaluates the whitelist. The original strict
+/// error is always propagated; a cleanup failure is logged but never masks it.
+///
+/// `finalize` only returns `Err` in strict mode (non-strict runs merely warn),
+/// so the rollback path is reached only when `--strict-whitelist` was set.
+fn finalize_whitelist_strict<C>(
+    tracker: Option<&WhitelistMatchTracker>,
+    manifest_dir: &Path,
+    discard_all_outputs: C,
+) -> Result<()>
+where
+    C: FnOnce() -> Result<()>,
+{
+    let Some(tracker) = tracker else {
+        return Ok(());
+    };
+    let Err(strict_err) = tracker.finalize() else {
+        return Ok(());
+    };
+    if let Err(cleanup_err) = discard_all_outputs() {
+        tracing::warn!(
+            error = %cleanup_err,
+            "failed to discard published outputs after strict --whitelist failure; \
+             a resumed run may skip the affected months",
+        );
+    }
+    let manifest = crate::progress_manifest::manifest_path(manifest_dir);
+    if let Err(cleanup_err) = crate::util::remove_with_short_backoff(&manifest) {
+        tracing::warn!(
+            path = %manifest.display(),
+            error = %cleanup_err,
+            "failed to remove resume manifest after strict --whitelist failure; \
+             a resumed run may skip the affected months",
+        );
+    }
+    Err(strict_err)
+}
+
 /// Remove every file under `dir` whose name passes `should_remove`. Used by
 /// the per-caller prune/clear helpers; centralizes the directory scan + error
 /// context so callers only have to supply their filename pattern.

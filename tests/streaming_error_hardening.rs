@@ -265,4 +265,4 @@ fn spool_publish_failure_is_fatal_and_does_not_commit_manifest() {
 // asserts on the returned `anyhow::Error`'s Display, which is what would
 // have been written to stderr and surfaced as a non-zero exit. The
 // in-process version uses `cap_backoff_budget_for_test` so the failure
-// surfaces in microseconds instead of ~21 s of retry-budget exhaustion.
+// surfaces in microseconds instead of ~14 s of retry-budget exhaustion.
