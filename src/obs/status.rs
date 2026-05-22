@@ -130,9 +130,10 @@ pub(crate) fn refresh_snapshot(
     let elapsed = shared.start_instant.elapsed().as_secs_f64();
     let avail_frac = crate::mem::available_memory_fraction();
     // Match the library's own low-memory predicate. The threshold echoes
-    // `AdaptiveMemCfg::default().low_threshold` so the status snapshot's
+    // `AdaptiveMemCfg::default().soft_low_frac` so the status snapshot's
     // `throttle_active` flag flips in step with the in-library throttling.
-    let throttle_active = crate::mem::is_low_memory(0.15);
+    let throttle_active =
+        crate::mem::is_low_memory(crate::mem::AdaptiveMemCfg::default().soft_low_frac);
 
     let (rss_bytes, cpu_pct) = match sys.process(pid) {
         Some(p) => (p.memory(), p.cpu_usage() as f64),

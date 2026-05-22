@@ -20,6 +20,7 @@ pub use fs_ops::{
 };
 pub(crate) use fs_ops::{create_dir_with_backoff, create_dir_with_default_backoff};
 pub use replace::replace_file_atomic_backoff;
+pub(crate) use replace::ATOMIC_REPLACE_TMP_EXT;
 #[cfg(any(test, feature = "test-utils"))]
 pub use retry::{cap_backoff_budget_for_test, TestBackoffBudgetGuard};
 pub use retry::{DEFAULT_BACKOFF_DELAY_MS, DEFAULT_BACKOFF_TRIES, SHORT_BACKOFF_TRIES};
