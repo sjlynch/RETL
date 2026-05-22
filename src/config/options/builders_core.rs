@@ -119,19 +119,23 @@ impl ETLOptions {
     }
 
     // IO buffers tuning
+    //
+    // Requests are clamped into `[MIN_IO_BUFFER, MAX_IO_BUFFER]` by
+    // `clamp_io_buffer`, which warns on either bound — a sub-8-KiB value is no
+    // longer raised silently, and `usize::MAX` no longer reaches the allocator.
     pub fn with_io_read_buffer(mut self, bytes: usize) -> Self {
-        self.read_buffer_bytes = bytes.max(8 * 1024);
+        self.read_buffer_bytes = clamp_io_buffer(bytes, "ETLOptions::with_io_read_buffer");
         self
     }
 
     pub fn with_io_write_buffer(mut self, bytes: usize) -> Self {
-        self.write_buffer_bytes = bytes.max(8 * 1024);
+        self.write_buffer_bytes = clamp_io_buffer(bytes, "ETLOptions::with_io_write_buffer");
         self
     }
 
     pub fn with_io_buffers(mut self, read_bytes: usize, write_bytes: usize) -> Self {
-        self.read_buffer_bytes = read_bytes.max(8 * 1024);
-        self.write_buffer_bytes = write_bytes.max(8 * 1024);
+        self.read_buffer_bytes = clamp_io_buffer(read_bytes, "ETLOptions::with_io_buffers");
+        self.write_buffer_bytes = clamp_io_buffer(write_bytes, "ETLOptions::with_io_buffers");
         self
     }
 }

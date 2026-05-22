@@ -148,6 +148,18 @@ impl RedditETL {
         self.opts = self.opts.with_inflight_budget(bytes);
         self
     }
+
+    /// Explicitly disable the `inflight_bytes` memory cap (producers fall back
+    /// to adaptive memory-fraction sampling).
+    ///
+    /// This is the deliberate, warning-free opt-out for that mode; passing `0`
+    /// to [`Self::inflight_bytes`] / [`Self::inflight_budget`] instead emits a
+    /// one-shot warning, since a budget computation rounding to `0` is almost
+    /// always a bug. See [`ETLOptions::disable_inflight_cap`].
+    pub fn disable_inflight_cap(mut self) -> Self {
+        self.opts = self.opts.disable_inflight_cap();
+        self
+    }
     /// Override the adaptive-memory policy used by bucketing/dedupe producers.
     pub fn adaptive_mem(mut self, cfg: AdaptiveMemCfg) -> Self {
         self.opts = self.opts.with_adaptive_mem(cfg);
