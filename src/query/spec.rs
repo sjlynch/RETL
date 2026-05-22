@@ -54,6 +54,14 @@ pub struct QuerySpec {
     /// text or a link-submission `url` whose value starts with http(s).
     pub no_url: bool,
     /// Full-record predicates evaluated against arbitrary JSON Pointer paths.
+    ///
+    /// Regex predicates compile their pattern lazily (once, via an internal
+    /// `OnceLock`) on first evaluation, so a directly-constructed `QuerySpec`
+    /// no longer recompiles the regex per record. Prefer routing through
+    /// [`ScanPlan::build`](crate::ScanPlan::build) (or calling
+    /// [`QuerySpec::validate`]) anyway: that compiles eagerly and rejects an
+    /// invalid pattern as a [`QueryBuildError`] up front, whereas the lazy
+    /// path *panics* mid-scan on a pattern that never passed validation.
     pub json_predicates: Vec<JsonPointerPredicate>,
     pub filter_pseudo_users: bool, // exclude [deleted]/[removed]/empty author; default true
 

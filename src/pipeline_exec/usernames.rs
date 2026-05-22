@@ -3,8 +3,20 @@
 // / `try_for_each_username` convenience wrappers).
 
 impl RedditETL {
-    #[deprecated(note = "use RedditETL::scan().usernames()")]
+    #[deprecated(
+        note = "use RedditETL::scan().usernames(); this shim ignores ETLOptions::resume \
+                (it always performs a full re-scan) and query filters"
+    )]
     pub fn usernames(self) -> Result<UsernameStream> {
+        // The deprecated shim has no resume support: unlike `ScanPlan::usernames`
+        // it never materializes a scan checkpoint. Warn loudly rather than
+        // silently performing a full re-scan when the caller asked to resume.
+        if self.opts.resume {
+            tracing::warn!(
+                "RedditETL::usernames() ignores resume: this deprecated path always performs a \
+                 full re-scan. Use RedditETL::scan().usernames() for resumable username collection."
+            );
+        }
         let subreddit = self
             .opts
             .subreddit
