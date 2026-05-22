@@ -4,6 +4,24 @@
 // outputs rather than full-record exports.
 
 impl ScanPlan {
+    /// Count matched records per calendar month.
+    ///
+    /// **Run-manifest exemption (deliberate).** Unlike its analytics siblings
+    /// [`ScanPlan::author_counts_to_tsv`] and
+    /// [`ScanPlan::build_first_seen_index_to_tsv`], this method does **not**
+    /// build a `RunManifestStart` or call `maybe_write_run_manifest`. It
+    /// returns an in-memory `BTreeMap` and has no output file, so there is no
+    /// `ManifestDestination::File` to anchor a sidecar manifest (and hence no
+    /// `partial_read` snapshot) to. Emitting provenance is therefore the
+    /// caller's responsibility:
+    ///
+    /// - The `retl count --mode month` handler writes a CLI scan manifest
+    ///   (including the partial-read snapshot) when `--out <file>` is given,
+    ///   and always prints the partial-read report to stderr.
+    /// - A resumed run (`--resume`) routes through `materialize_scan_checkpoint`,
+    ///   which emits a loud end-of-run `tracing::warn!` summarizing any month
+    ///   skipped by `--allow-partial` — so a `--resume --allow-partial` count
+    ///   that silently dropped a month is still visible to a watcher.
     pub fn count_by_month(self) -> Result<BTreeMap<YearMonth, u64>> {
         let plan = self.build()?;
         log_pseudo_user_filter(&plan.query);

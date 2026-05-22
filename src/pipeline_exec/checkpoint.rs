@@ -12,8 +12,8 @@ fn scan_checkpoint_dir(work_dir: &Path, fingerprint: &str) -> PathBuf {
 fn load_and_validate_scan_checkpoint_manifest(
     dir: &Path,
     fingerprint: &str,
-) -> Result<(HashMap<String, MonthEntry>, HashSet<String>)> {
-    let manifest = crate::progress_manifest::load(dir);
+) -> Result<HashMap<String, MonthEntry>> {
+    let manifest = crate::progress_manifest::load(dir)?;
     if manifest.fingerprint.as_deref() != Some(fingerprint) && !manifest.months.is_empty() {
         tracing::warn!(
             path=%crate::progress_manifest::manifest_path(dir).display(),
@@ -22,7 +22,7 @@ fn load_and_validate_scan_checkpoint_manifest(
             "scan checkpoint fingerprint does not match current query/config/corpus; discarding cached month parts"
         );
         clear_spool_resume_parts(dir)?;
-        return Ok((HashMap::new(), HashSet::new()));
+        return Ok(HashMap::new());
     }
 
     let mut keep = HashMap::<String, MonthEntry>::new();
@@ -55,8 +55,7 @@ fn load_and_validate_scan_checkpoint_manifest(
             }
         }
     }
-    let completed_keys = keep.keys().cloned().collect();
-    Ok((keep, completed_keys))
+    Ok(keep)
 }
 
 fn materialize_scan_checkpoint(
@@ -77,12 +76,15 @@ fn materialize_scan_checkpoint(
     let staging_dir = ensure_staging_dir(&checkpoint_dir)?;
     sweep_stale_inprogress(&checkpoint_dir, true)?;
 
-    let (initial_months, completed_keys) =
+    let initial_months =
         load_and_validate_scan_checkpoint_manifest(&checkpoint_dir, &fingerprint)?;
     crate::progress_manifest::save(&checkpoint_dir, &initial_months, Some(&fingerprint))?;
     let resumed_lines = committed_line_count(&initial_months);
-    let accumulator =
-        ManifestAccumulator::new(&checkpoint_dir, initial_months, Some(fingerprint.clone()));
+    let accumulator = ManifestAccumulator::new(
+        &checkpoint_dir,
+        initial_months.clone(),
+        Some(fingerprint.clone()),
+    );
 
     let total_bytes = total_compressed_size(&files);
     let pb = if show_progress && etl.opts.progress {
@@ -94,15 +96,15 @@ fn materialize_scan_checkpoint(
         None
     };
 
-    let parts = Mutex::new(Vec::<PathBuf>::new());
-    {
-        let mut guard = parts.lock().unwrap();
-        for key in &completed_keys {
-            guard.push(checkpoint_part_path(&checkpoint_dir, key));
-        }
-    }
+    // Pre-seed `parts` with already-completed months, but only those whose
+    // published part is still on disk at the recorded size. A part deleted or
+    // truncated since load-time validation is dropped here (and re-produced by
+    // `process_month`'s resume fast-path) rather than handed downstream as a
+    // phantom path that parents/aggregate would fail to open.
+    let parts = Mutex::new(surviving_resumed_parts(&initial_months, |key| {
+        checkpoint_part_path(&checkpoint_dir, key)
+    }));
 
-    let total_written = AtomicU64::new(0);
     let targets = resolve_target_subs_from(&etl.opts.subreddit, &query.subreddits);
     let targets_ref = targets.as_ref();
     let bounds = bounds_tuple(etl.opts.start, etl.opts.end);
@@ -129,14 +131,13 @@ fn materialize_scan_checkpoint(
                 whitelist_tracker: None,
                 record_limit: record_limit.as_deref(),
                 resume: true,
-                completed_keys: &completed_keys,
+                completed_months: &initial_months,
                 accumulator: Some(&accumulator),
                 allow_partial: etl.opts.allow_partial,
                 partial_reporter: Some(&etl.opts.partial_read_reporter),
             };
             let outcome = process_month(job, &ctx)?;
             if let Some(month) = outcome {
-                total_written.fetch_add(month.lines, Ordering::Relaxed);
                 parts.lock().unwrap().push(month.out_path.clone());
                 commit_entry_to_manifest(&accumulator, month).context(
                     "failed to durably update scan checkpoint progress manifest after publishing month part",
@@ -150,14 +151,42 @@ fn materialize_scan_checkpoint(
         pb.finish_with_message("done");
     }
     ensure_resume_manifest_durable(Some(&accumulator), "scan checkpoint")?;
+    warn_on_resumed_checkpoint_partial_reads(etl);
 
     let mut parts = parts.into_inner().unwrap();
     parts.sort();
     parts.dedup();
     Ok(ScanCheckpoint {
         parts,
-        matched_records: resumed_lines + total_written.load(Ordering::Relaxed),
+        // The accumulator's final manifest is authoritative: it counts each
+        // resumed and freshly produced month exactly once, including a month
+        // re-produced after its part went missing (which a
+        // `resumed_lines + this_run` sum would double-count).
+        matched_records: accumulator.total_lines(),
     })
+}
+
+/// After a resumed scan-checkpoint materialization, warn loudly if any input
+/// file was skipped by `--allow-partial`.
+///
+/// With `allow_partial = true`, a month whose zstd frame fails to decode
+/// returns `Ok(None)` from `process_month`: it is never committed to
+/// `_progress.json` and its records are simply absent from the checkpoint
+/// parts. The analytics / dedupe / usernames callers then reduce over only the
+/// surviving parts and return a normal `Ok` value, so without this a caller
+/// inspecting just the result cannot tell an entire month is missing. This
+/// mirrors the end-of-run skip summary `RedditETL::usernames` already emits
+/// for its non-resumed path.
+fn warn_on_resumed_checkpoint_partial_reads(etl: &RedditETL) {
+    let report = etl.opts.partial_read_reporter.snapshot();
+    if report.skipped_file_count > 0 {
+        tracing::warn!(
+            skipped_files = report.skipped_file_count,
+            "resumed scan checkpoint: {} input file(s) skipped due to zstd decode errors (--allow-partial); \
+             results derived from this checkpoint cover an INCOMPLETE corpus — see prior warnings for the skipped paths",
+            report.skipped_file_count
+        );
+    }
 }
 
 fn for_each_checkpoint_record<F>(parts: &[PathBuf], read_buf: usize, on_record: F) -> Result<()>

@@ -47,7 +47,10 @@ struct MonthJobCtx<'a> {
     whitelist_tracker: Option<&'a WhitelistMatchTracker>,
     record_limit: Option<&'a RecordLimit>,
     resume: bool,
-    completed_keys: &'a HashSet<String>,
+    /// Months already published by a prior run (the validated `_progress.json`
+    /// entries). The recorded `MonthEntry.size` lets the resume fast-path
+    /// re-stat each published output before trusting it.
+    completed_months: &'a HashMap<String, MonthEntry>,
     accumulator: Option<&'a ManifestAccumulator>,
     allow_partial: bool,
     partial_reporter: Option<&'a crate::config::PartialReadReporter>,
@@ -81,16 +84,44 @@ fn process_month(job: &FileJob, ctx: &MonthJobCtx<'_>) -> Result<Option<MonthRes
         return Ok(None);
     }
 
-    // Resume fast-path: skip the month entirely if it's already in the
-    // manifest (and the on-disk file matched at load time). Still bump the
-    // progress bar by the input file's compressed size so the user sees the
-    // work accounted for.
-    if ctx.resume && ctx.completed_keys.contains(&key) {
-        if let Some(pb) = ctx.pb {
-            let sz = fs::metadata(&job.path).map(|m| m.len()).unwrap_or(0);
-            pb.inc(sz);
+    // Resume fast-path: skip the month only if it is in the manifest *and*
+    // its published output is still on disk at the recorded size. The entry
+    // was size-validated once at load time, but between that check and this
+    // per-month worker running the part can be deleted or truncated (AV
+    // quarantine, user cleanup). A resumed month whose output has vanished or
+    // changed must be re-produced, not silently skipped — otherwise the run
+    // reports success with a missing output. On mismatch we fall through to
+    // the normal write path below. Still bump the progress bar by the input
+    // file's compressed size so the user sees the work accounted for.
+    if ctx.resume {
+        if let Some(entry) = ctx.completed_months.get(&key) {
+            match fs::metadata(&out_path) {
+                Ok(meta) if meta.len() == entry.size => {
+                    if let Some(pb) = ctx.pb {
+                        let sz = fs::metadata(&job.path).map(|m| m.len()).unwrap_or(0);
+                        pb.inc(sz);
+                    }
+                    return Ok(None);
+                }
+                Ok(meta) => {
+                    tracing::warn!(
+                        key = %key,
+                        path = %out_path.display(),
+                        expected_size = entry.size,
+                        actual_size = meta.len(),
+                        "resumed month output changed size since checkpoint validation; re-producing it"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        key = %key,
+                        path = %out_path.display(),
+                        error = %e,
+                        "resumed month output is missing since checkpoint validation; re-producing it"
+                    );
+                }
+            }
         }
-        return Ok(None);
     }
 
     let n = match write_jsonl_atomic(ctx.staging_dir, &out_path, ctx.write_buf, |w| {
@@ -195,8 +226,8 @@ impl ScanPlan {
 
             let ResumePrelude {
                 initial_months,
-                completed_keys,
                 accumulator,
+                ..
             } = prepare_resume_run(
                 out_dir,
                 &resume_fingerprint,
@@ -228,16 +259,22 @@ impl ScanPlan {
             let parts = Mutex::new(Vec::<PathBuf>::new());
 
             // Pre-seed `parts` with already-completed months so the returned
-            // list reflects the full set of published outputs (resumed + new).
+            // list reflects the full set of published outputs (resumed + new),
+            // but only those whose published part is still on disk at the
+            // recorded size. A part deleted/truncated since load-time
+            // validation is dropped here and re-produced by `process_month`'s
+            // resume fast-path — returning a phantom path would make a
+            // downstream parents/aggregate stage fail far from the real cause.
             if resume {
                 let mut guard = parts.lock().unwrap();
-                for key in &completed_keys {
-                    guard.push(out_dir.join(format!("part_{}.jsonl", key)));
+                for path in surviving_resumed_parts(&initial_months, |key| {
+                    out_dir.join(format!("part_{}.jsonl", key))
+                }) {
+                    guard.push(path);
                 }
             }
 
             let resumed_lines = committed_line_count(&initial_months);
-            let total_output_lines = AtomicU64::new(resumed_lines);
 
             let whitelist = plan.etl.opts.whitelist_fields.clone();
             let whitelist_tracker = whitelist.as_ref().map(|fields| {
@@ -271,7 +308,7 @@ impl ScanPlan {
                         whitelist_tracker: whitelist_tracker.as_deref(),
                         record_limit: record_limit.as_deref(),
                         resume,
-                        completed_keys: &completed_keys,
+                        completed_months: &initial_months,
                         accumulator: accumulator.as_ref(),
                         allow_partial: plan.etl.opts.allow_partial,
                         partial_reporter: Some(&plan.etl.opts.partial_read_reporter),
@@ -280,7 +317,6 @@ impl ScanPlan {
 
                     if let Some(month) = outcome {
                         total_written.fetch_add(month.lines, Ordering::Relaxed);
-                        total_output_lines.fetch_add(month.lines, Ordering::Relaxed);
                         parts.lock().unwrap().push(month.out_path.clone());
                         if let Some(acc) = &accumulator {
                             commit_entry_to_manifest(acc, month).context(
@@ -300,6 +336,17 @@ impl ScanPlan {
             }
             ensure_resume_manifest_durable(accumulator.as_ref(), "spool")?;
 
+            // `records_written` is the total published record count. On a
+            // resumed run the accumulator's final manifest is authoritative —
+            // it counts each resumed and freshly produced month exactly once,
+            // including a month re-produced after its output went missing
+            // (which `resumed_lines + this_run` arithmetic would double-count).
+            // A non-resumed run has no accumulator; its total is this run's.
+            let records_written = match accumulator.as_ref() {
+                Some(acc) => acc.total_lines(),
+                None => total_written.load(Ordering::Relaxed),
+            };
+
             let mut list = parts.into_inner().unwrap();
             list.sort();
             list.dedup();
@@ -312,10 +359,7 @@ impl ScanPlan {
                 &files,
                 plan.limit,
                 manifest_counts(&[
-                    (
-                        "records_written",
-                        total_output_lines.load(Ordering::Relaxed),
-                    ),
+                    ("records_written", records_written),
                     ("part_files", list.len() as u64),
                     (
                         "records_written_this_run",

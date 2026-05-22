@@ -17,6 +17,7 @@ use anyhow::{Context, Result};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::atomic_write::ensure_staging_dir;
@@ -70,28 +71,54 @@ pub fn month_key(prefix: &str, ym: impl std::fmt::Display) -> String {
     format!("{}_{}", prefix, ym)
 }
 
-/// Load the manifest if present. Missing file → empty manifest. A manifest
-/// that fails to parse, or has an unknown version, is treated as absent
-/// (warned, not fatal — we'd rather re-run than corrupt the user's data).
-pub fn load(out_dir: &Path) -> ProgressManifest {
+/// Load the manifest if present. Missing file → empty manifest.
+///
+/// `_progress.json` is opened through [`crate::util::open_with_default_backoff`]
+/// so a momentary Windows sharing/AV violation (transient error codes
+/// 5/32/33/...) retries instead of being misread as a missing checkpoint.
+/// A read failure that survives the backoff budget is **fatal** (`Err`): this
+/// file is resume-critical, and silently returning an empty manifest would
+/// discard the entire checkpoint and re-run every month from scratch — a user
+/// resuming a multi-hour run must not lose all prior progress to one
+/// transient stat.
+///
+/// A manifest that *parses* but has an unknown version, or fails to parse at
+/// all, is still treated as absent (warned, not fatal — we'd rather re-run
+/// than corrupt the user's data; a corrupt file will not fix itself on retry).
+pub fn load(out_dir: &Path) -> Result<ProgressManifest> {
     let path = manifest_path(out_dir);
-    let bytes = match std::fs::read(&path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ProgressManifest::default(),
+    let mut file = match crate::util::open_with_default_backoff(&path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ProgressManifest::default());
+        }
         Err(e) => {
-            tracing::warn!(path=%path.display(), error=%e, "could not read progress manifest; treating as empty");
-            return ProgressManifest::default();
+            return Err(anyhow::Error::new(e)).with_context(|| {
+                format!(
+                    "reading resume progress manifest {} (transient I/O errors already retried); \
+                     refusing to silently discard the resume checkpoint",
+                    path.display()
+                )
+            });
         }
     };
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).with_context(|| {
+        format!(
+            "reading resume progress manifest {}; \
+             refusing to silently discard the resume checkpoint",
+            path.display()
+        )
+    })?;
     match serde_json::from_slice::<ProgressManifest>(&bytes) {
-        Ok(m) if m.version == MANIFEST_VERSION => m,
+        Ok(m) if m.version == MANIFEST_VERSION => Ok(m),
         Ok(m) => {
             tracing::warn!(path=%path.display(), version=m.version, "progress manifest has unsupported version; ignoring");
-            ProgressManifest::default()
+            Ok(ProgressManifest::default())
         }
         Err(e) => {
             tracing::warn!(path=%path.display(), error=%e, "progress manifest is malformed; ignoring");
-            ProgressManifest::default()
+            Ok(ProgressManifest::default())
         }
     }
 }
@@ -213,12 +240,75 @@ impl ManifestAccumulator {
     pub fn is_poisoned(&self) -> bool {
         self.save_error.lock().is_some()
     }
+
+    /// Sum of `lines` across every entry currently in the in-memory manifest.
+    ///
+    /// After the per-file loop completes this is the authoritative count of
+    /// records published into the checkpoint/spool output set — resumed
+    /// months plus freshly produced ones, with a month that was re-produced
+    /// (its output went missing mid-run) counted exactly once because the
+    /// re-commit *replaced* its entry. Callers should prefer this over
+    /// `resumed_lines + records_written_this_run` arithmetic, which would
+    /// double-count such a re-produced month.
+    pub fn total_lines(&self) -> u64 {
+        self.months.lock().values().map(|entry| entry.lines).sum()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::atomic_write::STAGING_DIR_NAME;
+
+    #[test]
+    fn load_returns_empty_manifest_when_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let m = load(tmp.path()).expect("an absent manifest must not be an error");
+        assert!(m.months.is_empty());
+        assert_eq!(m.version, MANIFEST_VERSION);
+    }
+
+    #[test]
+    fn load_round_trips_a_saved_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut months = HashMap::new();
+        months.insert(
+            "RC_2024-01".to_string(),
+            MonthEntry {
+                size: 42,
+                lines: 7,
+                sha256: None,
+            },
+        );
+        save(tmp.path(), &months, Some("fp-1")).unwrap();
+
+        let m = load(tmp.path()).expect("a valid manifest must load");
+        assert_eq!(m.fingerprint.as_deref(), Some("fp-1"));
+        assert_eq!(m.months.get("RC_2024-01").map(|e| e.lines), Some(7));
+    }
+
+    #[test]
+    fn load_treats_malformed_manifest_as_empty_without_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(manifest_path(tmp.path()), b"{ this is not json").unwrap();
+        // A corrupt manifest is non-fatal: re-run every month rather than
+        // abort. (Distinct from a transient *read* failure, which is fatal.)
+        let m = load(tmp.path()).expect("a corrupt manifest is non-fatal");
+        assert!(m.months.is_empty());
+    }
+
+    #[test]
+    fn load_treats_unsupported_version_as_empty_without_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "version": MANIFEST_VERSION + 1,
+            "months": {},
+        }))
+        .unwrap();
+        std::fs::write(manifest_path(tmp.path()), bytes).unwrap();
+        let m = load(tmp.path()).expect("an unknown-version manifest is non-fatal");
+        assert!(m.months.is_empty());
+    }
 
     #[test]
     fn commit_rolls_back_in_memory_state_on_save_failure() {

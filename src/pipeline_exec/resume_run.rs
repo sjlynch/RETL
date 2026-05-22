@@ -69,7 +69,7 @@ where
         });
     }
 
-    let manifest = crate::progress_manifest::load(manifest_dir);
+    let manifest = crate::progress_manifest::load(manifest_dir)?;
     let fingerprint_mismatches = manifest.fingerprint.as_deref() != Some(fingerprint);
     let should_discard = fingerprint_mismatches
         && (warn_clear_when_empty || !manifest.months.is_empty());
@@ -191,6 +191,49 @@ where
         );
     }
     Err(strict_err)
+}
+
+/// Pre-seed helper for the resumed-`parts` list. Returns the published output
+/// paths for already-completed months, but **only** those still present on
+/// disk at the size recorded in the manifest.
+///
+/// Manifest entries are size-validated once at checkpoint load time
+/// (`prepare_resume_run` / `load_and_validate_scan_checkpoint_manifest`). The
+/// part file can still be deleted or truncated afterwards (AV quarantine, user
+/// cleanup) before this runs. A path that no longer matches its recorded
+/// entry is dropped here rather than handed to the downstream parents/aggregate
+/// stages, which would otherwise open a missing or partial file and fail far
+/// from the real cause. `process_month`'s resume fast-path independently
+/// re-stats and re-produces such a month, so the dropped path is reproduced,
+/// not lost — it is logged at `debug` here to avoid double-warning with the
+/// `warn` that `process_month` emits when it actually re-produces.
+fn surviving_resumed_parts(
+    months: &HashMap<String, MonthEntry>,
+    path_for_key: impl Fn(&str) -> PathBuf,
+) -> Vec<PathBuf> {
+    let mut parts = Vec::with_capacity(months.len());
+    for (key, entry) in months {
+        let path = path_for_key(key);
+        match fs::metadata(&path) {
+            Ok(meta) if meta.len() == entry.size => parts.push(path),
+            Ok(meta) => tracing::debug!(
+                key = %key,
+                path = %path.display(),
+                expected_size = entry.size,
+                actual_size = meta.len(),
+                "resumed part changed size since checkpoint validation; \
+                 omitting from parts list (process_month will re-produce it)"
+            ),
+            Err(e) => tracing::debug!(
+                key = %key,
+                path = %path.display(),
+                error = %e,
+                "resumed part missing since checkpoint validation; \
+                 omitting from parts list (process_month will re-produce it)"
+            ),
+        }
+    }
+    parts
 }
 
 /// Remove every file under `dir` whose name passes `should_remove`. Used by
