@@ -281,6 +281,75 @@ mod tests {
         );
     }
 
+    /// A zstd frame that decodes cleanly but contains a non-UTF-8 JSONL line
+    /// is a *record-level* fault, not zstd-frame corruption. It must abort the
+    /// file in BOTH strict and allow-partial modes: under `AllowPartial` it
+    /// must NOT be quietly tolerated as a decode skip (which would silently
+    /// drop the rest of the file and mark the month incomplete), and the
+    /// surfaced message must describe a record-level problem rather than a
+    /// "zstd decode error".
+    #[test]
+    fn invalid_utf8_line_is_fatal_in_strict_and_allow_partial() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad-utf8.zst");
+
+        // Two healthy lines, then a line with bare 0xFF bytes (invalid UTF-8).
+        // The zstd frame itself is valid and decodes cleanly.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"{\"id\":\"r0\"}\n");
+        payload.extend_from_slice(b"{\"id\":\"r1\"}\n");
+        payload.extend_from_slice(&[0xFF, 0xFF]);
+        payload.push(b'\n');
+        write_zst_with_checksum(&path, &payload);
+
+        // Strict mode: fatal, and the message must describe the record-level
+        // UTF-8 fault — NOT a "zstd decode error".
+        let err = for_each_line_cfg(&path, 16 * 1024, |_line| Ok(()))
+            .expect_err("invalid-UTF-8 line must be fatal in strict mode");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("not valid UTF-8"),
+            "strict error should name the UTF-8 fault: {msg}"
+        );
+        assert!(
+            !msg.contains("zstd decode error"),
+            "invalid UTF-8 must not be reported as a zstd-frame decode error: {msg}"
+        );
+        assert!(
+            msg.contains(&path.display().to_string()),
+            "error should name the offending path: {msg}"
+        );
+
+        // Allow-partial mode: still fatal. The file must NOT be tolerated as a
+        // decode skip, so `on_skip` must NOT fire and the call must error.
+        let mut skip_count = 0usize;
+        let mut on_skip = |_: &Path, _: &anyhow::Error| skip_count += 1;
+        let err = for_each_line_with_opts_status(
+            &path,
+            LineStreamOpts {
+                read_buf_bytes: Some(16 * 1024),
+                on_skip: Some(&mut on_skip),
+                partial_read_policy: PartialReadPolicy::AllowPartial,
+                ..Default::default()
+            },
+            |_line| Ok(()),
+        )
+        .expect_err("invalid-UTF-8 line must stay fatal under AllowPartial");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("not valid UTF-8"),
+            "allow-partial error should name the UTF-8 fault: {msg}"
+        );
+        assert!(
+            !msg.contains("zstd decode error"),
+            "allow-partial must not classify a UTF-8 fault as a tolerated zstd skip: {msg}"
+        );
+        assert_eq!(
+            skip_count, 0,
+            "on_skip must not fire for a record-level UTF-8 fault"
+        );
+    }
+
     /// Reddit dumps occasionally store `score` / `created_utc` as JSON strings
     /// or floats. `parse_minimal` must coerce those encodings to `i64` so the
     /// fast-path filters (`matches_minimal`, `within_bounds`) see the same

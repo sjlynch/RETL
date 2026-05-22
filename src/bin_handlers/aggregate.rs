@@ -35,7 +35,7 @@ pub(crate) fn run_aggregate(args: AggregateArgs) -> Result<()> {
             || GroupMetricAgg::new(group_by.clone(), metric.clone()),
         )?;
         report_aggregate_input_issues(&report);
-        ensure_aggregate_inputs_succeeded(input_count, &report)?;
+        ensure_aggregate_inputs_succeeded(input_count, &report, args.strict)?;
         let rows = if args.scientific {
             agg.rows_with_scientific(top, true)
         } else {
@@ -93,7 +93,7 @@ pub(crate) fn run_aggregate(args: AggregateArgs) -> Result<()> {
         let (agg, report) =
             etl.aggregate_jsonls_parallel_collect::<RecCount>(inputs, &shards_dir)?;
         report_aggregate_input_issues(&report);
-        ensure_aggregate_inputs_succeeded(input_count, &report)?;
+        ensure_aggregate_inputs_succeeded(input_count, &report, args.strict)?;
         write_rec_count_json(&args.out, &agg, args.pretty)?;
         let counts = counts_map(&[
             ("input_files", input_count as u64),
@@ -268,6 +268,16 @@ fn aggregate_manifest_warnings(report: &AggregateBuildReport) -> Vec<String> {
             report.partial_count()
         ));
     }
+    // A run that merged shards but ingested zero records produces an empty
+    // aggregation that otherwise looks successful. The library already emits a
+    // `tracing::warn!`; record it in the manifest too so a scripted pipeline
+    // reading the sidecar sees the empty result.
+    if report.ingested_zero_records() {
+        warnings.push(format!(
+            "aggregate merged {} shard(s) but ingested 0 record(s); the result is empty",
+            report.merged_shards
+        ));
+    }
     warnings
 }
 
@@ -289,12 +299,23 @@ fn report_aggregate_input_issues(report: &AggregateBuildReport) {
 fn ensure_aggregate_inputs_succeeded(
     input_count: usize,
     report: &AggregateBuildReport,
+    strict: bool,
 ) -> Result<()> {
     let errors = report.problem_count();
     if input_count > 0 && (errors == input_count || report.merged_shards == 0) {
         anyhow::bail!(
             "aggregate failed: {errors} of {input_count} input(s) failed or were partial; {} shard(s) merged",
             report.merged_shards
+        );
+    }
+    // `--strict`: any fatal input fails the whole run with a non-zero exit and
+    // no output written, so a mistyped path in a multi-file batch can't slip
+    // through as a successful partial result. The per-input diagnostics were
+    // already printed by `report_aggregate_input_issues`.
+    if strict && report.fatal_count() > 0 {
+        anyhow::bail!(
+            "aggregate --strict: {} of {input_count} input(s) failed during shard build; aborting with no output written",
+            report.fatal_count()
         );
     }
     Ok(())
@@ -347,6 +368,7 @@ fn write_cli_aggregate_manifest(
         "metric": args.metric.as_deref(),
         "top": args.top,
         "scientific": args.scientific,
+        "strict": args.strict,
         "parallelism": args.runtime.parallelism,
         "progress": !args.runtime.no_progress,
         "emit_manifest": !args.runtime.no_manifest,

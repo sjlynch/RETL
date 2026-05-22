@@ -8,11 +8,13 @@ enum ShardBuildResult {
     Clean {
         input: PathBuf,
         shard: PathBuf,
+        ingested: u64,
     },
     Partial {
         input: PathBuf,
         error: String,
         shard: Option<PathBuf>,
+        ingested: u64,
     },
     Fatal {
         input: PathBuf,
@@ -63,11 +65,15 @@ where
         .map(|(input, out_shard)| {
             let mut agg = make_agg();
             let mut line_no = 0_u64;
+            let mut ingested = 0_u64;
             let ingest_result = for_each_jsonl_line_cfg(input, AGGREGATE_INGEST_BUF_BYTES, |line| {
                 line_no += 1;
                 if !line.is_empty() {
                     match serde_json::from_str::<Value>(line) {
-                        Ok(v) => agg.ingest(&v),
+                        Ok(v) => {
+                            agg.ingest(&v);
+                            ingested += 1;
+                        }
                         Err(e) => anyhow::bail!(
                             "malformed JSON in {} at line {}: {}",
                             input.display(),
@@ -107,6 +113,7 @@ where
                             input: input.clone(),
                             error,
                             shard: None,
+                            ingested,
                         }
                     } else {
                         match write_shard(staging_dir, out_shard, &agg) {
@@ -122,11 +129,13 @@ where
                                         input: input.clone(),
                                         error,
                                         shard: Some(out_shard.clone()),
+                                        ingested,
                                     }
                                 } else {
                                     ShardBuildResult::Clean {
                                         input: input.clone(),
                                         shard: out_shard.clone(),
+                                        ingested,
                                     }
                                 }
                             }
@@ -162,17 +171,27 @@ where
     let mut report = AggregateBuildReport::default();
     for outcome in outcomes {
         match outcome {
-            ShardBuildResult::Clean { input, shard } => {
+            ShardBuildResult::Clean {
+                input,
+                shard,
+                ingested,
+            } => {
                 report.ok_inputs.push(input);
                 shards.push(shard);
+                report.records_ingested += ingested;
             }
             ShardBuildResult::Partial {
                 input,
                 error,
                 shard,
+                ingested,
             } => {
                 if let Some(shard) = shard {
                     shards.push(shard);
+                    // Only count records that actually reached a merged shard;
+                    // a partial shard dropped under the strict policy has
+                    // `shard == None` and contributes nothing.
+                    report.records_ingested += ingested;
                 }
                 report
                     .partial_inputs

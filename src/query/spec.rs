@@ -168,8 +168,8 @@ impl QuerySpec {
 
         validate_string_list_filter("subreddits", &self.subreddits)?;
         validate_id_list_filter("ids_in", &self.ids_in)?;
-        validate_id_list_filter("ids_in", &self.comment_ids_in)?;
-        validate_id_list_filter("ids_in", &self.submission_ids_in)?;
+        validate_id_list_filter("comment_ids_in", &self.comment_ids_in)?;
+        validate_id_list_filter("submission_ids_in", &self.submission_ids_in)?;
         validate_id_filter_overlaps(self)?;
         validate_string_list_filter("authors_in", &self.authors_in)?;
         validate_string_list_filter("authors_out", &self.authors_out)?;
