@@ -42,8 +42,10 @@ pub(super) fn notify_stage_path_for_tests(staged: &Path) {
 
 mod tests {
     use super::super::{
-        ensure_staging_dir, sweep_stale_inprogress, write_jsonl_atomic, INPROGRESS_EXT,
+        ensure_staging_dir, sweep_stale_atomic_replace_tmp, sweep_stale_inprogress,
+        write_jsonl_atomic, INPROGRESS_EXT,
     };
+    use crate::util::ATOMIC_REPLACE_TMP_EXT;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Stdio};
@@ -98,6 +100,23 @@ mod tests {
             "{dest}.retl-{pid}-{nonce}-{nanos}{INPROGRESS_EXT}"
         ));
         fs::write(&path, b"partial output").unwrap();
+        path
+    }
+
+    /// Write an orphaned copy+rename fallback sibling with the RETL-owned
+    /// suffix `<dest>.retl-<pid>-<nonce>-<nanos>.atomic-replace-tmp` directly
+    /// in `dir` — next to where a published output would live.
+    fn write_atomic_replace_tmp(
+        dir: &Path,
+        dest: &str,
+        pid: u32,
+        nonce: u64,
+        nanos: u128,
+    ) -> PathBuf {
+        let path = dir.join(format!(
+            "{dest}.retl-{pid}-{nonce}-{nanos}{ATOMIC_REPLACE_TMP_EXT}"
+        ));
+        fs::write(&path, b"orphaned fallback copy").unwrap();
         path
     }
 
@@ -245,5 +264,78 @@ mod tests {
         let swept = sweep_stale_inprogress(root, true).unwrap();
         assert_eq!(swept, 1, "a dead-PID leftover is swept regardless of age");
         assert!(!leftover.exists(), "dead-PID .inprogress was reclaimed");
+    }
+
+    /// Acceptance: an orphaned `.atomic-replace-tmp` copy+rename fallback file
+    /// left in an output directory by a dead PID is reclaimed by a later run's
+    /// sweep — without disturbing the real published outputs beside it. These
+    /// files live next to `dest`, not under `_staging`, so before this fix no
+    /// sweep ever reached them.
+    #[test]
+    fn orphaned_atomic_replace_tmp_with_dead_pid_is_reclaimed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // A real published output the sweep must never touch.
+        let published = root.join("part_RC_2024-01.jsonl");
+        fs::write(&published, b"{\"id\":\"abc\"}\n").unwrap();
+
+        // A PID that is not live: huge, and not a multiple-of-4 Windows PID.
+        let dead_pid = u32::MAX - 1;
+        let leftover =
+            write_atomic_replace_tmp(root, "part_RC_2024-01.jsonl", dead_pid, 0, now_nanos());
+
+        let swept = sweep_stale_inprogress(root, true).unwrap();
+        assert_eq!(
+            swept, 1,
+            "the orphaned .atomic-replace-tmp leftover is swept"
+        );
+        assert!(
+            !leftover.exists(),
+            "dead-PID .atomic-replace-tmp fallback file was reclaimed"
+        );
+        assert!(
+            published.exists(),
+            "the published output beside it must be left in place"
+        );
+    }
+
+    /// A `.atomic-replace-tmp` leftover owned by *this* live process is never
+    /// swept — it may belong to a copy+rename fallback in progress right now.
+    #[test]
+    fn atomic_replace_tmp_owned_by_self_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let own =
+            write_atomic_replace_tmp(root, "out.jsonl", std::process::id(), 0, now_nanos());
+
+        let swept = sweep_stale_inprogress(root, true).unwrap();
+        assert_eq!(swept, 0, "a self-owned fallback leftover is never swept");
+        assert!(
+            own.exists(),
+            "self-owned .atomic-replace-tmp survived the sweep"
+        );
+    }
+
+    /// `sweep_stale_atomic_replace_tmp` reclaims leftovers from a nested output
+    /// directory (e.g. a partitioned export's `comments/` dir) that the
+    /// `out_root`-level scan in `sweep_stale_inprogress` does not reach.
+    #[test]
+    fn sweep_atomic_replace_tmp_reclaims_nested_dir_leftovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("comments");
+        fs::create_dir_all(&nested).unwrap();
+
+        let dead_pid = u32::MAX - 1;
+        let leftover =
+            write_atomic_replace_tmp(&nested, "RC_2024-01.jsonl", dead_pid, 0, now_nanos());
+
+        let swept = sweep_stale_atomic_replace_tmp(&nested, true).unwrap();
+        assert_eq!(swept, 1, "the nested-dir fallback leftover is swept");
+        assert!(
+            !leftover.exists(),
+            "nested .atomic-replace-tmp was reclaimed"
+        );
     }
 }

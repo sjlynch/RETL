@@ -23,7 +23,7 @@ mod writer;
 pub const STAGING_DIR_NAME: &str = "_staging";
 
 pub(crate) use naming::{unique_inprogress_path, INPROGRESS_EXT};
-pub use sweep::sweep_stale_inprogress;
+pub use sweep::{sweep_stale_atomic_replace_tmp, sweep_stale_inprogress};
 #[cfg(test)]
 #[allow(unused_imports)]
 pub(crate) use testing::{set_stage_path_observer_for_tests, StagePathObserverGuard};
