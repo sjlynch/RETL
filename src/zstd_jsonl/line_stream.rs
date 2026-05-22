@@ -248,12 +248,21 @@ fn for_each_line_attempt<'borrow, 'cb: 'borrow>(
         let n = match read_line_capped(&mut reader, &mut buf, DEFAULT_MAX_LINE_BYTES, path) {
             Ok(n) => n,
             Err(e) => {
-                let is_line_cap = e.kind() == io::ErrorKind::InvalidData
-                    && e.to_string().contains("max_line_bytes");
-                if is_line_cap {
+                // `read_line_capped` marks *both* record-level faults — the
+                // line-length cap and an invalid-UTF-8 line — with an
+                // `InvalidLineError` payload. Classify either as `InvalidLine`
+                // (fatal even under `AllowPartial`) by downcasting the marker
+                // rather than string-matching the message: a UTF-8 error's
+                // message does not mention `max_line_bytes`, so the old
+                // substring check let it fall through to `Decode` and be
+                // mistaken for a tolerated zstd-frame skip.
+                let is_invalid_line = e
+                    .get_ref()
+                    .map_or(false, |inner| inner.is::<InvalidLineError>());
+                if is_invalid_line {
                     return Err(LineStreamAttemptError::InvalidLine(
                         anyhow::Error::new(e).context(format!(
-                            "read zstd JSONL line from {} with max_line_bytes={}",
+                            "read zstd JSONL line from {} (max_line_bytes={})",
                             path.display(),
                             DEFAULT_MAX_LINE_BYTES
                         )),
