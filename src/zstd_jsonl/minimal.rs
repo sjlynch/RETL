@@ -10,7 +10,7 @@ use std::sync::{
 use zstd::stream::read::Decoder;
 
 use crate::mem::maybe_throttle_low_memory;
-use crate::ndjson::{read_line_capped, DEFAULT_MAX_LINE_BYTES};
+use crate::ndjson::{read_line_capped, InvalidLineError, DEFAULT_MAX_LINE_BYTES};
 
 /// Prevents "Frame requires too much memory" on large Reddit dumps.
 ///

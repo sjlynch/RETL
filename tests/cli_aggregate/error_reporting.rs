@@ -102,6 +102,47 @@ fn aggregate_reports_each_failed_input_by_filename() {
 }
 
 #[test]
+fn aggregate_strict_fails_on_any_fatal_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let good_a = dir.path().join("good-a.jsonl");
+    let good_b = dir.path().join("good-b.jsonl");
+    let bad = dir.path().join("bad-input.jsonl");
+    let out = dir.path().join("counts.json");
+    write_jsonl(&good_a, &[json!({"id":"a"})]);
+    write_jsonl(&good_b, &[json!({"id":"b"})]);
+    fs::write(&bad, "not-json\n").unwrap();
+
+    // The same 2-good/1-bad batch succeeds 2/3 without `--strict` (see
+    // `aggregate_reports_each_failed_input_by_filename`). `--strict` turns the
+    // single fatal input into a hard failure: non-zero exit, no output.
+    retl()
+        .args([
+            "aggregate",
+            "--strict",
+            "--no-progress",
+            "--out",
+            out.to_str().unwrap(),
+            good_a.to_str().unwrap(),
+            bad.to_str().unwrap(),
+            good_b.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("bad-input.jsonl")
+                .and(predicate::str::contains("aggregate --strict"))
+                .and(predicate::str::contains(
+                    "1 of 3 input(s) failed during shard build",
+                )),
+        );
+
+    assert!(
+        !out.exists(),
+        "strict mode must not publish output when an input is fatal"
+    );
+}
+
+#[test]
 fn aggregate_reports_partial_read_and_does_not_merge_it() {
     let dir = tempfile::tempdir().unwrap();
     let good = dir.path().join("good.jsonl");

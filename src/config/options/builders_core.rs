@@ -90,6 +90,14 @@ impl ETLOptions {
         self
     }
 
+    /// Fail the whole aggregate run when any input is fatal, instead of
+    /// reporting it and merging the surviving shards. See
+    /// [`ETLOptions::aggregate_strict`].
+    pub fn with_aggregate_strict(mut self, yes: bool) -> Self {
+        self.aggregate_strict = yes;
+        self
+    }
+
     pub fn with_parallelism(mut self, threads: usize) -> Self {
         self.parallelism = Some(clamp_parallelism_threads(
             threads,

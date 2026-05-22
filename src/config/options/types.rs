@@ -14,6 +14,13 @@ pub struct ETLOptions {
     pub whitelist_fields: Option<Vec<String>>,
     pub strict_whitelist: bool, // fail instead of warn when whitelisted keys match nothing
     pub strict_key: bool,       // fail dedupe when matching records lack the requested key
+    /// Fail the whole aggregate run when any input is fatal (open error,
+    /// malformed JSON, shard write failure). Default `false` keeps the
+    /// historical tolerant behavior: a fatal input is reported but the run
+    /// still merges whatever shards succeeded. Honored by
+    /// [`RedditETL::aggregate_jsonls_parallel`]; the `retl aggregate --strict`
+    /// flag enforces the same rule on the CLI path.
+    pub aggregate_strict: bool,
     pub parallelism: Option<usize>, // Some(N) to set rayon threads (clamped), None to use default
     pub work_dir: Option<PathBuf>, // if None, create in base_dir/.reddit_etl_work/
     pub file_concurrency: usize, // limit monthly files processed concurrently, clamped to MAX_FILE_CONCURRENCY
