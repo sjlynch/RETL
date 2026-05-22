@@ -9,12 +9,13 @@
 //! preserved; new labels may pick fresh seeds, but **do not edit existing
 //! label seeds**.
 
-use ahash::RandomState;
+use crate::ndjson::{read_line_capped, DEFAULT_MAX_LINE_BYTES};
+use ahash::{AHashSet, RandomState};
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
 use std::fs::File;
 use std::hash::{BuildHasher, Hash, Hasher};
-use std::io::{BufWriter, Write};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 /// Construct a deterministic [`RandomState`] for a given module label.
@@ -84,4 +85,56 @@ pub(crate) fn flush_line_shard_writers(writers: &LineShardWriters) -> Result<()>
         writer.lock().flush()?;
     }
     Ok(())
+}
+
+/// Read a line-oriented shard file, collapse duplicate lines into a hash set,
+/// and write the unique lines back to `output`. Returns the unique line count.
+///
+/// `sort` controls the on-disk ordering of the output:
+/// - `true` — sort the unique lines (`sort_unstable`) for a deterministic
+///   layout. Used by [`crate::shard::ShardedWriter`].
+/// - `false` — write them in unspecified `AHashSet` iteration order. Used by
+///   the parent-id `dedupe` stage, which never needs a sorted shard.
+///
+/// `ShardedWriter` and the parent-id dedupe stage previously kept two
+/// copy-paste-derived dedup loops that had silently drifted (one sorted, one
+/// did not); both now route through this single helper so they cannot diverge
+/// again.
+pub(crate) fn dedup_line_shard(input: &Path, output: &Path, sort: bool) -> Result<usize> {
+    let in_file = crate::util::open_with_default_backoff(input)
+        .with_context(|| format!("open shard for dedup: {}", input.display()))?;
+    let mut reader = BufReader::new(in_file);
+
+    let mut seen: AHashSet<String> = AHashSet::with_capacity(64_000);
+    let mut buf = String::with_capacity(16 * 1024);
+    loop {
+        let n = read_line_capped(&mut reader, &mut buf, DEFAULT_MAX_LINE_BYTES, input)
+            .with_context(|| format!("read shard for dedup: {}", input.display()))?;
+        if n == 0 {
+            break;
+        }
+        if !buf.is_empty() {
+            seen.insert(buf.clone());
+        }
+    }
+
+    let unique_count = seen.len();
+    let out_file = crate::util::create_with_default_backoff(output)
+        .with_context(|| format!("create dedup output: {}", output.display()))?;
+    let mut writer = BufWriter::new(out_file);
+    if sort {
+        let mut keys: Vec<String> = seen.into_iter().collect();
+        keys.sort_unstable();
+        for key in keys {
+            writer.write_all(key.as_bytes())?;
+            writer.write_all(b"\n")?;
+        }
+    } else {
+        for key in seen {
+            writer.write_all(key.as_bytes())?;
+            writer.write_all(b"\n")?;
+        }
+    }
+    writer.flush()?;
+    Ok(unique_count)
 }

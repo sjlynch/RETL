@@ -176,10 +176,12 @@ mod tests {
     }
 
     #[test]
-    fn strict_whitelist_ignores_slow_path_only_emissions() {
-        // A run where 100% of emissions are slow-path must NOT trip the
-        // strict_whitelist verdict because fast-path presence is the production
-        // signal used by the checker.
+    fn strict_whitelist_fires_on_slow_path_only_typo() {
+        // Regression: when 100% of records take the slow path, a genuinely
+        // typo'd field must still be flagged. Previously the entire
+        // missing-field check (and the strict zero-match error) was skipped
+        // whenever `fast_seen == 0`, so a typo on an all-slow-path corpus
+        // slipped through silently.
         let fields = vec!["not_present".to_string()];
         let tokenizer = WhitelistTokenizer::new(fields.iter().map(|s| s.as_str()));
         let tracker = WhitelistMatchTracker::new(true, fields.iter().cloned());
@@ -189,6 +191,7 @@ mod tests {
         let mut written = 0_u64;
 
         for i in 0..(WHITELIST_ZERO_MATCH_SAMPLE * 2) {
+            // A top-level array always falls back to the slow path.
             let used_slow_path = write_with_whitelist(
                 &mut out,
                 r#"[{"id":"slow"}]"#,
@@ -209,11 +212,63 @@ mod tests {
                     matched_fields: &matched_indices,
                     used_slow_path,
                 })
-                .expect("slow-path emissions must not trip strict_whitelist");
+                .expect("observe only records field presence; finalization reports misses");
+        }
+
+        let msg = tracker
+            .finalize()
+            .expect_err("an all-slow-path corpus with a typo'd field must still error")
+            .to_string();
+        assert!(
+            msg.contains("--whitelist matched zero fields") && msg.contains("not_present"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("slow-path"),
+            "verdict must note it is slow-path-derived: {msg}"
+        );
+    }
+
+    #[test]
+    fn slow_path_only_emissions_clear_a_field_they_match() {
+        // The inverse: when no record takes the fast path but the whitelisted
+        // field *is* present on the slow path (e.g. a duplicate whitelisted
+        // top-level key the tokenizer rejects as Malformed), slow-path
+        // presence is enough to clear the field — no false positive.
+        let fields = vec!["permalink".to_string()];
+        let tokenizer = WhitelistTokenizer::new(fields.iter().map(|s| s.as_str()));
+        let tracker = WhitelistMatchTracker::new(true, fields.iter().cloned());
+        let mut tokenizer_buf = String::new();
+        let mut matched_indices = Vec::new();
+        let mut out = Vec::new();
+        let mut written = 0_u64;
+
+        for i in 0..WHITELIST_ZERO_MATCH_SAMPLE {
+            let used_slow_path = write_with_whitelist(
+                &mut out,
+                r#"{"id":"x","permalink":"/a","permalink":"/b"}"#,
+                &fields,
+                &tokenizer,
+                &mut tokenizer_buf,
+                &mut matched_indices,
+                false,
+                &mut written,
+                std::path::Path::new("test.jsonl"),
+                i + 1,
+            )
+            .unwrap();
+            assert!(used_slow_path, "a duplicate whitelisted key forces the slow path");
+            assert_eq!(matched_indices, [0], "the slow path projects `permalink`");
+            tracker
+                .observe(WhitelistEmission {
+                    matched_fields: &matched_indices,
+                    used_slow_path,
+                })
+                .expect("slow-path matches must not trip strict_whitelist");
         }
         tracker
             .finalize()
-            .expect("slow-path-only emissions must not trip strict_whitelist");
+            .expect("a field matched on the slow path is cleared when there is no fast path");
     }
 
     #[test]

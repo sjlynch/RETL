@@ -68,6 +68,15 @@ impl RedditETL {
         self.opts = self.opts.with_strict_key(yes);
         self
     }
+    /// Fail the whole aggregate run when any input is fatal (open error,
+    /// malformed JSON, shard write failure). Default is the historical
+    /// tolerant behavior — a fatal input is reported but the run still merges
+    /// the surviving shards. Honored by
+    /// [`RedditETL::aggregate_jsonls_parallel`].
+    pub fn aggregate_strict(mut self, yes: bool) -> Self {
+        self.opts = self.opts.with_aggregate_strict(yes);
+        self
+    }
     pub fn parallelism(mut self, threads: usize) -> Self {
         self.opts = self.opts.with_parallelism(threads);
         self
@@ -146,6 +155,18 @@ impl RedditETL {
     /// channel) and have measured headroom.
     pub fn inflight_budget(mut self, bytes: usize) -> Self {
         self.opts = self.opts.with_inflight_budget(bytes);
+        self
+    }
+
+    /// Explicitly disable the `inflight_bytes` memory cap (producers fall back
+    /// to adaptive memory-fraction sampling).
+    ///
+    /// This is the deliberate, warning-free opt-out for that mode; passing `0`
+    /// to [`Self::inflight_bytes`] / [`Self::inflight_budget`] instead emits a
+    /// one-shot warning, since a budget computation rounding to `0` is almost
+    /// always a bug. See [`ETLOptions::disable_inflight_cap`].
+    pub fn disable_inflight_cap(mut self) -> Self {
+        self.opts = self.opts.disable_inflight_cap();
         self
     }
     /// Override the adaptive-memory policy used by bucketing/dedupe producers.

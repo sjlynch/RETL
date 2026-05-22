@@ -520,3 +520,61 @@ fn extract_to_csv_does_not_warn_when_preset_whitelist_matches_fields() {
         "a matching preset whitelist should not warn, got logs: {logs:?}"
     );
 }
+
+/// Build a comment corpus where every record carries a *duplicate* top-level
+/// `permalink` key. `permalink` is whitelisted, so the `WhitelistTokenizer`
+/// rejects every line as Malformed and the slow `serde_json::Value` path
+/// serves all of them — the run ends with `fast_seen == 0`. `permalink` is not
+/// a `MinimalRecord` field, so `parse_minimal` still accepts each line.
+fn make_corpus_with_duplicate_permalink(n: usize) -> std::path::PathBuf {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.keep();
+    let rc_path = base.join("comments").join("RC_2006-01.zst");
+    fs::create_dir_all(rc_path.parent().unwrap()).unwrap();
+    fs::create_dir_all(base.join("submissions")).unwrap();
+
+    let mut lines: Vec<String> = Vec::with_capacity(n);
+    for i in 0..n {
+        let ts = 1136073600_i64 + i as i64;
+        lines.push(format!(
+            "{{\"id\":\"rc{i:08}\",\"author\":\"alice\",\"subreddit\":\"programming\",\"created_utc\":{ts},\"body\":\"hi\",\"permalink\":\"/a\",\"permalink\":\"/b\"}}"
+        ));
+    }
+    write_zst_lines(&rc_path, &lines);
+    base
+}
+
+/// Regression: a typo'd `--whitelist` field must still be flagged even when
+/// 100% of records take the slow path. The duplicate whitelisted `permalink`
+/// key forces every line through the slow `serde_json::Value` projection, so
+/// `fast_seen` never leaves 0; before the fix the whole missing-field check
+/// (including this strict error) was skipped, hiding the typo.
+#[test]
+fn strict_whitelist_fires_on_all_slow_path_corpus() {
+    let base = make_corpus_with_duplicate_permalink(8);
+    let out = base.join("all_slow_typo.jsonl");
+
+    let err = RedditETL::new()
+        .base_dir(&base)
+        .sources(Sources::Comments)
+        .progress(false)
+        .whitelist_fields(["permalink", "not_a_real_field"])
+        .strict_whitelist(true)
+        .scan()
+        .extract_to_jsonl(&out)
+        .unwrap_err();
+
+    let chain = format!("{err:#}");
+    assert!(
+        chain.contains("not_a_real_field"),
+        "strict whitelist must flag the typo'd field on an all-slow-path corpus: {chain}"
+    );
+    assert!(
+        chain.contains("slow-path"),
+        "verdict should note it is slow-path-derived: {chain}"
+    );
+    assert!(
+        !out.exists(),
+        "strict whitelist failure must not publish output"
+    );
+}

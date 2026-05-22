@@ -175,7 +175,8 @@ pub use crate::obs::{
 
 pub use crate::config::{
     max_parallelism_limit, ConfigBuildError, ETLOptions, PartialReadReport, PartialReadReporter,
-    SkippedFile, Sources, MAX_FILE_CONCURRENCY, MAX_RAYON_THREADS, MAX_SHARDS,
+    SkippedFile, Sources, MAX_FILE_CONCURRENCY, MAX_IO_BUFFER, MAX_RAYON_THREADS, MAX_SHARDS,
+    MIN_IO_BUFFER,
 };
 pub use crate::corpus_manifest::{
     CorpusAvailability, CorpusLocalStatus, CorpusManifest, CorpusManifestError, CorpusManifestFile,

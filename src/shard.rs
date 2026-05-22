@@ -1,14 +1,12 @@
 pub use crate::username_stream::UsernameStream;
 
 use crate::config::clamp_shard_count;
-use crate::ndjson::{read_line_capped, DEFAULT_MAX_LINE_BYTES};
 use crate::shard_common;
 use crate::util::unique_scratch_dir;
 use ahash::RandomState;
 use anyhow::{Context, Result};
 use rayon::prelude::*;
-use std::collections::HashSet;
-use std::io::{BufReader, BufWriter, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// Disk-backed sharded dedup writer: concurrent-safe.
@@ -105,46 +103,17 @@ impl ShardedWriter {
                         .to_string_lossy()
                         .replace(".tmp", ".txt"),
                 );
-                dedup_single_shard(shard_path, &out_path)?;
+                // `sort = true`: `ShardedWriter` shards are consumed by
+                // sorted-merge downstream, so the deduped output is sorted.
+                // Shares `shard_common::dedup_line_shard` with the parent-id
+                // dedupe stage (which passes `sort = false`).
+                shard_common::dedup_line_shard(shard_path, &out_path, true)?;
                 Ok(out_path)
             })
             .collect::<Result<Vec<_>>>()?;
 
         Ok((deduped, run_root))
     }
-}
-
-fn dedup_single_shard(input: &Path, output: &Path) -> Result<()> {
-    let in_file = crate::util::open_with_default_backoff(input)
-        .with_context(|| format!("open shard for dedup: {}", input.display()))?;
-    let mut reader = BufReader::new(in_file);
-
-    let out_file = crate::util::create_with_default_backoff(output)
-        .with_context(|| format!("create dedup output: {}", output.display()))?;
-    let mut writer = BufWriter::new(out_file);
-
-    let mut seen: HashSet<String> = HashSet::with_capacity(64_000);
-
-    let mut buf = String::with_capacity(8 * 1024);
-    loop {
-        let n = read_line_capped(&mut reader, &mut buf, DEFAULT_MAX_LINE_BYTES, input)
-            .with_context(|| format!("read shard for dedup: {}", input.display()))?;
-        if n == 0 {
-            break;
-        }
-        if !buf.is_empty() {
-            seen.insert(buf.clone());
-        }
-    }
-
-    let mut keys: Vec<String> = seen.into_iter().collect();
-    keys.sort_unstable();
-    for key in keys {
-        writer.write_all(key.as_bytes())?;
-        writer.write_all(b"\n")?;
-    }
-    writer.flush()?;
-    Ok(())
 }
 
 #[cfg(test)]

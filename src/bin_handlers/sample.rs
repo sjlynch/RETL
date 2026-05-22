@@ -1,5 +1,30 @@
 
+/// Reject `--format`-specific sample flags that would otherwise be silent
+/// no-ops, matching `export`'s `reject_inapplicable_export_format_flags` /
+/// `reject_unsupported_tabular_flags`. `--pretty` only field-indents the
+/// `json` array; `--human-timestamps` is unsupported for the CSV/TSV tabular
+/// formats (the library's `extract_to_tabular` enforces the same contract,
+/// but failing here keeps the error close to the flag). `sample` has no
+/// `--resume` / `--zst-level` flags, so only these two need checking.
+fn reject_inapplicable_sample_flags(args: &SampleArgs) -> Result<()> {
+    if args.pretty && !matches!(args.format, ExportFmt::Json) {
+        anyhow::bail!(
+            "--pretty only applies to --format json (it field-indents the JSON array); \
+             --format {} ignores it",
+            export_format_name(args.format)
+        );
+    }
+    if args.human_timestamps && matches!(args.format, ExportFmt::Csv | ExportFmt::Tsv) {
+        anyhow::bail!(
+            "--human-timestamps is not supported for CSV/TSV sample output; \
+             use --format jsonl/json/spool/zst/partitioned-jsonl or omit the flag"
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn run_sample(args: SampleArgs) -> Result<()> {
+    reject_inapplicable_sample_flags(&args)?;
     let mut etl = build_etl(&args.common)?;
     if !args.whitelist.is_empty() {
         if args.whitelist.iter().all(|field| field.trim().is_empty()) {
@@ -66,7 +91,9 @@ pub(crate) fn run_sample(args: SampleArgs) -> Result<()> {
         }
         ExportFmt::Spool => {
             if to_stdout {
-                anyhow::bail!("--out - is not valid for --format spool (it expects a directory)");
+                anyhow::bail!(
+                    "--format spool requires an explicit --out <DIR> (it writes one part file per month, not a stream)"
+                );
             }
             retl::create_dir_all_with_default_backoff(&args.out)
                 .with_context(|| format!("creating spool dir {}", args.out.display()))?;
@@ -80,7 +107,7 @@ pub(crate) fn run_sample(args: SampleArgs) -> Result<()> {
         ExportFmt::Zst | ExportFmt::PartitionedJsonl => {
             if to_stdout {
                 anyhow::bail!(
-                    "--out - is not valid for --format {} (it expects a directory)",
+                    "--format {} requires an explicit --out <DIR> (it writes a partitioned corpus tree, not a stream)",
                     export_format_name(args.format)
                 );
             }

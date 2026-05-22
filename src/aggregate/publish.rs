@@ -12,7 +12,11 @@ impl RedditETL {
     ///
     /// Returns an [`AggregateBuildReport`] naming clean, partial, and fatal
     /// inputs. If every non-empty input fails to produce a merged shard, no
-    /// final output is published and an error is returned.
+    /// final output is published and an error is returned. When
+    /// [`ETLOptions::aggregate_strict`](crate::ETLOptions::aggregate_strict) is
+    /// set (via [`RedditETL::aggregate_strict`]), *any* fatal input fails the
+    /// whole run before publishing — a mistyped path in a multi-file batch can
+    /// no longer slip through as a partial success.
     pub fn aggregate_jsonls_parallel<A: Aggregator>(
         &self,
         inputs: Vec<PathBuf>,
@@ -28,6 +32,17 @@ impl RedditETL {
             anyhow::bail!(
                 "aggregate failed: {} of {} input(s) failed or were partial; 0 shard(s) merged",
                 report.problem_count(),
+                input_count
+            );
+        }
+        // Strict mode: any fatal input fails the whole run before publishing,
+        // so a mistyped input path in a 12-file batch can't silently produce a
+        // successful 11/12 result. Each fatal input was already named via
+        // `tracing::warn!` during shard build.
+        if self.opts.aggregate_strict && report.fatal_count() > 0 {
+            anyhow::bail!(
+                "aggregate strict mode: {} of {} input(s) failed during shard build; no output published (clear --strict / aggregate_strict to merge the surviving shards)",
+                report.fatal_count(),
                 input_count
             );
         }
@@ -51,6 +66,7 @@ impl RedditETL {
         counts.insert("partial_inputs".to_string(), report.partial_count() as u64);
         counts.insert("fatal_inputs".to_string(), report.fatal_count() as u64);
         counts.insert("merged_shards".to_string(), report.merged_shards as u64);
+        counts.insert("records_ingested".to_string(), report.records_ingested);
         let mut manifest = RunManifestInput::new("aggregate_jsonls_parallel");
         manifest.start = manifest_start;
         manifest.api_operation = Some("RedditETL::aggregate_jsonls_parallel".to_string());
@@ -58,6 +74,7 @@ impl RedditETL {
         manifest.options = serde_json::json!({
             "pretty": pretty,
             "partial_read_policy": "strict",
+            "aggregate_strict": self.opts.aggregate_strict,
             "shards_dir": crate::run_manifest::path_to_stable_string(shards_dir),
             "parallelism": self.opts.parallelism,
             "progress": self.opts.progress,
@@ -180,6 +197,20 @@ impl RedditETL {
 
             Ok((total, report))
         });
+
+        // A run that merged shards but ingested zero records is otherwise
+        // presented as a successful aggregation with no signal. That is almost
+        // always a wrong input path or an empty spool directory, so warn once
+        // here — covering every caller (publish and collect, library and CLI).
+        if let Ok((_, report)) = &outcome {
+            if report.ingested_zero_records() {
+                tracing::warn!(
+                    merged_shards = report.merged_shards,
+                    "aggregate merged {} shard(s) but ingested 0 record(s); the result is an empty aggregation — verify the inputs point at non-empty JSONL",
+                    report.merged_shards
+                );
+            }
+        }
 
         // Success and panic both let `run_scratch` clean up on drop. Only a
         // returned `Err` is left for post-mortem inspection.

@@ -359,7 +359,8 @@ fn bucketing_partition_stage1_with_key_stats_counts_unkeyable_lines() {
         "both unkeyable lines must be counted as key-extraction failures"
     );
 
-    // The no-counter entry point still drops the same lines, just silently.
+    // The no-counter entry point still drops the same lines (no `AtomicU64`
+    // count surfaced), but the router now emits one summary `tracing::warn!`.
     let shards = partition_stage1(
         std::slice::from_ref(&in_path.to_path_buf()),
         &dir.path().join("out2"),

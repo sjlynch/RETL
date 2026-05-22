@@ -9,9 +9,9 @@ pub(crate) struct FirstSeenArgs {
     pub(crate) common: CommonOpts,
     #[command(flatten)]
     pub(crate) query: QueryOpts,
-    /// Output TSV file: `<author>\t<earliest_created_utc>` per line.
-    /// Use `-` for stdout.
-    #[arg(long, short)]
+    /// Output TSV file: `<author>\t<earliest_created_utc>` per line
+    /// (default stdout; `-` also means stdout).
+    #[arg(long, short, default_value = "-")]
     pub(crate) out: PathBuf,
     /// Stop after approximately N matching records have been scanned.
     /// With file_concurrency >1, already-running workers may emit a bounded over-shoot.

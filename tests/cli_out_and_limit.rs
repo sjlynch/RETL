@@ -92,6 +92,33 @@ fn first_seen_out_dash_streams_to_stdout_without_creating_dash_file() {
     );
 }
 
+#[test]
+fn aggregate_out_dash_streams_to_stdout_without_creating_dash_file() {
+    let cwd = tempfile::tempdir().unwrap();
+    let input = cwd.path().join("input.jsonl");
+    std::fs::write(&input, "{\"subreddit\":\"rust\"}\n{\"subreddit\":\"rust\"}\n").unwrap();
+
+    retl()
+        .current_dir(cwd.path())
+        .arg("aggregate")
+        .arg(&input)
+        .args([
+            "--shards-dir",
+            cwd.path().join("shards").to_str().unwrap(),
+            "--no-progress",
+            "--out",
+            "-",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("\"count\""));
+
+    assert!(
+        !cwd.path().join("-").exists(),
+        "`aggregate --out -` must stream to stdout, not stage-and-rename a file named `-`"
+    );
+}
+
 // --- `--limit` parity -------------------------------------------------------
 
 #[test]

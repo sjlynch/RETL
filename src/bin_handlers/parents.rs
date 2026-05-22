@@ -1,4 +1,8 @@
 
+/// Default `--window-months` slack used by spool mode when the flag is
+/// omitted. Direct-ID mode rejects the flag instead of defaulting it.
+const DEFAULT_WINDOW_MONTHS: u32 = 3;
+
 pub(crate) fn run_parents(args: ParentsArgs) -> Result<()> {
     let has_spool = args.spool.is_some();
     let has_direct_ids = !args.ids_file.is_empty() || !args.parent_id.is_empty();
@@ -23,6 +27,7 @@ fn run_parents_spool(args: ParentsArgs) -> Result<()> {
         anyhow::bail!("--id-kind is only used with --ids-file/--parent-id direct-ID mode");
     }
 
+    let window_months = args.window_months.unwrap_or(DEFAULT_WINDOW_MONTHS);
     let manifest_start = RunManifestStart::now();
     let spool = args
         .spool
@@ -33,7 +38,7 @@ fn run_parents_spool(args: ParentsArgs) -> Result<()> {
 
     let mut wstart = min_ym;
     let mut wend = max_ym;
-    for _ in 0..args.window_months {
+    for _ in 0..window_months {
         if let Some(p) = wstart.prev() {
             wstart = p;
         }
@@ -95,7 +100,7 @@ fn run_parents_spool(args: ParentsArgs) -> Result<()> {
             "data_dir": path_to_stable_string(&args.data_dir),
             "work_dir": path_to_stable_string(&args.work_dir),
             "resume": args.resume,
-            "window_months": args.window_months,
+            "window_months": window_months,
             "resolved_range": { "start": wstart.to_string(), "end": wend.to_string() },
             "parent_payload": {
                 "full_record": parent_payload_spec.is_full_record(),
@@ -126,7 +131,7 @@ fn run_parents_spool(args: ParentsArgs) -> Result<()> {
             resolved = stats.resolved,
             unresolved = stats.unresolved,
             unresolved_rate = stats.unresolved_rate(),
-            window_months = args.window_months,
+            window_months,
             "more than 5% of parent lookups were unresolved; consider a larger --window-months"
         );
     }
@@ -144,6 +149,15 @@ fn run_parents_spool(args: ParentsArgs) -> Result<()> {
 }
 
 fn run_parents_direct(args: ParentsArgs) -> Result<()> {
+    // `--window-months` only shapes spool mode's discovered-range slack.
+    // Direct-ID mode scopes its scan with `--start`/`--end` (or scans all
+    // discovered months), so the flag would be silently ignored here. Reject
+    // it, mirroring how `run_parents_spool` rejects `--start`/`--end`/`--id-kind`.
+    if args.window_months.is_some() {
+        anyhow::bail!(
+            "--window-months only applies to --spool mode; direct parent-ID resolution scopes its scan with --start/--end (or scans all discovered months when omitted)"
+        );
+    }
     if let (Some(start), Some(end)) = (args.start, args.end) {
         if start > end {
             anyhow::bail!("invalid date range: start {start} is after end {end}");

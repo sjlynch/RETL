@@ -62,9 +62,11 @@ pub(crate) struct ParentsArgs {
     #[arg(long)]
     pub(crate) resume: bool,
     /// Spool mode only: months of slack added on each side of the spool's
-    /// date range when scanning the corpus to resolve parent payloads.
-    #[arg(long, default_value_t = 3)]
-    pub(crate) window_months: u32,
+    /// date range when scanning the corpus to resolve parent payloads
+    /// (default 3). Rejected in `--ids-file`/`--parent-id` direct-ID mode,
+    /// which scopes its scan with `--start`/`--end` instead.
+    #[arg(long, value_name = "MONTHS")]
+    pub(crate) window_months: Option<u32>,
     /// Top-level parent fields to attach under `parent` (comma-separated,
     /// repeatable). Defaults to body,title,selftext for backwards-compatible
     /// output.

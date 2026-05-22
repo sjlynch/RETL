@@ -26,13 +26,15 @@ pub(crate) struct DescribeArgs {
     #[arg(long)]
     pub(crate) schema: bool,
 
-    /// Records sampled per selected month when --schema is set.
-    #[arg(long = "schema-sample", default_value_t = 100)]
-    pub(crate) schema_sample: usize,
+    /// Records sampled per selected month (default 100). Only valid with
+    /// `--schema`; rejected otherwise because it would have no effect.
+    #[arg(long = "schema-sample", value_name = "N")]
+    pub(crate) schema_sample: Option<usize>,
 
-    /// Schema output format when --schema is set.
-    #[arg(long = "schema-format", visible_alias = "format", value_enum, default_value_t = SchemaFmt::Tsv)]
-    pub(crate) schema_format: SchemaFmt,
+    /// Schema output format (default tsv). Only valid with `--schema`;
+    /// rejected otherwise because it would have no effect.
+    #[arg(long = "schema-format", visible_alias = "format", value_enum)]
+    pub(crate) schema_format: Option<SchemaFmt>,
 
     /// Compare the requested --start/--end/--source against a corpus manifest.
     #[arg(long)]

@@ -35,8 +35,9 @@ pub(crate) struct AggregateArgs {
     /// JSONL input files to aggregate. Omit when using `--spool`.
     #[arg(num_args = 1.., value_name = "INPUTS")]
     pub(crate) inputs: Vec<PathBuf>,
-    /// Output path. Without `--by`, writes JSON record-count state; with `--by`, writes TSV.
-    #[arg(long, short)]
+    /// Output path (default stdout; `-` also means stdout). Without `--by`,
+    /// writes JSON record-count state; with `--by`, writes TSV.
+    #[arg(long, short, default_value = "-")]
     pub(crate) out: PathBuf,
     /// Directory used for per-run aggregate shard namespaces (default:
     /// alongside `--out`).
@@ -60,6 +61,13 @@ pub(crate) struct AggregateArgs {
     /// exact decimal, and default decimal output no longer rounds to six places.
     #[arg(long)]
     pub(crate) scientific: bool,
+    /// Fail the whole run (non-zero exit, no output written) when any input
+    /// fails during shard build — an open error, malformed JSON, or shard
+    /// write failure. Without this flag a failed input is reported on stderr
+    /// but the run still succeeds with the surviving inputs, so a mistyped
+    /// path in a multi-file batch is easy to miss in a scripted pipeline.
+    #[arg(long)]
+    pub(crate) strict: bool,
     /// Hidden compatibility trap: aggregate reduces materialized inputs and is
     /// intentionally not resumable.
     #[arg(long, hide = true)]

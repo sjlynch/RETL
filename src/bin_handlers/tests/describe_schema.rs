@@ -111,6 +111,53 @@ fn describe_skips_invalid_month_filenames() {
 }
 
 #[test]
+fn describe_schema_runs_with_explicit_schema_format_flags() {
+    // `--schema-sample` / `--schema-format` (here via its `--format` alias)
+    // are honored when `--schema` is set.
+    let base = make_multi_month_corpus(&[YearMonth::new(2006, 1)]);
+    let out = describe_stdout(describe_args(&[
+        "--data-dir",
+        base.to_str().unwrap(),
+        "--schema",
+        "--schema-sample",
+        "1",
+        "--format",
+        "json",
+    ]));
+    assert!(
+        out.trim_start().starts_with('['),
+        "schema --format json should emit a JSON array, got: {out}"
+    );
+}
+
+#[test]
+fn describe_rejects_schema_format_without_schema() {
+    // Without `--schema`, `describe` prints the plain discovery table; the
+    // schema-only `--format`/`--schema-format` flag must be rejected, not
+    // silently ignored.
+    let args = describe_args(&["--format", "json"]);
+    let mut buf = Vec::new();
+    let err =
+        run_describe_to(args, &mut buf).expect_err("--format without --schema must be rejected");
+    assert!(
+        format!("{err}").contains("--schema-format/--format only applies"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn describe_rejects_schema_sample_without_schema() {
+    let args = describe_args(&["--schema-sample", "50"]);
+    let mut buf = Vec::new();
+    let err = run_describe_to(args, &mut buf)
+        .expect_err("--schema-sample without --schema must be rejected");
+    assert!(
+        format!("{err}").contains("--schema-sample only applies"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
 fn schema_reports_top_level_fields_as_tsv() {
     // Build a single-month rs-only corpus inline; schema's contract is
     // about the *type* and *presence* of top-level fields, not the

@@ -12,14 +12,18 @@ pub(crate) struct ExportArgs {
     /// Output format.
     #[arg(long, value_enum, default_value_t = ExportFmt::Jsonl)]
     pub(crate) format: ExportFmt,
-    /// Output destination — file for `jsonl`/`json` (use `-` for stdout),
-    /// directory for `spool`/`zst`/`partitioned-jsonl`.
-    #[arg(long, short)]
+    /// Output destination — file for `jsonl`/`json` (default stdout; `-` also
+    /// means stdout), directory for `spool`/`zst`/`partitioned-jsonl` (those
+    /// formats require an explicit `--out <DIR>`).
+    #[arg(long, short, default_value = "-")]
     pub(crate) out: PathBuf,
-    /// Field-indent the JSON array (only with `--format json`).
+    /// Field-indent the JSON array (only with `--format json`; rejected for
+    /// every other format because it would have no effect).
     #[arg(long)]
     pub(crate) pretty: bool,
-    /// zstd compression level for `.zst` outputs. Clamped to 1..=22 by the library.
+    /// zstd compression level for `.zst` outputs. Clamped to 1..=22 by the
+    /// library. Only valid with `--format zst`; rejected for other formats
+    /// because they produce no `.zst` output.
     #[arg(long)]
     pub(crate) zst_level: Option<i32>,
     /// Whitelist of top-level fields to keep on export. Comma-separated, repeatable.

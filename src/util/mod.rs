@@ -33,6 +33,9 @@ pub use backoff::{
 #[allow(unused_imports)]
 pub(crate) use backoff::create_dir_with_backoff;
 pub(crate) use backoff::create_dir_with_default_backoff;
+// Suffix on `replace_file_atomic_backoff`'s copy+rename fallback siblings;
+// `atomic_write`'s stale sweep matches it to reclaim orphaned leftovers.
+pub(crate) use backoff::ATOMIC_REPLACE_TMP_EXT;
 // `TestIoFailureGuard` is returned by the injectors below and only ever bound
 // as `_guard` by callers; the re-export is required so its type stays nameable
 // at `crate::util::TestIoFailureGuard`.

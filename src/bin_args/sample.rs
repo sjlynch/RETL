@@ -18,7 +18,8 @@ pub(crate) struct SampleArgs {
     /// Maximum matching records to emit. With file_concurrency >1, already-running workers may overshoot slightly.
     #[arg(long, visible_alias = "head", default_value_t = 10)]
     pub(crate) limit: u64,
-    /// Field-indent the JSON array (only with `--format json`).
+    /// Field-indent the JSON array (only with `--format json`; rejected for
+    /// every other format because it would have no effect).
     #[arg(long)]
     pub(crate) pretty: bool,
     /// Whitelist of top-level fields to keep. Required for csv/tsv.

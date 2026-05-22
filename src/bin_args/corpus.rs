@@ -21,7 +21,9 @@ pub(crate) enum CorpusCommand {
 #[derive(Args, Debug)]
 pub(crate) struct CorpusPlanArgs {
     /// Destination corpus base dir that will contain comments/ and submissions/.
-    #[arg(long, default_value = "./data")]
+    /// `--data-dir` is accepted as an alias so the same flag name works across
+    /// `corpus plan`, `describe`, `integrity`, and the scan-family subcommands.
+    #[arg(long, visible_alias = "data-dir", default_value = "./data")]
     pub(crate) dest: PathBuf,
 
     /// Inclusive start month (YYYY-MM).

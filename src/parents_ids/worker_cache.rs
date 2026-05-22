@@ -30,8 +30,23 @@ impl<V: serde::de::DeserializeOwned + Clone> WorkerShardCache<V> {
             let file = crate::util::open_with_default_backoff(path)
                 .with_context(|| format!("open parent shard {}", path.display()))?;
             let rdr = BufReader::new(file);
-            let map: HashMap<String, V> = serde_json::from_reader(rdr)
-                .with_context(|| format!("parse parent shard {}", path.display()))?;
+            // A corrupt/truncated cached shard JSON would otherwise fail
+            // attach for *every* input with an error naming only the shard
+            // path. Name it explicitly as resolver-cache corruption and give
+            // the one-line recovery: delete that shard and re-run with
+            // --resume so the resolver rebuilds just that shard (the resolver
+            // resume path in `build_id_shard_index` already validates and
+            // rebuilds corrupt resolver shards).
+            let map: HashMap<String, V> = serde_json::from_reader(rdr).map_err(|e| {
+                anyhow::anyhow!(
+                    "parent cache shard {} is corrupt: could not parse it as JSON ({e}). \
+                     This is a damaged file in the resolver parent cache, not a problem with \
+                     your input spool — delete {} and re-run with --resume to rebuild just \
+                     that shard.",
+                    path.display(),
+                    path.display(),
+                )
+            })?;
             self.cache.insert(path.to_path_buf(), map);
             self.order.push_back(path.to_path_buf());
         }

@@ -339,7 +339,8 @@ retl describe --data-dir ./data --source both --start 2016-01 --end 2016-12
 # total                          24              146913578024      0                    -
 ~~~
 
-Aliases: `retl ls`, `retl plan`.
+Alias: `retl ls`. (The former `retl plan` alias was dropped because it
+collided with `retl corpus plan`, the download-acquisition checklist.)
 
 Pass `--expected` (and optionally `--manifest path/to/manifest.json`) with an
 explicit `--start` / `--end` to add a manifest comparison table showing desired
@@ -657,7 +658,11 @@ reports that path on stderr, drops that partial shard from the merged result,
 and continues with other inputs. Inputs that fail to open, contain malformed
 JSON, or fail shard publishing are reported separately as fatal build failures.
 If every input fails or is partial, the CLI exits non-zero and publishes no
-final output.
+final output. By default a *partial* batch failure (some inputs fatal, some
+fine) still succeeds with the surviving inputs — pass `--strict` to make any
+fatal input fail the whole run with a non-zero exit and no output, so a
+mistyped path in a multi-file batch can't slip through unnoticed. A run that
+merges shards but ingests zero records is also flagged with a warning.
 
 ---
 
