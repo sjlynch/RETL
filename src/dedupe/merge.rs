@@ -44,6 +44,14 @@ impl PartialEq for HeapItem {
 // Lines without a key are counted and skipped; `read_bytes` and `pb` are
 // updated on every successful read so progress accounting stays
 // consistent across the call sites below.
+//
+// `line_buf` is a single reusable buffer shared across every call: each
+// read fills it in place (`read_line_capped` reuses the backing storage),
+// so skipped no-key lines cost no allocation at all. When a keyed line is
+// found it is moved straight into the `HeapItem` and `line_buf` is re-
+// primed with an equal-capacity allocation, so the next read stays warm
+// instead of growing a fresh `String` from zero. Mirrors the reusable-
+// buffer pattern in `runs.rs` / `bucketing`.
 fn advance_reader(
     reader: &mut BufReader<File>,
     run_path: &Path,
@@ -53,10 +61,10 @@ fn advance_reader(
     line_number: &mut u64,
     pb: &ProgressScope,
     key_extractions_failed: Option<&AtomicU64>,
+    line_buf: &mut String,
 ) -> Result<Option<HeapItem>> {
     loop {
-        let mut s = String::new();
-        let n = read_line_capped(reader, &mut s, DEFAULT_MAX_LINE_BYTES, run_path).with_context(
+        let n = read_line_capped(reader, line_buf, DEFAULT_MAX_LINE_BYTES, run_path).with_context(
             || {
                 format!(
                     "read dedupe run {} near line {}",
@@ -72,15 +80,17 @@ fn advance_reader(
         *line_number += 1;
         pb.inc_bytes(n as u64);
         match key
-            .key_from_line(&s)
+            .key_from_line(line_buf.as_str())
             .map_err(|e| malformed_json_error(run_path, *line_number, e))?
         {
             Some(k) => {
+                let cap = line_buf.capacity();
+                let line = std::mem::replace(line_buf, String::with_capacity(cap));
                 return Ok(Some(HeapItem {
                     key: k,
                     run_idx,
-                    line: s,
-                }))
+                    line,
+                }));
             }
             None => note_key_extraction_failed(key_extractions_failed),
         }
@@ -152,6 +162,10 @@ pub(crate) fn merge_runs_sorted_with_key_stats(
         cfg.write_buf_bytes,
         |out_buf| -> Result<()> {
             let mut heap = BinaryHeap::<HeapItem>::new();
+            // One reusable line buffer shared by every `advance_reader` call
+            // so the merge phase never heap-allocates a fresh `String` per
+            // line (only one per emitted `HeapItem`, which it must own).
+            let mut line_buf = String::new();
 
             // Prime heap
             for i in 0..readers.len() {
@@ -165,6 +179,7 @@ pub(crate) fn merge_runs_sorted_with_key_stats(
                     line_number,
                     &pb,
                     key_extractions_failed,
+                    &mut line_buf,
                 )? {
                     heap.push(item);
                 }
@@ -190,6 +205,7 @@ pub(crate) fn merge_runs_sorted_with_key_stats(
                         line_number,
                         &pb,
                         key_extractions_failed,
+                        &mut line_buf,
                     )? {
                         heap.push(item);
                     }
@@ -211,6 +227,7 @@ pub(crate) fn merge_runs_sorted_with_key_stats(
                         line_number,
                         &pb,
                         key_extractions_failed,
+                        &mut line_buf,
                     )? {
                         heap.push(item);
                     }
