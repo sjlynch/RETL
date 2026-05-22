@@ -26,9 +26,13 @@ use super::hash::{stable_index, stage1_state, stage2_state};
 ///
 /// **Dropped lines:** a line whose routing key cannot be extracted
 /// ([`KeyExtractor::key_from_line`] returns `Ok(None)` — e.g. the keyed field
-/// is absent or null) is **silently dropped** from the output shards. When
+/// is absent or null) is dropped from the output shards. When
 /// `key_extractions_failed` is `Some`, each such drop increments the counter
 /// so callers can surface the loss (mirrors the dedupe stage's counter).
+/// Independently of that opt-in counter, one summary `tracing::warn!` is
+/// emitted before return whenever the run dropped at least one line — so the
+/// loss is never fully invisible, even on the plain `partition_stage1` /
+/// `bucketize_shards` entry points that pass `None`.
 fn route_lines_to_shards(
     inputs: &[PathBuf],
     out_dir: &Path,
@@ -51,6 +55,11 @@ fn route_lines_to_shards(
         writers.push(Mutex::new(BufWriter::new(f)));
         paths.push(p);
     }
+
+    // Tracked unconditionally — even when the caller passed `None` for
+    // `key_extractions_failed` — so the post-loop summary warning below can
+    // surface an otherwise-invisible loss.
+    let dropped = AtomicU64::new(0);
 
     inputs.par_iter().try_for_each(|p| -> Result<()> {
         let f = crate::util::open_with_default_backoff(p)
@@ -87,9 +96,11 @@ fn route_lines_to_shards(
                     w.write_all(line.as_bytes())?;
                     w.write_all(b"\n")?;
                 }
-                // No routing key: drop the line. Count it so callers using a
-                // `_with_key_stats` entry point can detect the silent loss.
+                // No routing key: drop the line. Count it locally for the
+                // summary warning, and forward to the caller's counter when a
+                // `_with_key_stats` entry point supplied one.
                 None => {
+                    dropped.fetch_add(1, Ordering::Relaxed);
                     if let Some(counter) = key_extractions_failed {
                         counter.fetch_add(1, Ordering::Relaxed);
                     }
@@ -100,6 +111,22 @@ fn route_lines_to_shards(
     })?;
     for w in &writers {
         w.lock().flush()?;
+    }
+
+    // Surface key-less drops even when no external counter was supplied:
+    // one summary warning per call (not per line), so e.g. bucketing a mixed
+    // RC+RS corpus by `json:/parent_id` — which drops every submission — is
+    // never a fully silent loss.
+    let dropped = dropped.load(Ordering::Relaxed);
+    if dropped > 0 {
+        tracing::warn!(
+            stage = file_prefix,
+            dropped_lines = dropped,
+            shards = shard_count,
+            "bucketing dropped {} line(s) with no extractable routing key; \
+             those records are absent from the output shards",
+            dropped,
+        );
     }
     Ok(paths)
 }
@@ -112,8 +139,9 @@ fn route_lines_to_shards(
 /// [`KeyExtractor::key_from_line`], which uses the `MinimalRecord` fast path
 /// for the common Reddit fields.
 ///
-/// **Dropped lines:** lines whose routing key cannot be extracted are
-/// silently dropped. Use [`partition_stage1_with_key_stats`] to count them.
+/// **Dropped lines:** lines whose routing key cannot be extracted are dropped
+/// from the output shards. A summary `tracing::warn!` fires when any line is
+/// dropped; use [`partition_stage1_with_key_stats`] to also count them.
 pub fn partition_stage1(
     inputs: &[PathBuf],
     out_dir: &Path,
@@ -153,8 +181,9 @@ pub fn partition_stage1_with_key_stats(
 /// `serde_json::Value` parse (uses [`KeyExtractor::key_from_line`]) and reads
 /// lines into a reusable `String` buffer.
 ///
-/// **Dropped lines:** lines whose routing key cannot be extracted are
-/// silently dropped. Use [`bucketize_shards_with_key_stats`] to count them.
+/// **Dropped lines:** lines whose routing key cannot be extracted are dropped
+/// from the output shards. A summary `tracing::warn!` fires when any line is
+/// dropped; use [`bucketize_shards_with_key_stats`] to also count them.
 pub fn bucketize_shards(
     shards: &[PathBuf],
     out_dir: &Path,
