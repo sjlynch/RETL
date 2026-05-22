@@ -22,10 +22,25 @@ pub(crate) fn run_describe_to(args: DescribeArgs, w: &mut dyn Write) -> Result<(
                 start: args.start,
                 end: args.end,
                 source: args.source,
-                sample_per_month: args.schema_sample,
-                format: args.schema_format,
+                sample_per_month: args.schema_sample.unwrap_or(100),
+                format: args.schema_format.unwrap_or(SchemaFmt::Tsv),
             },
             w,
+        );
+    }
+
+    // `--schema-sample` / `--schema-format` (and its `--format` alias) only
+    // shape the `--schema` output. Without `--schema`, `describe` prints the
+    // plain discovery table and would silently ignore them — reject instead so
+    // `retl describe --format json` fails loudly rather than emitting TSV.
+    if args.schema_sample.is_some() {
+        anyhow::bail!(
+            "--schema-sample only applies to `retl describe --schema`; add --schema or drop the flag"
+        );
+    }
+    if args.schema_format.is_some() {
+        anyhow::bail!(
+            "--schema-format/--format only applies to `retl describe --schema`; add --schema or drop the flag"
         );
     }
 

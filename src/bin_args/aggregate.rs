@@ -35,8 +35,9 @@ pub(crate) struct AggregateArgs {
     /// JSONL input files to aggregate. Omit when using `--spool`.
     #[arg(num_args = 1.., value_name = "INPUTS")]
     pub(crate) inputs: Vec<PathBuf>,
-    /// Output path. Without `--by`, writes JSON record-count state; with `--by`, writes TSV.
-    #[arg(long, short)]
+    /// Output path (default stdout; `-` also means stdout). Without `--by`,
+    /// writes JSON record-count state; with `--by`, writes TSV.
+    #[arg(long, short, default_value = "-")]
     pub(crate) out: PathBuf,
     /// Directory used for per-run aggregate shard namespaces (default:
     /// alongside `--out`).

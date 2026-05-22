@@ -82,7 +82,10 @@ impl Command {
 #[derive(Subcommand, Debug)]
 pub(crate) enum Command {
     /// Inspect discovered corpus months, file counts, and compressed bytes without decoding.
-    #[command(alias = "ls", alias = "plan")]
+    ///
+    /// Aliased as `retl ls`. The former `retl plan` alias was dropped because
+    /// it collided with `retl corpus plan` (the acquisition checklist).
+    #[command(alias = "ls")]
     Describe(DescribeArgs),
     /// Plan corpus acquisition from a versioned manifest.
     Corpus(CorpusArgs),
@@ -107,9 +110,10 @@ pub(crate) enum Command {
     Count(CountArgs),
     /// Validate `.zst` monthly files (quick sample or full decode).
     ///
-    /// `integrity` only reads and checks corpus files; it emits no records and
-    /// writes no provenance manifest, so the shared `--no-manifest` flag has no
-    /// effect here and passing it logs a warning.
+    /// `integrity` only reads and checks whole corpus files; it never builds a
+    /// record-level scan plan and writes no provenance manifest. The shared
+    /// record filters `--subreddit`/`--include-deleted` are therefore rejected,
+    /// and the inert `--no-manifest`/`--allow-partial` toggles log a warning.
     Integrity(IntegrityArgs),
     /// Aggregate JSONL inputs into JSON record counts or built-in TSV rollups.
     Aggregate(AggregateArgs),

@@ -21,7 +21,31 @@ fn reject_unsupported_tabular_flags(args: &ExportArgs) -> Result<()> {
     Ok(())
 }
 
+/// Reject `--format`-specific flags up front when the chosen format would
+/// make them silent no-ops. `--pretty` only field-indents the `json` array
+/// and `--zst-level` only sets the `.zst` compression level; for any other
+/// format they have no effect. Mirrors `reject_unsupported_tabular_flags` —
+/// fail close to the flag instead of accepting it and doing nothing.
+fn reject_inapplicable_export_format_flags(args: &ExportArgs) -> Result<()> {
+    if args.pretty && !matches!(args.format, ExportFmt::Json) {
+        anyhow::bail!(
+            "--pretty only applies to --format json (it field-indents the JSON array); \
+             --format {} ignores it",
+            export_format_name(args.format)
+        );
+    }
+    if args.zst_level.is_some() && !matches!(args.format, ExportFmt::Zst) {
+        anyhow::bail!(
+            "--zst-level only applies to --format zst (it sets the .zst compression level); \
+             --format {} produces no .zst output",
+            export_format_name(args.format)
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn run_export(args: ExportArgs) -> Result<()> {
+    reject_inapplicable_export_format_flags(&args)?;
     let mut etl = build_etl(&args.common)?;
     if !args.whitelist.is_empty() {
         if args.whitelist.iter().all(|field| field.trim().is_empty()) {
@@ -106,7 +130,9 @@ pub(crate) fn run_export(args: ExportArgs) -> Result<()> {
         }
         ExportFmt::Spool => {
             if to_stdout {
-                anyhow::bail!("--out - is not valid for --format spool (it expects a directory)");
+                anyhow::bail!(
+                    "--format spool requires an explicit --out <DIR> (it writes one part file per month, not a stream)"
+                );
             }
             retl::create_dir_all_with_default_backoff(&args.out)
                 .with_context(|| format!("creating spool dir {}", args.out.display()))?;
@@ -116,7 +142,7 @@ pub(crate) fn run_export(args: ExportArgs) -> Result<()> {
         ExportFmt::Zst | ExportFmt::PartitionedJsonl => {
             if to_stdout {
                 anyhow::bail!(
-                    "--out - is not valid for --format {} (it expects a directory)",
+                    "--format {} requires an explicit --out <DIR> (it writes a partitioned corpus tree, not a stream)",
                     export_format_name(args.format)
                 );
             }

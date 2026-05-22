@@ -339,7 +339,8 @@ retl describe --data-dir ./data --source both --start 2016-01 --end 2016-12
 # total                          24              146913578024      0                    -
 ~~~
 
-Aliases: `retl ls`, `retl plan`.
+Alias: `retl ls`. (The former `retl plan` alias was dropped because it
+collided with `retl corpus plan`, the download-acquisition checklist.)
 
 Pass `--expected` (and optionally `--manifest path/to/manifest.json`) with an
 explicit `--start` / `--end` to add a manifest comparison table showing desired

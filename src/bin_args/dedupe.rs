@@ -13,8 +13,9 @@ pub(crate) struct DedupeArgs {
     /// JSON pointers should reference a scalar; strings, numbers, and bools are emitted as text.
     #[arg(long, value_name = "KEY")]
     pub(crate) key: String,
-    /// Output text file, one unique key per line. Use `-` for stdout.
-    #[arg(long, short)]
+    /// Output text file, one unique key per line (default stdout; `-` also
+    /// means stdout).
+    #[arg(long, short, default_value = "-")]
     pub(crate) out: PathBuf,
     /// Stop after approximately N matching records have been scanned.
     /// With file_concurrency >1, already-running workers may emit a bounded over-shoot.

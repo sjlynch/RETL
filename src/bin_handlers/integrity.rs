@@ -5,12 +5,33 @@ pub(crate) fn run_integrity(args: IntegrityArgs) -> Result<HandlerOutcome> {
             "retl integrity does not support --resume; it validates corpus files directly. Narrow long runs with --source/--start/--end or use resumable scan/export/count workflows for record processing."
         );
     }
-    // `integrity` validates corpus files in place and never writes a
-    // provenance manifest, so `--no-manifest` (shared via `CommonOpts`) is
-    // inert here. Surface it instead of silently accepting it.
+    // `integrity` validates whole `.zst` files and never builds a record-level
+    // scan plan, so the record filters carried by `CommonOpts` are silent
+    // no-ops here. Reject them outright — `retl integrity --subreddit rust`
+    // otherwise quietly validates the entire corpus, contradicting the flag.
+    if !args.common.subreddits.is_empty() {
+        anyhow::bail!(
+            "--subreddit/-s has no effect on `retl integrity`: it validates whole .zst files and never filters individual records. Scope the run with --source/--start/--end instead."
+        );
+    }
+    if args.common.include_deleted {
+        anyhow::bail!(
+            "--include-deleted has no effect on `retl integrity`: it validates whole .zst files and never inspects individual records."
+        );
+    }
+    // `--no-manifest` / `--allow-partial` are inert too — integrity writes no
+    // provenance manifest, and detecting corrupt/truncated files is the whole
+    // job, so a damaged file is always reported, never skipped. These are
+    // harmless toggles rather than misleading record filters, so surface them
+    // with a warning instead of failing.
     if args.common.no_manifest {
         tracing::warn!(
             "--no-manifest has no effect on `retl integrity`: it validates corpus files in place and writes no manifest"
+        );
+    }
+    if args.common.allow_partial {
+        tracing::warn!(
+            "--allow-partial has no effect on `retl integrity`: reporting corrupt/truncated files is exactly what integrity does — such files are always flagged, never skipped"
         );
     }
     if args.expected || args.manifest.is_some() {

@@ -301,7 +301,10 @@ fn ensure_aggregate_inputs_succeeded(
 }
 
 fn write_rec_count_json(out: &Path, agg: &RecCount, pretty: bool) -> Result<()> {
-    write_text_atomic(out, CLI_TEXT_WRITE_BUF_BYTES, |w| {
+    // `write_text_or_stdout` honors `--out -` (stream to stdout) and otherwise
+    // routes through `write_text_atomic`, so `retl aggregate --out -` streams
+    // the JSON instead of staging-and-renaming a file literally named `-`.
+    write_text_or_stdout(out, |w| {
         if pretty {
             serde_json::to_writer_pretty(w, agg)?;
         } else {
@@ -313,7 +316,8 @@ fn write_rec_count_json(out: &Path, agg: &RecCount, pretty: bool) -> Result<()> 
 }
 
 fn write_grouped_tsv(out: &Path, rows: Vec<(String, String)>) -> Result<()> {
-    write_text_atomic(out, CLI_TEXT_WRITE_BUF_BYTES, |w| {
+    // See `write_rec_count_json`: `--out -` streams the TSV to stdout.
+    write_text_or_stdout(out, |w| {
         for (key, value) in rows {
             writeln!(w, "{key}\t{value}")?;
         }
@@ -332,7 +336,10 @@ fn write_cli_aggregate_manifest(
     counts: BTreeMap<String, u64>,
     warnings: Vec<String>,
 ) -> Result<()> {
-    if args.runtime.no_manifest {
+    // No manifest when the user opted out, and none for `--out -`: a manifest
+    // beside stdout would be staged next to a path literally named `-`.
+    // Suppressing it matches `scan`/`dedupe`/`count`/`first-seen` to-stdout.
+    if args.runtime.no_manifest || args.out == Path::new("-") {
         return Ok(());
     }
     let mut manifest = RunManifestInput::new("cli.aggregate");
