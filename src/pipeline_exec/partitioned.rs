@@ -375,6 +375,12 @@ impl ScanPlan {
             })?;
             let staging_dir = ensure_staging_dir(out_base_dir)?;
             sweep_stale_inprogress(out_base_dir, true)?;
+            // Partitioned outputs land in nested `comments/` and `submissions/`
+            // dirs; `sweep_stale_inprogress` only reclaims `.atomic-replace-tmp`
+            // fallback leftovers from `out_base_dir` itself, so reclaim the ones
+            // orphaned beside the nested outputs explicitly.
+            sweep_stale_atomic_replace_tmp(&comments_dir, true)?;
+            sweep_stale_atomic_replace_tmp(&submissions_dir, true)?;
 
             let planned_keys = planned_job_keys(&files);
             let resume = prepared.etl.opts.resume;

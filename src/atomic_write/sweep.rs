@@ -3,8 +3,9 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use super::naming::{parse_inprogress_suffix, StagedSuffix};
+use super::naming::{parse_staged_suffix, StagedSuffix};
 use super::{INPROGRESS_EXT, STAGING_DIR_NAME};
+use crate::util::ATOMIC_REPLACE_TMP_EXT;
 
 /// A staged file owned by a *currently-live* PID is normally left in place —
 /// that PID may be a concurrent RETL run still writing the file. But PIDs are
@@ -42,9 +43,9 @@ fn staged_age(path: &Path, created_nanos: Option<u128>) -> Option<Duration> {
 /// Return the subset of `candidates` whose process is still alive.
 ///
 /// Does a **single** `sysinfo` process-table refresh for the whole PID set.
-/// `sweep_stale_inprogress` can inspect many `.inprogress` files in one pass
-/// (and runs near the top of the minute), so refreshing per-entry made the
-/// sweep O(n) in full process-table scans.
+/// A sweep can inspect many staged files in one pass (and runs near the top
+/// of the minute), so refreshing per-entry made the sweep O(n) in full
+/// process-table scans.
 fn live_pids(candidates: &HashSet<u32>) -> HashSet<u32> {
     let self_pid = std::process::id();
     let mut live = HashSet::new();
@@ -70,56 +71,59 @@ fn live_pids(candidates: &HashSet<u32>) -> HashSet<u32> {
     live
 }
 
-/// Sweep stale `*.inprogress` files in `<out_root>/_staging`.
+/// Reclaim stale RETL-owned staged artifacts ending in `ext` from `dir`.
+///
+/// Shared core of [`sweep_stale_inprogress`] and
+/// [`sweep_stale_atomic_replace_tmp`]: collect every `*<ext>` entry in `dir`,
+/// resolve process liveness for the whole owner-PID set in one batched
+/// `sysinfo` refresh, then remove leftovers whose owner PID is no longer live
+/// — plus those older than [`LIVE_PID_RECYCLE_GRACE`] whose embedded PID has
+/// been recycled by an unrelated live process.
 ///
 /// `delete` chooses behavior:
-///   - `true`  → remove RETL-owned leftovers whose PID is no longer live, plus
-///     leftovers older than [`LIVE_PID_RECYCLE_GRACE`] whose embedded PID has
-///     been recycled by an unrelated live process
+///   - `true`  → remove the reclaimable leftovers, returning how many were
+///     removed
 ///   - `false` → warn and list, leave files in place (forensic mode)
 ///
-/// Legacy fixed-name `*.inprogress` files are never deleted. Staged files
-/// owned by a live PID are kept while they are recent enough that the live PID
-/// is plausibly the original writer — this avoids a concurrent run deleting
-/// another run's active staged output. Once a staged file outlives the grace
-/// window a live-PID match is treated as a recycled PID and the leftover is
-/// swept; see [`LIVE_PID_RECYCLE_GRACE`].
-pub fn sweep_stale_inprogress(out_root: &Path, delete: bool) -> Result<usize> {
-    let dir = out_root.join(STAGING_DIR_NAME);
+/// Legacy/unowned names (no parseable `STAGE_MARKER` suffix) are never
+/// deleted. Staged files owned by a live PID are kept while they are recent
+/// enough that the live PID is plausibly the original writer — this avoids a
+/// concurrent run deleting another run's active artifact.
+fn reclaim_staged_in(dir: &Path, ext: &str, delete: bool) -> Result<usize> {
     if !dir.exists() {
         return Ok(0);
     }
 
-    // Collect every `.inprogress` entry first so the process-liveness check
-    // can be resolved with one batched `sysinfo` refresh below.
-    let mut inprogress: Vec<PathBuf> = Vec::new();
-    for entry in crate::util::read_dir_with_default_backoff(&dir)
+    // Collect every matching entry first so the process-liveness check can be
+    // resolved with one batched `sysinfo` refresh below.
+    let mut staged: Vec<PathBuf> = Vec::new();
+    for entry in crate::util::read_dir_with_default_backoff(dir)
         .with_context(|| format!("read_dir {}", dir.display()))?
     {
         let path = entry.path();
-        let is_inprogress = path
+        let matches = path
             .file_name()
             .and_then(|s| s.to_str())
-            .map(|s| s.ends_with(INPROGRESS_EXT))
+            .map(|s| s.ends_with(ext))
             .unwrap_or(false);
-        if is_inprogress {
-            inprogress.push(path);
+        if matches {
+            staged.push(path);
         }
     }
 
     if !delete {
-        for path in &inprogress {
-            tracing::warn!(path=%path.display(), "leftover .inprogress (sweep disabled)");
+        for path in &staged {
+            tracing::warn!(path=%path.display(), ext, "leftover staged artifact (sweep disabled)");
         }
-        return Ok(inprogress.len());
+        return Ok(staged.len());
     }
 
     // Pair each staged file with its parsed RETL suffix, then resolve liveness
     // for the whole PID set in one refresh instead of one per file.
-    let owners: Vec<(PathBuf, Option<StagedSuffix>)> = inprogress
+    let owners: Vec<(PathBuf, Option<StagedSuffix>)> = staged
         .into_iter()
         .map(|path| {
-            let suffix = parse_inprogress_suffix(&path);
+            let suffix = parse_staged_suffix(&path, ext);
             (path, suffix)
         })
         .collect();
@@ -139,7 +143,7 @@ pub fn sweep_stale_inprogress(out_root: &Path, delete: bool) -> Result<usize> {
         else {
             tracing::warn!(
                 path=%path.display(),
-                "leaving legacy/unowned .inprogress in place; not safe to sweep"
+                "leaving legacy/unowned staged artifact in place; not safe to sweep"
             );
             continue;
         };
@@ -158,7 +162,7 @@ pub fn sweep_stale_inprogress(out_root: &Path, delete: bool) -> Result<usize> {
                 tracing::warn!(
                     path=%path.display(),
                     owner_pid,
-                    "leaving live .inprogress in place"
+                    "leaving live staged artifact in place"
                 );
                 continue;
             }
@@ -166,19 +170,70 @@ pub fn sweep_stale_inprogress(out_root: &Path, delete: bool) -> Result<usize> {
                 path=%path.display(),
                 owner_pid,
                 age_secs = age.map(|a| a.as_secs()).unwrap_or_default(),
-                "sweeping stale .inprogress whose embedded PID was recycled by an unrelated live process"
+                "sweeping stale staged artifact whose embedded PID was recycled by an unrelated live process"
             );
         }
 
         match crate::util::remove_with_short_backoff(&path) {
             Ok(_) => {
-                tracing::info!(path=%path.display(), owner_pid, "swept stale .inprogress");
+                tracing::info!(path=%path.display(), owner_pid, "swept stale staged artifact");
                 count += 1;
             }
             Err(e) => {
-                tracing::warn!(path=%path.display(), owner_pid, error=%e, "failed to sweep .inprogress");
+                tracing::warn!(path=%path.display(), owner_pid, error=%e, "failed to sweep staged artifact");
             }
         }
     }
     Ok(count)
+}
+
+/// Sweep stale RETL-owned leftovers under an output root.
+///
+/// Reclaims two kinds of artifact, both attributed to their owner PID via the
+/// `.retl-<pid>-<nonce>-<nanos>` suffix:
+///
+///   - `*.inprogress` staged files in `<out_root>/_staging` — the normal
+///     atomic-write staging path.
+///   - `*.atomic-replace-tmp` files directly in `out_root` — the copy+rename
+///     fallback siblings `replace_file_atomic_backoff` writes next to a
+///     published output. A crash mid-fallback (or a failed best-effort
+///     cleanup) orphans one of these beside real outputs, where the `_staging`
+///     sweep never sees it; reclaiming them here keeps a flaky host from
+///     accreting `*.atomic-replace-tmp` files forever.
+///
+/// `delete` chooses behavior:
+///   - `true`  → remove RETL-owned leftovers whose PID is no longer live, plus
+///     leftovers older than [`LIVE_PID_RECYCLE_GRACE`] whose embedded PID has
+///     been recycled by an unrelated live process
+///   - `false` → warn and list, leave files in place (forensic mode)
+///
+/// Legacy fixed-name files are never deleted. Staged files owned by a live PID
+/// are kept while they are recent enough that the live PID is plausibly the
+/// original writer — this avoids a concurrent run deleting another run's
+/// active output. Once a leftover outlives the grace window a live-PID match
+/// is treated as a recycled PID and it is swept; see [`LIVE_PID_RECYCLE_GRACE`].
+///
+/// Returns the total number of leftovers removed.
+pub fn sweep_stale_inprogress(out_root: &Path, delete: bool) -> Result<usize> {
+    let staging = out_root.join(STAGING_DIR_NAME);
+    let inprogress = reclaim_staged_in(&staging, INPROGRESS_EXT, delete)?;
+    // The copy+rename fallback stages its private sibling next to the
+    // *published* file, not under `_staging`, so a crash mid-fallback orphans
+    // an `.atomic-replace-tmp` file in `out_root` itself — reclaim those too.
+    let fallback = reclaim_staged_in(out_root, ATOMIC_REPLACE_TMP_EXT, delete)?;
+    Ok(inprogress + fallback)
+}
+
+/// Sweep orphaned `*.atomic-replace-tmp` copy+rename fallback files directly
+/// in `dir`.
+///
+/// [`sweep_stale_inprogress`] already reclaims them from an output *root*, but
+/// some pipelines publish into nested subdirectories (e.g. partitioned export
+/// writes `comments/RC_*.jsonl` / `submissions/RS_*.jsonl`). Call this on each
+/// such directory so a fallback file orphaned beside those nested outputs is
+/// reclaimed too, using the same PID-liveness + age-gate rules.
+///
+/// Returns the number of leftovers removed.
+pub fn sweep_stale_atomic_replace_tmp(dir: &Path, delete: bool) -> Result<usize> {
+    reclaim_staged_in(dir, ATOMIC_REPLACE_TMP_EXT, delete)
 }

@@ -13,6 +13,7 @@ use std::sync::{
     Arc,
 };
 
+use crate::config::clamp_shard_count;
 use crate::dedupe::BYTES_PER_MB;
 use crate::key_extractor::KeyExtractor;
 use crate::mem::{available_memory_fraction, is_low_memory};
@@ -65,29 +66,39 @@ impl MicroBucketState {
         self.total_bytes += add;
     }
 
-    /// Drain micro-bucket `idx`, zero its byte counters, and ship every
-    /// `(key, group)` over `tx`. Returns `Err(())` if the consumer dropped
-    /// the receiver — the producer breaks and lets the join surface the
-    /// underlying error.
+    /// Drain micro-bucket `idx` and ship every `(key, group)` over `tx`.
+    /// Returns `Err(())` if the consumer dropped the receiver — the producer
+    /// breaks and lets the join surface the underlying error.
+    ///
+    /// Byte accounting is discharged **per group, after its send succeeds** —
+    /// never up front. The swapped-out map stays fully resident until each
+    /// `(k, v)` has been handed to the bounded channel, so subtracting its
+    /// bytes before the send loop would make `total_bytes()` under-count live
+    /// memory by up to a full flush during a backpressure stall (exactly when
+    /// the producer's `target_bytes`/`is_low_memory` check needs it accurate).
     fn flush_bucket(
         &mut self,
         idx: usize,
         tx: &crossbeam_channel::Sender<(String, Vec<String>)>,
+        #[cfg(feature = "test-utils")] buffered_bytes_metric: Option<&Arc<AtomicUsize>>,
     ) -> std::result::Result<(), ()> {
         if self.maps[idx].is_empty() {
             return Ok(());
         }
         let mut m = HashMap::new();
         std::mem::swap(&mut m, &mut self.maps[idx]);
-        let used = self.mb_bytes[idx];
-        self.mb_bytes[idx] = 0;
-        if self.total_bytes >= used {
-            self.total_bytes -= used;
-        } else {
-            self.total_bytes = 0;
-        }
         for (k, v) in m.into_iter() {
+            // Byte charge for this group, mirroring `insert`'s `line.len() + 1`.
+            let used: usize = v.iter().map(|line| line.len() + 1).sum();
             tx.send((k, v)).map_err(|_| ())?;
+            // The group has left our maps for the channel; only now is it safe
+            // to discharge its bytes.
+            self.mb_bytes[idx] = self.mb_bytes[idx].saturating_sub(used);
+            self.total_bytes = self.total_bytes.saturating_sub(used);
+            #[cfg(feature = "test-utils")]
+            if let Some(metric) = buffered_bytes_metric {
+                metric.store(self.total_bytes, AtomicOrdering::Relaxed);
+            }
         }
         Ok(())
     }
@@ -97,6 +108,7 @@ impl MicroBucketState {
     fn flush_largest(
         &mut self,
         tx: &crossbeam_channel::Sender<(String, Vec<String>)>,
+        #[cfg(feature = "test-utils")] buffered_bytes_metric: Option<&Arc<AtomicUsize>>,
     ) -> std::result::Result<(), ()> {
         if self.maps.is_empty() {
             return Ok(());
@@ -110,7 +122,12 @@ impl MicroBucketState {
             }
         }
         if max_val > 0 {
-            self.flush_bucket(max_idx, tx)?;
+            self.flush_bucket(
+                max_idx,
+                tx,
+                #[cfg(feature = "test-utils")]
+                buffered_bytes_metric,
+            )?;
         }
         Ok(())
     }
@@ -204,7 +221,14 @@ fn run_micro_bucket_producer(
                 target_bytes,
                 "handing largest micro-bucket to on_group (bounded channel; producer blocks if full)"
             );
-            if state.flush_largest(tx).is_err() {
+            if state
+                .flush_largest(
+                    tx,
+                    #[cfg(feature = "test-utils")]
+                    buffered_bytes_metric,
+                )
+                .is_err()
+            {
                 // consumer dropped rx (errored); break and let join surface it
                 break;
             }
@@ -220,7 +244,15 @@ fn run_micro_bucket_producer(
 
     // Final flush of any remaining micro-buckets.
     for i in 0..mb_count {
-        if state.flush_bucket(i, tx).is_err() {
+        if state
+            .flush_bucket(
+                i,
+                tx,
+                #[cfg(feature = "test-utils")]
+                buffered_bytes_metric,
+            )
+            .is_err()
+        {
             break;
         }
     }
@@ -278,11 +310,19 @@ where
 
     let rs = micro_state();
 
+    // Clamp the fan-out like every other shard count in the crate
+    // (`clamp_shard_count`: [1, MAX_SHARDS] + a one-shot warn). Without this a
+    // caller of this pub re-exported API could pass a huge `micro_buckets` and
+    // allocate that many HashMaps unbounded and unwarned.
+    let micro_buckets = clamp_shard_count(micro_buckets, "bucketing::process_bucket_streaming");
     let mut state = MicroBucketState::with_capacity(micro_buckets);
 
     // Per-flush byte cap: with channel cap = inflight_groups, total inflight
-    // bytes are bounded by 2 * per_flush_cap (one growing producer-side bucket
-    // + the channel + the consumer's current group).
+    // bytes are bounded by (1 + inflight_groups) * per_flush_cap (one growing
+    // producer-side bucket plus up to inflight_groups groups buffered in the
+    // bounded channel) — ~1.125 GiB at the defaults, not 256 MiB. See CLAUDE.md
+    // and the `ETLOptions::inflight_bytes` / `inflight_worst_case_peak_bytes`
+    // docs.
     let per_flush_cap = if cfg.inflight_bytes > 0 {
         (cfg.inflight_bytes / 2).max(BYTES_PER_MB)
     } else {
