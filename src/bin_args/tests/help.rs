@@ -197,6 +197,7 @@ fn aggregate_help_advertises_spool_inputs_out_and_runtime_flags_only() {
         "--metric",
         "--top",
         "--scientific",
+        "--strict",
         "Field-indent the final JSON",
         "--parallelism",
         "--no-progress",

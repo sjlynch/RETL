@@ -29,33 +29,50 @@ fn effective_plan_range(
     let mut end = etl.opts.end;
 
     if let Some(bounds) = query.map(|q| q.timestamp_bounds) {
-        // The explicit date range wins for file planning on any side it
-        // covers; a `created_utc` timestamp bound only fills in a `None`
-        // side. When both are present the explicit range silently governs
-        // which months are read — narrower timestamp bounds don't shrink the
-        // scan and wider ones don't widen it (the bound is still applied as a
-        // record-level filter, so results stay correct either way). Log it so
-        // a user wondering why an `--after` scan reads more or fewer months
-        // than expected can see what drove file selection.
+        // A `created_utc` timestamp bound (`--after`/`--before`) is strictly
+        // more precise than the month-granularity `--start`/`--end` range. When
+        // both are present we INTERSECT them for file planning —
+        // `max(explicit_start, derived_start)` on the low side and
+        // `min(explicit_end, derived_end)` on the high side — so a tighter
+        // timestamp bound can skip whole months the explicit range would
+        // otherwise open and decode. The bound is still applied as a
+        // record-level filter, so a narrower planned set is always correct:
+        // intersecting only ever drops months that would have matched zero
+        // records anyway. A timestamp bound *wider* than the explicit range
+        // never widens the scan — the explicit endpoint wins on that side.
+        // The fill-only side (`None` explicit) keeps deriving the month from
+        // the bound as before. Log a narrowing so a user wondering why an
+        // `--after` scan read fewer months than `--start` implied can see what
+        // drove file selection.
         match (start, bounds.derived_start_month()) {
             (None, derived) => start = derived,
             (Some(explicit), Some(derived)) => {
-                tracing::info!(
-                    explicit_start = %explicit,
-                    timestamp_start = %derived,
-                    "file planning start month governed by the explicit date range ({explicit}); the created_utc timestamp bound (>= {derived}) is applied only as a record-level filter"
-                );
+                let planned = explicit.max(derived);
+                if planned > explicit {
+                    tracing::info!(
+                        explicit_start = %explicit,
+                        timestamp_start = %derived,
+                        planned_start = %planned,
+                        "file planning start month narrowed from the explicit date range ({explicit}) to {planned}: the created_utc timestamp bound (>= {derived}) is tighter"
+                    );
+                }
+                start = Some(planned);
             }
             (Some(_), None) => {}
         }
         match (end, bounds.derived_end_month()) {
             (None, derived) => end = derived,
             (Some(explicit), Some(derived)) => {
-                tracing::info!(
-                    explicit_end = %explicit,
-                    timestamp_end = %derived,
-                    "file planning end month governed by the explicit date range ({explicit}); the created_utc timestamp bound (<= {derived}) is applied only as a record-level filter"
-                );
+                let planned = explicit.min(derived);
+                if planned < explicit {
+                    tracing::info!(
+                        explicit_end = %explicit,
+                        timestamp_end = %derived,
+                        planned_end = %planned,
+                        "file planning end month narrowed from the explicit date range ({explicit}) to {planned}: the created_utc timestamp bound (<= {derived}) is tighter"
+                    );
+                }
+                end = Some(planned);
             }
             (Some(_), None) => {}
         }

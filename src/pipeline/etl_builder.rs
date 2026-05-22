@@ -68,6 +68,15 @@ impl RedditETL {
         self.opts = self.opts.with_strict_key(yes);
         self
     }
+    /// Fail the whole aggregate run when any input is fatal (open error,
+    /// malformed JSON, shard write failure). Default is the historical
+    /// tolerant behavior — a fatal input is reported but the run still merges
+    /// the surviving shards. Honored by
+    /// [`RedditETL::aggregate_jsonls_parallel`].
+    pub fn aggregate_strict(mut self, yes: bool) -> Self {
+        self.opts = self.opts.with_aggregate_strict(yes);
+        self
+    }
     pub fn parallelism(mut self, threads: usize) -> Self {
         self.opts = self.opts.with_parallelism(threads);
         self
