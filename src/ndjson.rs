@@ -62,15 +62,47 @@ impl NdjsonReader {
     }
 }
 
+/// Marker payload for a *record-level* invalid line surfaced by
+/// [`read_line_capped`]: either the per-line byte cap was exceeded or the line
+/// was not valid UTF-8. Both cases are wrapped in an `io::Error` with
+/// `io::ErrorKind::InvalidData` and this type as the inner error.
+///
+/// The zstd line streamer (`for_each_line_attempt`) downcasts an `io::Error`'s
+/// payload to this type to tell a record-level problem apart from a genuine
+/// zstd-frame decode error. Without the marker, an invalid-UTF-8 line was
+/// misclassified as a tolerated corrupt-frame skip under
+/// `PartialReadPolicy::AllowPartial`; with it, both the cap and the UTF-8
+/// violation stay fatal regardless of partial-read policy. `Display` forwards
+/// the human-readable message verbatim, so `io::Error::to_string()` is
+/// unchanged from a plain `io::Error::new(InvalidData, msg)`.
+#[derive(Debug)]
+pub(crate) struct InvalidLineError(String);
+
+impl InvalidLineError {
+    /// Wrap `msg` as an `InvalidData` `io::Error` carrying this marker.
+    fn io_error(msg: String) -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidData, InvalidLineError(msg))
+    }
+}
+
+impl std::fmt::Display for InvalidLineError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for InvalidLineError {}
+
 /// Read one line from `reader` into `buf`, enforcing `max_bytes` as a hard
 /// upper bound on the raw line length (terminator included).
 ///
 /// Trailing `\r?\n` is stripped from `buf`. Returns the number of raw bytes
-/// consumed (0 on EOF). On cap violation, returns
-/// `io::ErrorKind::InvalidData` with a message naming the offending path and
-/// the cap; the reader position is left at the bytes that would have
-/// overflowed (callers should abort the file rather than try to re-sync,
-/// because the next bytes are still part of the same oversized line).
+/// consumed (0 on EOF). A cap violation **or** an invalid-UTF-8 line returns
+/// `io::ErrorKind::InvalidData` with an `InvalidLineError` payload and a
+/// message naming the offending path; on a cap violation the reader position
+/// is left at the bytes that would have overflowed (callers should abort the
+/// file rather than try to re-sync, because the next bytes are still part of
+/// the same oversized line).
 pub fn read_line_capped<R: BufRead>(
     reader: &mut R,
     buf: &mut String,
@@ -98,17 +130,14 @@ pub fn read_line_capped<R: BufRead>(
             None => (available.len(), false),
         };
         if bytes.len().saturating_add(take) > max_bytes {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "JSONL line in {} exceeds max_line_bytes={} (read {} so far; next chunk would push to {}). \
-                     Bump NdjsonReader::with_max_line_bytes or raise the caller's per-line cap to accept larger records.",
-                    path.display(),
-                    max_bytes,
-                    bytes.len(),
-                    bytes.len().saturating_add(take)
-                ),
-            ));
+            return Err(InvalidLineError::io_error(format!(
+                "JSONL line in {} exceeds max_line_bytes={} (read {} so far; next chunk would push to {}). \
+                 Bump NdjsonReader::with_max_line_bytes or raise the caller's per-line cap to accept larger records.",
+                path.display(),
+                max_bytes,
+                bytes.len(),
+                bytes.len().saturating_add(take)
+            )));
         }
         bytes.extend_from_slice(&available[..take]);
         reader.consume(take);
@@ -121,7 +150,17 @@ pub fn read_line_capped<R: BufRead>(
         return Ok(0);
     }
     let raw_len = bytes.len();
-    *buf = String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    // Invalid UTF-8 is a record-level fault, not zstd-frame corruption: mark it
+    // with `InvalidLineError` (same as the cap violation above) so the zstd
+    // streamer classifies it as a fatal `InvalidLine` rather than a tolerated
+    // decode skip.
+    *buf = String::from_utf8(bytes).map_err(|e| {
+        InvalidLineError::io_error(format!(
+            "JSONL line in {} is not valid UTF-8: {}",
+            path.display(),
+            e
+        ))
+    })?;
     if buf.ends_with('\n') {
         buf.pop();
         if buf.ends_with('\r') {

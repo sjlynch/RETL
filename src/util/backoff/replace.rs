@@ -11,6 +11,18 @@ use super::retry::{with_backoff, DEFAULT_BACKOFF_DELAY_MS, DEFAULT_BACKOFF_TRIES
 /// Per-process nonce so two concurrent fallbacks never collide on a temp name.
 static FALLBACK_NONCE: AtomicU64 = AtomicU64::new(0);
 
+/// Extension on the copy+rename fallback's private sibling temp file.
+///
+/// The fallback in [`replace_file_atomic_backoff`] streams bytes into a
+/// `<dest>.retl-<pid>-<nonce>-<nanos>.atomic-replace-tmp` sibling before
+/// renaming it over `dest`. A crash between the copy and that rename — or a
+/// failed best-effort cleanup in the non-atomic last-resort branch — can
+/// orphan the sibling next to published outputs. The suffix deliberately
+/// mirrors the `.inprogress` staged-file contract (`.retl-<pid>-<nonce>-
+/// <nanos>`) so `atomic_write`'s stale sweep can age-gate and reclaim a
+/// leftover whose owner PID is no longer live, instead of leaking it forever.
+pub(crate) const ATOMIC_REPLACE_TMP_EXT: &str = ".atomic-replace-tmp";
+
 /// Rename a file with retries/backoff for transient errors.
 fn rename_with_backoff(src: &Path, dest: &Path, tries: usize, delay_ms: u64) -> Result<()> {
     with_backoff(tries, delay_ms, || fs::rename(src, dest))
@@ -30,7 +42,9 @@ fn copy_with_backoff(src: &Path, dest: &Path, tries: usize, delay_ms: u64) -> Re
 /// knows it), then renames it over `dest`. Living in `dest`'s own directory
 /// keeps that rename a same-volume `MoveFileExW` swap rather than a degrading
 /// cross-volume copy. The PID + nonce + timestamp suffix keeps it unique
-/// across processes and concurrent in-process calls.
+/// across processes and concurrent in-process calls — and lets the
+/// `atomic_write` stale sweep reclaim it (see [`ATOMIC_REPLACE_TMP_EXT`]) if a
+/// crash mid-fallback orphans it next to the published output.
 fn unique_sibling_tmp(dest: &Path) -> Result<PathBuf> {
     let parent = match dest.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
@@ -46,7 +60,7 @@ fn unique_sibling_tmp(dest: &Path) -> Result<PathBuf> {
         .unwrap_or(0);
     let mut name = OsString::from(base);
     name.push(format!(
-        ".retl-{}-{nonce}-{nanos}.atomic-replace-tmp",
+        ".retl-{}-{nonce}-{nanos}{ATOMIC_REPLACE_TMP_EXT}",
         std::process::id()
     ));
     Ok(parent.join(name))
@@ -114,7 +128,11 @@ pub fn replace_file_atomic_backoff(tmp: &Path, dest: &Path) -> Result<()> {
                  observe a zero-length or partially written destination"
             );
             // Drop the orphaned sibling copy first (best-effort): the in-place
-            // copy below makes it dead weight either way.
+            // copy below makes it dead weight either way. If this remove
+            // fails, the `.atomic-replace-tmp` sibling is left behind — but it
+            // carries the RETL-owned PID/nonce/timestamp suffix, so a later
+            // run's `sweep_stale_inprogress` reclaims it once the owner PID is
+            // no longer live (it is no longer leaked permanently).
             let _ = remove_with_backoff(&staged, tries, delay_ms);
             copy_with_backoff(tmp, dest, tries, delay_ms)?;
             remove_with_backoff(tmp, tries, delay_ms)?;
