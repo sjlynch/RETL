@@ -134,11 +134,18 @@ pub enum CorpusLocalStatus {
         actual_bytes: u64,
         /// `None` means the manifest did not provide an expected byte count.
         size_matches: Option<bool>,
-        /// `None` means checksum verification was not requested or the manifest
-        /// did not provide a SHA-256 value.
+        /// `None` means checksum verification was not requested, the manifest
+        /// did not provide a SHA-256 value, or computing the hash failed (in
+        /// which case `sha256_error` is set).
         sha256_matches: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
         sha256_actual: Option<String>,
+        /// `Some` when checksum verification was requested but computing the
+        /// SHA-256 failed (e.g. a transient read error mid-hash). The file is
+        /// still present and may still have the expected size; this is a
+        /// warning, not grounds for reporting the file inaccessible.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sha256_error: Option<String>,
     },
     Inaccessible {
         error: String,
@@ -206,6 +213,11 @@ pub enum CorpusManifestError {
         start: YearMonth,
         end: YearMonth,
     },
+    InvalidSourceRange {
+        source: CorpusSource,
+        first_month: YearMonth,
+        last_month: YearMonth,
+    },
 }
 
 impl fmt::Display for CorpusManifestError {
@@ -225,6 +237,15 @@ impl fmt::Display for CorpusManifestError {
             Self::InvalidUnavailableRange { source, start, end } => write!(
                 f,
                 "corpus manifest source {} has invalid unavailable range {start}..={end}",
+                source.label()
+            ),
+            Self::InvalidSourceRange {
+                source,
+                first_month,
+                last_month,
+            } => write!(
+                f,
+                "corpus manifest source {} has first_month {first_month} after last_month {last_month}",
                 source.label()
             ),
         }

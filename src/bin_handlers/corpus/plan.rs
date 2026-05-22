@@ -114,14 +114,14 @@ fn write_corpus_plan_tsv(out: &Path, items: &[CorpusPlanItem]) -> Result<()> {
     write_text_or_stdout(out, |w| {
         writeln!(
             w,
-            "source\tmonth\tavailability\tlocal_status\tfile_name\texpected_path\tcompressed_bytes\tactual_bytes\tsize_matches\tsha256\tsha256_matches\turl\ttorrent\tnote"
+            "source\tmonth\tavailability\tlocal_status\tfile_name\texpected_path\tcompressed_bytes\tactual_bytes\tsize_matches\tsha256\tsha256_matches\tsha256_error\turl\ttorrent\tnote"
         )?;
         for item in items {
-            let (local_status, actual_bytes, size_matches, sha256_matches) =
+            let (local_status, actual_bytes, size_matches, sha256_matches, sha256_error) =
                 local_status_cells(&item.local);
             writeln!(
                 w,
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 item.source.label(),
                 item.month,
                 availability_cell(item.availability),
@@ -133,6 +133,7 @@ fn write_corpus_plan_tsv(out: &Path, items: &[CorpusPlanItem]) -> Result<()> {
                 opt_bool_cell(size_matches),
                 tsv_cell(item.sha256.as_deref().unwrap_or("")),
                 opt_bool_cell(sha256_matches),
+                tsv_cell(sha256_error.unwrap_or("")),
                 tsv_cell(item.url.as_deref().unwrap_or("")),
                 tsv_cell(item.torrent.as_deref().unwrap_or("")),
                 tsv_cell(item.note.as_deref().unwrap_or("")),
@@ -170,20 +171,28 @@ fn corpus_plan_next_steps(args: &CorpusPlanArgs) -> Vec<String> {
 
 fn local_status_cells(
     local: &CorpusLocalStatus,
-) -> (&'static str, Option<u64>, Option<bool>, Option<bool>) {
+) -> (
+    &'static str,
+    Option<u64>,
+    Option<bool>,
+    Option<bool>,
+    Option<&str>,
+) {
     match local {
-        CorpusLocalStatus::Missing => ("missing", None, None, None),
-        CorpusLocalStatus::Inaccessible { .. } => ("inaccessible", None, None, None),
+        CorpusLocalStatus::Missing => ("missing", None, None, None, None),
+        CorpusLocalStatus::Inaccessible { .. } => ("inaccessible", None, None, None, None),
         CorpusLocalStatus::Present {
             actual_bytes,
             size_matches,
             sha256_matches,
+            sha256_error,
             ..
         } => (
             "present",
             Some(*actual_bytes),
             *size_matches,
             *sha256_matches,
+            sha256_error.as_deref(),
         ),
     }
 }
