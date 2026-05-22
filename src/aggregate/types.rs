@@ -88,6 +88,13 @@ pub struct AggregateBuildReport {
     pub fatal_inputs: Vec<AggregateInputIssue>,
     /// Number of shard files actually folded into the returned aggregate.
     pub merged_shards: usize,
+    /// Total non-empty JSONL lines ingested across the [`merged_shards`]. Lines
+    /// from fatal inputs and from partial inputs dropped under the strict
+    /// partial-read policy are excluded — this counts only records that
+    /// reached the merged aggregate.
+    ///
+    /// [`merged_shards`]: AggregateBuildReport::merged_shards
+    pub records_ingested: u64,
 }
 
 impl AggregateBuildReport {
@@ -105,5 +112,13 @@ impl AggregateBuildReport {
 
     pub fn has_problems(&self) -> bool {
         self.problem_count() > 0
+    }
+
+    /// True when shards were merged but every one of them ingested zero
+    /// records — a "successful" aggregate whose output is empty. This is
+    /// almost always a wrong input path or an empty spool directory rather
+    /// than intent, so callers should surface it as a warning.
+    pub fn ingested_zero_records(&self) -> bool {
+        self.merged_shards > 0 && self.records_ingested == 0
     }
 }

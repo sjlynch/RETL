@@ -189,6 +189,35 @@ fn build_rejects_duplicate_record_ids_after_normalization() {
 }
 
 #[test]
+fn duplicate_comment_ids_name_the_comment_id_input() {
+    // A duplicate confined to the t1_ comment selector must report
+    // `comment_ids_in` — the field that actually holds it — not the literal
+    // `ids_in`, which the user never set.
+    let err = RedditETL::new()
+        .scan()
+        .ids(["t1_abc", "t1_abc"])
+        .build()
+        .err()
+        .expect("expected ScanPlan::build to fail");
+    let msg = err_msg(err);
+    assert!(msg.contains("comment_ids_in"), "{msg}");
+    assert!(msg.contains("duplicate ID"), "{msg}");
+}
+
+#[test]
+fn duplicate_submission_ids_name_the_submission_id_input() {
+    let err = RedditETL::new()
+        .scan()
+        .ids(["t3_xyz", "t3_xyz"])
+        .build()
+        .err()
+        .expect("expected ScanPlan::build to fail");
+    let msg = err_msg(err);
+    assert!(msg.contains("submission_ids_in"), "{msg}");
+    assert!(msg.contains("duplicate ID"), "{msg}");
+}
+
+#[test]
 fn repeated_ids_calls_accumulate_rather_than_replace() {
     // `ids` / `ids_in` append: a second call must not discard the first
     // call's selectors. With the old replace-setter semantics the repeated

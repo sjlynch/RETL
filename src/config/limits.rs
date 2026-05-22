@@ -47,6 +47,22 @@ pub const MAX_RAYON_THREADS: usize = 256;
 /// `file_concurrency` is intentionally capped below the worker-thread limit.
 pub const MAX_FILE_CONCURRENCY: usize = 8;
 
+/// Hard floor for `read_buffer_bytes` / `write_buffer_bytes`.
+///
+/// A sub-8-KiB `BufReader`/`BufWriter` capacity degrades streaming throughput
+/// (more syscalls per file) without bounding memory usefully, so the builder
+/// setters raise smaller requests to this floor.
+pub const MIN_IO_BUFFER: usize = 8 * 1024;
+
+/// Hard ceiling for `read_buffer_bytes` / `write_buffer_bytes`.
+///
+/// Each open monthly file gets its own `BufReader`/`BufWriter` of this
+/// capacity, so an oversized request — e.g. `usize::MAX` — would attempt a
+/// multi-exabyte allocation per file and abort. 256 MiB is 1024× the 256-KiB
+/// default: generous tuning headroom while keeping typos away from the
+/// allocator.
+pub const MAX_IO_BUFFER: usize = 256 * 1024 * 1024;
+
 /// Effective upper bound for `.parallelism(n)` and `--parallelism`.
 ///
 /// RETL allows a small oversubscription factor for I/O-heavy phases but keeps
@@ -94,6 +110,31 @@ pub(crate) fn clamp_file_concurrency(n: usize, component: &str) -> usize {
             requested = n,
             max = MAX_FILE_CONCURRENCY,
             "clamping zstd file concurrency to bound decoder-window memory"
+        );
+    }
+    clamped
+}
+
+/// Clamp a requested IO buffer capacity into `[MIN_IO_BUFFER, MAX_IO_BUFFER]`,
+/// emitting a `tracing::warn!` on either bound — consistent with
+/// `clamp_shard_count` / `clamp_parallelism_threads` / `clamp_file_concurrency`,
+/// which previously had no IO-buffer sibling. A sub-floor request used to be
+/// raised silently and an oversized one accepted outright; both are now logged.
+pub(crate) fn clamp_io_buffer(bytes: usize, component: &str) -> usize {
+    let clamped = bytes.clamp(MIN_IO_BUFFER, MAX_IO_BUFFER);
+    if bytes < MIN_IO_BUFFER {
+        tracing::warn!(
+            component,
+            requested = bytes,
+            min = MIN_IO_BUFFER,
+            "raising IO buffer capacity to the minimum that sustains streaming throughput"
+        );
+    } else if bytes > MAX_IO_BUFFER {
+        tracing::warn!(
+            component,
+            requested = bytes,
+            max = MAX_IO_BUFFER,
+            "clamping IO buffer capacity to bound per-file allocation"
         );
     }
     clamped
