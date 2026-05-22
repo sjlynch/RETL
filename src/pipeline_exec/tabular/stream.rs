@@ -32,16 +32,26 @@ fn stream_tabular_job<W: Write + ?Sized>(
         if !matches_minimal(&min, targets, query, job.kind) || !within_bounds(&min, bounds) {
             return Ok(());
         }
-        if query.requires_full_parse() {
+        // Parse the full JSON `Value` at most once per surviving record.
+        // When the query needs a full parse, keep that `Value` and reuse it
+        // for `tabular_cells_from_value` below instead of re-deserializing
+        // the same line; otherwise parse lazily just before building cells.
+        let prevalidated: Option<Value> = if query.requires_full_parse() {
             let val: Value = serde_json::from_str(line)
                 .map_err(|e| malformed_json_error(&job.path, line_number, e))?;
             if !matches_full(&val, job.kind, query) {
                 return Ok(());
             }
-        }
+            Some(val)
+        } else {
+            None
+        };
         claim_record_or_stop(record_limit)?;
-        let val: Value = serde_json::from_str(line)
-            .map_err(|e| malformed_json_error(&job.path, line_number, e))?;
+        let val: Value = match prevalidated {
+            Some(val) => val,
+            None => serde_json::from_str(line)
+                .map_err(|e| malformed_json_error(&job.path, line_number, e))?,
+        };
         let (cells, matched_indices) = tabular_cells_from_value(&val, selectors)?;
         write_tabular_row(writer, fields, &cells, format).with_context(|| {
             format!(
