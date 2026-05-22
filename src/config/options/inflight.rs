@@ -1,13 +1,36 @@
 impl ETLOptions {
     /// Set the inflight-bytes budget that bounds bucketing/dedupe producers.
     /// Lower values trade smaller memory peaks for more frequent flushes.
-    /// 0 disables the explicit cap and falls back to memory-fraction sampling.
     ///
     /// Note: this does **not** also bound the bucketing-stage channel. See the
     /// docs on [`ETLOptions::inflight_bytes`] for the worst-case peak formula,
     /// or use [`Self::with_inflight_budget`] to set both knobs together.
+    ///
+    /// **`bytes == 0` does not set a zero-byte ceiling.** `0` is the sentinel
+    /// that *disables* the explicit cap, falling back to memory-fraction
+    /// sampling — the opposite of a hard ceiling, so it risks OOM. Passing `0`
+    /// here emits a one-shot `tracing::warn!`; if you mean to disable the cap
+    /// deliberately, call [`Self::disable_inflight_cap`] (warning-free) so a
+    /// budget computation that rounds to `0` can still be caught as an error.
     pub fn with_inflight_bytes(mut self, bytes: usize) -> Self {
+        if bytes == 0 {
+            warn_inflight_cap_disabled("ETLOptions::with_inflight_bytes");
+        }
         self.inflight_bytes = bytes;
+        self
+    }
+
+    /// Explicitly disable the `inflight_bytes` memory cap.
+    ///
+    /// Sets `inflight_bytes = 0`, which makes the bucketing/dedupe producers
+    /// fall back to [`AdaptiveMemCfg`] memory-fraction sampling instead of a
+    /// hard per-flush byte ceiling. This is the *intentional* path for that
+    /// sentinel: unlike passing `0` to [`Self::with_inflight_bytes`] /
+    /// [`Self::with_inflight_budget`] it emits no warning, so a caller deriving
+    /// a budget from a computation can keep `0` as an error case while this
+    /// method stays the deliberate opt-out.
+    pub fn disable_inflight_cap(mut self) -> Self {
+        self.inflight_bytes = 0;
         self
     }
 
@@ -37,10 +60,15 @@ impl ETLOptions {
     /// **`bytes == 0` does not set a zero-byte ceiling.** `0` is the sentinel
     /// that *disables* the explicit `inflight_bytes` cap (see
     /// [`Self::with_inflight_bytes`]), falling back to memory-fraction
-    /// sampling — the opposite of a hard ceiling. If you derive the budget
-    /// from a computation that can yield `0`, guard against it before calling
-    /// this so an empty input does not silently unbound the run.
+    /// sampling — the opposite of a hard ceiling. Passing `0` here emits a
+    /// one-shot `tracing::warn!`; if you derive the budget from a computation
+    /// that can yield `0`, guard against it (or call
+    /// [`Self::disable_inflight_cap`] to opt out of the cap deliberately) so an
+    /// empty input does not silently unbound the run.
     pub fn with_inflight_budget(mut self, bytes: usize) -> Self {
+        if bytes == 0 {
+            warn_inflight_cap_disabled("ETLOptions::with_inflight_budget");
+        }
         self.inflight_bytes = bytes;
         self.inflight_groups = 1;
         self
@@ -76,6 +104,36 @@ pub(crate) fn inflight_worst_case_peak_bytes(
     }
     let chan_cap = inflight_groups.max(1);
     chan_cap.saturating_add(1).saturating_mul(inflight_bytes / 2)
+}
+
+/// One-shot tracing warning emitted when `0` is passed to an `inflight_bytes`
+/// setter ([`ETLOptions::with_inflight_bytes`] / [`ETLOptions::with_inflight_budget`]).
+///
+/// `inflight_bytes == 0` is the *disable-the-cap* sentinel: downstream the
+/// dedupe/bucketing producers fall back to memory-fraction sampling
+/// (`dedupe::runs` uses `per_flush_cap = usize::MAX`,
+/// `inflight_worst_case_peak_bytes` returns 0), which is the **opposite** of a
+/// hard ceiling. A caller deriving a budget as `available / n` that rounds to
+/// `0`, or passing `0` thinking it means "no buffering", would silently unbound
+/// the run and risk OOM with a budget they believed they set. Surfacing the
+/// sentinel here turns that silent footgun into an observable signal. Callers
+/// that *intend* to disable the cap should use
+/// [`ETLOptions::disable_inflight_cap`], the explicit warning-free path. Gated
+/// by a process-wide [`Once`] so it is emitted at most once per process; tests
+/// that don't initialize tracing won't see it.
+pub(crate) fn warn_inflight_cap_disabled(component: &str) {
+    use std::sync::Once;
+    static WARNED: Once = Once::new();
+
+    WARNED.call_once(|| {
+        tracing::warn!(
+            component,
+            "inflight_bytes set to 0 — this DISABLES the explicit memory cap (producers fall \
+             back to memory-fraction sampling); it does NOT set a zero-byte ceiling. If a \
+             computed budget rounded to 0, guard against it before calling this setter; to \
+             disable the cap deliberately call ETLOptions::disable_inflight_cap()."
+        );
+    });
 }
 
 /// One-shot tracing warning when a configured `(inflight_bytes,

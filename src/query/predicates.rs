@@ -40,7 +40,13 @@ enum JsonPredicateKind {
     },
     Regex {
         pattern: String,
-        compiled: Option<Regex>,
+        /// Compiled form of `pattern`. Populated eagerly by
+        /// [`QuerySpec::compile_json_predicates`] (run by `ScanPlan::build`),
+        /// or — for a directly-built `QuerySpec` that skipped the builder —
+        /// lazily on the first [`JsonPointerPredicate::matches`] call. The
+        /// `OnceLock` guarantees the regex is compiled at most once either
+        /// way, so `matches` never recompiles per record.
+        compiled: OnceLock<Regex>,
     },
 }
 
@@ -90,13 +96,20 @@ impl JsonPointerPredicate {
     }
 
     /// Match when the pointer resolves to a string matched by `pattern`.
-    /// The regex is compiled during [`ScanPlan::build`](crate::ScanPlan::build).
+    ///
+    /// [`ScanPlan::build`](crate::ScanPlan::build) compiles the pattern
+    /// eagerly and surfaces an invalid pattern as a [`QueryBuildError`]. A
+    /// [`QuerySpec`] constructed directly and scanned without going through
+    /// `build` still compiles the regex only **once** — lazily, on the first
+    /// match — but an invalid pattern then *panics* at scan time instead of
+    /// failing the build. Call [`QuerySpec::validate`] (or use the builder)
+    /// to surface a bad pattern up front.
     pub fn regex(pointer: impl Into<String>, pattern: impl Into<String>) -> Self {
         Self {
             pointer: pointer.into(),
             kind: JsonPredicateKind::Regex {
                 pattern: pattern.into(),
-                compiled: None,
+                compiled: OnceLock::new(),
             },
         }
     }
@@ -137,15 +150,17 @@ impl JsonPointerPredicate {
         Ok(())
     }
 
-    pub(crate) fn compile_regex(mut self) -> Result<Self, QueryBuildError> {
-        if let JsonPredicateKind::Regex { pattern, compiled } = &mut self.kind {
+    pub(crate) fn compile_regex(self) -> Result<Self, QueryBuildError> {
+        if let JsonPredicateKind::Regex { pattern, compiled } = &self.kind {
             let re = Regex::new(pattern).map_err(|e| {
                 QueryBuildError::new(format!(
                     "JSON pointer predicate at {:?} has invalid regex value {:?}: {e}",
                     self.pointer, pattern
                 ))
             })?;
-            *compiled = Some(re);
+            // `set` only fails when already compiled (e.g. `compile_regex`
+            // called twice); the existing regex is equivalent, so ignore it.
+            let _ = compiled.set(re);
         }
         Ok(self)
     }
@@ -167,12 +182,22 @@ impl JsonPointerPredicate {
                 let Some(text) = record.pointer(&self.pointer).and_then(Value::as_str) else {
                     return false;
                 };
-                match compiled {
-                    Some(re) => re.is_match(text),
-                    None => Regex::new(pattern)
-                        .map(|re| re.is_match(text))
-                        .unwrap_or(false),
-                }
+                // Compile once. `compile_json_predicates` (via `ScanPlan::build`)
+                // normally populates this; a directly-built `QuerySpec` that
+                // skipped the builder gets a single lazy compile here rather
+                // than one `Regex::new` per record. An invalid, never-validated
+                // pattern panics loudly instead of silently matching nothing.
+                let re = compiled.get_or_init(|| {
+                    Regex::new(pattern).unwrap_or_else(|e| {
+                        panic!(
+                            "JSON pointer predicate at {:?} has an invalid, \
+                             never-validated regex {:?}: {e}; call \
+                             QuerySpec::validate() or ScanPlan::build() before scanning",
+                            self.pointer, pattern
+                        )
+                    })
+                });
+                re.is_match(text)
             }
         }
     }

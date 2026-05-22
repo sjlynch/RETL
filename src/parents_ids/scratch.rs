@@ -12,7 +12,7 @@ use rayon::prelude::*;
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::fs;
-use std::io::{self, BufReader, BufWriter, Write};
+use std::io::{self, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;

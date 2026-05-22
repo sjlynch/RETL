@@ -193,6 +193,121 @@ fn resolve_parent_maps_errors_on_truncated_corpus_and_does_not_publish_cache() {
 }
 
 #[test]
+fn attach_parents_rejects_duplicate_input_basenames() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir_a = tmp.path().join("a");
+    let dir_b = tmp.path().join("b");
+    fs::create_dir_all(&dir_a).unwrap();
+    fs::create_dir_all(&dir_b).unwrap();
+    // Two inputs from different directories sharing one basename would both
+    // map to <out_dir>/part_RC_2006-01.jsonl, so the last writer would
+    // silently win. The collision must be rejected up front.
+    let in_a = dir_a.join("part_RC_2006-01.jsonl");
+    let in_b = dir_b.join("part_RC_2006-01.jsonl");
+    fs::write(&in_a, "{\"id\":\"a\",\"created_utc\":1136073600}\n").unwrap();
+    fs::write(&in_b, "{\"id\":\"b\",\"created_utc\":1136073600}\n").unwrap();
+
+    let parents = empty_parent_maps();
+    let err = RedditETL::new()
+        .progress(false)
+        .attach_parents_jsonls_parallel_with_stats(
+            vec![in_a.clone(), in_b.clone()],
+            &tmp.path().join("attached"),
+            &parents,
+            false,
+        )
+        .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("collide on basename"),
+        "unexpected error: {msg}"
+    );
+    assert!(
+        msg.contains(&in_a.display().to_string()),
+        "unexpected error: {msg}"
+    );
+    assert!(
+        msg.contains(&in_b.display().to_string()),
+        "unexpected error: {msg}"
+    );
+}
+
+#[test]
+fn attach_parents_counts_unprefixed_parent_id_records_as_unresolved() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input = tmp.path().join("part_RC_2006-01.jsonl");
+    // c1 has a prefixed-but-unresolvable parent_id; c2 has a bare numeric
+    // parent_id. Both records claim a parent, so both must be tallied —
+    // `total()` would otherwise undercount c2 (silently dropped pre-fix).
+    fs::write(
+        &input,
+        "{\"id\":\"c1\",\"body\":\"x\",\"parent_id\":\"t1_p1\",\"created_utc\":1136073600}\n\
+         {\"id\":\"c2\",\"body\":\"y\",\"parent_id\":\"12345\",\"created_utc\":1136073600}\n",
+    )
+    .unwrap();
+    let parents = empty_parent_maps();
+
+    let (_paths, stats) = RedditETL::new()
+        .progress(false)
+        .attach_parents_jsonls_parallel_with_stats(
+            vec![input.clone()],
+            &tmp.path().join("attached"),
+            &parents,
+            false,
+        )
+        .unwrap();
+    assert_eq!(stats.resolved, 0, "no parents are resolvable");
+    assert_eq!(
+        stats.unresolved, 2,
+        "both the prefixed-unresolvable and the bare parent_id record count"
+    );
+    assert_eq!(stats.total(), 2, "every record claiming a parent is tallied");
+}
+
+#[test]
+fn attach_parents_reports_corrupt_cache_shard_with_recovery_hint() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input = tmp.path().join("part_RC_2006-01.jsonl");
+    fs::write(
+        &input,
+        "{\"id\":\"c1\",\"body\":\"x\",\"parent_id\":\"t1_p1\",\"created_utc\":1136073600}\n",
+    )
+    .unwrap();
+
+    // A truncated/corrupt cached parent shard JSON must fail with an error
+    // that names it as cache corruption and gives the delete + --resume
+    // recovery, not a bare "parse parent shard" propagation.
+    let corrupt_shard = tmp.path().join("RC_2006-01.json");
+    fs::write(&corrupt_shard, "{ this is not valid json").unwrap();
+    let mut comment_shards = HashMap::new();
+    comment_shards.insert(YearMonth::new(2006, 1), corrupt_shard.clone());
+    let parents = ParentMaps {
+        comments: HashMap::new(),
+        submissions: HashMap::new(),
+        comment_shards: Some(comment_shards),
+        submission_shards: Some(HashMap::new()),
+        payload_spec: Default::default(),
+    };
+
+    let err = RedditETL::new()
+        .progress(false)
+        .attach_parents_jsonls_parallel_with_stats(
+            vec![input.clone()],
+            &tmp.path().join("attached"),
+            &parents,
+            false,
+        )
+        .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("corrupt"), "unexpected error: {msg}");
+    assert!(msg.contains("--resume"), "unexpected error: {msg}");
+    assert!(
+        msg.contains(&corrupt_shard.display().to_string()),
+        "unexpected error: {msg}"
+    );
+}
+
+#[test]
 fn attach_parents_errors_on_malformed_spool_json_with_location() {
     let tmp = tempfile::tempdir().unwrap();
     let input = tmp.path().join("part_RC_2006-01.jsonl");

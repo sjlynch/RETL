@@ -27,6 +27,12 @@ fn extract_tabular_common(
                 tmp_dir.display()
             )
         })?;
+        // Reclaim the per-month `.part_*.{csv,tsv}part` scratch on *every*
+        // exit path — normal return, an early `Err` (notably the strict-
+        // whitelist mismatch from `tracker.finalize()` below, which used to
+        // return before any cleanup and leak a full projected per-month copy
+        // on every `--strict-whitelist` failure), and a panic-unwind.
+        let _scratch_guard = crate::util::ScratchGuard::new(tmp_dir.clone());
         let staging_dir = ensure_staging_dir(&tmp_dir)?;
         sweep_stale_inprogress(&tmp_dir, true)?;
 
@@ -125,9 +131,7 @@ fn extract_tabular_common(
             manifest,
             ManifestDestination::File(out_path.to_path_buf()),
         )?;
-        if let Err(e) = crate::util::remove_dir_all_with_short_backoff(&tmp_dir) {
-            tracing::warn!(path=%tmp_dir.display(), error=%e, "failed to remove tabular extract scratch dir");
-        }
+        // `_scratch_guard` removes `tmp_dir` when this closure scope ends.
         Ok(())
     })
 }

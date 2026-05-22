@@ -276,6 +276,8 @@ fn aggregate_same_basename_inputs_get_distinct_shards() {
     // overwritten the other and the merged count could not have reached 3.
     assert_eq!(agg.count, 3);
     assert_eq!(report.merged_shards, 2);
+    assert_eq!(report.records_ingested, 3);
+    assert!(!report.ingested_zero_records());
     assert_eq!(report.problem_count(), 0);
 
     // The per-run shard directory is scratch and is removed after a
@@ -367,6 +369,67 @@ fn aggregate_malformed_json_line_counts_shard_error() {
     assert_eq!(report.fatal_count(), 1);
     assert_eq!(report.fatal_inputs[0].input, bad);
     assert_eq!(aggregate_shard_paths_recursive(&shards_dir).len(), 0);
+}
+
+#[test]
+fn aggregate_strict_fails_publish_on_any_fatal_input() {
+    let tmp = tempfile::tempdir().unwrap();
+    let good = tmp.path().join("good.jsonl");
+    let bad = tmp.path().join("bad.jsonl");
+    fs::write(&good, "{\"id\":\"a\"}\n").unwrap();
+    fs::write(&bad, "not-json\n").unwrap();
+    let shards_dir = tmp.path().join("agg_shards");
+    let final_out = tmp.path().join("agg_final.json");
+
+    // Without strict mode this batch publishes a 1/2 partial success. With
+    // `aggregate_strict(true)` the single fatal input fails the whole run and
+    // nothing is published.
+    let result = RedditETL::new()
+        .progress(false)
+        .aggregate_strict(true)
+        .aggregate_jsonls_parallel::<RecCount>(
+            vec![good.clone(), bad],
+            &shards_dir,
+            &final_out,
+            false,
+        );
+    assert!(
+        result.is_err(),
+        "strict mode should fail when any input is fatal"
+    );
+    assert!(
+        !final_out.exists(),
+        "strict mode must not publish output when an input is fatal"
+    );
+
+    // The same inputs publish a 1/2 result once strict mode is off.
+    let report = RedditETL::new()
+        .progress(false)
+        .aggregate_jsonls_parallel::<RecCount>(vec![good], &shards_dir, &final_out, false)
+        .unwrap();
+    assert_eq!(report.merged_shards, 1);
+    assert!(final_out.exists());
+}
+
+#[test]
+fn aggregate_reports_zero_records_ingested_for_empty_inputs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let empty = tmp.path().join("empty.jsonl");
+    fs::write(&empty, "").unwrap();
+    let shards_dir = tmp.path().join("agg_shards");
+
+    // An empty input still builds and merges a (default) shard, so the run
+    // "succeeds" — but it ingested no records. `ingested_zero_records()` lets a
+    // caller surface that as a warning instead of a silent empty result.
+    let (agg, report) = RedditETL::new()
+        .progress(false)
+        .aggregate_jsonls_parallel_collect::<RecCount>(vec![empty], &shards_dir)
+        .unwrap();
+
+    assert_eq!(agg.count, 0);
+    assert_eq!(report.merged_shards, 1);
+    assert_eq!(report.records_ingested, 0);
+    assert!(report.ingested_zero_records());
 }
 
 #[test]

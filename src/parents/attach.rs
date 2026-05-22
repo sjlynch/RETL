@@ -63,6 +63,43 @@ fn attach_output_basenames(inputs: &[(usize, PathBuf)]) -> Result<BTreeSet<Strin
     Ok(names)
 }
 
+/// Reject input sets in which two paths share a file name.
+///
+/// `attach_parents_jsonls_parallel_with_stats` derives every output path as
+/// `out_dir.join(<input file name>)`, so two inputs from different directories
+/// with the same basename map to one output. The atomic publish would then let
+/// the last writer win — one input's attached output silently lost, `attached`
+/// returning duplicate paths, and `prune_stale_attach_outputs` /
+/// `attach_output_basenames` collapsing the pair. The CLI never reaches this
+/// (`discover_spool_parts` reads a single directory), but the public
+/// `Vec<PathBuf>` API can, so fail fast and name the colliding paths.
+fn ensure_unique_attach_basenames(inputs: &[(usize, PathBuf)]) -> Result<()> {
+    let mut seen: HashMap<String, PathBuf> = HashMap::new();
+    for (_idx, input) in inputs {
+        let name = input
+            .file_name()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "attach_parents input path has no file name: {}",
+                    input.display()
+                )
+            })?
+            .to_string_lossy()
+            .to_string();
+        if let Some(prev) = seen.insert(name.clone(), input.clone()) {
+            anyhow::bail!(
+                "attach_parents inputs collide on basename `{name}`: `{}` and `{}` would both \
+                 write to <out_dir>/{name}; attach derives each output path from the input file \
+                 name, so same-named inputs from different directories overwrite each other — \
+                 rename one input or pass inputs whose file names are unique",
+                prev.display(),
+                input.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 fn prune_stale_attach_outputs(out_dir: &Path, keep_basenames: &BTreeSet<String>) -> Result<()> {
     if !out_dir.exists() {
         return Ok(());
@@ -294,6 +331,14 @@ fn attach_parents_for_one_file<W: std::io::Write + ?Sized>(
                     file_stats.unresolved += 1;
                 }
             }
+        } else if has_parent_id {
+            // The record carries a `parent_id` field, but its value is not a
+            // `t1_`/`t3_`-prefixed string, so it can never be resolved. Count
+            // it as `unresolved` rather than dropping it from the tally:
+            // `ParentAttachStats::total()` must account for every record that
+            // claims a parent, or a spool full of malformed parent_ids reports
+            // a misleadingly clean `total()`. See `warn_if_malformed_parent_ids`.
+            file_stats.unresolved += 1;
         }
 
         serde_json::to_writer(&mut *w, &v)?;

@@ -29,6 +29,7 @@ impl RedditETL {
             sweep_stale_inprogress(out_dir, true)?;
 
             let indexed_inputs: Vec<(usize, PathBuf)> = inputs.into_iter().enumerate().collect();
+            ensure_unique_attach_basenames(&indexed_inputs)?;
             let keep_basenames = attach_output_basenames(&indexed_inputs)?;
             prune_stale_attach_outputs(out_dir, &keep_basenames)?;
 

@@ -114,6 +114,27 @@ fn malformed_returns_error_and_clears_buf() {
 }
 
 #[test]
+fn leading_zero_number_falls_back_to_slow_path() {
+    // `007` is not valid JSON; serde_json rejects the whole line. The
+    // tokenizer must reject too so the caller falls back rather than copying
+    // a non-JSON number verbatim into projected output.
+    let line = r#"{"id":007,"author":"alice"}"#;
+    assert!(serde_json::from_str::<Value>(line).is_err());
+    let tok = WhitelistTokenizer::new(["id"]);
+    let mut out = String::new();
+    assert!(tok.tokenize_into(line, &mut out).is_err());
+}
+
+#[test]
+fn plain_zero_and_zero_fraction_still_accepted() {
+    let line = r#"{"a":0,"b":-0,"c":0.5,"d":10}"#;
+    let tok = WhitelistTokenizer::new(["a", "b", "c", "d"]);
+    let mut out = String::new();
+    tok.tokenize_into(line, &mut out).unwrap();
+    assert!(equal_as_json(&out, &slow_path(line, &["a", "b", "c", "d"])));
+}
+
+#[test]
 fn non_object_top_level_errors() {
     let line = r#"[1,2,3]"#;
     let tok = WhitelistTokenizer::new(["a"]);

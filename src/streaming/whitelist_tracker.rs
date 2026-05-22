@@ -22,9 +22,15 @@ impl WhitelistMatchState {
 
 /// Shared per-export whitelist sanity checker. It tracks the requested field
 /// names and reports once if any individual field never appears in accepted
-/// records. Fast-path and slow-path observations are kept separate: fast-path
-/// presence decides the warning/error, while slow-path-only matches are called
-/// out explicitly so tokenizer fallback lines cannot hide a real typo.
+/// records. Fast-path and slow-path observations are kept separate: while any
+/// record takes the fast `WhitelistTokenizer` path, that path decides the
+/// warning/error and slow-path-only matches are called out explicitly so
+/// tokenizer fallback lines cannot hide a real typo. When **no** record takes
+/// the fast path (every line fell back to the slow `serde_json::Value`
+/// projection — e.g. a corpus that always repeats a whitelisted top-level key,
+/// which the tokenizer rejects as Malformed), the verdict is derived from
+/// slow-path presence instead, so a genuinely typo'd field is still flagged
+/// rather than the whole check being silently skipped.
 #[derive(Debug)]
 pub(crate) struct WhitelistMatchTracker {
     strict: bool,
@@ -82,54 +88,83 @@ impl WhitelistMatchTracker {
     }
 
     fn report_missing_fields(&self, state: &mut WhitelistMatchState) -> Result<()> {
-        if state.reported || state.fast_seen == 0 || self.field_names.is_empty() {
+        if state.reported || self.field_names.is_empty() {
             return Ok(());
         }
 
-        let missing: Vec<usize> = state
-            .fast_field_seen
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, seen)| (!*seen).then_some(idx))
-            .collect();
-        if missing.is_empty() {
+        // Fast-path presence is the production signal and decides the verdict
+        // whenever any record took the fast `WhitelistTokenizer` path. When no
+        // record did — every line fell back to the slow `serde_json::Value`
+        // projection (a corpus that always repeats a whitelisted top-level key,
+        // a top-level array, ...) — fall back to slow-path presence so a
+        // genuinely typo'd field is still flagged instead of the whole check
+        // (including the strict zero-match error) being skipped.
+        let slow_path_derived = state.fast_seen == 0;
+        let (seen_count, missing, observed): (u64, Vec<usize>, Vec<usize>) = {
+            let (seen_count, field_seen) = if slow_path_derived {
+                (state.slow_seen, &state.slow_field_seen)
+            } else {
+                (state.fast_seen, &state.fast_field_seen)
+            };
+            let missing = field_seen
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, seen)| (!*seen).then_some(idx))
+                .collect();
+            let observed = field_seen
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, seen)| (*seen).then_some(idx))
+                .collect();
+            (seen_count, missing, observed)
+        };
+        if seen_count == 0 || missing.is_empty() {
             return Ok(());
         }
 
         state.reported = true;
-        let slow_only: Vec<usize> = missing
-            .iter()
-            .copied()
-            .filter(|idx| state.slow_field_seen.get(*idx).copied().unwrap_or(false))
-            .collect();
+        // Only the fast-path verdict cross-references the slow-path counters;
+        // a slow-path-derived verdict already decides on slow-path presence,
+        // so there is nothing left to "exclude".
+        let slow_only: Vec<usize> = if slow_path_derived {
+            Vec::new()
+        } else {
+            missing
+                .iter()
+                .copied()
+                .filter(|idx| state.slow_field_seen.get(*idx).copied().unwrap_or(false))
+                .collect()
+        };
         let missing_names = join_field_names(&self.field_names, missing.iter().copied());
         let all_missing = missing.len() == self.field_names.len();
         let mut msg = if all_missing {
-            if state.fast_seen >= WHITELIST_ZERO_MATCH_SAMPLE {
+            // Keep the fast-path wording byte-identical (CLI tests assert it);
+            // the slow-path verdict inserts a "slow-path " qualifier.
+            let path_prefix = if slow_path_derived { "slow-path " } else { "" };
+            if seen_count >= WHITELIST_ZERO_MATCH_SAMPLE {
                 format!(
-                    "--whitelist matched zero fields on the first {} records; fields never matched: {}; {}",
-                    WHITELIST_ZERO_MATCH_SAMPLE, missing_names, WHITELIST_ZERO_MATCH_HINT
+                    "--whitelist matched zero fields on the first {} {}records; fields never matched: {}; {}",
+                    WHITELIST_ZERO_MATCH_SAMPLE, path_prefix, missing_names, WHITELIST_ZERO_MATCH_HINT
                 )
             } else {
                 format!(
-                    "--whitelist matched zero fields on all {} records; fields never matched: {}; {}",
-                    state.fast_seen, missing_names, WHITELIST_ZERO_MATCH_HINT
+                    "--whitelist matched zero fields on all {} {}records; fields never matched: {}; {}",
+                    seen_count, path_prefix, missing_names, WHITELIST_ZERO_MATCH_HINT
                 )
             }
         } else {
-            let observed_names = join_field_names(
-                &self.field_names,
-                state
-                    .fast_field_seen
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(idx, seen)| (*seen).then_some(idx)),
-            );
+            let observed_names = join_field_names(&self.field_names, observed.into_iter());
+            let path_label = if slow_path_derived { "slow-path" } else { "fast-path" };
             format!(
-                "--whitelist fields never matched any fast-path records: {}; observed fields: {}; {}",
-                missing_names, observed_names, WHITELIST_ZERO_MATCH_HINT
+                "--whitelist fields never matched any {} records: {}; observed fields: {}; {}",
+                path_label, missing_names, observed_names, WHITELIST_ZERO_MATCH_HINT
             )
         };
+        if slow_path_derived {
+            msg.push_str(
+                " (No record took the fast WhitelistTokenizer path, so this verdict is slow-path-derived.)",
+            );
+        }
         if !slow_only.is_empty() {
             msg.push_str(&format!(
                 " Fields matched only on slow-path emissions and were excluded from this check: {}.",

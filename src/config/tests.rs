@@ -85,6 +85,48 @@ mod tests {
     }
 
     #[test]
+    fn disable_inflight_cap_sets_zero_sentinel() {
+        // The explicit, warning-free opt-out for the disable-the-cap sentinel.
+        let opts = ETLOptions::default().disable_inflight_cap();
+        assert_eq!(opts.inflight_bytes, 0);
+        // 0 means "no explicit ceiling" — the worst-case peak helper reports 0.
+        assert_eq!(
+            inflight_worst_case_peak_bytes(opts.inflight_bytes, opts.inflight_groups),
+            0
+        );
+    }
+
+    #[test]
+    fn with_inflight_budget_zero_keeps_disable_sentinel() {
+        // Passing 0 still stores the disable sentinel (and emits a one-shot
+        // warn the first time any inflight setter sees 0 this process); the
+        // stored value/groups are unchanged.
+        let opts = ETLOptions::default().with_inflight_budget(0);
+        assert_eq!(opts.inflight_bytes, 0);
+        assert_eq!(opts.inflight_groups, 1);
+    }
+
+    #[test]
+    fn io_buffer_setters_clamp_floor_and_ceiling() {
+        // Sub-floor request raised to MIN_IO_BUFFER (previously raised silently).
+        let low = ETLOptions::default().with_io_buffers(1, 0);
+        assert_eq!(low.read_buffer_bytes, MIN_IO_BUFFER);
+        assert_eq!(low.write_buffer_bytes, MIN_IO_BUFFER);
+
+        // Oversized request clamped to MAX_IO_BUFFER instead of reaching the
+        // allocator with a usize::MAX-capacity BufReader/BufWriter.
+        let high = ETLOptions::default()
+            .with_io_read_buffer(usize::MAX)
+            .with_io_write_buffer(usize::MAX);
+        assert_eq!(high.read_buffer_bytes, MAX_IO_BUFFER);
+        assert_eq!(high.write_buffer_bytes, MAX_IO_BUFFER);
+
+        // In-range request passes through untouched.
+        let ok = ETLOptions::default().with_io_read_buffer(1024 * 1024);
+        assert_eq!(ok.read_buffer_bytes, 1024 * 1024);
+    }
+
+    #[test]
     fn resource_knobs_clamp_low_values_to_one() {
         let opts = ETLOptions::default()
             .with_shard_count(0)

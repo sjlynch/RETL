@@ -111,6 +111,36 @@ fn direct_parent_kind_label(kind: ParentIdKindArg) -> &'static str {
     }
 }
 
+/// Reject a `t1_`/`t3_`-prefixed direct ID whose prefix contradicts an
+/// explicit `--id-kind`.
+///
+/// Without this check `retl parents --parent-id t1_abc --id-kind submission`
+/// silently honors the `t1_` prefix and discards `--id-kind` — a silent
+/// winner between two contradictory user inputs. `--id-kind` only ever
+/// disambiguates *bare* IDs, so a prefixed ID plus a disagreeing `--id-kind`
+/// is always a mistake worth surfacing.
+fn check_prefixed_id_kind_agreement(
+    id: &str,
+    prefix_kind: ParentIdKindArg,
+    bare_kind: Option<ParentIdKindArg>,
+    source: &str,
+) -> Result<()> {
+    if let Some(requested) = bare_kind {
+        if requested != prefix_kind {
+            anyhow::bail!(
+                "parent ID `{id}` in {source} is `{}`-prefixed (RETL reads it as a {}), but \
+                 --id-kind {} was given; the fullname prefix and --id-kind disagree — drop \
+                 --id-kind, or pass the ID without its `{}` prefix",
+                direct_parent_kind_prefix(prefix_kind),
+                direct_parent_kind_label(prefix_kind),
+                direct_parent_kind_label(requested),
+                direct_parent_kind_prefix(prefix_kind),
+            );
+        }
+    }
+    Ok(())
+}
+
 fn normalize_direct_parent_id(
     raw: &str,
     bare_kind: Option<ParentIdKindArg>,
@@ -122,11 +152,13 @@ fn normalize_direct_parent_id(
     }
 
     let (kind, bare) = if let Some(rest) = id.strip_prefix("t1_") {
+        check_prefixed_id_kind_agreement(id, ParentIdKindArg::Comment, bare_kind, source)?;
         (
             ParentIdKindArg::Comment,
             validate_parent_bare_id(rest, source)?,
         )
     } else if let Some(rest) = id.strip_prefix("t3_") {
+        check_prefixed_id_kind_agreement(id, ParentIdKindArg::Submission, bare_kind, source)?;
         (
             ParentIdKindArg::Submission,
             validate_parent_bare_id(rest, source)?,
