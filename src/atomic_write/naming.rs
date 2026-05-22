@@ -37,7 +37,7 @@ pub(crate) fn unique_inprogress_path(staging_dir: &Path, final_dest: &Path) -> R
     Ok(staging_dir.join(staged_name))
 }
 
-/// RETL-owned suffix fields parsed out of a staged `.inprogress` filename.
+/// RETL-owned suffix fields parsed out of a staged filename.
 ///
 /// `unique_inprogress_path` always emits `<pid>-<nonce>-<nanos>`, but a sweep
 /// may also encounter `.inprogress` files left by an older RETL build whose
@@ -50,18 +50,24 @@ pub(super) struct StagedSuffix {
     pub created_nanos: Option<u128>,
 }
 
-/// Parse the RETL-owned suffix of a staged `.inprogress` path.
+/// Parse the RETL-owned suffix of a staged path whose name ends in `ext`.
 ///
-/// Returns `None` for legacy fixed-name `.inprogress` files and any path that
-/// does not carry the `STAGE_MARKER` suffix — those cannot be safely
-/// attributed to a RETL process, so the sweep leaves them in place.
-pub(super) fn parse_inprogress_suffix(path: &Path) -> Option<StagedSuffix> {
+/// Both staged `.inprogress` files and the `.atomic-replace-tmp` copy+rename
+/// fallback siblings created by `replace_file_atomic_backoff` carry the same
+/// `<base>.retl-<pid>-<nonce>-<nanos><ext>` shape — only the trailing
+/// extension differs — so the sweep can attribute either kind to its owner
+/// PID with one parser.
+///
+/// Returns `None` for legacy fixed-name files and any path that does not carry
+/// the `STAGE_MARKER` suffix — those cannot be safely attributed to a RETL
+/// process, so the sweep leaves them in place.
+pub(super) fn parse_staged_suffix(path: &Path, ext: &str) -> Option<StagedSuffix> {
     let name = path.file_name()?.to_str()?;
-    if !name.ends_with(INPROGRESS_EXT) {
+    if !name.ends_with(ext) {
         return None;
     }
     let start = name.rfind(STAGE_MARKER)? + STAGE_MARKER.len();
-    let rest = &name[start..name.len() - INPROGRESS_EXT.len()];
+    let rest = &name[start..name.len() - ext.len()];
     let parts: Vec<&str> = rest.split('-').collect();
     let pid: u32 = parts.first()?.parse().ok()?;
     // `unique_inprogress_path` emits `<pid>-<nonce>-<nanos>`; the trailing
