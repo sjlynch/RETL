@@ -22,6 +22,7 @@ impl Default for ETLOptions {
             whitelist_fields: None,
             strict_whitelist: false,
             strict_key: false,
+            aggregate_strict: false,
             parallelism: None,
             work_dir: None,
             file_concurrency: DEFAULT_FILE_CONCURRENCY, // safe default to prevent OOM on big .zst windows

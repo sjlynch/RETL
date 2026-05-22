@@ -191,8 +191,8 @@ Field guide for watchers:
   around `n_workers * 100`. Values near 0 with a wedged `last_event_ts`
   suggest the scan is stuck (deadlock or stalled in a syscall).
 - `available_memory_fraction` — system-wide, sampled from `sysinfo`. When
-  this drops below ~0.15 the in-library adaptive throttling kicks in
-  and `throttle_active` flips true.
+  this drops below ~0.18 (`AdaptiveMemCfg::default().soft_low_frac`) the
+  in-library adaptive throttling kicks in and `throttle_active` flips true.
 - `throttle_active` — when true, the library is intentionally slowing
   bucketing/dedupe producers. A watcher seeing this set for extended
   periods may want to lower `--inflight-bytes`.

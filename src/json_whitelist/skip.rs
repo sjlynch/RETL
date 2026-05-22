@@ -107,6 +107,12 @@ pub(super) fn skip_number(bytes: &[u8], mut i: usize) -> Option<usize> {
     if i == int_start {
         return None;
     }
+    // JSON forbids a leading zero followed by another digit (`007`, `01`).
+    // serde_json rejects the whole line on the slow path; reject here too so
+    // the caller falls back rather than copying a non-JSON number verbatim.
+    if i - int_start > 1 && bytes[int_start] == b'0' {
+        return None;
+    }
     if i < bytes.len() && bytes[i] == b'.' {
         i += 1;
         let frac_start = i;

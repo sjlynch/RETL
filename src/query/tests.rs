@@ -72,6 +72,47 @@ mod tests {
     }
 
     #[test]
+    fn json_regex_predicate_compiles_lazily_without_explicit_build() {
+        use serde_json::json;
+
+        // A directly-built `QuerySpec` that never ran `compile_json_predicates`
+        // (i.e. skipped `ScanPlan::build`) must still compile each regex
+        // predicate exactly once — lazily on first use — not once per record.
+        let predicate = JsonPointerPredicate::regex("/distinguished", "^mod");
+        let JsonPredicateKind::Regex { compiled, .. } = &predicate.kind else {
+            panic!("constructed a regex predicate");
+        };
+        assert!(
+            compiled.get().is_none(),
+            "regex must not be compiled until first match"
+        );
+
+        assert!(predicate.matches(&json!({"distinguished": "moderator"})));
+        assert!(!predicate.matches(&json!({"distinguished": "admin"})));
+
+        // After the first evaluation the compiled regex is cached, so later
+        // records reuse it instead of recompiling per line.
+        let JsonPredicateKind::Regex { compiled, .. } = &predicate.kind else {
+            unreachable!()
+        };
+        assert!(
+            compiled.get().is_some(),
+            "first match must populate the lazy regex cache"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "never-validated regex")]
+    fn json_regex_predicate_panics_on_invalid_uncompiled_pattern() {
+        use serde_json::json;
+
+        // An invalid pattern that never passed `validate`/`compile_regex` must
+        // fail loudly at scan time rather than silently matching nothing.
+        let predicate = JsonPointerPredicate::regex("/x", "(unclosed");
+        let _ = predicate.matches(&json!({"x": "anything"}));
+    }
+
+    #[test]
     fn normalize_str_re_trims_after_stripping_r_prefix() {
         // Without the post-strip re-trim, "r/  foo" yields a leading-space
         // subreddit that passes `is_empty()` validation and then silently
