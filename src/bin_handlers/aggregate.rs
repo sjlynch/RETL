@@ -5,6 +5,27 @@ pub(crate) fn run_aggregate(args: AggregateArgs) -> Result<()> {
             "retl aggregate does not support --resume because it reduces existing JSONL inputs. For resumable corpus filtering, run `retl export --format spool --resume ...` first, then aggregate with `retl aggregate --spool <DIR>`."
         );
     }
+    if matches!(args.format, AggregateFmt::Parquet) && args.by.is_none() {
+        anyhow::bail!(
+            "--format parquet requires --by (the ungrouped record-count output has no row schema). Re-run with `--by <field>` to write a two-column parquet rollup, or drop `--format parquet`."
+        );
+    }
+    let is_parquet = matches!(args.format, AggregateFmt::Parquet);
+    if args.parquet_row_group_size.is_some() && !is_parquet {
+        anyhow::bail!(
+            "--parquet-row-group-size only applies to --format parquet; drop it or pass --format parquet"
+        );
+    }
+    if args.parquet_compression.is_some() && !is_parquet {
+        anyhow::bail!(
+            "--parquet-compression only applies to --format parquet; drop it or pass --format parquet"
+        );
+    }
+    if is_parquet && args.out == Path::new("-") {
+        anyhow::bail!(
+            "--format parquet requires an explicit --out <FILE>; parquet is a binary container and cannot stream to stdout"
+        );
+    }
     let manifest_start = RunManifestStart::now();
     let mut etl = RedditETL::new()
         .progress(!args.runtime.no_progress)
@@ -41,7 +62,23 @@ pub(crate) fn run_aggregate(args: AggregateArgs) -> Result<()> {
         } else {
             agg.rows(top)
         };
-        write_grouped_tsv(&args.out, rows)?;
+        let output_format = match args.format {
+            AggregateFmt::Tsv => {
+                write_grouped_tsv(&args.out, rows)?;
+                "tsv"
+            }
+            AggregateFmt::Parquet => {
+                let row_group_size = args
+                    .parquet_row_group_size
+                    .unwrap_or(retl::DEFAULT_PARQUET_ROW_GROUP_SIZE);
+                let compression = args
+                    .parquet_compression
+                    .clone()
+                    .unwrap_or_else(|| retl::DEFAULT_PARQUET_COMPRESSION.to_string());
+                write_grouped_parquet(&args.out, rows, row_group_size, &compression)?;
+                "parquet"
+            }
+        };
         let mut counts = counts_map(&[
             ("input_files", input_count as u64),
             ("ok_inputs", report.ok_inputs.len() as u64),
@@ -69,13 +106,14 @@ pub(crate) fn run_aggregate(args: AggregateArgs) -> Result<()> {
             &args,
             &shards_dir,
             &manifest_inputs,
-            "tsv",
+            output_format,
             counts,
             warnings,
         )?;
         eprintln!(
-            "Aggregated {} shard(s) to TSV; {} input(s) failed during shard build; {} input(s) skipped after partial read",
+            "Aggregated {} shard(s) to {}; {} input(s) failed during shard build; {} input(s) skipped after partial read",
             report.merged_shards,
+            output_format.to_uppercase(),
             report.fatal_count(),
             report.partial_count()
         );
@@ -336,6 +374,41 @@ fn write_rec_count_json(out: &Path, agg: &RecCount, pretty: bool) -> Result<()> 
     .with_context(|| format!("publishing output file {}", out.display()))
 }
 
+/// Write a two-column (`key`, `value`) Parquet rollup of `rows` to `out`.
+/// Atomically published through [`retl::parquet_writer::write_kv_rows_atomic`]
+/// so a crashed run never leaves a partial `.parquet` at the published path.
+///
+/// The `key` and `value` columns are STRING because grouped values can be
+/// integer, decimal, or scientific-notation depending on `--scientific`,
+/// matching the TSV path's behavior; downstream readers can `CAST` as
+/// needed.
+fn write_grouped_parquet(
+    out: &Path,
+    rows: Vec<(String, String)>,
+    row_group_size: usize,
+    compression: &str,
+) -> Result<()> {
+    let parent = out
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    retl::create_dir_all_with_default_backoff(&parent)
+        .with_context(|| format!("creating parquet output parent {}", parent.display()))?;
+    // `write_kv_rows_atomic` derives its own staging dir from `parent`.
+    let staging = parent.join(retl::STAGING_DIR_NAME);
+    retl::parquet_writer::write_kv_rows_atomic(
+        &staging,
+        out,
+        row_group_size,
+        compression,
+        64 * 1024,
+        rows.into_iter(),
+    )
+    .map(|_| ())
+    .with_context(|| format!("publishing aggregate parquet {}", out.display()))
+}
+
 fn write_grouped_tsv(out: &Path, rows: Vec<(String, String)>) -> Result<()> {
     // See `write_rec_count_json`: `--out -` streams the TSV to stdout.
     write_text_or_stdout(out, |w| {
@@ -379,6 +452,16 @@ fn write_cli_aggregate_manifest(
         "parallelism": args.runtime.parallelism,
         "progress": !args.runtime.no_progress,
         "emit_manifest": !args.runtime.no_manifest,
+        "format": match args.format {
+            AggregateFmt::Tsv => "tsv",
+            AggregateFmt::Parquet => "parquet",
+        },
+        "parquet_row_group_size": (matches!(args.format, AggregateFmt::Parquet)).then_some(
+            args.parquet_row_group_size.unwrap_or(retl::DEFAULT_PARQUET_ROW_GROUP_SIZE),
+        ),
+        "parquet_compression": matches!(args.format, AggregateFmt::Parquet).then(|| {
+            args.parquet_compression.clone().unwrap_or_else(|| retl::DEFAULT_PARQUET_COMPRESSION.to_string())
+        }),
     });
     manifest.inputs = file_identities(inputs);
     manifest.output_format = output_format.to_string();

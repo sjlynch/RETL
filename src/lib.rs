@@ -167,6 +167,7 @@ mod json_whitelist;
 mod key_extractor;
 mod ndjson;
 mod obs;
+pub mod parquet_writer;
 
 pub use crate::obs::{
     install_monitor, Event, EventKind, LifecycleEvent, LogFormat, MonitorHandle, MonitorOptions,
@@ -175,8 +176,8 @@ pub use crate::obs::{
 
 pub use crate::config::{
     max_parallelism_limit, ConfigBuildError, ETLOptions, PartialReadReport, PartialReadReporter,
-    SkippedFile, Sources, MAX_FILE_CONCURRENCY, MAX_IO_BUFFER, MAX_RAYON_THREADS, MAX_SHARDS,
-    MIN_IO_BUFFER,
+    SkippedFile, Sources, DEFAULT_PARQUET_COMPRESSION, DEFAULT_PARQUET_ROW_GROUP_SIZE,
+    MAX_FILE_CONCURRENCY, MAX_IO_BUFFER, MAX_RAYON_THREADS, MAX_SHARDS, MIN_IO_BUFFER,
 };
 pub use crate::corpus_manifest::{
     CorpusAvailability, CorpusLocalStatus, CorpusManifest, CorpusManifestError, CorpusManifestFile,
@@ -247,7 +248,7 @@ pub use crate::partition::{PartitionFinalizeError, PartitionWriters, MAX_PARTITI
 
 // Re-export atomic-write entry points used by binaries and downstream library
 // callers that don't already hold a staging-dir handle.
-pub use crate::atomic_write::{write_at_path_atomic, write_text_atomic};
+pub use crate::atomic_write::{write_at_path_atomic, write_text_atomic, STAGING_DIR_NAME};
 
 //export robust file ops from util so binaries can import from crate root.
 pub use crate::util::{

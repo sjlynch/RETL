@@ -13,6 +13,30 @@ impl ETLOptions {
         self
     }
 
+    /// Rows per Parquet row group when writing `.parquet` outputs. Larger
+    /// groups improve scan performance and compression ratio but raise the
+    /// writer's per-group memory peak. Values < 1 are clamped to 1. Default:
+    /// 128 * 1024 rows.
+    pub fn with_parquet_row_group_size(mut self, rows: usize) -> Self {
+        self.parquet_row_group_size = rows.max(1);
+        self
+    }
+
+    /// Compression codec used by Parquet writers. See
+    /// [`ETLOptions::parquet_compression`] for the accepted spelling. Empty
+    /// or whitespace-only input is rejected by falling back to the default
+    /// (`"zstd:3"`). Default: `"zstd:3"`.
+    pub fn with_parquet_compression(mut self, codec: impl Into<String>) -> Self {
+        let codec = codec.into();
+        let trimmed = codec.trim();
+        self.parquet_compression = if trimmed.is_empty() {
+            DEFAULT_PARQUET_COMPRESSION.to_string()
+        } else {
+            trimmed.to_string()
+        };
+        self
+    }
+
     /// Opt in to resumable extract/export and analytics runs (`scan`/usernames,
     /// dedupe, count, first-seen, `extract_to_jsonl`, `extract_to_json`,
     /// `extract_spool_monthly`, `export_partitioned`, and parents helpers).

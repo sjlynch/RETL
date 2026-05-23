@@ -41,6 +41,21 @@ fn reject_inapplicable_export_format_flags(args: &ExportArgs) -> Result<()> {
             export_format_name(args.format)
         );
     }
+    let is_parquet = matches!(args.format, ExportFmt::Parquet | ExportFmt::PartitionedParquet);
+    if args.parquet_row_group_size.is_some() && !is_parquet {
+        anyhow::bail!(
+            "--parquet-row-group-size only applies to --format parquet or partitioned-parquet; \
+             --format {} produces no .parquet output",
+            export_format_name(args.format)
+        );
+    }
+    if args.parquet_compression.is_some() && !is_parquet {
+        anyhow::bail!(
+            "--parquet-compression only applies to --format parquet or partitioned-parquet; \
+             --format {} produces no .parquet output",
+            export_format_name(args.format)
+        );
+    }
     Ok(())
 }
 
@@ -67,6 +82,12 @@ pub(crate) fn run_export(args: ExportArgs) -> Result<()> {
     }
     if let Some(level) = args.zst_level {
         etl = etl.zst_level(level);
+    }
+    if let Some(rows) = args.parquet_row_group_size {
+        etl = etl.parquet_row_group_size(rows);
+    }
+    if let Some(ref codec) = args.parquet_compression {
+        etl = etl.parquet_compression(codec.clone());
     }
     if args.resume {
         etl = etl.resume(true);
@@ -139,7 +160,7 @@ pub(crate) fn run_export(args: ExportArgs) -> Result<()> {
             let (parts, n) = scan.extract_spool_monthly(&args.out)?;
             eprintln!("Spooled {} records across {} part files", n, parts.len());
         }
-        ExportFmt::Zst | ExportFmt::PartitionedJsonl => {
+        ExportFmt::Zst | ExportFmt::PartitionedJsonl | ExportFmt::PartitionedParquet => {
             if to_stdout {
                 anyhow::bail!(
                     "--format {} requires an explicit --out <DIR> (it writes a partitioned corpus tree, not a stream)",
@@ -149,9 +170,18 @@ pub(crate) fn run_export(args: ExportArgs) -> Result<()> {
             let partition_format = match args.format {
                 ExportFmt::Zst => ExportFormat::Zst,
                 ExportFmt::PartitionedJsonl => ExportFormat::Jsonl,
+                ExportFmt::PartitionedParquet => ExportFormat::Parquet,
                 _ => unreachable!(),
             };
             scan.export_partitioned(&args.out, partition_format)?;
+        }
+        ExportFmt::Parquet => {
+            if to_stdout {
+                anyhow::bail!(
+                    "--format parquet requires an explicit --out <FILE> (parquet is a binary container, not a stream)"
+                );
+            }
+            scan.extract_to_parquet(&args.out)?;
         }
     }
     emit_partial_read_report(&partial_reporter)?;

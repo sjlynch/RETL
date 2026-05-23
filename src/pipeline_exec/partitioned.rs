@@ -16,6 +16,7 @@ fn partitioned_resume_operation(format: ExportFormat) -> &'static str {
     match format {
         ExportFormat::Jsonl => "partitioned-jsonl",
         ExportFormat::Zst => "partitioned-zst",
+        ExportFormat::Parquet => "partitioned-parquet",
     }
 }
 
@@ -23,6 +24,7 @@ fn partitioned_ext(format: ExportFormat) -> &'static str {
     match format {
         ExportFormat::Jsonl => "jsonl",
         ExportFormat::Zst => "zst",
+        ExportFormat::Parquet => "parquet",
     }
 }
 
@@ -138,6 +140,13 @@ fn validate_partitioned_resume_output(
             crate::zstd_jsonl::validate_zst_full(path)
                 .with_context(|| format!("validating partitioned zst {}", path.display()))?;
         }
+        ExportFormat::Parquet => {
+            // Parquet validation is size-only on resume re-entry: a full row-
+            // count round-trip would re-decode every row group. The file
+            // already passed atomic publish (the parquet footer was closed
+            // before the rename), so a size match is sufficient evidence that
+            // the same publish recorded by `_progress.json` is still on disk.
+        }
     }
     Ok(())
 }
@@ -170,6 +179,8 @@ struct PartitionedJobCtx<'a> {
     write_buf: usize,
     human_ts: bool,
     zst_level: i32,
+    parquet_row_group_size: usize,
+    parquet_compression: &'a str,
     whitelist_tracker: Option<&'a WhitelistMatchTracker>,
     record_limit: Option<&'a RecordLimit>,
     allow_partial: bool,
@@ -254,6 +265,15 @@ fn process_partitioned_job(job: &FileJob, ctx: &PartitionedJobCtx<'_>) -> Result
             should_publish,
             stream,
         ),
+        ExportFormat::Parquet => crate::parquet_writer::write_parquet_atomic_if(
+            ctx.staging_dir,
+            &out_path,
+            ctx.parquet_row_group_size,
+            ctx.parquet_compression,
+            ctx.write_buf,
+            should_publish,
+            stream,
+        ),
     };
 
     let written = match written_result {
@@ -319,6 +339,8 @@ fn emit_partitioned_resume_manifest(
         serde_json::json!({
             "partition_format": partitioned_ext(format),
             "zst_level": (format == ExportFormat::Zst).then_some(plan.etl.opts.zst_level),
+            "parquet_row_group_size": (format == ExportFormat::Parquet).then_some(plan.etl.opts.parquet_row_group_size),
+            "parquet_compression": (format == ExportFormat::Parquet).then_some(plan.etl.opts.parquet_compression.clone()),
         }),
     );
     maybe_write_run_manifest(
@@ -456,6 +478,8 @@ impl ScanPlan {
                 write_buf: prepared.etl.opts.write_buffer_bytes,
                 human_ts: prepared.etl.opts.human_readable_timestamps,
                 zst_level: prepared.etl.opts.zst_level,
+                parquet_row_group_size: prepared.etl.opts.parquet_row_group_size,
+                parquet_compression: &prepared.etl.opts.parquet_compression,
                 whitelist_tracker: whitelist_tracker.as_deref(),
                 record_limit: record_limit.as_deref(),
                 allow_partial: prepared.etl.opts.allow_partial,

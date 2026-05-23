@@ -40,8 +40,23 @@ crossbeam-channel = "0.5"
 # ~10s to clean builds, so it is gated behind the `duckdb-load` feature.
 duckdb = { version = "1", features = ["bundled"], optional = true }
 
+# Optional Apache Arrow + Parquet dependencies — gated behind the `parquet`
+# feature because they roughly double the cold compile time. With the feature
+# off, ExportFormat::Parquet still exists but `extract_to_parquet` /
+# `export_partitioned` / the `aggregate --format parquet` CLI return a
+# build-time error pointing at this feature flag.
+parquet = { version = "53", default-features = false, features = ["arrow", "zstd"], optional = true }
+arrow-array = { version = "53", optional = true }
+arrow-schema = { version = "53", optional = true }
+
 [features]
 default = []
+# Compile in the Parquet output path (`ExportFormat::Parquet`,
+# `ScanPlan::extract_to_parquet`, `retl export --format parquet`,
+# `retl aggregate --format parquet`). Off by default to keep the default
+# build (`cargo build`) lean; Apache Arrow + Parquet add several hundred
+# kLOC of dependency code.
+parquet = ["dep:parquet", "dep:arrow-array", "dep:arrow-schema"]
 # Exposes test-only injection points and hooks used by integration tests:
 #   * `set_available_memory_fraction_for_tests` (see `src/mem.rs`) lets tests
 #     drive process-global memory-pressure state deterministically.
@@ -106,3 +121,11 @@ required-features = ["test-utils"]
 [[test]]
 name = "backpressure_bucketing"
 required-features = ["test-utils"]
+
+# `parquet_round_trip` validates the parquet writer end-to-end (line in →
+# row out → read back). Requires the `parquet` cargo feature so the
+# parquet/arrow-array deps are in the test's dep graph. Run with
+# `cargo test --features parquet --test parquet_round_trip`.
+[[test]]
+name = "parquet_round_trip"
+required-features = ["parquet"]

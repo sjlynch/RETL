@@ -5,6 +5,8 @@ pub(crate) const DEFAULT_WRITE_BUFFER_BYTES: usize = 256 * 1024;
 pub(crate) const DEFAULT_ZST_LEVEL: i32 = 7;
 pub(crate) const DEFAULT_INFLIGHT_BYTES: usize = 256 * 1024 * 1024;
 pub(crate) const DEFAULT_INFLIGHT_GROUPS: usize = 8;
+pub const DEFAULT_PARQUET_ROW_GROUP_SIZE: usize = 128 * 1024;
+pub const DEFAULT_PARQUET_COMPRESSION: &str = "zstd:3";
 
 impl Default for ETLOptions {
     fn default() -> Self {
@@ -35,6 +37,8 @@ impl Default for ETLOptions {
             human_readable_timestamps: false,
 
             zst_level: DEFAULT_ZST_LEVEL,
+            parquet_row_group_size: DEFAULT_PARQUET_ROW_GROUP_SIZE,
+            parquet_compression: DEFAULT_PARQUET_COMPRESSION.to_string(),
 
             inflight_bytes: DEFAULT_INFLIGHT_BYTES,
             inflight_groups: DEFAULT_INFLIGHT_GROUPS,

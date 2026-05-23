@@ -20,7 +20,7 @@ use std::io::{self, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use crate::bin_args::{
-    AggregateArgs, CommonOpts, ConvertArgs, ConvertFmt, CorpusArgs, CorpusCommand,
+    AggregateArgs, AggregateFmt, CommonOpts, ConvertArgs, ConvertFmt, CorpusArgs, CorpusCommand,
     CorpusManifestArgs, CorpusPlanArgs, CorpusPlanFmt, CountArgs, CountMode, DedupeArgs,
     DescribeArgs, ExportArgs, ExportFmt, FirstSeenArgs, IntegrityArgs, IntegrityModeArg, LoadArgs,
     ParentIdKindArg, ParentsArgs, QueryOpts, QuickstartArgs, SampleArgs, ScanArgs, SchemaArgs,

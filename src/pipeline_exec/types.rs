@@ -51,10 +51,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Export format for partitioned corpus-style outputs.
+///
+/// `Parquet` is always present in the type, but the actual write path is
+/// compiled in only when the `parquet` cargo feature is enabled. Without the
+/// feature, attempting to write `Parquet` returns a clear build-flag error
+/// instead of a confusing runtime panic.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExportFormat {
     Jsonl,
     Zst,
+    Parquet,
 }
 
 /// Options for [`ScanPlan::extract_to_csv`] and [`ScanPlan::extract_to_tsv`].
