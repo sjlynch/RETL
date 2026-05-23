@@ -105,5 +105,7 @@ fn export_format_name(fmt: ExportFmt) -> &'static str {
         ExportFmt::Spool => "spool",
         ExportFmt::Zst => "zst",
         ExportFmt::PartitionedJsonl => "partitioned-jsonl",
+        ExportFmt::Parquet => "parquet",
+        ExportFmt::PartitionedParquet => "partitioned-parquet",
     }
 }

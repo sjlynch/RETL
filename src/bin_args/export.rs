@@ -26,6 +26,16 @@ pub(crate) struct ExportArgs {
     /// because they produce no `.zst` output.
     #[arg(long)]
     pub(crate) zst_level: Option<i32>,
+    /// Rows per Parquet row group (only with `--format parquet`/
+    /// `partitioned-parquet`; rejected for other formats). Default: 131072.
+    #[arg(long)]
+    pub(crate) parquet_row_group_size: Option<usize>,
+    /// Parquet compression codec (only with `--format parquet`/
+    /// `partitioned-parquet`; rejected for other formats). Accepts
+    /// `uncompressed`, `snappy`, `gzip[:LEVEL]`, `brotli[:LEVEL]`, `lz4`,
+    /// `lz4_raw`, `zstd[:LEVEL]`. Default: `zstd:3`.
+    #[arg(long)]
+    pub(crate) parquet_compression: Option<String>,
     /// Whitelist of top-level fields to keep on export. Comma-separated, repeatable.
     /// Required for csv/tsv; missing fields render as empty cells.
     /// Comments use `body`/`parent_id`/`link_id`; submissions use `title`/`selftext`/`domain`.
@@ -82,4 +92,13 @@ pub(crate) enum ExportFmt {
     Zst,
     /// Corpus-style partitioned `.jsonl` files under `comments/` and `submissions/`.
     PartitionedJsonl,
+    /// Single Apache Parquet file. Schema covers `MinimalRecord` fields plus a
+    /// `payload` STRING column carrying the raw JSON line for downstream
+    /// readers that need fields outside the minimal schema. Requires the
+    /// `parquet` cargo feature.
+    Parquet,
+    /// Corpus-style partitioned `.parquet` files under `comments/` and
+    /// `submissions/`, one file per month. Requires the `parquet` cargo
+    /// feature.
+    PartitionedParquet,
 }

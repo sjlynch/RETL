@@ -104,7 +104,7 @@ pub(crate) fn run_sample(args: SampleArgs) -> Result<()> {
                 parts.len()
             );
         }
-        ExportFmt::Zst | ExportFmt::PartitionedJsonl => {
+        ExportFmt::Zst | ExportFmt::PartitionedJsonl | ExportFmt::PartitionedParquet => {
             if to_stdout {
                 anyhow::bail!(
                     "--format {} requires an explicit --out <DIR> (it writes a partitioned corpus tree, not a stream)",
@@ -114,9 +114,18 @@ pub(crate) fn run_sample(args: SampleArgs) -> Result<()> {
             let partition_format = match args.format {
                 ExportFmt::Zst => ExportFormat::Zst,
                 ExportFmt::PartitionedJsonl => ExportFormat::Jsonl,
+                ExportFmt::PartitionedParquet => ExportFormat::Parquet,
                 _ => unreachable!(),
             };
             scan.export_partitioned(&args.out, partition_format)?;
+        }
+        ExportFmt::Parquet => {
+            if to_stdout {
+                anyhow::bail!(
+                    "--format parquet requires an explicit --out <FILE> (parquet is a binary container, not a stream)"
+                );
+            }
+            scan.extract_to_parquet(&args.out)?;
         }
     }
     emit_partial_read_report(&partial_reporter)?;

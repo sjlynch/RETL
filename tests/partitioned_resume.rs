@@ -63,10 +63,12 @@ fn assert_partitioned_resume_after_repair(format: ExportFormat) {
     let out_dir = base.join(match format {
         ExportFormat::Jsonl => "out_jsonl",
         ExportFormat::Zst => "out_zst",
+        ExportFormat::Parquet => unreachable!("test not parameterized over parquet"),
     });
     let ext = match format {
         ExportFormat::Jsonl => "jsonl",
         ExportFormat::Zst => "zst",
+        ExportFormat::Parquet => unreachable!(),
     };
     let jan_out = out_dir.join("comments").join(format!("RC_2006-01.{ext}"));
     let feb_out = out_dir.join("comments").join(format!("RC_2006-02.{ext}"));
@@ -106,6 +108,7 @@ fn assert_partitioned_resume_after_repair(format: ExportFormat) {
     let feb_lines = match format {
         ExportFormat::Jsonl => read_lines(&feb_out),
         ExportFormat::Zst => decompress_zst_lines(&feb_out),
+        ExportFormat::Parquet => unreachable!(),
     };
     assert_eq!(feb_lines.len(), 1);
     assert!(feb_lines[0].contains("feb"), "{feb_lines:?}");
@@ -116,12 +119,14 @@ fn assert_partitioned_resume_rebuilds_corrupt_output(format: ExportFormat) {
     let out_dir = base.join(match format {
         ExportFormat::Jsonl => "out_jsonl_rebuild",
         ExportFormat::Zst => "out_zst_rebuild",
+        ExportFormat::Parquet => unreachable!(),
     });
     run_export(&base, &out_dir, format, false);
 
     let ext = match format {
         ExportFormat::Jsonl => "jsonl",
         ExportFormat::Zst => "zst",
+        ExportFormat::Parquet => unreachable!(),
     };
     let out = out_dir.join("comments").join(format!("RC_2006-01.{ext}"));
     fs::write(&out, b"not a valid completed partition").unwrap();
@@ -130,6 +135,7 @@ fn assert_partitioned_resume_rebuilds_corrupt_output(format: ExportFormat) {
     let lines = match format {
         ExportFormat::Jsonl => read_lines(&out),
         ExportFormat::Zst => decompress_zst_lines(&out),
+        ExportFormat::Parquet => unreachable!(),
     };
     assert_eq!(lines.len(), 1);
     assert!(lines[0].contains("jan"), "{lines:?}");

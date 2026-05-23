@@ -121,6 +121,18 @@ impl RedditETL {
         self.opts = self.opts.with_zst_level(level);
         self
     }
+    /// Rows per Parquet row group (`extract_to_parquet` / partitioned Parquet).
+    /// See [`ETLOptions::parquet_row_group_size`].
+    pub fn parquet_row_group_size(mut self, rows: usize) -> Self {
+        self.opts = self.opts.with_parquet_row_group_size(rows);
+        self
+    }
+    /// Compression codec used by Parquet writers (e.g. `"zstd:3"`). See
+    /// [`ETLOptions::parquet_compression`].
+    pub fn parquet_compression(mut self, codec: impl Into<String>) -> Self {
+        self.opts = self.opts.with_parquet_compression(codec);
+        self
+    }
     /// Override the inflight-bytes backpressure budget used by bucketing/dedupe
     /// producer/consumer pairs.
     ///

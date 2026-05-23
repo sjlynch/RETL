@@ -23,7 +23,7 @@ mod sample;
 mod scan;
 mod schema;
 
-pub(crate) use aggregate::AggregateArgs;
+pub(crate) use aggregate::{AggregateArgs, AggregateFmt};
 #[allow(unused_imports)]
 pub(crate) use aggregate::AggregateRuntimeOpts;
 pub(crate) use common::{CommonOpts, MonitorOpts, QueryOpts, SourceArg};
@@ -102,7 +102,9 @@ pub(crate) enum Command {
     /// Emit distinct keys (author, subreddit, or JSON pointer) matching the query selection.
     #[command(alias = "unique", alias = "distinct")]
     Dedupe(DedupeArgs),
-    /// Export filtered records as JSONL, JSON, spool files, or partitioned corpus files.
+    /// Export filtered records as JSONL, JSON, CSV/TSV, spool, partitioned
+    /// JSONL/ZST/Parquet trees, or a single Parquet file (parquet requires the
+    /// `parquet` cargo feature).
     Export(ExportArgs),
     /// Flatten existing JSONL/spool files into CSV or TSV columns.
     Convert(ConvertArgs),
@@ -115,7 +117,8 @@ pub(crate) enum Command {
     /// record filters `--subreddit`/`--include-deleted` are therefore rejected,
     /// and the inert `--no-manifest`/`--allow-partial` toggles log a warning.
     Integrity(IntegrityArgs),
-    /// Aggregate JSONL inputs into JSON record counts or built-in TSV rollups.
+    /// Aggregate JSONL inputs into JSON record counts, TSV rollups, or
+    /// Parquet rollups (parquet requires the `parquet` cargo feature).
     Aggregate(AggregateArgs),
     /// Resolve parent comments/submissions from a spool directory or direct IDs.
     Parents(ParentsArgs),

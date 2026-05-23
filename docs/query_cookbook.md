@@ -277,7 +277,99 @@ retl export --source rc --no-progress \
 
 - `exists:` gates the more-specific predicate. Without it, missing-field records would be dropped silently. Using both is the safe pattern for fields that might not be present on every record.
 
-### 3h. Subreddit-locked "find recent activity" with a stop-file watchdog
+### 3h. Parquet export → DuckDB / Polars / Athena downstream
+
+```sh
+# Build the parquet feature-enabled binary first:
+cargo build --release --features parquet
+
+# Single .parquet file across the whole 2022 r/rust corpus, dropping
+# pseudo-users on the fast path.
+./target/release/retl export \
+  --data-dir ./data --source both --no-progress \
+  --subreddit rust --start 2022-01 --end 2022-12 \
+  --format parquet \
+  --parquet-compression zstd:3 \
+  --parquet-row-group-size 131072 \
+  --out rust_2022.parquet
+```
+
+Then point any columnar reader at it:
+
+```sh
+duckdb -c "SELECT count(*) FROM read_parquet('rust_2022.parquet')"
+duckdb -c "
+  SELECT author, count(*) AS n
+  FROM read_parquet('rust_2022.parquet')
+  GROUP BY 1 ORDER BY n DESC LIMIT 10
+"
+```
+
+```python
+# Polars
+import polars as pl
+pl.scan_parquet("rust_2022.parquet").group_by("author").len().sort("len", descending=True).head(10).collect()
+```
+
+Walk-through:
+
+- Schema is fixed: the `MinimalRecord` fast-path fields
+  (`subreddit`/`author`/`created_utc`/`score`/`id`/`body`/`selftext`/`title`/`url`/`is_self`/`parent_id`/`domain`)
+  as typed columns, plus a `payload: STRING` column carrying the raw JSON
+  line so downstream readers can still recover anything outside the
+  minimal schema with `json_extract(payload, '$.<field>')`.
+- `--parquet-compression` accepts `uncompressed`, `snappy`, `gzip[:LEVEL]`,
+  `brotli[:LEVEL]`, `lz4`, `lz4_raw`, `zstd[:LEVEL]`. The default
+  `zstd:3` is the best ratio/speed compromise the `parquet` crate
+  supports out of the box. If you need a different codec available to
+  downstream readers, swap it here (the codec name is recorded in the
+  parquet footer so DuckDB/Spark pick it up automatically).
+- `--parquet-row-group-size` defaults to 131072 rows; larger groups
+  improve scan throughput and compression ratio at the cost of a higher
+  per-group writer memory peak.
+
+Per-month partitioning is much more valuable for columnar formats than
+for JSONL/ZST — downstream readers can prune entire months without
+opening the file when your filter includes a date column. Prefer
+`--format partitioned-parquet` for any "scan multiple years, filter by
+month" workload:
+
+```sh
+./target/release/retl export \
+  --data-dir ./data --source rc --no-progress \
+  --subreddit rust --start 2020-01 --end 2024-12 \
+  --format partitioned-parquet \
+  --parquet-compression zstd:3 \
+  --out rust_partitioned/
+
+duckdb -c "
+  SELECT count(*) FROM read_parquet('rust_partitioned/comments/*.parquet')
+"
+```
+
+The aggregate subcommand also speaks parquet for grouped rollups:
+
+```sh
+./target/release/retl aggregate \
+  --spool rust_2022_spool/ \
+  --by author --metric 'sum:/score' \
+  --format parquet \
+  --out author_total_score.parquet
+```
+
+Notes:
+
+- `retl export --format parquet` and `aggregate --format parquet` both
+  require building with `--features parquet` (the dependency stack is
+  gated to keep the default build lean). Without the feature, the CLI
+  rejects the flag with a build-flag error.
+- The atomic-write contract is honored: parquet files are staged under
+  `<out_dir>/_staging/<name>.retl-<pid>-<nonce>.inprogress` and only
+  promoted onto the published path after the writer closes the parquet
+  footer. A killed mid-run never leaves a partial `.parquet` at the
+  published path.
+
+### 3i. Subreddit-locked "find recent activity" with a stop-file watchdog
 
 ```sh
 retl scan \

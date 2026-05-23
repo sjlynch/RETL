@@ -1,7 +1,25 @@
-use clap::Args;
+use clap::{Args, ValueEnum};
 use std::path::PathBuf;
 
 use super::MonitorOpts;
+
+/// Output format for `retl aggregate`. With `--by`, controls how grouped rows
+/// are emitted; without `--by`, only `tsv` (the historical record-count JSON
+/// path, written as tsv-or-json depending on `--by`) is meaningful.
+///
+/// `Parquet` requires the `parquet` cargo feature and is only valid alongside
+/// `--by` (the record-count case has no row schema to write).
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(crate) enum AggregateFmt {
+    /// Default for grouped output: `key\tvalue\n` rows. Default for
+    /// ungrouped output: a single JSON object with the record count.
+    #[default]
+    Tsv,
+    /// Apache Parquet file with `key: STRING, value: STRING` columns. Only
+    /// valid with `--by` (the ungrouped record-count output has no row
+    /// schema). Requires the `parquet` cargo feature.
+    Parquet,
+}
 
 #[derive(Args, Debug, Clone)]
 pub(crate) struct AggregateRuntimeOpts {
@@ -72,4 +90,16 @@ pub(crate) struct AggregateArgs {
     /// intentionally not resumable.
     #[arg(long, hide = true)]
     pub(crate) resume: bool,
+    /// Output format. `tsv` (default) writes the historical TSV / JSON.
+    /// `parquet` writes a two-column Parquet file (`key`, `value`); only
+    /// valid with `--by`.
+    #[arg(long, value_enum, default_value_t = AggregateFmt::Tsv)]
+    pub(crate) format: AggregateFmt,
+    /// Rows per Parquet row group (only with `--format parquet`).
+    #[arg(long)]
+    pub(crate) parquet_row_group_size: Option<usize>,
+    /// Parquet compression codec (only with `--format parquet`). See
+    /// `retl export --help` for accepted values. Default: `zstd:3`.
+    #[arg(long)]
+    pub(crate) parquet_compression: Option<String>,
 }

@@ -37,6 +37,21 @@ pub struct ETLOptions {
     // zstd compression level used by partitioned ZST writers
     pub zst_level: i32,
 
+    /// Rows per Parquet row group when writing `.parquet` outputs (single-file
+    /// `extract_to_parquet` and per-partition writers). Larger groups improve
+    /// scan performance and compression ratio but raise the writer's per-group
+    /// memory peak (one full RecordBatch is materialized at flush time).
+    /// Default: 128 * 1024.
+    pub parquet_row_group_size: usize,
+
+    /// Compression codec used by Parquet writers. Accepted values:
+    /// `"uncompressed"`, `"snappy"`, `"gzip"`, `"lzo"`, `"brotli"`, `"lz4"`,
+    /// `"zstd"`, or any of the above with a level suffix (e.g. `"zstd:3"`,
+    /// `"gzip:6"`, `"brotli:5"`). Default: `"zstd:3"` — a good ratio/speed
+    /// compromise for log-shaped corpora and the standard for DuckDB/Polars
+    /// downstream readers.
+    pub parquet_compression: String,
+
     /// Bound (in bytes) on data inflight between bucketing/dedupe producers
     /// and their downstream consumers. Sets `per_flush_cap = inflight_bytes /
     /// 2` for the producer-side map. Defaults to 256 MiB.
