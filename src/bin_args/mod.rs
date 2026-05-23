@@ -16,6 +16,7 @@ mod describe;
 mod export;
 mod first_seen;
 mod integrity;
+mod load;
 mod parents;
 mod parsers;
 mod quickstart;
@@ -37,6 +38,14 @@ pub(crate) use describe::DescribeArgs;
 pub(crate) use export::{ExportArgs, ExportFmt};
 pub(crate) use first_seen::FirstSeenArgs;
 pub(crate) use integrity::{IntegrityArgs, IntegrityModeArg};
+pub(crate) use load::LoadArgs;
+// `LoadMode` and `IfExists` are referenced only inside the gated `run_load`
+// handler and the in-process clap parse tests.
+#[cfg_attr(
+    not(any(test, feature = "duckdb-load")),
+    allow(unused_imports)
+)]
+pub(crate) use load::{IfExists, LoadMode};
 pub(crate) use parents::{ParentIdKindArg, ParentsArgs};
 pub(crate) use quickstart::QuickstartArgs;
 pub(crate) use sample::SampleArgs;
@@ -122,6 +131,13 @@ pub(crate) enum Command {
     /// Build a per-author "first-seen" timestamp index TSV.
     #[command(name = "first-seen")]
     FirstSeen(FirstSeenArgs),
+    /// Register Parquet output as a queryable DuckDB table or view.
+    ///
+    /// Available only when `retl` is built with the `duckdb-load` cargo
+    /// feature (the bundled libduckdb adds ~10s to clean builds, so it is
+    /// off by default). Without the feature the subcommand still parses but
+    /// the handler errors out with a rebuild hint.
+    Load(LoadArgs),
 }
 
 #[cfg(test)]

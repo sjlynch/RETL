@@ -48,6 +48,7 @@ fn main() -> Result<()> {
         Command::Aggregate(a) => bin_handlers::run_aggregate(a).map(|()| HandlerOutcome::Done),
         Command::Parents(a) => bin_handlers::run_parents(a).map(|()| HandlerOutcome::Done),
         Command::FirstSeen(a) => bin_handlers::run_first_seen(a).map(|()| HandlerOutcome::Done),
+        Command::Load(a) => bin_handlers::run_load(a).map(|()| HandlerOutcome::Done),
     };
 
     // Map the handler outcome to a monitor `outcome` string, then finalize.

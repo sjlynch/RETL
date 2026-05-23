@@ -20,6 +20,7 @@ fn root_help_lists_all_subcommands() {
         "aggregate",
         "parents",
         "first-seen",
+        "load",
     ] {
         assert!(h.contains(s), "root --help should mention `{s}`:\n{h}");
     }
@@ -183,6 +184,26 @@ fn integrity_help_advertises_modes_and_sample() {
     let h = render_help(&["integrity"]);
     for s in ["--mode", "quick", "full", "--sample-bytes", "--collect"] {
         assert!(h.contains(s), "integrity --help missing `{s}`:\n{h}");
+    }
+}
+
+#[test]
+fn load_help_advertises_target_flags() {
+    let h = render_help(&["load"]);
+    for s in [
+        "--from",
+        "--to",
+        "--table",
+        "--mode",
+        "view",
+        "table",
+        "--if-exists",
+        "fail",
+        "replace",
+        "append",
+        "duckdb://",
+    ] {
+        assert!(h.contains(s), "load --help missing `{s}`:\n{h}");
     }
 }
 

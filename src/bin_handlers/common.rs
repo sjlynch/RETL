@@ -22,10 +22,14 @@ use std::path::{Path, PathBuf};
 use crate::bin_args::{
     AggregateArgs, CommonOpts, ConvertArgs, ConvertFmt, CorpusArgs, CorpusCommand,
     CorpusManifestArgs, CorpusPlanArgs, CorpusPlanFmt, CountArgs, CountMode, DedupeArgs,
-    DescribeArgs, ExportArgs, ExportFmt, FirstSeenArgs, IntegrityArgs, IntegrityModeArg,
+    DescribeArgs, ExportArgs, ExportFmt, FirstSeenArgs, IntegrityArgs, IntegrityModeArg, LoadArgs,
     ParentIdKindArg, ParentsArgs, QueryOpts, QuickstartArgs, SampleArgs, ScanArgs, SchemaArgs,
     SchemaFmt, SourceArg,
 };
+// `LoadMode` / `IfExists` are pattern-matched only inside the gated
+// `run_load` implementation in `load.rs`.
+#[cfg(feature = "duckdb-load")]
+use crate::bin_args::{IfExists, LoadMode};
 use crate::bin_helpers::{
     build_etl, discover_spool_parts, emit_partial_read_report, plan, stream_extract_to_stdout,
     stream_path_output_to_stdout, GroupBySpec, GroupMetricAgg, MetricSpec, RecCount,

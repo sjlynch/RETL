@@ -294,6 +294,53 @@ retl scan \
 - `--after`/`--before` accept epoch seconds, `YYYY-MM-DD` (UTC midnight), or full RFC3339. **`--before` is exclusive**, `--after` is inclusive — pay attention when partitioning a year by month.
 - `--stop-file STOP` — drop a file at that path to gracefully stop the run.
 
+### 3i. End-to-end: export Parquet, load into DuckDB, run interactive SQL
+
+`retl load` closes the L in ETL by registering Parquet output as either a
+view or a materialized table inside a DuckDB database file — no server, no
+schema-by-hand step, just `duckdb reddit.duckdb` and SQL.
+
+The subcommand is gated behind the `duckdb-load` cargo feature because the
+bundled libduckdb adds ~10s to clean builds. Enable it once:
+
+```sh
+cargo build --release --features duckdb-load
+```
+
+Then export Parquet and register it:
+
+```sh
+# 1. Export filtered records as Parquet (one or many files; see the export docs).
+retl export \
+  --data-dir ./data --source rc --no-progress \
+  --start 2024-01 --end 2024-12 \
+  --subreddit rust \
+  --format parquet --out ./out/
+
+# 2. Register the Parquet files as a DuckDB view (zero-copy, sub-second).
+retl load \
+  --from 'out/*.parquet' \
+  --to duckdb://reddit.duckdb \
+  --table rust_2024
+
+# 3. Query interactively from the DuckDB CLI.
+duckdb reddit.duckdb -c "SELECT count(*) FROM rust_2024"
+duckdb reddit.duckdb -c "
+  SELECT author, count(*) AS n
+  FROM rust_2024
+  GROUP BY 1 ORDER BY n DESC LIMIT 10
+"
+```
+
+Walk-through:
+
+- `--mode view` (default) issues `CREATE OR REPLACE VIEW <name> AS SELECT * FROM read_parquet(...)`. The Parquet files are *not* copied — every query re-scans them, but registration is sub-second regardless of input size.
+- `--mode table` issues `CREATE TABLE AS SELECT`, materializing the Parquet into native DuckDB storage. The cost is proportional to the data; subsequent queries skip the Parquet read entirely. Use this when the input is small enough to fit comfortably and you'll query it many times.
+- `--if-exists replace` (default) is atomic from a reader's perspective: the DROP + CREATE are wrapped in `BEGIN; ... COMMIT;` for `--mode table`. Use `--if-exists fail` to error out instead of overwriting, or `--if-exists append` (table mode only) to insert into an existing table.
+- `--from` accepts globs and lists exactly as DuckDB's `read_parquet(...)` does — pass it quoted so your shell doesn't expand it client-side first.
+- `--to duckdb://<path>` — the scheme is required so the flag stays unambiguous if other loader targets are added later.
+- Atomic-write contract: DuckDB's own WAL handles power-loss / SIGKILL safety. The `.duckdb` file is never left in a torn state from a mid-`CREATE` interruption.
+
 ---
 
 ## 4. Performance hints relevant to query design

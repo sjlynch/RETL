@@ -18,6 +18,7 @@ include!("count.rs");
 include!("integrity.rs");
 include!("aggregate.rs");
 include!("first_seen.rs");
+include!("load.rs");
 include!("parents_helpers.rs");
 include!("parents.rs");
 

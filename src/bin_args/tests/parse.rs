@@ -1,4 +1,4 @@
-use super::super::{Cli, Command, CorpusArgs, CorpusCommand};
+use super::super::{Cli, Command, CorpusArgs, CorpusCommand, IfExists, LoadMode};
 use super::parse_failure;
 use clap::Parser;
 use retl::YearMonth;
@@ -59,6 +59,76 @@ fn cli_accepts_corpus_plan_command() {
         }
         other => panic!("expected corpus plan command, got {other:?}"),
     }
+}
+
+#[test]
+fn load_command_parses_defaults() {
+    let cli = Cli::try_parse_from([
+        "retl",
+        "load",
+        "--from",
+        "out/*.parquet",
+        "--to",
+        "duckdb://reddit.duckdb",
+        "--table",
+        "comments",
+    ])
+    .expect("load with defaults should parse");
+
+    match cli.command {
+        Command::Load(args) => {
+            assert_eq!(args.from, "out/*.parquet");
+            assert_eq!(args.to, std::path::PathBuf::from("reddit.duckdb"));
+            assert_eq!(args.table, "comments");
+            assert_eq!(args.mode, LoadMode::View);
+            assert_eq!(args.if_exists, IfExists::Replace);
+        }
+        other => panic!("expected Load command, got {other:?}"),
+    }
+}
+
+#[test]
+fn load_command_accepts_table_mode_and_fail_policy() {
+    let cli = Cli::try_parse_from([
+        "retl",
+        "load",
+        "--from",
+        "out/*.parquet",
+        "--to",
+        "duckdb://reddit.duckdb",
+        "--table",
+        "rc_2024",
+        "--mode",
+        "table",
+        "--if-exists",
+        "fail",
+    ])
+    .expect("load with explicit mode/if-exists should parse");
+
+    match cli.command {
+        Command::Load(args) => {
+            assert_eq!(args.mode, LoadMode::Table);
+            assert_eq!(args.if_exists, IfExists::Fail);
+        }
+        other => panic!("expected Load command, got {other:?}"),
+    }
+}
+
+#[test]
+fn load_command_rejects_missing_scheme_on_to() {
+    let msg = parse_failure(&[
+        "load",
+        "--from",
+        "out/*.parquet",
+        "--to",
+        "reddit.duckdb",
+        "--table",
+        "comments",
+    ]);
+    assert!(
+        msg.contains("duckdb://"),
+        "expected duckdb:// hint in error, got: {msg}"
+    );
 }
 
 #[test]

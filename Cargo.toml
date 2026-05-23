@@ -35,6 +35,10 @@ sysinfo = "0.33"
 aho-corasick = "1"
 clap = { version = "4", features = ["derive"] }
 crossbeam-channel = "0.5"
+# Optional: enables the `retl load` subcommand that materializes Parquet
+# output into a DuckDB database file. The crate bundles libduckdb and adds
+# ~10s to clean builds, so it is gated behind the `duckdb-load` feature.
+duckdb = { version = "1", features = ["bundled"], optional = true }
 
 [features]
 default = []
@@ -47,6 +51,11 @@ default = []
 # overhead — gated parameters are absent from function signatures when the
 # feature is off.
 test-utils = []
+# Enables the `retl load` subcommand (Parquet → DuckDB).
+# Off by default because the bundled libduckdb dependency adds ~10s to
+# clean builds. Without the feature `retl load` parses but errors out
+# with a rebuild hint.
+duckdb-load = ["dep:duckdb"]
 
 [profile.release]
 opt-level = 3
