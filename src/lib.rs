@@ -154,6 +154,7 @@ mod stitch;
 mod streaming;
 mod util;
 
+mod agg_expr;
 mod aggregate;
 mod integrity;
 mod parents;
@@ -204,6 +205,10 @@ pub use crate::shard::UsernameStream;
 
 pub use crate::aggregate::{
     AggregateBuildReport, AggregateInputIssue, AggregatePartialReadPolicy, Aggregator,
+};
+pub use crate::agg_expr::{
+    parse_agg_ops, parse_group_keys, write_rows_jsonl, AggOp, DateGranularity, ExprAggregator,
+    GroupKey, HllState, DISTINCT_HLL_THRESHOLD,
 };
 pub use crate::parents::{
     ParentAttachStats, ParentIds, ParentMaps, ParentPayload, ParentPayloadSpec,

@@ -5,6 +5,17 @@ pub(crate) fn run_aggregate(args: AggregateArgs) -> Result<()> {
             "retl aggregate does not support --resume because it reduces existing JSONL inputs. For resumable corpus filtering, run `retl export --format spool --resume ...` first, then aggregate with `retl aggregate --spool <DIR>`."
         );
     }
+    let uses_expr_dsl = args.group_by.is_some() || args.agg.is_some();
+    if uses_expr_dsl && (args.by.is_some() || args.metric.is_some()) {
+        anyhow::bail!(
+            "--group-by/--agg are the generalized DSL and cannot be combined with the legacy --by/--metric flags. Pick one surface for this run."
+        );
+    }
+    if matches!(args.format, AggregateFmt::Jsonl) && !uses_expr_dsl {
+        anyhow::bail!(
+            "--format jsonl is only valid alongside --group-by/--agg (the generalized DSL); drop --format jsonl or supply --group-by/--agg"
+        );
+    }
     if matches!(args.format, AggregateFmt::Parquet) && args.by.is_none() {
         anyhow::bail!(
             "--format parquet requires --by (the ungrouped record-count output has no row schema). Re-run with `--by <field>` to write a two-column parquet rollup, or drop `--format parquet`."
@@ -46,6 +57,11 @@ pub(crate) fn run_aggregate(args: AggregateArgs) -> Result<()> {
     });
     retl::create_dir_all_with_default_backoff(&shards_dir)
         .with_context(|| format!("creating shards_dir {}", shards_dir.display()))?;
+    if uses_expr_dsl {
+        run_aggregate_expr(args, etl, inputs, manifest_inputs, input_count, &shards_dir, manifest_start)?;
+        return Ok(());
+    }
+
     if let Some(by) = args.by.clone() {
         let group_by = GroupBySpec::parse(&by)?;
         let metric = MetricSpec::parse(args.metric.as_deref())?;
@@ -77,6 +93,14 @@ pub(crate) fn run_aggregate(args: AggregateArgs) -> Result<()> {
                     .unwrap_or_else(|| retl::DEFAULT_PARQUET_COMPRESSION.to_string());
                 write_grouped_parquet(&args.out, rows, row_group_size, &compression)?;
                 "parquet"
+            }
+            AggregateFmt::Jsonl => {
+                // Rejected upstream with a clearer message for the
+                // `--by`/`--metric` rollup; this branch is unreachable but
+                // exhaustive matching demands it.
+                anyhow::bail!(
+                    "--format jsonl requires --group-by/--agg, not --by/--metric"
+                );
             }
         };
         let mut counts = counts_map(&[
@@ -409,6 +433,138 @@ fn write_grouped_parquet(
     .with_context(|| format!("publishing aggregate parquet {}", out.display()))
 }
 
+/// Generalized GROUP BY / agg-expression DSL path (`--group-by`/`--agg`).
+/// Distinct from the legacy `--by`/`--metric` rollup: produces one JSON
+/// object per group, with columns named after each [`retl::AggOp`] (and
+/// each [`retl::GroupKey`]).
+fn run_aggregate_expr(
+    args: AggregateArgs,
+    etl: retl::RedditETL,
+    inputs: Vec<PathBuf>,
+    manifest_inputs: Vec<PathBuf>,
+    input_count: usize,
+    shards_dir: &Path,
+    manifest_start: RunManifestStart,
+) -> Result<()> {
+    let group_keys = match args.group_by.as_deref() {
+        Some(s) => retl::parse_group_keys(s).map_err(anyhow::Error::msg)?,
+        None => Vec::new(),
+    };
+    let ops = match args.agg.as_deref() {
+        Some(s) => retl::parse_agg_ops(s).map_err(anyhow::Error::msg)?,
+        None => vec![retl::AggOp::Count],
+    };
+    let group_keys_for_factory = group_keys.clone();
+    let ops_for_factory = ops.clone();
+
+    let (agg, report) = etl
+        .aggregate_jsonls_parallel_collect_with::<retl::ExprAggregator, _>(
+            inputs,
+            shards_dir,
+            move || {
+                retl::ExprAggregator::new(group_keys_for_factory.clone(), ops_for_factory.clone())
+            },
+        )?;
+    report_aggregate_input_issues(&report);
+    ensure_aggregate_inputs_succeeded(input_count, &report, args.strict)?;
+
+    let records_skipped_no_group_key = agg.records_skipped_no_group_key();
+    let records_ingested = agg.records_ingested();
+    let row_count = agg.row_count();
+    let rows = agg.into_rows();
+
+    let output_format = match args.format {
+        AggregateFmt::Tsv | AggregateFmt::Jsonl => {
+            // TSV is the AggregateFmt::default; treat it as JSONL for the
+            // expression DSL since the rollup carries an N-column schema
+            // that does not map to two columns.
+            write_grouped_jsonl(&args.out, &rows)?;
+            "jsonl"
+        }
+        AggregateFmt::Parquet => {
+            anyhow::bail!(
+                "--format parquet is not yet supported for --group-by/--agg; use --format jsonl (the default) or --format tsv"
+            );
+        }
+    };
+
+    let mut counts = counts_map(&[
+        ("input_files", input_count as u64),
+        ("ok_inputs", report.ok_inputs.len() as u64),
+        ("partial_inputs", report.partial_count() as u64),
+        ("fatal_inputs", report.fatal_count() as u64),
+        ("merged_shards", report.merged_shards as u64),
+        ("output_rows", row_count as u64),
+        ("records_ingested", records_ingested),
+        (
+            "records_skipped_no_group_key",
+            records_skipped_no_group_key,
+        ),
+    ]);
+    if let Some(top) = args.top {
+        counts.insert("top".to_string(), top as u64);
+    }
+
+    let mut warnings = aggregate_manifest_warnings(&report);
+    if records_ingested > 0
+        && records_skipped_no_group_key > 0
+        && (records_skipped_no_group_key as f64 / records_ingested as f64)
+            > AGGREGATE_RECORD_SKIP_WARN_RATE
+    {
+        let group_by = args.group_by.as_deref().unwrap_or("");
+        tracing::warn!(
+            group_by = %group_by,
+            records_ingested,
+            records_skipped_no_group_key,
+            skip_rate = records_skipped_no_group_key as f64 / records_ingested as f64,
+            "aggregate skipped {} of {} record(s) missing a --group-by '{}' value",
+            records_skipped_no_group_key,
+            records_ingested,
+            group_by,
+        );
+        warnings.push(format!(
+            "{records_skipped_no_group_key} of {records_ingested} record(s) skipped: missing --group-by '{group_by}' value"
+        ));
+    }
+
+    write_cli_aggregate_manifest(
+        manifest_start,
+        &args,
+        shards_dir,
+        &manifest_inputs,
+        output_format,
+        counts,
+        warnings,
+    )?;
+
+    eprintln!(
+        "Aggregated {} shard(s) to {} ({} group(s)); {} input(s) failed during shard build; {} input(s) skipped after partial read",
+        report.merged_shards,
+        output_format.to_uppercase(),
+        row_count,
+        report.fatal_count(),
+        report.partial_count()
+    );
+    if records_skipped_no_group_key > 0 {
+        eprintln!(
+            "  {} record(s) skipped without a --group-by value (of {} ingested)",
+            records_skipped_no_group_key, records_ingested,
+        );
+    }
+    Ok(())
+}
+
+fn write_grouped_jsonl(out: &Path, rows: &[serde_json::Map<String, Value>]) -> Result<()> {
+    write_text_or_stdout(out, |w| {
+        for row in rows {
+            serde_json::to_writer(&mut *w, row)?;
+            w.write_all(b"\n")?;
+        }
+        Ok(())
+    })
+    .with_context(|| format!("publishing output file {}", out.display()))
+}
+
 fn write_grouped_tsv(out: &Path, rows: Vec<(String, String)>) -> Result<()> {
     // See `write_rec_count_json`: `--out -` streams the TSV to stdout.
     write_text_or_stdout(out, |w| {
@@ -452,9 +608,12 @@ fn write_cli_aggregate_manifest(
         "parallelism": args.runtime.parallelism,
         "progress": !args.runtime.no_progress,
         "emit_manifest": !args.runtime.no_manifest,
+        "group_by": args.group_by.as_deref(),
+        "agg": args.agg.as_deref(),
         "format": match args.format {
             AggregateFmt::Tsv => "tsv",
             AggregateFmt::Parquet => "parquet",
+            AggregateFmt::Jsonl => "jsonl",
         },
         "parquet_row_group_size": (matches!(args.format, AggregateFmt::Parquet)).then_some(
             args.parquet_row_group_size.unwrap_or(retl::DEFAULT_PARQUET_ROW_GROUP_SIZE),

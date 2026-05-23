@@ -19,6 +19,9 @@ pub(crate) enum AggregateFmt {
     /// valid with `--by` (the ungrouped record-count output has no row
     /// schema). Requires the `parquet` cargo feature.
     Parquet,
+    /// One JSON object per line. Only valid with the expression-DSL path
+    /// (`--group-by` / `--agg`); the legacy `--by` rollup uses TSV.
+    Jsonl,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -71,6 +74,18 @@ pub(crate) struct AggregateArgs {
     /// `avg:/pointer`, `min:/pointer`, or `max:/pointer`.
     #[arg(long = "metric")]
     pub(crate) metric: Option<String>,
+    /// Generalized GROUP BY columns: comma-separated list of `subreddit`,
+    /// `author`, `year`, `month`, `day`/`date`, `hour`, or
+    /// `json:/pointer`. Mutually exclusive with `--by`/`--metric`.
+    #[arg(long = "group-by")]
+    pub(crate) group_by: Option<String>,
+    /// Generalized aggregate-expression list, e.g.
+    /// `count(*),distinct(id),max(score)`. Supports `count(*)`,
+    /// `distinct(<field>)`, `sum/min/max/first/last(<field>)` where
+    /// `<field>` is a top-level name or `/json/pointer`. Output is one
+    /// JSON object per group. Mutually exclusive with `--by`/`--metric`.
+    #[arg(long = "agg")]
+    pub(crate) agg: Option<String>,
     /// Keep only the top N groups by metric value (ties sort by key).
     #[arg(long)]
     pub(crate) top: Option<usize>,
